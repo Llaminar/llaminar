@@ -97,9 +97,7 @@ namespace llaminar2::cpu::native_quantised
             if constexpr (Instruction == multi_scale::NEONByteDot::DotProd)
                 ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
             if (!grid_.beginWorkshare()) return;
-            const int chunks = weights_.N_padded / 64;
-            const auto n_blocks = (std::int64_t(chunks) + n_block_chunks_ - 1) / n_block_chunks_;
-            const std::int64_t tasks = std::int64_t(grid_.tiles(width_)) * n_blocks;
+            const std::int64_t tasks = taskCount();
             // Tasks are independent output tiles whose full-K arithmetic does
             // not depend on the executing worker, so dynamic claiming keeps
             // every byte while letting faster cores of a heterogeneous host
@@ -107,29 +105,60 @@ namespace llaminar2::cpu::native_quantised
             auto workshare = [&] {
 #pragma omp for schedule(dynamic, 1)
                 for (std::int64_t task = 0; task < tasks; ++task)
-                {
-                    const auto span = grid_.tileSpan(static_cast<int>(task / n_blocks), width_);
-                    const auto first = task % n_blocks * n_block_chunks_;
-                    const auto end = std::min<std::int64_t>(chunks, first + n_block_chunks_);
-                    for (auto current = first; current < end; ++current)
-                    {
-                        const int chunk = static_cast<int>(current);
-                        switch (span.size())
-                        {
-                        case 0: break;
-                        case 1: tile<1, Instruction>(span.first, chunk); break;
-                        case 2: tile<2, Instruction>(span.first, chunk); break;
-                        case 3: tile<3, Instruction>(span.first, chunk); break;
-                        case 4: tile<4, Instruction>(span.first, chunk); break;
-                        default: throw std::logic_error("Native NEON task exceeds its bound shared-row tile");
-                        }
-                    }
-                }
+                    runTask<Instruction>(task);
             };
             OMP_WORKSHARE_REGION(workshare);
         }
 
+        /**
+         * @brief Number of independent (row tile, chunk group) tasks.
+         * @return Zero when no original row is active; otherwise the exact count.
+         */
+        [[nodiscard]] std::int64_t taskCount() const
+        {
+            if (!grid_.hasAny()) return 0;
+            return std::int64_t(grid_.tiles(width_)) * chunkGroups();
+        }
+
+        /**
+         * @brief Execute one independent task; no synchronization, no shared writes.
+         * @details Lets a caller pool the tasks of several independent bindings
+         * into one dynamic workshare (one barrier instead of one per member).
+         * Each task writes only its own output tile with the same full-K
+         * arithmetic, so pooling changes no byte.
+         * @param task Index in [0, taskCount()).
+         */
+        template <multi_scale::NEONByteDot Instruction = multi_scale::NEONByteDot::ASIMD>
+        void runTask(std::int64_t task) const
+        {
+            const int chunks = weights_.N_padded / 64;
+            const auto n_blocks = chunkGroups();
+            const auto span = grid_.tileSpan(static_cast<int>(task / n_blocks), width_);
+            const auto first = task % n_blocks * n_block_chunks_;
+            const auto end = std::min<std::int64_t>(chunks, first + n_block_chunks_);
+            for (auto current = first; current < end; ++current)
+            {
+                const int chunk = static_cast<int>(current);
+                switch (span.size())
+                {
+                case 0: break;
+                case 1: tile<1, Instruction>(span.first, chunk); break;
+                case 2: tile<2, Instruction>(span.first, chunk); break;
+                case 3: tile<3, Instruction>(span.first, chunk); break;
+                case 4: tile<4, Instruction>(span.first, chunk); break;
+                default: throw std::logic_error("Native NEON task exceeds its bound shared-row tile");
+                }
+            }
+        }
+
     private:
+        /** @return Ceil(physical 64-column chunks / chunks per task). */
+        [[nodiscard]] std::int64_t chunkGroups() const noexcept
+        {
+            const int chunks = weights_.N_padded / 64;
+            return (std::int64_t(chunks) + n_block_chunks_ - 1) / n_block_chunks_;
+        }
+
         /** @brief Seal only immutable coordinates and borrowed publication spans.
          * @param weights Checked resident prepared stream.
          * @param activation Original physical Q8 bank.
