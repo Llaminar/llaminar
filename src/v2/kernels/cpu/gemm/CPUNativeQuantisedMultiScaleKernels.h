@@ -464,8 +464,12 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         using I = typename Ops::I;
         using F = typename Ops::F;
         static_assert(Rows >= 1 && Rows <= 4);
-        if (chunk < 0 || chunk >= packed.N_padded / 64 || begin < 0 || end < begin ||
-            end > packed.blocks_per_row || columns <= 0 || columns > 64)
+        // Ordered K tiles have a fixed count, so the trailing tiles of a short
+        // K start at or beyond blocks_per_row with a clamped end. Such an empty
+        // span reads no weight block and still publishes zero or the retained
+        // accumulator; only a nonempty span must lie inside the matrix.
+        if (chunk < 0 || chunk >= packed.N_padded / 64 || columns <= 0 || columns > 64 ||
+            (end > begin && (begin < 0 || end > packed.blocks_per_row)))
             throw std::invalid_argument("Multi-scale CPU tile is outside its admitted geometry");
         if constexpr (Tree == Reduction::OrderedPartitions)
             if (partitions <= 0 || blocks_per_partition <= 0 ||
