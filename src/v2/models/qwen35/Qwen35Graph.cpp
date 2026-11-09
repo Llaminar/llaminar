@@ -473,9 +473,23 @@ namespace llaminar2
             weights.fa_block.moe_gate_exps ||
             weights.fa_block.moe_up_exps ||
             weights.fa_block.moe_down_exps;
+        /*
+         * Routed MTP experts are registry-owned either through ExpertOverlay
+         * or, on a CPU endpoint, because CPU model population commits every
+         * routed expert (including the nextn predictor layer) as exact
+         * per-expert prepared projections and binds no 3-D parent. The CPU
+         * local-expert stage then authenticates that registry bank and fails
+         * hard on any missing projection. A partial raw parent set is never
+         * registry ownership and is rejected below.
+         */
+        const bool cpu_registry_owned_mtp_experts =
+            device.is_cpu() && prepared_weight_store_ &&
+            !weights.fa_block.moe_gate_exps && !weights.fa_block.moe_up_exps &&
+            !weights.fa_block.moe_down_exps;
         const bool registry_owned_mtp_experts =
-            config_.moe.routed_expert_plan &&
-            config_.moe.routed_expert_plan->usesExpertOverlayAuthority();
+            cpu_registry_owned_mtp_experts ||
+            (config_.moe.routed_expert_plan &&
+             config_.moe.routed_expert_plan->usesExpertOverlayAuthority());
         const bool mirror_mtp_lm_head =
             !kv_cache_only &&
             mirroredMTPHeadConfigured();
