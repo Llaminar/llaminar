@@ -823,12 +823,15 @@ class AssemblerInputTest(unittest.TestCase):
                        'return 0; }())); }',
                        'void f() { asm("nop"); }', 'asm("nop");', 'void f(int x) { if (x) asm("nop"); }',
                        'void f() { extern int g __asm("h"); }', 'int f() __asm__ volatile("g");',
-                       'int f() __asm__("g" : );', 'auto l = [] { int v __asm("w"); };'):
+                       'int f() __asm__("g" : );', 'auto l = [] { int v __asm("w"); };',
+                       '__extension__ asm("nop");', 'void f() { __extension__ asm("nop"); }',
+                       'auto l = []<class T> { extern int g __asm("h"); };', 'struct S { static int x __asm("y"); };',
+                       'int y = 1; return asm("nop");'):
             with self.subTest(source=source):
                 self.assertTrue(CHECKER.inline_assembly_violations(source))
         for source in ('extern "C" { int fputs(const char *, void *) __asm("_" "fputs"); }',
                        'namespace a { inline namespace b { long tz __asm("_timezone"); } }',
-                       'struct S { static int x __asm("y"); };', 'int a[2] __asm("b");'):
+                       'int a[2] __asm("b");', 'int x __asm("y") = 1;'):
             with self.subTest(source=source):
                 self.assertEqual(CHECKER.inline_assembly_violations(source), [])
 
@@ -1076,18 +1079,29 @@ class PolicyTest(unittest.TestCase):
 
 
 FAKE_COMPILER = """#!{python}
-import pathlib, shutil, sys
+import os, pathlib, shutil, sys
 here = pathlib.Path(__file__).parent
 args = sys.argv[1:]
 if args == ["--version"]:
     sys.stdout.write((here / "version.txt").read_text()); sys.exit(0)
 def value(flag):
     return args[args.index(flag) + 1]
+def setting(name, default):
+    path = here / name
+    return path.read_text() if path.exists() else default
+if args[-1] == "-print-search-dirs":
+    if (here / "fail-search.txt").exists():
+        sys.stderr.write("driver error\\n"); sys.exit(1)
+    sys.stdout.write("install: /x/\\nprograms: =" + setting("progdirs.txt", str(here) + "/") + "\\n"); sys.exit(0)
+if args[-1].startswith("-print-prog-name="):
+    name = args[-1].split("=", 1)[1]
+    sys.stdout.write(setting(f"progname-{{name}}.txt", str(here / name)) + "\\n"); sys.exit(0)
 if "-###" in args:
-    jobs = (here / "jobs.txt").read_text() if (here / "jobs.txt").exists() else (
-        " {{here}}/cc1plus -quiet {{source}} -o /tmp/ccTEST.s\\n as -EL -march=armv8-a -o {{obj}} /tmp/ccTEST.s\\n")
-    sys.stderr.write("Using built-in specs.\\nCOMPILER_PATH={{here}}\\n".format(here=here) + jobs.format(
-        here=here, source=args[args.index("-c") + 1] if "-c" in args else "", obj=value("-o") if "-o" in args else ""))
+    source = args[args.index("-c") + 1] if "-c" in args else ""
+    default = (f" {{here}}/cc1plus -quiet -MD {{value('-MF')}} -MF {{value('-MF')}} -MT probe -H {{source}} "
+               f"-o /tmp/ccTEST.s\\n as -EL -march=armv8-a -o {{value('-o')}} /tmp/ccTEST.s\\n")
+    jobs = setting("jobs.txt", default).format(here=here, source=source, obj=value("-o"), deps=value("-MF"))
+    sys.stderr.write("Using built-in specs.\\nCOMPILER_PATH=" + str(here) + "\\n" + jobs)
     sys.exit(0)
 (here / "invocations.txt").open("a").write(" ".join(args) + "\\n")
 if "-E" in args:
@@ -1281,21 +1295,22 @@ class ProofBindingTest(unittest.TestCase):
 
     def test_opaque_routes_are_rejected_before_or_by_the_compile(self) -> None:
         here = self.tool
-        default_jobs = f" {here}/cc1plus -quiet {{source}} -o /tmp/ccTEST.s\n as -EL -o {{obj}} /tmp/ccTEST.s\n"
+        cc1 = f" {here}/cc1plus -quiet -MD {{deps}} -MF {{deps}} -MT probe -H {{source}} -o /tmp/ccTEST.s"
+        assembler = " as -EL -o {obj} /tmp/ccTEST.s"
         cases = {
             "PCH marker in the translation unit": ("preprocessed.txt", '#pragma GCC pch_preprocess "p.h.gch"\nint a;\n'),
             "PCH used by the compile": ("headers.txt", ". /usr/include/stdio.h\n! /work/probe.h.gch\n"),
             "invalid PCH tried": ("headers.txt", "..x /work/x.h.gch\n"),
-            "specs file read": ("jobs.txt", "Reading specs from /tmp/extra.specs\n" + default_jobs),
-            "extra assembler input (renamed asm spec)": (
-                "jobs.txt", f" {here}/cc1plus -quiet {{source}} -o /tmp/ccTEST.s\n"
-                            f" as -EL -o {{obj}} /tmp/ccTEST.s /abs/extra.s\n"),
-            "assembler include path option": (
-                "jobs.txt", f" {here}/cc1plus -quiet {{source}} -o /tmp/ccTEST.s\n as --defsym x=1 -o {{obj}} /tmp/ccTEST.s\n"),
-            "PCH in a compiler job": (
-                "jobs.txt", f" {here}/cc1plus -quiet -include-pch p.pch {{source}} -o /tmp/ccTEST.s\n"
-                            f" as -EL -o {{obj}} /tmp/ccTEST.s\n"),
-            "third job": ("jobs.txt", default_jobs + f" {here}/cc1plus -quiet x.cpp -o /tmp/other.s\n"),
+            "specs file read": ("jobs.txt", "Reading specs from /tmp/extra.specs\n" + cc1 + "\n" + assembler + "\n"),
+            "extra assembler input (renamed asm spec)": ("jobs.txt", cc1 + "\n" + assembler + " /abs/extra.s\n"),
+            "unadmitted assembler option": ("jobs.txt", cc1 + "\n as --defsym x=1 -o {obj} /tmp/ccTEST.s\n"),
+            "PCH in the compiler job": ("jobs.txt", cc1.replace("-quiet", "-quiet -include-pch p.pch") + "\n" +
+                                        assembler + "\n"),
+            "profile in the compiler job": ("jobs.txt", cc1.replace("-quiet", "-quiet -fprofile-use=/p.gcda") + "\n" +
+                                            assembler + "\n"),
+            "third job": ("jobs.txt", cc1 + "\n" + assembler + "\n" + cc1 + "\n"),
+            "failed search-directory query": ("fail-search.txt", "1"),
+            "driver selects another assembler": ("progname-as.txt", "/usr/local/bin/as"),
         }
         for label, (name, content) in cases.items():
             with self.subTest(label=label):
@@ -1305,26 +1320,112 @@ class ProofBindingTest(unittest.TestCase):
                 self.assertFalse(Path(self.args.proof).exists())
                 (self.tool / name).unlink()
         CHECKER.build(self.args)
-        self.assertEqual(len(self.proof()["driver_jobs"]), 2)
+        self.assertEqual(len(self.proof()["driver_plan"]["jobs"]), 2)
 
-    def test_job_programs_are_bound(self) -> None:
+    def test_job_programs_are_bound_by_content_symlink_and_selection(self) -> None:
+        (self.tool / "versions").mkdir()
+        for version in ("A", "B"):
+            (self.tool / "versions" / version).write_text(f"#!/bin/sh\n# assembler {version}\n")
+            (self.tool / "versions" / version).chmod(0o755)
+        (self.tool / "as").unlink()
+        (self.tool / "as").symlink_to(self.tool / "versions" / "A")
+        (self.tool / "first").mkdir()
+        (self.tool / "progdirs.txt").write_text(f"{self.tool}/first/:{self.tool}/")
         CHECKER.build(self.args)
         CHECKER.verify(self.args)
-        (self.tool / "as").write_text("#!/bin/sh\n# replaced assembler\n")
+        programs = self.proof()["programs"]
+        self.assertEqual(programs["job1"]["examined"], [f"{self.tool}/first/"])
+        self.assertEqual(programs["job1"]["resolved"], os.path.realpath(self.tool / "versions" / "A"))
+        (self.tool / "as").unlink()
+        (self.tool / "as").symlink_to(self.tool / "versions" / "B")
+        with self.assertRaisesRegex(ValueError, "program"):
+            CHECKER.verify(self.args)
+        (self.tool / "as").unlink()
+        (self.tool / "as").symlink_to(self.tool / "versions" / "A")
+        CHECKER.verify(self.args)
+        (self.tool / "first" / "as").write_text("#!/bin/sh\n# shadow\n")
+        (self.tool / "first" / "as").chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "program"):
+            CHECKER.verify(self.args)
+        (self.tool / "first" / "as").unlink()
+        CHECKER.verify(self.args)
+        (self.tool / "versions" / "A").write_text("#!/bin/sh\n# replaced assembler\n")
         with self.assertRaisesRegex(ValueError, "program"):
             CHECKER.verify(self.args)
 
-    def test_assembler_options_in_the_compile_command_fail(self) -> None:
-        for option in ("-Wa,-I/tmp", "-Xassembler", "-save-temps", "-specs=/tmp/extra.specs", "--specs=x",
-                       "-B/tmp/tools", "-include-pch", "-fpch-preprocess", "-fmodules", "-fplugin=x.so", "@args.rsp",
-                       "-no-integrated-as", "--config=x.cfg"):
-            (self.root / "args.rsp").write_text("-Wa,-I/tmp\n")  # Response files are expanded first.
-            with self.subTest(option=option):
-                database = json.loads(Path(self.args.compile_database).read_text())
-                database[0]["arguments"] = [str(self.compiler), option, "-c", str(self.source), "-o", "x.o"]
-                Path(self.args.compile_database).write_text(json.dumps(database))
-                with self.assertRaisesRegex(ValueError, "routes inputs outside"):
-                    CHECKER.build(self.args)
+    def test_receipt_plan_and_program_coverage_are_required(self) -> None:
+        CHECKER.build(self.args)
+        path, original = Path(self.args.proof), self.proof()
+        plan, programs = original["driver_plan"], original["programs"]
+        mutations = {
+            "no plan": {key: value for key, value in original.items() if key != "driver_plan"},
+            "plan without jobs": dict(original, driver_plan={"program_dirs": [], "path": []}),
+            "incompatible plan": dict(original, driver_plan=dict(plan, jobs=plan["jobs"][:1])),
+            "foreign job argument": dict(original, driver_plan=dict(plan, jobs=[
+                plan["jobs"][0] + ["-fplugin=/x.so"], plan["jobs"][1]])),
+            "assembler identity removed": dict(original, programs={key: value for key, value in programs.items()
+                                                                     if key != "job1"}),
+            "foreign program entry": dict(original, programs=dict(programs, job9=programs["job0"])),
+            "mismatched job program": dict(original, programs=dict(programs, job1=programs["job0"])),
+            "no programs": {key: value for key, value in original.items() if key != "programs"},
+        }
+        for label, receipt in mutations.items():
+            with self.subTest(label=label):
+                path.write_text(json.dumps(receipt))
+                with self.assertRaises(ValueError):
+                    CHECKER.verify(self.args)
+        path.write_text(json.dumps(original))
+        CHECKER.verify(self.args)
+
+    def test_typed_job_admission(self) -> None:
+        paths = CHECKER.JobPaths("/w/probe.cpp", "/w/out/proof.o", "/w/out/proof.deps", "/w/build",
+                                 frozenset({"/w/probe.cpp", "/sdk/SDKSettings.json"}))
+        clang = ["/xc/usr/bin/clang", "-cc1", "-triple", "arm64-apple-macosx27.0.0", "-O3", "-emit-obj",
+                 "-main-file-name", "probe.cpp", "-target-feature", "+i8mm", "-mllvm", "-extra-vectorizer-passes",
+                 "-fdepfile-entry=/sdk/SDKSettings.json", "-I", "/w/src", "-I/usr/local/include",
+                 "-fdebug-compilation-dir=/w/build", "-Wno-error=allocator-wrappers", "-D", "NDEBUG", "-H",
+                 "-dependency-file", "/w/out/proof.deps", "-MT", "probe", "-o", "/w/out/proof.o", "-x", "c++",
+                 "/w/probe.cpp"]
+        gnu = [["/usr/libexec/gcc/cc1plus", "-quiet", "-I", "/w/src", "-MD", "/w/out/proof.d", "-MF",
+                "/w/out/proof.deps", "-MT", "probe", "-D_GNU_SOURCE", "-D", "X=1", "/w/probe.cpp", "-march=armv8-a+i8mm",
+                "-g", "-O3", "-dumpdir", "/tmp/", "-dumpbase", "proof.cpp", "-o", "/tmp/cc.s", "-H"],
+               ["as", "-I", "/w/src", "--gdwarf-5", "-EL", "-march=armv8-a", "-mabi=lp64", "-o", "/w/out/proof.o",
+                "/tmp/cc.s"]]
+        CHECKER.validate_plan([clang], "AppleClang-21", paths)
+        CHECKER.validate_plan(gnu, "GNU-14", paths)
+        clang_mutations = {
+            "remap-file": ["-remap-file", "/w/src/view.h;/outside/actual.h"],
+            "vfs overlay": ["-ivfsoverlay", "/x/overlay.yaml"], "vfsoverlay": ["-vfsoverlay", "/x/o.yaml"],
+            "profile use path": ["-fprofile-instrument-use-path=/x/default.profdata"],
+            "sample profile": ["-fprofile-sample-use=/x/p.prof"], "include pch": ["-include-pch", "/x/p.pch"],
+            "plugin": ["-load", "/x/plugin.so"], "other mllvm option": ["-mllvm", "-some-file=/x"],
+            "depfile entry outside the closure": ["-fdepfile-entry=/x/other.json"],
+            "relative include root": ["-I", "include"], "other compilation directory": ["-fdebug-compilation-dir=/x"],
+            "second positional input": ["/x/other.cpp"], "ignorelist": ["-fsanitize-ignorelist=/x/list.txt"],
+            "assembler-style warning": ["-Wa,-I/x"], "embed directory": ["--embed-dir=/x"],
+        }
+        for label, extra in clang_mutations.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    CHECKER.validate_plan([clang[:-1] + extra + clang[-1:]], "AppleClang-21", paths)
+        for label, plan in {"other output": [clang[:clang.index("-o") + 1] + ["/x.o"] + clang[clang.index("-o") + 2:]],
+                            "not integrated": [clang, ["/usr/bin/as", "-o", "/w/out/proof.o"]],
+                            "relative program": [["clang"] + clang[1:]]}.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    CHECKER.validate_plan(plan, "AppleClang-21", paths)
+        gnu_mutations = {
+            "compiler profile": (0, ["-fprofile-use=/x/p.gcda"]), "compiler plugin": (0, ["-fplugin=/x/p.so"]),
+            "compiler include": (0, ["-include", "/x/h.h"]), "assembler extra input": (1, ["/abs/extra.s"]),
+            "assembler defsym": (1, ["--defsym", "x=1"]), "assembler warning flag": (1, ["-Wno-foo"]),
+            "second assembly output": (0, ["-o", "/tmp/other.s"]),
+        }
+        for label, (index, extra) in gnu_mutations.items():
+            with self.subTest(label=label):
+                mutated = [list(job) for job in gnu]
+                mutated[index] = mutated[index] + extra
+                with self.assertRaises(ValueError):
+                    CHECKER.validate_plan(mutated, "GNU-14", paths)
 
     def test_inline_assembly_file_input_is_rejected_before_compiling(self) -> None:
         (self.tool / "preprocessed.txt").write_text('void f() { asm(".incbin \\"blob.bin\\""); }\n')
