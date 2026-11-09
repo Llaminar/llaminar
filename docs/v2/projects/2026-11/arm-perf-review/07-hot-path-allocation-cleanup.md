@@ -283,3 +283,12 @@ the source policy). Dead persistent_state parameter removed.
   team in/out; negative control fails at 407347f6c; rope_bytes_driver
   n_past<0). Routing (a) into branch before handover preferred, (b) separate
   follow-up — awaiting reviewer final.
+
+- ROUTING = (a): fix on the branch BEFORE handover (current tip NOT green for
+  handover). Reviewer specifics: keep negative control at unfixed tip
+  407347f6c; regression covers ≥32-row BF16/FP16 table paths + one-row/
+  partial FP32; compare vs APPLICABLE original arithmetic; EveryPosition/
+  VerifierPadding contract (no fatal). Reviewer finish HOLD on this P2
+  (remaining source read + orphan-deletion check); will review exact fix
+  SHA. Lane implementing; WSL (5') continues as unfixed-tip signal (final
+  gate will be at fixed tip).
