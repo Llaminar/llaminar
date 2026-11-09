@@ -5,7 +5,7 @@ Base: `feat/qfn-ngram-continuation` at `b65ee52fd`. Working branch
 `codex/qfn-ngram-continuation-arm64` (draft PR #32), force-pushed after every
 commit; `arm-validation/<sha9>` branches pin each commit for the Spark hosts.
 
-**Status: implementation complete for the ARM CPU scope; post-merge performance work is tracked in `arm-perf-review/`.**
+**Status: implementation complete for the ARM CPU scope; post-merge performance work is tracked separately on the `codex/arm-perf-review` branch.**
 The objective remains native CPU inference with the robustness of the Intel
 path, finished by a Release `Perf__` scaling round. Detailed historical
 evidence (K-series snapshots, seals, falsification controls) lives in
@@ -125,8 +125,8 @@ Cross-ISA and host gates (failures classified, no unexplained failure):
   failure is a known upstream target-selection registration (3) or a
   CUDA-device profiler surrogate (6).
 
-Performance follow-ups after merge are tracked in
-[`arm-perf-review/`](arm-perf-review/README.md): I8MM for grouped rows,
+Performance follow-ups after merge are tracked on the separate
+`codex/arm-perf-review` branch: I8MM for grouped rows,
 27B dense MTP and its depth controller, region/barrier count per step, LM head,
 GDN verifier economics, FA2 policy regret, placement by core class, in-model
 overlay collection, GB10 CUDA register pressure, NUMA-less hosts.
