@@ -119,7 +119,8 @@ def physical_workers():
     cores=set()
     for cpu in os.sched_getaffinity(0):
         root=Path('/sys/devices/system/cpu')/f'cpu{cpu}'/'topology'
-        cores.add(((root/'physical_package_id').read_text().strip(),(root/'core_id').read_text().strip()))
+        # Thread-sibling sets identify cores; hybrid hosts (GB10) repeat core_id across clusters.
+        cores.add(((root/'physical_package_id').read_text().strip(),(root/'thread_siblings_list').read_text().strip()))
     require(cores,'No physical worker cores');return len(cores)
 
 
