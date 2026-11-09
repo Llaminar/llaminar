@@ -241,3 +241,20 @@ separate (shared) path with the same pattern but different owners.
 - (4) COVERAGE: verifyTailPadding focused matrix = contiguous Rows1/2 +
   ordered Rows1/2/3/4 (NOT Rows1..4 × both policies as claimed) → add
   CONTIGUOUS Rows3/4 (preferred) or narrow the claim.
+
+## SOURCE112 FINAL (2026-11-09) — fix scope consolidated
+
+- HOLD on normalization-admission P1 (sent items): checked canonical structural
+  admission BEFORE writes; no executable unsealed view; invalid N/K/source/
+  encoding/storage coverage + unchanged-byte asserts.
+- Proof corrections: per-reader x86 poisoned/normalized; contiguous Rows3/4;
+  poison-rejection AND positive-execution = COMPLEMENTARY proofs, separate
+  fixtures (not one normalized-arrival trace).
+- Ordering ACK (positive): poll ready-before-completion.ready; ready/claimed
+  precede arrival.publish; normalization+seal before reachable engine-field
+  install; seals not rewritten; writer-policy gate recognizes
+  unsealedGenerationBytes; core-free test proves only intended secondary-padding
+  intervals change on valid layouts; 3 focused registrations present. No
+  arithmetic/transfer-extent change; normalizer no allocation. First-touch/
+  NUMA/economy unchanged = OWNER evidence (not claimed).
+- Housekeeping: remove duplicate @throws logic_error in the touched admission.
