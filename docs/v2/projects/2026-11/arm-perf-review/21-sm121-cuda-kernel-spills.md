@@ -101,3 +101,25 @@ Evidence: `~/llaminar-spark-results/K14-CUDA-SPILL-MIGRATION-a62696317`.
   (302318f1e) contains 7e709d60e → Release CUDA sm_121 builds fail there
   until fixed. Idea-25 trace substitution: cff351901 (523230ab0 + bd9dcd12a;
   U2✓ U5✓) sealed.
+
+## Main's response (2026-11-09) — bd9dcd12a REJECTED as a fix
+
+- bd9dcd12a = the rejected pre-review state: contains exactly the register-array
+  DEMOTIONS excluded on purpose (tensor_prefill P/V n-loop unroll 1 over the
+  128-float accumulator; BK64 wj-loop unroll 1 indexing acc[wi][wj]; BK256
+  non-ordered k-loop unroll 1 indexing A_frag_all/sa_all) — unconditional on
+  every architecture. Rolling a loop that indexes a register array moves it to
+  LOCAL MEMORY: ptxas reports 'stack frame', not spill stores → the spill guard
+  passes while the hottest accumulators live in lmem. '0 spills' on bd9dcd12a
+  = that artifact; it would also change non-12.x targets.
+- Evidence requested from arm-sparks (on 7e709d60e or 302318f1e):
+  1) exact ptxas 'Function properties'/'Used N registers' lines for the
+     spilling BK64 instantiations (h0/h4/h24 256-staging) + CUDAFlashAttention
+     at sm_121; 2) configure line (build type, CMAKE_CUDA_ARCHITECTURES,
+     flags, image). Main's A/B (uma3, 80;86;89;90;120;121) showed 744 BK64
+     instantiations at 0 spills on 120/121 → variant set or flags differ;
+     CUDAFlashAttentionKernels.cu was NOT in the probed object set.
+- Expected remaining 12.x list (fixed WITHOUT register-array demotion):
+  BK256 tail + tensor_prefill + FlashAttention (+ BK64 if confirmed).
+- Idea-25 qualifier: cff351901 runs the demoted kernels — graph/launch
+  STRUCTURE only; kernel timings NOT representative of #43 (sealed that way).
