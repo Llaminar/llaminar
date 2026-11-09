@@ -138,6 +138,33 @@ namespace llaminar2
                                                const MPILaunchConfig &config);
 
         /**
+         * @brief Bounded libgomp idle-spin budget for CPU-executing ranks.
+         *
+         * A decode step runs many short OpenMP regions separated by short
+         * serial work (stage dispatch, routing, sampling). With libgomp's
+         * default budget (300000 spins) workers futex-sleep inside those gaps,
+         * and every region then pays a full team wake-up; on GB10's mixed
+         * X925/A725 cores this made the grouped MTP verifier cost as much per
+         * row as serial decode. Measured on Qwen3.6-35B-A3B-MTP (GB10, 20
+         * threads, -n 256): 3,000,000 reaches 99.6% of an unbounded spin
+         * (MTP dynamic 13.23 -> 18.73 tok/s; MTP off 13.68 -> 14.34 tok/s),
+         * while an idle server still parks every worker (0 cores busy versus
+         * 19 with an unbounded spin). This is a scheduling budget only; it
+         * never changes arithmetic or bytes.
+         */
+        static constexpr const char *kOpenMPIdleSpinCount = "3000000";
+
+        /**
+         * @brief Install the bounded OpenMP idle-spin policy for child ranks.
+         *
+         * Must run in the launcher, before mpirun is executed: libgomp reads
+         * GOMP_SPINCOUNT once at library load and has no runtime setter. An
+         * explicitly supplied GOMP_SPINCOUNT is preserved for measurement.
+         * buildMPIRunCommand exports the effective value to remote ranks.
+         */
+        static void configureOpenMPWaitPolicy();
+
+        /**
          * @brief Build mpirun command line for self-launch
          *
          * Constructs appropriate mpirun invocation based on configuration:

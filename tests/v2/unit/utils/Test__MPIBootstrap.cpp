@@ -145,6 +145,35 @@ TEST(Test__MPIBootstrap, PortableDiagnosticsAreExplicitNameOnlyExports)
     }
 }
 
+/** The bounded libgomp idle-spin budget is installed once and reaches every rank by name. */
+TEST(Test__MPIBootstrap, OpenMPIdleSpinPolicyIsBoundedAndExportedByName)
+{
+    {
+        ScopedLaunchEnvironment absent("GOMP_SPINCOUNT", nullptr);
+        llaminar2::MPIBootstrap::configureOpenMPWaitPolicy();
+        ASSERT_NE(std::getenv("GOMP_SPINCOUNT"), nullptr);
+        EXPECT_STREQ(std::getenv("GOMP_SPINCOUNT"), llaminar2::MPIBootstrap::kOpenMPIdleSpinCount);
+        // Bounded: never an unbounded active wait that keeps an idle server busy.
+        EXPECT_STRNE(std::getenv("GOMP_SPINCOUNT"), "infinite");
+        for (const char *hostfile : {"", "/cluster/hosts"})
+        {
+            llaminar2::MPILaunchConfig config;
+            config.hostfile = hostfile;
+            const auto command = buildCommand(config, {});
+            const auto found = std::find(command.begin(), command.end(), "GOMP_SPINCOUNT");
+            ASSERT_NE(found, command.end());
+            EXPECT_EQ(*(found - 1), "-x");
+            EXPECT_FALSE(contains(command, llaminar2::MPIBootstrap::kOpenMPIdleSpinCount));
+        }
+    }
+    {
+        // An explicit measurement value is preserved, never overwritten.
+        ScopedLaunchEnvironment explicit_value("GOMP_SPINCOUNT", "30000000");
+        llaminar2::MPIBootstrap::configureOpenMPWaitPolicy();
+        EXPECT_STREQ(std::getenv("GOMP_SPINCOUNT"), "30000000");
+    }
+}
+
 /** Credentials and rank-local hardware policy must not become cluster-wide settings. */
 TEST(Test__MPIBootstrap, DiagnosticPropagationExcludesSecretsAndDeviceLocalPolicy)
 {
