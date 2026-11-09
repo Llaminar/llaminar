@@ -214,3 +214,25 @@ the source policy). Dead persistent_state parameter removed.
   skips; ProductionTestPreflight repeat-until-fail:20 NEON_DOTPROD 214/214;
   RoPE angle-storage source policy clean. Handover drafting; only WSL x86 gate
   (@989b7bada) before reviewer.
+
+## Rebased onto 425002104 — tip 8ba25fc28 (2026-11-09)
+
+- Rebase --onto 425002104 5922cd1f5 (no NativeVNNI tokens in diff; clean).
+- LATENT COMPILE BUG fixed (lane's, since original 7d; found by sweeping ALL
+  callers of the changed APIs outside the diff): Perf__RMSNormThreadSweep
+  (registered) + Perf__RMSNormParallelSweep (unregistered) passed float gamma
+  to rmsnorm_q8_1_pure_integer (const int16_t* gamma_q11) — old tree fails
+  ("cannot convert float* to const int16_t*"). Fixed in 7d (20d85fa31):
+  quantize_rmsnorm_gamma_q11 ONCE, outside the timed loop.
+- NEW: FromGGUF_ExtractsPartialRotaryDimension in Test__ModelMemoryProfile
+  (generic <arch>.rope.dimension_count: undeclared→head_dim, 32→32 wire
+  round-trip, 64→full head).
+- range-diff vs 989b7bada: commits 2/4/5/6 =; commit 1 = sweep fix; commit 3
+  (docker) context only (MODE=full cuobjdump + MODE=profilers/repo merge;
+  bash -n clean); commit 7 = profile test.
+- Checks: gcc-16 aarch64 syntax 25 TUs + 13 callers; Mac portability
+  NEON_DOTPROD 270/270 + NEON 270/270 0 skips; preflight 214/214 ×20;
+  source policy clean; ImageIdentityTests 17/17; test_production_pipeline
+  53 failures = IDENTICAL on pure 425002104 (base defects). A/B stands.
+- Pending: reviewer pass at 8ba25fc28; WSL (5'); handover draft
+  /tmp/armqual/hotpath-handover.md.
