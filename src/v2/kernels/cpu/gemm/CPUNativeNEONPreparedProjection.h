@@ -56,12 +56,10 @@ namespace llaminar2::cpu::native_quantised
             const std::array<std::span<const Q8_1Block>, Rows> &activation,
             const std::array<std::span<float>, Rows> &output, int chunk)
         {
-            // The compiler envelope is admitted even when the caller deliberately
-            // selects ASIMD in a DotProd build: auto-generated code may use SDOT.
-            ARMCPUCapabilities::native().require(ARMCPUFeature::ASIMD);
-#if defined(__ARM_FEATURE_DOTPROD)
-            ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
-#endif
+            // The whole compiler envelope is admitted even when the caller
+            // deliberately selects a narrower leaf: auto-generated code may use
+            // any instruction of the envelope (SDOT, or SMMLA in an I8MM build).
+            ARMCPUCapabilities::native().requireCompiledEnvelope();
             if (chunk < 0 || chunk >= weights.N_padded / 64)
                 throw std::invalid_argument("Native NEON projection chunk is outside its matrix");
             const int columns = std::min(64, weights.N - chunk * 64);
@@ -114,12 +112,14 @@ namespace llaminar2::cpu::native_quantised
          * @brief Execute with one explicit native operation set.
          * @tparam Ops NEONMultiScaleOps of an admitted family, or a test type
          * derived from one that observes its integer leaf calls.
-         * @details execute() is the production entry and admits the hardware;
-         * callers of this overload must have admitted Ops' instructions.
+         * @details Admits the complete compiler envelope itself, so an Ops type
+         * cannot run instructions the machine lacks whichever entry is used.
          * @throws std::invalid_argument For an unsupported source/encoding/policy tuple.
          */
         template <typename Ops> void executeWith() const
         {
+            // Every entry, including an observer seam, admits the full envelope.
+            ARMCPUCapabilities::native().requireCompiledEnvelope();
             if (weights_.usesCompactMultiScale())
             {
                 std::array<const Q8_1Block *, Rows> input;

@@ -75,13 +75,7 @@ namespace llaminar2::cpu::native_quantised
             // Admit auto-generated code as well as the explicitly selected dot
             // family before spawning a team. A narrower diagnostic route does
             // not narrow a DotProd compiler envelope.
-            ARMCPUCapabilities::native().require(ARMCPUFeature::ASIMD);
-#if defined(__ARM_FEATURE_DOTPROD)
-            ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
-#endif
-#if defined(__ARM_FEATURE_MATMUL_INT8)
-            ARMCPUCapabilities::native().require(ARMCPUFeature::IntegerMatMul);
-#endif
+            ARMCPUCapabilities::native().requireCompiledEnvelope();
             return CPUNativeNEONProjectionBatch(weights, activation, output, output_stride, width, grid, bias, n_block_chunks);
         }
 
