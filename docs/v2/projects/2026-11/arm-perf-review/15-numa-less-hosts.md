@@ -85,3 +85,25 @@ and VMs. It is not needed for the qualified GB10 target.
   CPUJointBufferedSource 64K env cases). ONESHOT SMOKE (I8MM build, greedy
   -t 0 -s 42 n=16, 16 threads): PASS — prefill 5 tok; 'Paris, and it is the
   capital of Europe…'; staging 0.4GB/291 tensors; prefix cache 1/1.
+
+## 15 UNMASKED final classification (2026-11-09, lane; SHA 27b2a803)
+
+- 52 tests: 16 PASS = pure seccomp (S1-only). 36 FAIL with deciding lines:
+  4 B0 base; 9 T1 mmap window 4096; 8 T2 4K literal; 2 M1 (test iterates
+  CPU-less nodes; product fail-fast correct); 9 G2 CONFIRMED (mbind EINVAL →
+  DeviceWorkspaceManager cannot allocate ordinary CPU workspaces — blast
+  radius: CPU inference can't allocate workspaces on 64K NUMA hosts →
+  #49 bumped HIGH); 1 G1 CONFIRMED; 1 G3 CONFIRMED.
+- NEW GAPS: G6 #54 (MED) ExpertPreparedMemoryGeometry 4096 Heap min-align →
+  AnonymousPageMapping always rounds → sub-64K projection UNDER-ADMITTED
+  (PMA 'admitted=4096 requested=65536'; production admission) — CORRECTS the
+  earlier 'benign' note (4096 min-align benign only for >=1-page payloads).
+  G7 #55 (MED) detectViaProcfs substring cpulist parse + nodes 0-7 only
+  (misses CPU 9) → node0 fallback (G5) → ClusterInventoryBootstrap hard-fail;
+  host-independent; fold with #52 recommended. G8 candidate (trace pending):
+  activation_arena 'admitted=23615 claimed=23552 requested=64' in
+  NativeSizedDisabledMTPUsesAdmittedStorageRowsAcrossDepthPolicies (passes
+  x86 WSL) — trace production-estimated admission before calling a gap.
+- Caveat: unmasking container used default 64 MiB shm; no 36-explanation in
+  shm. CSV: /tmp/armqual-b1/15/classification-39c24d8b4.csv (unmasked
+  columns). Grace record building (I8MM logs checked for changes).
