@@ -665,3 +665,11 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   Perf__CPURootedPublicationTransport.OriginalNUMAVariableRecordGatherReplay.
 - Base-issue flag sent to Main (CMake-harness family + ROCm CSVs + new-base
   set) — separate from the addon handover.
+
+- RESOLVED (Main): FusedFinalAddPreservesRawAndWeightedBytes = base defect
+  (NaN/Inf/subnormal corpus vs fail_on_nan, Integration default; scalar fails
+  identically on pure base; passes with LLAMINAR_FAIL_ON_NAN=0);
+  OriginalNUMAVariableRecordGatherReplay (+NativeEpochAbortWitnessReplay) =
+  env (set_mempolicy/NUMA container; SYS_NICE/seccomp; in afe62c5ef reference
+  set pre-rebase). ALL classified → .80 gate seal authorized. A–C → upstream
+  base-defect note (Main collects). R1 remaining = WSL (4') only.
