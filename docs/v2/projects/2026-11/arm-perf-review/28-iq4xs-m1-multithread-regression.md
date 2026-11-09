@@ -111,3 +111,28 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   changes M=1; else investigate separately (bind/admission per call, code
   alignment). Ratchet gate approved (idea 29): Rows=1 zero; Rows2–4 per-program
   budgets keyed by compiler id+major + envelope; unknown → fail closed.
+
+## Tooling successor 7abfc0dc1 (2026-11-09) — Source115 scope
+
+- The b01d285dc gate FAILED .80 Integration on Linux gcc-14: pre-existing
+  grouped spills addressed through [sp] there (114 programs), x29 on Darwin —
+  old [sp]-only gate would have BROKEN CI. Superseded.
+- Detection: all FP/SIMD widths (b/h/s/d/q/v) via sp, x29, or add/sub/mov-
+  derived aliases (retired on reassignment); ABI saves d8–d15 classified
+  separately (1 save, ≤1 restore/return).
+- Inventory: probe inventory string; every expected rows×family×policy×
+  dispatched-encoding/map/minimum emitted exactly once, non-empty body;
+  duplicate/missing/empty/missing-inventory rejected.
+- Callee closure: local + tail callees audited; external = violation except
+  never-returning fatal + abort.
+- Policy (approved ratchet): Rows=1 ZERO; Rows2–4 per-program budgets
+  (CPUNativeTileRegisterBudget.json) keyed by CMake compiler id + major +
+  envelope; unknown/stale fail closed; qualified GNU-14 + AppleClang-21 ×
+  NEON/NEON_DOTPROD/NEON_I8MM; budget totals gcc-14 1029/1176/1274, AppleClang
+  1429/2017/2185; census action for future budgets.
+- Binding: -M closure per-file hashes (incl. NEONFP16.h,
+  MoEProjectionNumericalContract.h), executed command+directory, target
+  command digest, compiler version, checker/envelope/budget hashes; Ninja
+  depfile (CMP0116); Mac checks (touch NEONFP16.h regenerates; edit
+  MoEProjection → verify fails until rebuild).
+- Tests: 13 negative cases. SOURCE115 forwarded. .80 run at 7abfc0dc1.
