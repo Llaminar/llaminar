@@ -230,20 +230,8 @@ TEST_F(ComputeStageTest, RoPEBasic)
 
     EXPECT_EQ(stage.type(), ComputeStageType::ROPE);
 
-    bool success = false;
-    try
-    {
-        success = stage.execute(ctx_.get());
-    }
-    catch (const std::exception &e)
-    {
-        GTEST_SKIP() << "RoPE execution requires device enumeration: " << e.what();
-    }
-
-    if (!success)
-    {
-        GTEST_SKIP() << "RoPE execution failed (missing kernel support)";
-    }
+    // A CPU context with a bound workspace must execute; any failure is a test failure.
+    ASSERT_TRUE(stage.execute(ctx_.get()));
 
     // At position 0, cos(0) = 1, sin(0) = 0
     // So rotation should be identity
@@ -286,21 +274,9 @@ TEST_F(ComputeStageTest, RoPEPositionOffset)
     const test::StageWorkspaceTestBinding workspace0(stage0, seq_len);
     const test::StageWorkspaceTestBinding workspace1(stage1, seq_len);
 
-    bool success0 = false, success1 = false;
-    try
-    {
-        success0 = stage0.execute(ctx_.get());
-        success1 = stage1.execute(ctx_.get());
-    }
-    catch (const std::exception &e)
-    {
-        GTEST_SKIP() << "RoPE execution requires device enumeration: " << e.what();
-    }
-
-    if (!success0 || !success1)
-    {
-        GTEST_SKIP() << "RoPE execution failed (missing kernel support)";
-    }
+    // A CPU context with bound workspaces must execute; any failure is a test failure.
+    ASSERT_TRUE(stage0.execute(ctx_.get()));
+    ASSERT_TRUE(stage1.execute(ctx_.get()));
 
     // Results should be different due to position offset
     const float *out0 = Q0->data();
@@ -369,21 +345,9 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_BatchedParity)
     const test::StageWorkspaceTestBinding contiguous_workspace(stage_contiguous, total_tokens);
     const test::StageWorkspaceTestBinding batched_workspace(stage_batched, total_tokens);
 
-    bool success1 = false, success2 = false;
-    try
-    {
-        success1 = stage_contiguous.execute(ctx_.get());
-        success2 = stage_batched.execute(ctx_.get());
-    }
-    catch (const std::exception &e)
-    {
-        GTEST_SKIP() << "RoPE execution requires device enumeration: " << e.what();
-    }
-
-    if (!success1 || !success2)
-    {
-        GTEST_SKIP() << "RoPE execution failed (missing kernel support)";
-    }
+    // A CPU context with bound workspaces must execute; any failure is a test failure.
+    ASSERT_TRUE(stage_contiguous.execute(ctx_.get()));
+    ASSERT_TRUE(stage_batched.execute(ctx_.get()));
 
     const float *out_contiguous = Q_contiguous->data();
     const float *out_batched = Q_batched->data();
@@ -471,23 +435,14 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_OverridesPosOffset)
     RoPEStage stage1(params1);
     RoPEStage stage2(params2);
     RoPEStage stage3(params3);
+    const test::StageWorkspaceTestBinding workspace1(stage1, seq_len);
+    const test::StageWorkspaceTestBinding workspace2(stage2, seq_len);
+    const test::StageWorkspaceTestBinding workspace3(stage3, seq_len);
 
-    bool success1 = false, success2 = false, success3 = false;
-    try
-    {
-        success1 = stage1.execute(ctx_.get());
-        success2 = stage2.execute(ctx_.get());
-        success3 = stage3.execute(ctx_.get());
-    }
-    catch (const std::exception &e)
-    {
-        GTEST_SKIP() << "RoPE execution requires device enumeration: " << e.what();
-    }
-
-    if (!success1 || !success2 || !success3)
-    {
-        GTEST_SKIP() << "RoPE execution failed (missing kernel support)";
-    }
+    // A CPU context with bound workspaces must execute; any failure is a test failure.
+    ASSERT_TRUE(stage1.execute(ctx_.get()));
+    ASSERT_TRUE(stage2.execute(ctx_.get()));
+    ASSERT_TRUE(stage3.execute(ctx_.get()));
 
     const float *out1 = Q1->data(); // pos_offset=5
     const float *out2 = Q2->data(); // position_ids=[0] (should override)
