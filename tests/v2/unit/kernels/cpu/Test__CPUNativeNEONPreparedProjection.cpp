@@ -577,8 +577,9 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsIncompleteAliasedAndUnalignedExpe
 
 /**
  * @test Opaque source words cannot hide reserved bits by masking them into a
- * usable coefficient. Publication admission rejects them before any tile or
- * worker team exists, so no output is ever authored.
+ * usable coefficient. Publication admission rejects them in every live column
+ * before any tile or worker team exists, so no output is ever authored; padding
+ * words past N are not admitted and provably cannot change an output byte.
  */
 TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBitsBeforeAnyWrite)
 {
@@ -595,8 +596,8 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBitsBefo
         const std::array<std::span<float>, 1> output{std::span(result)};
         CPUNativeNEONProjectionTile<1>::bind(weights, input, output, 0).execute();
         const auto reference = result;
-        // Every lane of the unit, including the 56 padding columns past N=8.
-        for (int bad_column = 0; bad_column < 64; ++bad_column)
+        // Every live column (N=8) is admitted and rejected before any tile exists.
+        for (int bad_column = 0; bad_column < 8; ++bad_column)
         {
             SCOPED_TRACE(bad_column);
             std::uint16_t original = 0;
@@ -608,6 +609,21 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBitsBefo
             EXPECT_THROW((void)fixture.view(), std::invalid_argument);
             for (const float value : result) EXPECT_EQ(value, 123.0f);
             std::memcpy(word, &original, sizeof(original));
+        }
+        // Padding words (never moved) may hold anything and cannot change a published byte.
+        for (int padding = 8; padding < 64; ++padding)
+        {
+            const std::uint16_t invalid = 0xffff;
+            std::memcpy(fixture.bytes.data() + secondary + padding * 2, &invalid, sizeof(invalid));
+        }
+        result.fill(123.0f);
+        CPUNativeNEONProjectionTile<1>::bind(fixture.view(), input, output, 0).execute();
+        for (int column = 0; column < 8; ++column)
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(result[column]), std::bit_cast<std::uint32_t>(reference[column]));
+        for (int padding = 8; padding < 64; ++padding)
+        {
+            const std::uint16_t zero = 0;
+            std::memcpy(fixture.bytes.data() + secondary + padding * 2, &zero, sizeof(zero));
         }
         result.fill(123.0f);
         CPUNativeNEONProjectionTile<1>::bind(fixture.view(), input, output, 0).execute();
