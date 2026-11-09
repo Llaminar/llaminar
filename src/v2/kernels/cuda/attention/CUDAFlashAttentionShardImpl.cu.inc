@@ -1281,7 +1281,21 @@ namespace
                         l_i *= scale_old;
 
                         float l_ij = 0.0f;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+                        // sm_120/121 allocate about 40 more registers than
+                        // sm_80..90 (221-224) for the unstriped HD256
+                        // context-partial body, whose 128 accumulators then
+                        // spill at 255. Unrolling the key loop by four keeps
+                        // it in registers on 12.x. The loop indexes only
+                        // shared scores/V rows; O_acc stays fully unrolled
+                        // per key, so every element still accumulates keys
+                        // in ascending order with unchanged arithmetic.
+                        constexpr int kPVKeyUnroll =
+                            HEAD_DIM == 256 && PV_WARPS_PER_Q_GROUP == 1 && WRITE_CONTEXT_PARTIAL ? 4 : 16;
+#pragma unroll kPVKeyUnroll
+#else
 #pragma unroll 16
+#endif
                         for (int j = 0; j < kReductionTileKV; ++j)
                         {
                             if (j < reduction_len)
