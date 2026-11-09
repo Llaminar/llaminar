@@ -326,3 +326,18 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   (1029/1176/1274), mismatches=0. Last GNU-14 gap closed — the requalified
   object-disassembly gate has its complete owner evidence (AppleClang Mac E2E
   + GNU-14 .80). Reviewer SOURCE119 (source) pending; .80 free.
+
+## SOURCE119 FINAL (2026-11-09) — successor scope (SOURCE120)
+
+- P1a complete instruction coverage: bind admitted ranges + symbol
+  entries/extents to the object; reject gaps/prefix/tail/overlap/duplicate/
+  out-of-order/cross-section; consistent positive fixtures + deletion/
+  extent/address controls (hash-binding an incomplete rendering ≠ proof).
+- P1b trusted callees by BINDING: external-import-only libc exceptions; reject
+  defined/rebound/alias trusted symbols; ELF + Mach-O controls + undefined-
+  import positives; proven_noreturn must bind the selected bodies.
+- P1c assembler-input freshness: .include/.incbin consumed by the assembler
+  outside -M/-MD → bind into stability/rebuild/verify closure or reject
+  unbound cases; mutation control alongside C++ header controls.
+- Precision: 'lo12 on stack base FAILS' = memory operands only (ADD generalizes
+  to UNKNOWN_STACK) — narrow claim or enforce/test the broader rule.
