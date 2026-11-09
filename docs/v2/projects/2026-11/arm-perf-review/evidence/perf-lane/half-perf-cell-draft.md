@@ -79,3 +79,24 @@ Replaces the earlier proposed modification of Perf__CPUFloatingMoEExpert
 - Test__CPUHalfOperands.cpp already proves the engine constructor, FP32-RNE +
   stored-half entries, rounding words, serial/grouped, worker policy; the new
   file adds performance ownership only.
+
+## Reviewer #143 contract corrections (2026-11-09) — MUST reflect before any source
+
+(1) ORACLE: half-representable FP32 inputs = necessary, NOT sufficient for an
+FP32-A byte oracle; the reference must use the SAME 256-lane tree AND the same
+completion program. ORDER-DISCRIMINATING fixture (add separately from
+conversion-discriminating fixtures): K=257 with products p[0]=2^24, p[1]=1,
+p[256]=-2^24, all others zero (every A/B exactly binary16: +-4096x4096, 1x1)
+-> increasing-K serial FP32 gives 0, canonical 256-lane tree gives 1.
+A generic native/oneDNN FP32 reference CANNOT certify by representability.
+(2) TIMING STATE: repeated timing with beta!=0 needs a NAMED initial-C/state
+protocol: restore the same C0 outside each measured interval OR specify/replay
+the same bounded trajectory in both processes (warmups/samples must not
+consume changing states). GROUPED bundle is NOT an arbitrary alpha/beta API:
+executeHalfBundle (FloatingPointGemmKernel.h:4728) calls executeHalfOperands
+(...,1.f,0.f,...,0) -> REJECT unsupported grouped alpha/beta/offset requests
+(no silent ignore). Record alpha/beta, bias/initial-output bytes, offsets/
+selections and bundle geometry in the case identity.
+- Confirmed by reviewer: constructor/public-entry ownership; separate new perf
+  owner; smoke-vs-recorded-preflight separation. HOLD retained until the
+  oracle/state/API distinctions are explicit; no test-only source authorized.
