@@ -19,6 +19,8 @@
 #include <functional>
 #include <initializer_list>
 #include <memory>
+#include <optional>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1621,6 +1623,89 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_ExecutesChunksInOrd
     EXPECT_EQ(host.forward_token_batches[1], (std::vector<int>{14, 15, 16, 17}));
     EXPECT_EQ(host.last_maintenance_chunk.chunk_index, 1);
     EXPECT_TRUE(host.last_maintenance_decision.required);
+}
+
+/**
+ * @test Bucketed prefill publishes host-only chunk, gap and family wall timers.
+ *
+ * Every executed chunk records its host wall with bucket geometry and the
+ * chunk/token sequence; each chunk after the first records the host gap since
+ * its predecessor returned; the family records one wall. Collection adds no
+ * event or synchronization, and nothing is recorded when the domain is off.
+ */
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_PublishesHostChunkGapAndFamilyTimers)
+{
+    std::map<std::string, std::optional<std::string>> environment;
+    for (const char *key : {"LLAMINAR_PERF_STATS_JSON", "LLAMINAR_PERF_STATS_FILTER"})
+    {
+        const char *value = std::getenv(key);
+        environment[key] = value ? std::optional<std::string>(value) : std::nullopt;
+    }
+    const auto restore = [&]
+    {
+        for (const auto &[key, value] : environment)
+            if (value) ::setenv(key.c_str(), value->c_str(), 1);
+            else ::unsetenv(key.c_str());
+        PerfStatsCollector::reloadConfigurationFromEnvironment();
+        PerfStatsCollector::reset();
+    };
+    const auto run = [&]
+    {
+        auto engine = makeEngine(/*cache_enabled=*/false);
+        MockForwardExecutionHost host(&mock_ctx_);
+        host.graph_stage_count = 1;
+        const std::vector<int> tokens = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21};
+        auto input = makeTestInput(static_cast<int>(tokens.size()), 1, DeviceId::cpu(), tokens.data(), nullptr);
+        PrefillChunkSchedulerPolicy policy;
+        policy.bucket_sizes = {4};
+        policy.fixed_chunk_real_tokens = 4;
+        policy.min_rebalance_interval_tokens = 4;
+        policy.max_rebalance_interval_tokens = 4;
+        policy.real_token_count = static_cast<int>(tokens.size());
+        auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+            input, policy, /*pad_token_id=*/0, /*allow_padded_execution=*/false);
+        ASSERT_TRUE(schedule) << schedule.error;
+        ASSERT_EQ(schedule.chunks.size(), 3u);
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.runPrefillChunkSchedule(input, schedule, output, host));
+    };
+    const auto family = [](const std::string &name) -> std::optional<PerfStatRecord>
+    {
+        for (const auto &row : PerfStatsCollector::snapshot())
+            if (row.domain == "forward_graph" && row.name == name)
+                return row;
+        return std::nullopt;
+    };
+
+    ::setenv("LLAMINAR_PERF_STATS_JSON", "1", 1);
+    ::setenv("LLAMINAR_PERF_STATS_FILTER", "forward_graph", 1);
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
+    PerfStatsCollector::reset();
+    run();
+    const auto chunk = family("prefill_chunk_host_wall");
+    const auto gap = family("prefill_inter_chunk_gap");
+    const auto whole = family("prefill_family_host_wall");
+    ASSERT_TRUE(chunk && gap && whole);
+    EXPECT_EQ(chunk->kind, PerfStatRecord::Kind::Timer);
+    EXPECT_EQ(chunk->count, 3u);
+    EXPECT_EQ(gap->count, 2u);
+    EXPECT_EQ(whole->count, 1u);
+    EXPECT_EQ(chunk->tags.at("bucket_seq_len"), "4");
+    EXPECT_EQ(chunk->tags.at("real_token_count"), "4");
+    EXPECT_EQ(chunk->tags.at("sync_scope"), "none");
+    EXPECT_EQ(chunk->sequence_minimum_words, (std::vector<uint64_t>{0, 0, 4}));
+    EXPECT_EQ(chunk->sequence_maximum_words, (std::vector<uint64_t>{2, 8, 12}));
+    EXPECT_EQ(gap->sequence_minimum_words, (std::vector<uint64_t>{1, 4, 8}));
+    EXPECT_EQ(whole->sequence_minimum_words, (std::vector<uint64_t>{3, 0, 12}));
+    EXPECT_GE(whole->total_ns, chunk->total_ns + gap->total_ns);
+
+    ::setenv("LLAMINAR_PERF_STATS_FILTER", "moe_placement", 1);
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
+    PerfStatsCollector::reset();
+    run();
+    EXPECT_FALSE(family("prefill_chunk_host_wall"));
+    EXPECT_FALSE(family("prefill_family_host_wall"));
+    restore();
 }
 
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_HoldsDistinctAuthorityLeaseAcrossEverySubmission)

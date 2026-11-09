@@ -25636,6 +25636,11 @@ add_v2_test(V2_Unit_ForwardExecutionEngine
     LABELS "V2;Unit;Execution;ForwardExecutionEngine;DGORefactor"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_PrefillBucketHostTimers
+    COMMAND $<TARGET_FILE:v2_test_forward_execution_engine>
+        --gtest_filter=Test__ForwardExecutionEngine.RunPrefillChunkSchedule_PublishesHostChunkGapAndFamilyTimers
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Execution;PerfStats;Prefill;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
 # Setup-only captures never contribute executed decode traversals; transaction
 # zero contributes exactly once through the real executor with device-free mocks.
