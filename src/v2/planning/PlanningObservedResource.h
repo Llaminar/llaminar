@@ -14,6 +14,32 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Attach the discovered physical backing of one GPU allocator.
+     *
+     * Every planner that projects a GPU from a rank inventory routes through
+     * this function, so the same allocator never appears with two backings
+     * (PhysicalMemoryPlanBuilder rejects that as conflicting observations).
+     * For an integrated GPU the uncapped driver free figure is a sample of the
+     * rank host pool and becomes the joint pool limit; the resource's own
+     * admission availability keeps any user cap.
+     * @throws std::invalid_argument when a GPU is absent from the inventory.
+     */
+    inline PhysicalMemoryResource withObservedBacking(PhysicalMemoryResource resource, const RankInventory &rank)
+    {
+        if (!resource.device.is_gpu())
+            return resource;
+        const auto found = std::find_if(rank.gpus.begin(), rank.gpus.end(), [&](const auto &gpu) {
+            return gpu.type == resource.device.type && gpu.local_device_id == resource.device.ordinal;
+        });
+        if (found == rank.gpus.end())
+            throw std::invalid_argument("Physical backing requested for a GPU absent from rank inventory");
+        resource.backing = found->memory_backing;
+        resource.pool_available_bytes =
+            found->memory_backing == PhysicalMemoryBacking::RankHostPool ? found->free_memory_bytes : 0u;
+        return resource;
+    }
+
     /** @return Exact published allocator; unknown and noncanonical host devices are rejected. */
     inline PhysicalMemoryResource planningObservedResource(const RankInventory &rank, DeviceId device)
     {
@@ -28,6 +54,6 @@ namespace llaminar2
         }
         else if (device != DeviceId::cpu())
             throw std::invalid_argument("Planning host allocator must use the rank-bound CPU resource");
-        return {rank.rank, device, info->memory_bytes, info->free_memory_bytes};
+        return withObservedBacking({rank.rank, device, info->memory_bytes, info->free_memory_bytes}, rank);
     }
 }

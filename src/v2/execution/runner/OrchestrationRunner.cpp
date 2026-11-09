@@ -1858,8 +1858,8 @@ namespace llaminar2
             const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &budgets)
         {
             constexpr std::uint32_t kMagic = 0x43415034u; // "CAP4"
-            constexpr std::uint32_t kVersion = 4;
-            constexpr std::size_t kHeaderBytes = 40;
+            constexpr std::uint32_t kVersion = 5; // v5 adds physical backing + pool observation
+            constexpr std::size_t kHeaderBytes = 52;
             constexpr std::size_t kOwnerBytes = 16;
             constexpr std::size_t kRecordBytes =
                 kHeaderBytes +
@@ -1895,6 +1895,12 @@ namespace llaminar2
                     bytes,
                     static_cast<std::uint64_t>(
                         bom.resource().admission_available_bytes));
+                appendCapacityWireScalar(
+                    bytes, static_cast<std::uint32_t>(bom.resource().backing));
+                appendCapacityWireScalar(
+                    bytes,
+                    static_cast<std::uint64_t>(
+                        bom.resource().pool_available_bytes));
                 for (std::size_t owner_index = 0;
                      owner_index < PhysicalMemoryBOM::ownerCount();
                      ++owner_index)
@@ -1923,8 +1929,8 @@ namespace llaminar2
             std::vector<MoEOverlayBoundPhysicalMemoryBudget> &output)
         {
             constexpr std::uint32_t kMagic = 0x43415034u;
-            constexpr std::uint32_t kVersion = 4;
-            constexpr std::size_t kHeaderBytes = 40;
+            constexpr std::uint32_t kVersion = 5; // v5 adds physical backing + pool observation
+            constexpr std::size_t kHeaderBytes = 52;
             constexpr std::size_t kOwnerBytes = 16;
             constexpr std::size_t kRecordBytes =
                 kHeaderBytes +
@@ -1960,6 +1966,18 @@ namespace llaminar2
                 const auto available_bytes =
                     readCapacityWireScalar<std::uint64_t>(
                         bytes, cursor, end);
+                const auto backing_value =
+                    readCapacityWireScalar<std::uint32_t>(
+                        bytes, cursor, end);
+                const auto pool_available_bytes =
+                    readCapacityWireScalar<std::uint64_t>(
+                        bytes, cursor, end);
+                if (backing_value > std::numeric_limits<std::uint8_t>::max() ||
+                    pool_available_bytes > std::numeric_limits<std::size_t>::max())
+                    throw std::invalid_argument(
+                        "ExpertOverlay capacity wire backing failed range validation");
+                const auto backing = physicalMemoryBackingFromWire(
+                    static_cast<std::uint8_t>(backing_value));
                 const DeviceId device(device_type, ordinal);
                 if (magic != kMagic || version != kVersion ||
                     world_rank != contributing_rank ||
@@ -1979,6 +1997,9 @@ namespace llaminar2
                     .total_bytes = static_cast<std::size_t>(total_bytes),
                     .admission_available_bytes =
                         static_cast<std::size_t>(available_bytes),
+                    .backing = backing,
+                    .pool_available_bytes =
+                        static_cast<std::size_t>(pool_available_bytes),
                 });
                 for (std::size_t owner_index = 0;
                      owner_index < PhysicalMemoryBOM::ownerCount();

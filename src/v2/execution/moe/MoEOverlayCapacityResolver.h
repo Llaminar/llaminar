@@ -168,6 +168,8 @@ namespace llaminar2
                     .device = source.resource().device,
                     .total_bytes = source.resource().total_bytes,
                     .admission_available_bytes = available_bytes,
+                    .backing = source.resource().backing,
+                    .pool_available_bytes = source.resource().pool_available_bytes,
                 },
                 source);
             return MoEOverlayPhysicalMemoryBudget(
