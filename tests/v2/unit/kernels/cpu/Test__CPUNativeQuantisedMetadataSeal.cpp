@@ -14,6 +14,9 @@
 #include "utils/NativeQuantisedPreparedByteFixture.h"
 
 #include <gtest/gtest.h>
+#include <exception>
+#include <cstdio>
+#include <csignal>
 
 #include <algorithm>
 #include <cstdint>
@@ -212,6 +215,38 @@ TEST(CPUNativeQuantisedMetadataSeal, PaddingNormalizationRejectsMalformedOwnersW
     empty.data_stride = 0; empty.interleaved_block_stride = 0;
     empty.codebook_id = native_quantised_formats::Q4_1.codebook_id;
     rejects(std::move(empty), "unknown encoding with empty storage");
+}
+
+/**
+ * @test Admitted metadata access inside a worker team keeps its coordinate
+ * bound: every in-range unit resolves to the canonical address, and an
+ * out-of-range chunk or block is fatal by SIGABRT with the diagnostic, never an
+ * exception (a terminate handler exits 77, so an escaped throw cannot pass).
+ */
+TEST(CPUNativeQuantisedMetadataSeal, AdmittedMetadataAccessIsFatalOutsideThePublication)
+{
+    GTEST_FLAG_SET(death_test_style, "fast");
+    NativeQuantisedPreparedByteFixture fixture(native_quantised_formats::IQ3_S, 65, 96);
+    fixture.seedPayloadAndMetadata();
+    const auto view = fixture.view();
+    for (int chunk = 0; chunk < view.N_padded / 64; ++chunk)
+        for (int block = 0; block < view.blocks_per_row; ++block)
+        {
+            EXPECT_EQ(view.admittedScales(chunk, block), view.chunkScales(chunk, block));
+            EXPECT_EQ(view.admittedMins(chunk, block), view.chunkMins(chunk, block));
+        }
+    const int chunks = view.N_padded / 64, blocks = view.blocks_per_row;
+    for (const auto [chunk, block] : {std::array{-1, 0}, std::array{chunks, 0}, std::array{0, -1}, std::array{0, blocks}})
+    {
+        SCOPED_TRACE(::testing::Message() << chunk << "/" << block);
+        for (const bool secondary : {false, true})
+            EXPECT_EXIT(({
+                std::set_terminate([] { std::fputs("escaped exception or terminate\n", stderr); std::_Exit(77); });
+                const auto *words = secondary ? view.admittedMins(chunk, block) : view.admittedScales(chunk, block);
+                std::fprintf(stderr, "%p\n", static_cast<const void *>(words));
+                std::_Exit(0);
+            }), ::testing::KilledBySignal(SIGABRT), "coordinate outside its admitted publication");
+    }
 }
 
 /** @test A view needs a seal of exactly its bytes and interpretation; arithmetic policy is not part of it. */
