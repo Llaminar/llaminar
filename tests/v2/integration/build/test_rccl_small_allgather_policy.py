@@ -174,6 +174,42 @@ def publish_verified_report(report, destination):
     pending.replace(destination)
 
 
+def original_enqueue_policy_patch():
+    """Reverse only policy-consumer bodies, retaining the current private ABI.
+
+    The later completed-Broadcast patch adds an adjacent enqueue include. Its
+    presence invalidates the older include hunk's context, but must remain in
+    both variants using the current headers and DSO. Keep the exact authored
+    body hunks and Git's ordinary context checks; no fuzz or relaxed application
+    is permitted. A changed patch layout is a new proof contract, not a guess.
+    """
+    section=(ROOT/PATCH).read_text().split('diff --git a/src/enqueue.cc b/src/enqueue.cc\n',1)[1]
+    section=section.split('\ndiff --git ',1)[0]
+    pieces=re.split(r'(?m)(?=^@@ )',section)
+    require(len(pieces)==4,'Native enqueue proof requires the three authored policy hunks')
+    includes=[line[1:] for line in pieces[1].splitlines() if line.startswith('+')]
+    require(includes==['#include "SmallAllGatherPolicy.h"','#include <limits>'] and
+            not any(line.startswith('-') for line in pieces[1].splitlines()),
+            'Native enqueue include/private ABI contract changed')
+    return ('diff --git a/src/enqueue.cc b/src/enqueue.cc\n'+pieces[0]+''.join(pieces[2:])).rstrip('\n').encode()+b'\n'
+
+
+def prepare_original_enqueue(source, destination):
+    """Construct the exact old consumer privately without modifying native inputs."""
+    body=source.read_bytes();preamble=b'#include "hip/hip_runtime.h"\n'
+    prefix=preamble if body.startswith(preamble) else b''
+    destination.parent.mkdir(parents=True,exist_ok=True)
+    destination.write_bytes(body[len(prefix):])
+    command=['git','apply','--reverse','--include=src/enqueue.cc','-']
+    delta=original_enqueue_policy_patch()
+    subprocess.run([*command[:-1],'--check','-'],input=delta,
+                   cwd=destination.parent.parent,check=True)
+    subprocess.run(command,input=delta,cwd=destination.parent.parent,check=True)
+    require(destination.read_bytes()!=body[len(prefix):],
+            'Negative control did not change the actual enqueue consumer')
+    destination.write_bytes(prefix+destination.read_bytes())
+
+
 def compile_report(args):
     """Execute only actual host selectors and original body; retain exact dependency ABI."""
     retire_proof(args.report)
@@ -202,12 +238,8 @@ def compile_report(args):
                 native_compile_inputs=[dict(source=str(source),flags=flags) for source,flags in source_flags],observations=[])
     with tempfile.TemporaryDirectory(prefix='llaminar-rccl-small-allgather-') as directory:
         tmp=Path(directory);old=tmp/'original';(old/'src').mkdir(parents=True)
-        source=source_flags[0][0];body=source.read_bytes();preamble=b'#include "hip/hip_runtime.h"\n'
-        prefix=preamble if body.startswith(preamble) else b''
-        original=old/'src/enqueue.cc';original.write_bytes(body[len(prefix):])
-        subprocess.run(['git','apply','--reverse','--include=src/enqueue.cc',str(ROOT/PATCH)],cwd=old,check=True)
-        require(original.read_bytes()!=body[len(prefix):],'Negative control did not change the actual enqueue implementation')
-        original.write_bytes(prefix+original.read_bytes())
+        original=old/'src/enqueue.cc'
+        prepare_original_enqueue(source_flags[0][0],original)
         symbols=tmp/'probe.map';symbols.write_text('{ local: *; };\n')
         common=[str(compiler_driver),'-x','hip','--offload-host-only','--offload-arch='+args.architecture,
                 '--hip-path='+str(args.sdk),'--rocm-path='+str(args.sdk),'-std=c++17','-O3',

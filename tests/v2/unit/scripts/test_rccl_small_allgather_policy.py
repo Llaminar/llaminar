@@ -3,6 +3,8 @@
 import copy
 import importlib.util
 import json
+import re
+import subprocess
 from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
@@ -78,6 +80,42 @@ class NativeSmallAllGatherProofTests(unittest.TestCase):
             bad['native_compile_inputs'][0]['flags']=tokens
             with self.subTest(installed=tokens),self.assertRaises(RuntimeError):
                 P.verify(bad,self.library)
+
+    def test_original_consumer_retains_later_private_abi_includes(self):
+        """Replay Git on the authored hunks with a later adjacent include change.
+
+        The original include reversal fails on this valid successor, as it does
+        in the cloud. Only policy bodies are reversed; current ABI includes and
+        the HIP-generated preamble survive byte-for-byte in the old consumer.
+        """
+        section=(ROOT/P.PATCH).read_text().split('diff --git a/src/enqueue.cc b/src/enqueue.cc\n',1)[1]
+        section=section.split('\ndiff --git ',1)[0]+'\n'
+        chunks=re.split(r'(?m)(?=^@@ )',section)
+        baseline=[]
+        for hunk in chunks[1:]:
+            header,*lines=hunk.splitlines(keepends=True)
+            first=int(re.match(r'@@ -(\d+)',header)[1])
+            while len(baseline)<first-1:baseline.append('// unchanged native line\n')
+            baseline.extend(line[1:] for line in lines if line.startswith((' ','-')))
+        for prefix in (b'',b'#include "hip/hip_runtime.h"\n'):
+            with self.subTest(prefix=prefix),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);(root/'src').mkdir()
+                current=root/'src/enqueue.cc';current.write_text(''.join(baseline))
+                patch_data=('diff --git a/src/enqueue.cc b/src/enqueue.cc\n'+section).encode()
+                subprocess.run(['git','apply','-'],input=patch_data,cwd=root,check=True)
+                body=current.read_bytes().replace(b'#include "enqueue.h"\n',
+                    b'#include "enqueue.h"\n#include "later_private_abi.h"\n')
+                current.write_bytes(prefix+body)
+                old_attempt=subprocess.run(['git','apply','--reverse','--check','-'],
+                    input=patch_data,cwd=root,capture_output=True)
+                self.assertNotEqual(old_attempt.returncode,0)
+                original=root/'negative/src/enqueue.cc'
+                P.prepare_original_enqueue(current,original)
+                expected=''.join(baseline).replace('#include "enqueue.h"\n',
+                    '#include "enqueue.h"\n#include "later_private_abi.h"\n'
+                    '#include "SmallAllGatherPolicy.h"\n#include <limits>\n')
+                self.assertEqual(original.read_bytes(),prefix+expected.encode())
+                self.assertEqual(current.read_bytes(),prefix+body)
 
     def test_complete_metadata_contract(self):
         P.verify(self.report,self.library)

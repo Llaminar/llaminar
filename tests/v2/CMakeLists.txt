@@ -4671,6 +4671,14 @@ foreach(V2_RCCL_PATCH_CHAIN_SUITE Unit Integration)
 endforeach()
 set_property(TEST V2_Integration_RCCLPatchChain APPEND PROPERTY LABELS ProductionTestPreflight)
 include(cmake/V2RCCLSmallAllGatherTests.cmake)
+foreach(V2_EXECUTION_REGISTRATION_SUITE Unit Integration)
+    add_test(NAME V2_${V2_EXECUTION_REGISTRATION_SUITE}_CPUExecutionExactRegistration
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_execution_exact_registration.py)
+    set_tests_properties(V2_${V2_EXECUTION_REGISTRATION_SUITE}_CPUExecutionExactRegistration PROPERTIES
+        LABELS "V2;${V2_EXECUTION_REGISTRATION_SUITE};CPU;DeviceFree;BuildSystem;Regression" TIMEOUT 30)
+endforeach()
+set_property(TEST V2_Integration_CPUExecutionExactRegistration APPEND PROPERTY LABELS ProductionTestPreflight)
 add_test(NAME V2_Unit_RCCLSmallAllGatherProof
     COMMAND ${Python3_EXECUTABLE} -B
         ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rccl_small_allgather_policy.py)
@@ -18213,12 +18221,6 @@ foreach(V2_FUSED_COMPLETION_ISA AVX2 AVX512)
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;PerfStats;Economy;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=2")
-    add_v2_test(V2_Integration_CPU_NativeQuantisedExecutionExactPolicy_${V2_FUSED_COMPLETION_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
-            --gtest_filter=CPUNativeQuantisedExecutionExactPolicy.*
-        LABELS "V2;Unit;Integration;ProductionTestPreflight;CPU;NativeQuantised;Dispatch;MTP;Replay;Regression"
-        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=1")
     add_v2_test(V2_Integration_CPU_NativeQuantisedOrderedNibbleReplay_${V2_FUSED_COMPLETION_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
             --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedOrderedNibbleAllFormatReplay
@@ -18280,6 +18282,8 @@ foreach(V2_FUSED_COMPLETION_ISA AVX2 AVX512)
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}")
 endforeach()
+
+include(cmake/V2CPUExecutionExactPolicyTests.cmake)
 
 add_executable(v2_integration_cpu_native_quantised_gemv integration/kernels/cpu/native_quantised/Test__CPUNativeQuantised_GEMV.cpp)
 target_link_libraries(v2_integration_cpu_native_quantised_gemv
@@ -28137,6 +28141,7 @@ add_v2_test(V2_Integration_GDNStateLayoutCliqueIdentity
 )
 
 set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_CPUExecutionExactRegistration
     V2_Integration_ReplicatedPrefillGatherSelectionReplay
     V2_Integration_ShmemSpinAbsorbingAbortReplay
     V2_Integration_CPURootedGatherParallelCopyReplay
@@ -28145,8 +28150,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     ${V2_PREPARED_GRAPH_TEMPLATE_PREFLIGHT_TESTS}
     ${V2_PIPELINE_MIXED_GDN_LAYOUT_PREFLIGHT_TESTS}
     ${V2_GDN_LIVE_STATE_LAYOUT_NATIVE_PREFLIGHT_TESTS}
-    V2_Integration_CPU_NativeQuantisedExecutionExactPolicy_AVX2
-    V2_Integration_CPU_NativeQuantisedExecutionExactPolicy_AVX512
+    ${V2_CPU_EXECUTION_EXACT_POLICY_PREFLIGHT_TESTS}
     V2_Integration_GDNStateLayoutOwnerAndImportIdentity
     V2_Integration_GDNStateLayoutPrefixIdentity
     V2_Integration_GDNStateLayoutArchiveIdentity
