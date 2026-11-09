@@ -57,6 +57,25 @@ namespace llaminar2
 #endif
 #endif
 
+#ifndef LLAMINAR_COMPILED_WITH_NEON_I8MM
+#if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
+#define LLAMINAR_COMPILED_WITH_NEON_I8MM 1
+#else
+#define LLAMINAR_COMPILED_WITH_NEON_I8MM 0
+#endif
+#endif
+
+// The I8MM build envelope is DotProd plus the Int8 matrix-multiply extension.
+// A declared envelope that its compiler does not implement, or the reverse,
+// would make the startup admission below authenticate the wrong instructions.
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM && \
+    (!LLAMINAR_COMPILED_WITH_NEON_DOTPROD || !defined(__ARM_FEATURE_MATMUL_INT8))
+#error "LLAMINAR_COMPILED_WITH_NEON_I8MM requires a DotProd envelope compiled with __ARM_FEATURE_MATMUL_INT8"
+#endif
+#if !LLAMINAR_COMPILED_WITH_NEON_I8MM && defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
+#error "The compiler enables I8MM outside the declared NEON_I8MM envelope"
+#endif
+
     /** @return Whether native AArch64 ASIMD is available on the executing host. */
     inline bool cpu_supports_neon()
     {
@@ -72,6 +91,16 @@ namespace llaminar2
     {
 #if defined(__aarch64__) && defined(__ARM_NEON)
         return cpu::ARMCPUCapabilities::native().supports(cpu::ARMCPUFeature::DotProd);
+#else
+        return false;
+#endif
+    }
+
+    /** @return Whether the native OS advertises ARM Int8 matrix-multiply (SMMLA) instructions. */
+    inline bool cpu_supports_neon_i8mm()
+    {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        return cpu::ARMCPUCapabilities::native().supports(cpu::ARMCPUFeature::IntegerMatMul);
 #else
         return false;
 #endif
@@ -190,6 +219,13 @@ namespace llaminar2
         // leaf too. Validate the machine before accepting any override.
         if (!cpu_supports_neon_dotprod())
             throw std::runtime_error("The NEON_DOTPROD binary requires native ARM DotProd support");
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+        // I8MM changes only the projection leaf instructions, never the
+        // arithmetic level: SMMLA and SDOT publish identical exact INT32 sums.
+        // The machine must still execute every instruction in the envelope.
+        if (!cpu_supports_neon_i8mm())
+            throw std::runtime_error("The NEON_I8MM binary requires native ARM I8MM support");
 #endif
         if (env && *env)
         {
