@@ -172,3 +172,22 @@ Evidence: `~/llaminar-spark-results/K14-CUDA-SPILL-MIGRATION-a62696317`.
   deterministic). Main confirmed it will take R1 (5d4e3716a) after the
   current spill checkpoint; handover doc =
   /Users/floriankinder/repo/arm-addon-notes/r1-handover.md.
+
+## Fix plan (2026-11-09, Main) — architectural
+
+- REMOVE nvcc --split-compile everywhere; SHARD instead (maxim 34; spill
+  guard needs deterministic evidence; preflight test will BAN --split-compile
+  on spill-guarded targets). Prefill (d641463bd): 8 codebook-pair shards +
+  host-policy header + dispatcher (public ABI + single launch-policy state)
+  → deterministic, BK64 spill-free at 120/121/120;121/6-arch. tensor_prefill
+  (fbacc8409): 12.x opaque per-step PV address; 255 regs w/o spill on 6
+  geometries; shipped SASS byte-identical; producer/consumer split spec
+  (170b8c6af) RETIRED. BK256 (5c90b4340): 12.x per-K-step fragment loads
+  (pure load schedule; same k/wj/wi order). NEXT: FA (7 shards: prefill/
+  context × FP32/FP16/BF16 + decode/utility) then real fix for the 18
+  deterministic HD256/1-PV-warp/context-partial spills (255 regs, 16–100 B;
+  likely hoisted V-row/score addressing in j-loop). NOTHING pushed until FA
+  + policy test land. GB10 runtime gates after (parity/byte, prefill timing,
+  tracked CUDA tests incl. RoPEGraphCaptureNoH2D, Qwen3.8 trace, spill
+  re-check). Sequencing: ideas-7+25 FF (#43 5d4e3716a → 912d0107) BEFORE the
+  CUDA push recommended; CUDA commits stack on the merged tip.
