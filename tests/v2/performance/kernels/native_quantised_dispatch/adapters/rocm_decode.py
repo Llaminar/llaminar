@@ -337,17 +337,9 @@ def _read_rocm_decode_timing_shard(
 def _rocm_timing_physical_core_count() -> int:
     """Return physical cores visible through the analyzer's affinity mask."""
 
-    visible = tuple(sorted(os.sched_getaffinity(0)))
-    physical = set()
-    for cpu in visible:
-        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            package = (topology / "physical_package_id").read_text().strip()
-            core = (topology / "core_id").read_text().strip()
-        except OSError:
-            return max(1, len(visible))
-        physical.add((package, core))
-    return max(1, len(physical))
+    from ..host_cores import physical_core_count
+
+    return physical_core_count()
 
 
 def read_rocm_decode_timing_sidecars(

@@ -412,17 +412,9 @@ def _cuda_timing_byte_ranges(
 def _cuda_timing_physical_core_count() -> int:
     """Return the affinity-visible physical-core count for sidecar parsing."""
 
-    visible = tuple(sorted(os.sched_getaffinity(0)))
-    physical = set()
-    for cpu in visible:
-        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            package = (topology / "physical_package_id").read_text().strip()
-            core = (topology / "core_id").read_text().strip()
-        except OSError:
-            return max(1, len(visible))
-        physical.add((package, core))
-    return max(1, len(physical))
+    from ..host_cores import physical_core_count
+
+    return physical_core_count()
 
 
 def read_cuda_decode_timing_sidecars(
