@@ -33,7 +33,7 @@ namespace llaminar2
         (void)k;
         if (m <= 0 || n <= 0)
             return {};
-        return cpu_rope_workspace::requirements({.graph_rows = m, .head_dim = n});
+        return cpu_rope_workspace::requirements({.graph_rows = m, .rotary_dim = n});
     }
 
     primitives::RoPEAngleRows CPURoPEAngleWorkspaceConsumer::borrowAngles(int rows, int values_per_row) const
