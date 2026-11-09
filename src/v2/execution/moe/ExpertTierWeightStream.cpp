@@ -1505,6 +1505,8 @@ namespace llaminar2
         output.native_interleaved.resize(
             unit_count * static_cast<size_t>(output.interleaved_block_stride),
             0);
+        const std::span<std::uint8_t> interleaved =
+            output.native_interleaved.beginRewrite();
 
         // Traverse the GPU's [K block][N column] order.
         for (int kb = 0; kb < output.blocks_per_row; ++kb)
@@ -1523,9 +1525,9 @@ namespace llaminar2
                 {
                     // Reserved payload/metadata bytes remain deterministic zero.
                     for (int byte = 0; byte < output.payload_bytes; ++byte)
-                        output.native_interleaved[
+                        interleaved[
                             interleavedValueOffset(output, n, kb, byte)] = source[byte];
-                    uint8_t *const metadata = output.native_interleaved.data() + unit + output.data_stride;
+                    uint8_t *const metadata = interleaved.data() + unit + output.data_stride;
                     std::memcpy(metadata + local_column * 2, &gpu.scales[linear], 2);
                     std::memcpy(metadata + 128 + local_column * 2, &gpu.mins[linear], 2);
                     if (gpu.has_emins)
@@ -1538,7 +1540,7 @@ namespace llaminar2
                     // Scatter compact bytes into the four-value VNNI lane groups.
                     for (int value = 0; value < 16; ++value)
                     {
-                        output.native_interleaved[
+                        interleaved[
                             interleavedValueOffset(output, n, kb, value)] =
                             source[value];
                     }
@@ -1551,13 +1553,13 @@ namespace llaminar2
                         sum += value;
                     const int16_t compensation = static_cast<int16_t>(sum);
                     std::memcpy(
-                        output.native_interleaved.data() +
+                        interleaved.data() +
                             unit + output.data_stride +
                             static_cast<size_t>(local_column) * sizeof(int16_t),
                         &compensation,
                         sizeof(compensation));
                     std::memcpy(
-                        output.native_interleaved.data() +
+                        interleaved.data() +
                             unit + output.data_stride + 128u +
                             static_cast<size_t>(local_column) * sizeof(uint16_t),
                         &gpu.scales[linear],
@@ -1565,7 +1567,7 @@ namespace llaminar2
                     if (output.is_asymmetric || output.usesNibbleLUTSourceScale())
                     {
                         std::memcpy(
-                            output.native_interleaved.data() +
+                            interleaved.data() +
                                 unit + output.data_stride + 256u +
                                 static_cast<size_t>(local_column) * sizeof(uint16_t),
                             &gpu.mins[linear],
@@ -1587,20 +1589,20 @@ namespace llaminar2
                     int32_t sum = 0;
                     for (int value = 0; value < 32; ++value)
                     {
-                        output.native_interleaved[
+                        interleaved[
                             interleavedValueOffset(output, n, kb, value)] =
                             static_cast<uint8_t>(decoded[value]);
                         sum += decoded[value];
                     }
                     const int16_t compensation = static_cast<int16_t>(sum);
                     std::memcpy(
-                        output.native_interleaved.data() +
+                        interleaved.data() +
                             unit + output.data_stride +
                             static_cast<size_t>(local_column) * sizeof(int16_t),
                         &compensation,
                         sizeof(compensation));
                     std::memcpy(
-                        output.native_interleaved.data() +
+                        interleaved.data() +
                             unit + output.data_stride + 128u +
                             static_cast<size_t>(local_column) * sizeof(uint16_t),
                         &gpu.scales[linear],
@@ -1608,7 +1610,7 @@ namespace llaminar2
                     if (output.is_asymmetric || output.usesIQ3SExpandedSourceScale())
                     {
                         std::memcpy(
-                            output.native_interleaved.data() +
+                            interleaved.data() +
                                 unit + output.data_stride + 256u +
                                 static_cast<size_t>(local_column) * sizeof(uint16_t),
                             &gpu.mins[linear],
@@ -1620,7 +1622,7 @@ namespace llaminar2
                 // Q6 low nibbles follow the ordinary VNNI byte transpose.
                 for (int value = 0; value < 16; ++value)
                 {
-                    output.native_interleaved[
+                    interleaved[
                         interleavedValueOffset(output, n, kb, value)] =
                         source[value];
                 }
@@ -1633,7 +1635,7 @@ namespace llaminar2
                 {
                     const uint8_t packed_high = source[16 + group];
                     uint8_t *planes =
-                        output.native_interleaved.data() + unit + 1024u +
+                        interleaved.data() + unit + 1024u +
                         static_cast<size_t>(group) * 64u +
                         static_cast<size_t>(zmm) * 16u;
                     uint64_t low = loadU64(planes);
@@ -1653,12 +1655,12 @@ namespace llaminar2
                 }
                 // Preserve the original Q6 half base and signed coefficient pair.
                 std::memcpy(
-                    output.native_interleaved.data() + unit + 1536u +
+                    interleaved.data() + unit + 1536u +
                         static_cast<size_t>(local_column) * sizeof(uint16_t),
                     &gpu.scales[linear],
                     sizeof(uint16_t));
                 std::memcpy(
-                    output.native_interleaved.data() + unit + 1664u +
+                    interleaved.data() + unit + 1664u +
                         static_cast<size_t>(local_column) * sizeof(uint16_t),
                     &gpu.mins[linear],
                     sizeof(uint16_t));
@@ -1666,6 +1668,14 @@ namespace llaminar2
         }
 
         // Publish only after every logical block and padded unit is complete.
+        try
+        {
+            output.sealPublication();
+        }
+        catch (const std::exception &exception)
+        {
+            return reject(error, exception.what());
+        }
         cpu = std::move(output);
         return true;
     }

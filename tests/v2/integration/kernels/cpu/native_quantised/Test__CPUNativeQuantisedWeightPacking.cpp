@@ -398,9 +398,10 @@ namespace llaminar2::cpu::native_quantised::test
          * @param rhs Second packed byte stream.
          * @param context Format-specific assertion context.
          */
+        template <typename Bytes>
         void expectIdenticalBytes(
-            const AlignedVector<uint8_t> &lhs,
-            const AlignedVector<uint8_t> &rhs,
+            const Bytes &lhs,
+            const Bytes &rhs,
             std::string_view context)
         {
             ASSERT_EQ(lhs.size(), rhs.size()) << context;

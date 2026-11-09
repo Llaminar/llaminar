@@ -1079,9 +1079,10 @@ namespace llaminar2::test
                 static_cast<std::size_t>(
                     packed.interleaved_block_stride);
             packed.native_interleaved.resize_uninitialized(bytes);
+            const auto written = packed.native_interleaved.beginRewrite();
             for (std::size_t index = 0; index < bytes; ++index)
             {
-                packed.native_interleaved[index] =
+                written[index] =
                     static_cast<std::uint8_t>(
                         seed + static_cast<std::uint8_t>(index * 29u));
             }
