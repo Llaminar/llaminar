@@ -3,7 +3,8 @@
 Status: provisional NUMA-correct QFN run and focused SDK/NUMA/native RCCL
 gates are closed green. Bounded original-model OpenMP attribution identifies
 runtime pause loops; the original recorder receipt remains red for requested
-SIGINT, and no wait policy is selected. Full preflight remains deferred; this
+SIGINT. Closed reduced-spin controls regress; GNU wait policy stays unchanged.
+Full preflight remains deferred; this
 scoped qualification is not a complete SDK/preflight certificate.
 
 The upgrade accompanies the QFN NUMA ownership correction. A process must
@@ -362,10 +363,14 @@ records; it does not turn that original receipt green.
 
 [Detailed results, exact cohorts and limits](QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md)
 retain runtime/process identities, phase durations, cycle periods, hot-loop
-addresses and control receipts. No wait-policy decision is made. The next
-matched **GOMP_SPINCOUNT=0** diagnostic keeps the original model owner, exact
-work and separate passive timings. Eight-row work and broad team changes stay
-parked; no cycle percentage is converted into removable elapsed milliseconds.
+addresses and control receipts. Closed matched controls retain GNU's unchanged
+wait policy: fresh unset **299.559883 P /38.993654 after-prefill D** versus
+GOMP_SPINCOUNT=0 **199.393089 /29.381258** and 1000 **203.444590 /32.726287**.
+All 768 IDs/full MTP/config/initial placement match; native closure checks pass,
+and actual waiting inputs are verified in both ranks. Dynamic movement can differ, so no
+identical-route or isolated wakeup-cost claim is made. All three roughly 0.728 GB
+owned archives were reclaimed by metadata-only inventory after retirement.
+No cycle percentage is converted into removable elapsed milliseconds.
 
 ## Qualification boundary and local evidence
 

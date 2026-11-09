@@ -33,11 +33,14 @@ Cache/work block sizes1–4 pass; model uses Auto. CPU-result readiness remains 
 [All-format evidence](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md).
 **Latest CPU slice:** selected M1 loops have zero vector stack traffic;
 20 focused tests pass, all 768 IDs/MTP/placement match. No model speedup proved;
-final-add fusion withdrawn; eight-row work parked. Two complete P/D profile
+final-add fusion withdrawn; eight-row candidate rejected: bytes/spills pass,
+component +0.9%/−4.5% throughput in reversed orders. [Decision](../2026-11/QFN_CPU_EIGHT_ROW_REGISTER_TILE_20261109.md). Two complete P/D profile
 pairs: exact GNU libgomp uses **59–68% P /76–82% D user cycles**, nearly all in
 two pause loops—not wall overhead or saved time. Original requested-SIGINT
 receipt stays red; separate actual-recorder control retires/flushes correctly.
-No wait-policy choice; matched **GOMP_SPINCOUNT=0** diagnostic next.
+**Keep GNU wait policy unchanged:** fresh unset 299.560P/38.994D; spin0
+199.393/29.381 and spin1000 203.445/32.726 regress. All 768/MTP/config/initial
+placement match; actual inputs verified, dynamic movement can differ.
 [OpenMP result/limits](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
 [Evidence](../2026-11/QFN_CPU_M1_SCALE_LIFETIME_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
