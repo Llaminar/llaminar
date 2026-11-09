@@ -1999,6 +1999,9 @@ namespace llaminar2::cpu::native_quantised
         };
         const __m512i mask_0F = _mm512_set1_epi8(0x0F);
         const __m512i q4_zero_offset = _mm512_set1_epi8(8);
+        // Match ordinary M1: resolve this same scalar scale before vector
+        // dots/scales become live across its finite/nonfinite conversion edge.
+        const float a_scale = nativeQuantisedFP16ScaleToFP32(a_blk.d);
         __m512i int_acc0 = _mm512_setzero_si512();
         __m512i int_acc1 = _mm512_setzero_si512();
         __m512i int_acc2 = _mm512_setzero_si512();
@@ -2075,7 +2078,6 @@ namespace llaminar2::cpu::native_quantised
         const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 16);
         const __m512 scale2 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 32);
         const __m512 scale3 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 48);
-        const float a_scale = nativeQuantisedFP16ScaleToFP32(a_blk.d);
 
         if constexpr (IsAsymmetric)
         {

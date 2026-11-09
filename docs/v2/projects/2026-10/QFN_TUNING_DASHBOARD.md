@@ -7,8 +7,8 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Release 512/256: **303.365 P /39.901 D**; after-prefill **39.745 D**.
-CPU scheduling: **+3.44% P** versus fresh control; all768 IDs/MTP/placement match.
+Latest Release 512/256: **298.175 P /39.891 D**; after-prefill **39.735 D**.
+Earlier CPU scheduling: **+3.44% P**; all768 IDs/MTP/placement match.
 Short-prefill indexer elision saves **36 kernels/chunk/GPU**; its matched
 control showed **+7.09% P**, with unchanged output IDs/MTP.
 Paired retained graphs cost eight GPU expert slots: **8066 total, 4033/card**.
@@ -27,10 +27,10 @@ CPU Auto: all21 byte-exact; mixed FFN improves **2.5–14%** in16 formats,
 five within **+2.5%**. QFN-shaped FFN saves **26–31%** in both row orders.
 Cache/work block sizes1–4 pass; model uses Auto. CPU-result readiness remains next.
 [All-format evidence](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md).
-**Latest scoped checkpoint:** **+2.45% P /-0.72% D** versus fresh control;
-all768 IDs/MTP/placement match. CPU14 + ngram23 focused gates pass. Ngram error
-publication is repaired. Next: remaining CPU spills and final add/weight fusion.
-[Evidence](../2026-11/QFN_UNSIGNED_NIBBLE_AND_FREQUENCY_LANES_20261109.md).
+**Latest CPU slice:** selected M1 loops have zero vector stack traffic;
+20 focused tests pass, all768 IDs/MTP/placement match. No model speedup proved;
+final-add fusion withdrawn. Next: NUMA-local GPU ownership and eight-row tiles.
+[Evidence](../2026-11/QFN_CPU_M1_SCALE_LIFETIME_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
 [timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md),
 [root phases](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md),

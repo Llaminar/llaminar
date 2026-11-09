@@ -285,7 +285,12 @@ TEST(CPUShardRouteCollective, FusedFinalAddPreservesRawAndWeightedBytes) {
         0x7f800000u,0xff800000u,0x7fc12345u,0xffc54321u,
         0x7f812345u,0x00000001u,0x80000001u,0x00800000u,
         0x60ad78ecu,0xe0ad78ecu,0x33800000u,0x3f800001u};
-    for(const int threads:{1,3})for(const int columns:{1,7,16,17,31,32,33,65,2560})
+    // Every remainder position matters: compiler vectorization can choose
+    // different NaN operands even when the source expression is identical.
+    std::vector<int> widths;
+    for(int columns=1;columns<=65;++columns)widths.push_back(columns);
+    widths.insert(widths.end(),{127,128,129,2560});
+    for(const int threads:{1,3})for(const int columns:widths)
     for(size_t degree=2;degree<=8;++degree) {
         SCOPED_TRACE("workers="+std::to_string(threads)+" columns="+std::to_string(columns)+
             " degree="+std::to_string(degree));
