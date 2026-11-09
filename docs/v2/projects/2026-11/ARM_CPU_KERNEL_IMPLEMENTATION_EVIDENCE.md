@@ -2237,25 +2237,26 @@ Local trees also include `build_arm_portability_debug`,
 `build_arm_portability_dotprod_sanitized`, and `build_arm_portability_llvm`.
 They are ignored working artifacts, not published corpus/certification payloads.
 
-## Required continuation
+## Final qualification (2026-11-08)
 
-- Complete actual Tensor-factory construction, preparation/slot/demotion,
-  graph/workspace publication and model/request-state qualification of the now
-  native entrypoints. Header parsing and small-owner execution do not certify
-  the full engine path.
-- Finish floating/nonlinear/RoPE, attention/KV/TurboQuant, GDN/QFN, MoE/sampling
-  and stage/transport SIMD coverage from the source inventory. Native FA2
-  tail/rescale exponentials remain to be unified and runtime-qualified; retire
-  the existing AQ8 `key[D]` decoded-head scratch in favor of original-code
-  streaming arithmetic rather than blessing it as a bounded cache mirror.
-- Complete Darwin memory/topology/cache observation, loader/process/MPI
-  lifecycle and robust native serving. Full configuration still rejects the
-  Linux-only memory backend; that is implementation work, not an external impasse.
-- Implement authenticated native exact-overlay collection/installation over a
-  total ARM policy. Do not reuse x86 timing labels or invoke generic retraining.
-- Pass complete engine Unit/preflight, real source/slot/demotion and x86 gates,
-  model/HTTP/MTP/prefix correctness, then the final Release `Perf__` round with
-  isolated profiling, grouped economics and actual 1..10-worker scaling here.
+The earlier continuation list is superseded by the following verified state.
+Seals live in the Spark results archive named below.
 
-No generic prefill/decode ML retraining, model/corpus download, exact-overlay
-installation or full-objective completion has occurred.
+| Area | Result | Seal / commit |
+|---|---|---|
+| GB10 CPU-only Integration gate | Unit 951/958, preflight 2250/2252; 3 known upstream target-selection, 6 CUDA-device profiler surrogates | `K14-GATES-A8D380CD0-20261108` |
+| M1 Max Docker VM gate | Unit 938/958, preflight 2194/2252; failure set identical to `7b655e015` (NUMA-less host, upstream, CUDA surrogate, VM slowness) | `M1-gate-a8d380cd0` |
+| x86 CPU-only gate (AVX512 and AVX2) | byte-exact suites pass on both ISAs; one branch defect fixed | `05930d91a` |
+| Cross-architecture greedy text | Qwen3-0.6B byte-identical on GB10 NEON dotprod and x86 AVX512/AVX2 | `K14-CROSSARCH-PROBE-GB10-20261107` |
+| Serving A/B/C (GB10, mode-asserted) | 35B MTP dynamic 18.18 -> 27.19 tok/s with the pooled bundle; text byte-identical across commits | `K14-ABC-*` |
+| Exact overlays | byte-neutral, end-to-end regression; retired | `K14-OVERLAY-AB-HEAD-20261108`, `264970e14` |
+| Final Release `Perf__` round | thread scaling all formats on mixed/X925/A725 placements, byte-authenticated; fused verifier 45/45; FA2 regret and GDN grouped economics handed to follow-up | `K14-PERF-FINAL-264970E14-20261108` |
+| GB10 integrated GPU (with `codex/cuda-sm121-spills`) | zero-spill sm_121 build, joint-pool admission and over-subscription rejection, 35B 132/97 tok/s, deterministic across fresh processes | `K14-UMA-MERGED-BEF53EDB6-FINAL-20261108`, `98e427c7c` |
+| Refresh-suite CTest timeout | CTest PROCESSOR_AFFINITY grants at most the parallel level; not a defect | `K14-REFRESH-CONFIRM-A8D380CD0`, `a8d380cd0` |
+
+Out of scope for this branch and tracked in
+[`arm-perf-review/`](arm-perf-review/README.md): I8MM grouped rows and 27B
+dense MTP economics, GDN grouped verifier, FA2 policy regret, region/barrier
+count, LM head, placement by core class, in-model overlay collection, GB10 CUDA
+register pressure (separate branch), NUMA-less hosts and a native macOS engine
+port. No generic prefill/decode retraining was performed.
