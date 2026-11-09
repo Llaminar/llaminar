@@ -154,3 +154,24 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - Reviewer continues inventory/binding/depfile; ratchet = reported-approved
   (not zero-spill/economy qualification); Linux-RED + Darwin-false-clean
   history separate.
+
+## SOURCE115 FINAL (2026-11-09) — SOURCE116 tooling scope (HOLD)
+
+- Ratchet = reported-approved policy, NOT zero-spill/economy approval.
+- P1a structural failures fatal independent of spill counts (uninspectable
+  callee as cost1 within budget; blr/br uninspected; fatal exception substring
+  → exact no-return identity).
+- P1b CFG + interprocedural provenance; [sp,x9]/shifted-imm handled or
+  reject; alias retirement only on matched defs; callee traversal preserves
+  provenance (caller sp-derived x0 + callee [x0] store = spill); ABI exemption
+  only with save-before-clobber/slot/lifetime/epilogue proof (count ceilings
+  rejected).
+- P1c inventory from admitted ENVELOPE (not same assembly string); reject
+  unexpected/unaccounted programs (drop-Rows1-with-symbols fails); bodies need
+  real instructions; no circular test derivation.
+- P1d closure = executed compilation's (exact effective regime; logical include
+  resolution preserves symlink identity; pre+post input hashing).
+- P2a verify() validates observed compiler identity against configured policy.
+- P2b declare ALL outputs/byproducts (proof.s); success JSON LAST.
+- Scope: probe header stale under ratchet; SDK-independence not claimed.
+  Owner evidence stays owner; Linux-RED/Darwin-false-clean stand.
