@@ -370,3 +370,14 @@ the source policy). Dead persistent_state parameter removed.
   doesn't prove arrival order; argv[2]=17231 = starts 17231+rows (record as
   argument/offset). P2 stays source-closed. SOURCE COMPLETE for handover;
   remaining = WSL (5') only.
+
+## Rebased tip dca2a3021 (2026-11-09)
+
+- 10 commits on 5d4e3716a (correction from 9: orphan deletion + 7 original +
+  review fix + P2 fix + claims commit). range-diff b199ccfa0..dca2a3021: all
+  `=`; whole-tree diff = same 50-file set + identical diffstat as
+  425002104..5d4e3716a; after stripping index/hunk numbers → identical
+  (only offsets in the 2 overlapping CMake files). = b199ccfa0 + R1 exactly.
+- Mac gate at dca2a3021: NEON_DOTPROD 289/289 + NEON 289/289 0 skips;
+  preflight 226/226 ×20; RoPE source policy clean. Reviewer mechanical pass +
+  WSL (5'') = dca2a3021 in flight; handover draft next.
