@@ -191,3 +191,9 @@ Evidence: `~/llaminar-spark-results/K14-CUDA-SPILL-MIGRATION-a62696317`.
   tracked CUDA tests incl. RoPEGraphCaptureNoH2D, Qwen3.8 trace, spill
   re-check). Sequencing: ideas-7+25 FF (#43 5d4e3716a → 912d0107) BEFORE the
   CUDA push recommended; CUDA commits stack on the merged tip.
+
+- Sequencing AGREED (Main): ideas-7+25 FIRST (#43 FF 5d4e3716a → 912d0107 on
+  WSL (5'') green); CUDA stack rebased locally onto 912d0107 before pushing;
+  GB10 gates once on the merged tip. Tensor-split spec retired in the CUDA
+  stack (doc removed; history keeps; commit names fbacc8409). SHA sent when
+  the full slice is pushed.
