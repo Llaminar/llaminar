@@ -103,3 +103,23 @@ separate (shared) path with the same pattern but different owners.
 - R1 CLOSE GATES: successor native byte/geometry/team paths (.80), core-linked
   slot/movement/serialization (.80), x86 WSL Unit/preflight, resource/economy
   evidence. No merge/execution grant from reviewer.
+
+## Hardened R1 5c89f981c (2026-11-09) — P2s closed
+
+- P2a: MetadataSeal::rebound PRIVATE (friend: CPUNativeVNNIPublishedBytes,
+  after its deep-copy); Tile::admitted/executeAdmitted PRIVATE (friend:
+  CPUNativeNEONProjectionBatch — admits features/publication/policy/K-tree/
+  spans before forming the team); concept checks w/ positive controls pin both.
+- P2b: NonfiniteWeightIsFatalBeforeAnySharedNumeratorWrite
+  (V2_Integration_NEONAttentionStorageAdmission) — MAP_SHARED numerator,
+  Rows1/2/4 × NaN/±Inf × every row, SIGABRT w/ diagnostic (terminate handler
+  exits 77 → escaped exception/terminate fails), parent byte-check +
+  write-then-reject negative, single stdio per diagnostic.
+- Wording: 'every whole-head integer reduction' (multi-block ≤ block_elems,
+  FP32 combine) in commit + source; 746e694a2 body untouched (SHA stability).
+- M1 core-free: Seal 6/6, WeightView 4/4, PreparedProjection 8/8,
+  ProjectionBatch 10/10, NEONExecution 10/10, NEONAttentionMath 8/8; syntax
+  (gcc-16 ARM, core-linked slot, x86 Seal) pass.
+- OWED (booked): .80 Integration NEON_I8MM full run + core-linked
+  slot/movement/serialization; WSL x86 Unit+preflight; economy evidence
+  (IQ3_S/IQ4_XS R1-vs-ea5402a54 M1+grouped ABBA; 35B decode ABBA).
