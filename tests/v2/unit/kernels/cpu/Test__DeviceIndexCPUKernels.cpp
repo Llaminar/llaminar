@@ -24,6 +24,7 @@
 #include "utils/MPIStager.h"
 #include <vector>
 #include <cmath>
+#include "../../../utils/CPURoPETestBinding.h"
 
 using namespace llaminar2;
 
@@ -127,6 +128,7 @@ TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_IgnoresDeviceIndex)
 TEST_F(Test__DeviceIndexCPUKernels, RoPE_AcceptsDeviceZero)
 {
     CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+    const test::CPURoPETestBinding kernel_angles(kernel);
 
     const int seq_len = 2;
     const int n_heads = 4;
@@ -152,6 +154,7 @@ TEST_F(Test__DeviceIndexCPUKernels, RoPE_AcceptsDeviceZero)
 TEST_F(Test__DeviceIndexCPUKernels, RoPE_AcceptsDeviceMinusOne)
 {
     CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+    const test::CPURoPETestBinding kernel_angles(kernel);
 
     const int seq_len = 2;
     const int n_heads = 4;

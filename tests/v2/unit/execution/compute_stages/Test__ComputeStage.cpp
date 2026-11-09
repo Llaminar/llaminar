@@ -9,6 +9,7 @@
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/Tensors.h"
+#include "../../../utils/CPURoPETestBinding.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -225,6 +226,7 @@ TEST_F(ComputeStageTest, RoPEBasic)
         .theta_base = 10000.0f};
 
     RoPEStage stage(params);
+    const test::StageWorkspaceTestBinding workspace(stage, seq_len);
 
     EXPECT_EQ(stage.type(), ComputeStageType::ROPE);
 
@@ -281,6 +283,8 @@ TEST_F(ComputeStageTest, RoPEPositionOffset)
 
     RoPEStage stage0(params0);
     RoPEStage stage1(params1);
+    const test::StageWorkspaceTestBinding workspace0(stage0, seq_len);
+    const test::StageWorkspaceTestBinding workspace1(stage1, seq_len);
 
     bool success0 = false, success1 = false;
     try
@@ -362,6 +366,8 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_BatchedParity)
 
     RoPEStage stage_contiguous(params_contiguous);
     RoPEStage stage_batched(params_batched);
+    const test::StageWorkspaceTestBinding contiguous_workspace(stage_contiguous, total_tokens);
+    const test::StageWorkspaceTestBinding batched_workspace(stage_batched, total_tokens);
 
     bool success1 = false, success2 = false;
     try

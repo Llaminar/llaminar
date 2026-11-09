@@ -89,6 +89,12 @@ namespace llaminar2
                     params_.device_id.ordinal);
                 cached_kernel_ = owned_kernel_.get();
                 cached_kernel_tensor_type_ = tensor_type;
+                // A recreated kernel inherits the stage's admitted binding; it
+                // must never execute against an unbound or stale workspace.
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(cached_kernel_);
+                if (bound_workspace_ && consumer &&
+                    consumer->workspaceBindingPolicy() == WorkspaceBindingPolicy::PreparedEngine)
+                    consumer->bindWorkspace(bound_workspace_);
             }
             catch (const std::exception &e)
             {
@@ -827,6 +833,15 @@ namespace llaminar2
 
         // Cast to IWorkspaceConsumer (CUDA/ROCm RoPE kernels implement both ITensorRoPE and IWorkspaceConsumer)
         return dynamic_cast<IWorkspaceConsumer *>(kernel);
+    }
+
+    WorkspaceRequirements RoPEStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        (void)n;
+        auto *consumer = const_cast<RoPEStage *>(this)->getKernelAsWorkspaceConsumer();
+        if (!consumer)
+            return {};
+        return consumer->getWorkspaceRequirements(m, params_.head_dim, k);
     }
 
     StageBufferContract RoPEStage::bufferContract() const

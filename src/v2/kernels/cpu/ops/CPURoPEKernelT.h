@@ -14,6 +14,12 @@
  *
  * KernelFactory can simply return the typed kernel as ITensorRoPE* - no adapters needed.
  *
+ * Angle ownership: the FP32/BF16/FP16/Q8_1 kernels own no angle storage. Each
+ * declares the `cpu_rope_angles` workspace (graph rows x head_dim/2 pairs) and
+ * borrows it from the RoPEStage binding on every call; a missing or undersized
+ * binding is fatal. There is no thread-local memo: every call fills its rows
+ * through the single absolute-position row function.
+ *
  * Usage:
  *   auto kernel = std::make_unique<CPURoPEKernelT<ActivationPrecision::FP32>>();
  *   kernel->apply_tensor(Q, K, ...);  // Uses ITensorRoPE interface
@@ -25,7 +31,7 @@
 #include "../../../execution/config/RuntimeConfig.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/TensorKernels.h" // For ITensorRoPE
-#include "../primitives/RoPEPrimitives.h"   // For RoPEPersistentState
+#include "../primitives/RoPEPrimitives.h"
 
 #include <cstdint>
 
@@ -143,12 +149,42 @@ namespace llaminar2
             int pos_offset = 0);
     };
 
+    /**
+     * @brief Workspace declaration and borrow shared by the angle-table CPU RoPE kernels.
+     *
+     * The stage-owned kernel receives its stage's DeviceWorkspaceManager through
+     * the PreparedEngine binding. RoPE consumers receive the physical head width
+     * as `n`; the requirement then depends only on graph rows and head geometry.
+     */
+    class CPURoPEAngleWorkspaceConsumer : public CPUKernelBase
+    {
+    public:
+        /**
+         * @brief Declare the angle planes for m rows of an n-wide head.
+         * @param m Maximum rows one invocation of this graph rotates.
+         * @param n Physical head width; zero leaves the geometry undeclared.
+         * @param k Unused.
+         * @return The single `cpu_rope_angles` buffer, or nothing without a head width.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+
+    protected:
+        /**
+         * @brief Borrow live angle planes from the bound workspace.
+         * @param rows Rows this call fills.
+         * @param values_per_row Rotated pairs per row.
+         * @return Planes carved from the start of the bound buffer.
+         * @throws std::invalid_argument When the binding is missing or undersized.
+         */
+        primitives::RoPEAngleRows borrowAngles(int rows, int values_per_row) const;
+    };
+
     // =========================================================================
     // FP32 Specialization - implements ITensorRoPE directly
     // =========================================================================
 
     template <>
-    class CPURoPEKernelT<ActivationPrecision::FP32> : public ITensorRoPE
+    class CPURoPEKernelT<ActivationPrecision::FP32> : public ITensorRoPE, public CPURoPEAngleWorkspaceConsumer
     {
     public:
         using StorageType = float;
@@ -234,7 +270,7 @@ namespace llaminar2
          *
          * This grouped entry point keeps the verifier contract in the kernel
          * layer.  It avoids RoPEStage-owned one-row scratch tensors while using
-         * the same persistent decode recurrence as the live one-token path.
+         * the same absolute-position row function as the live one-token path.
          */
         bool apply_verifier_rows_decode_equivalent(
             TensorBase *Q,
@@ -256,7 +292,7 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    class CPURoPEKernelT<ActivationPrecision::BF16> : public ITensorRoPE
+    class CPURoPEKernelT<ActivationPrecision::BF16> : public ITensorRoPE, public CPURoPEAngleWorkspaceConsumer
     {
     public:
         using StorageType = uint16_t;
@@ -361,7 +397,7 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    class CPURoPEKernelT<ActivationPrecision::FP16> : public ITensorRoPE
+    class CPURoPEKernelT<ActivationPrecision::FP16> : public ITensorRoPE, public CPURoPEAngleWorkspaceConsumer
     {
     public:
         using StorageType = uint16_t;
@@ -476,7 +512,7 @@ namespace llaminar2
      * Constraint: head_dim must be divisible by 32 (Q8_1 block size)
      */
     template <>
-    class CPURoPEKernelT<ActivationPrecision::Q8_1> : public ITensorRoPE
+    class CPURoPEKernelT<ActivationPrecision::Q8_1> : public ITensorRoPE, public CPURoPEAngleWorkspaceConsumer
     {
     public:
         using StorageType = Q8_1Block;
@@ -815,9 +851,6 @@ namespace llaminar2
             int device_idx = -1,
             int pos_offset = 0,
             int rotary_dim = 0) override;
-
-    private:
-        primitives::RoPEPersistentState tls_state_;
     };
 
 } // namespace llaminar2

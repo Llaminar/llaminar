@@ -48,6 +48,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include "../../../../utils/CPURoPETestBinding.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test::cuda;
@@ -814,6 +815,7 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Small)
 
     // CPU reference (in-place)
     CPURoPEKernelT<ActivationPrecision::FP32> cpu_kernel;
+    const test::CPURoPETestBinding cpu_kernel_angles(cpu_kernel);
     cpu_kernel.apply_typed(cpu_q.data(), cpu_k.data(), position_ids.data(),
                            seq_len, n_heads, n_heads, head_dim, rope_theta, -1);
 
@@ -895,6 +897,7 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Large)
     std::vector<float> cuda_k = k_data;
 
     CPURoPEKernelT<ActivationPrecision::FP32> cpu_kernel;
+    const test::CPURoPETestBinding cpu_kernel_angles(cpu_kernel);
     cpu_kernel.apply_typed(cpu_q.data(), cpu_k.data(), position_ids.data(),
                            seq_len, n_heads, n_kv_heads, head_dim, rope_theta, -1);
 
@@ -969,6 +972,7 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_PartialRotaryKeepsFullHeadStride)
     std::vector<int> position_ids = {1024, 1025, 1026, 1027, 1028};
 
     CPURoPEKernelT<ActivationPrecision::FP32> cpu_kernel;
+    const test::CPURoPETestBinding cpu_kernel_angles(cpu_kernel);
     ASSERT_TRUE(cpu_kernel.apply_typed(cpu_q.data(), cpu_k.data(), position_ids.data(),
                                        seq_len, n_heads, n_kv_heads, head_dim,
                                        rope_theta, -1, rotary_dim));
