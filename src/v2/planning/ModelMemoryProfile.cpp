@@ -497,33 +497,12 @@ namespace llaminar2
                 profile.head_dim = static_cast<int>(model.embedding_length / model.head_count);
             }
 
-            // d_ff: try metadata, else estimate as 4 * d_model (common default)
-            auto ff_it = model.metadata.find("llama.feed_forward_length");
-            if (ff_it == model.metadata.end())
-                ff_it = model.metadata.find(model.architecture + ".feed_forward_length");
-            if (ff_it != model.metadata.end())
-            {
-                profile.d_ff = static_cast<int>(ff_it->second.asUInt64());
-            }
-            else
-            {
-                // Estimate: for most models, d_ff is discoverable from tensor shapes
-                // Look for ffn_gate or ffn_up weight to infer d_ff
-                for (const auto &t : model.tensors)
-                {
-                    if ((t.name.find("ffn_gate") != std::string::npos ||
-                         t.name.find("ffn_up") != std::string::npos) &&
-                        t.dimensions.size() == 2)
-                    {
-                        profile.d_ff = static_cast<int>(t.dimensions[0]);
-                        break;
-                    }
-                }
-                if (profile.d_ff == 0)
-                {
-                    profile.d_ff = profile.d_model * 4; // Fallback heuristic
-                }
-            }
+            // d_ff has one source authority shared with graph configuration;
+            // the graph builders apply the same 4*d_model default when the
+            // source declares no FFN width.
+            profile.d_ff = static_cast<int>(ggufFeedForwardLength(model));
+            if (profile.d_ff == 0)
+                profile.d_ff = profile.d_model * 4;
 
         }
 
