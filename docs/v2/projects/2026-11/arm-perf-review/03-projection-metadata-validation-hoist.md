@@ -258,3 +258,22 @@ separate (shared) path with the same pattern but different owners.
   arithmetic/transfer-extent change; normalizer no allocation. First-touch/
   NUMA/economy unchanged = OWNER evidence (not claimed).
 - Housekeeping: remove duplicate @throws logic_error in the touched admission.
+
+## SOURCE112 successor — 035d1d948 (2026-11-09, parent 661fc9284)
+
+- (a) normalizePaddingMetadata geometry from
+  CPUNativeVNNIWeightView::publishedGeometry (canonical admitStructure: source/
+  encoding/positive widened geometry/exact stored extent; plain geometry only,
+  no readable/executable view); owner fields compared before any mutable span/
+  pointer arithmetic. Regression
+  PaddingNormalizationRejectsMalformedOwnersWithoutMutation: N=INT_MAX/N=0,
+  K-alone/K<0, unknown source/encoding, foreign blocks_per_row/N_padded, short
+  storage, empty unknown-encoding zero-stride asymmetric owner — bytes
+  unchanged; ASan/UBSan clean M1.
+- (b) x86 TWO owners (raw/normalized); per-reader IQ2_S dispatch<8>/<16>,
+  loadScales256/512 on every block's padding vector — reject raw+accept
+  normalized, seal agrees (clang-x86 syntax; WSL proves).
+- (c) verifyTailPadding Rows1..4 × contiguous + ordered. (d) complementary
+  separate-fixture proofs. (g) duplicate @throws removed. (f) measured-only.
+- SOURCE113 re-check queued. .80: 661fc9284 Unit 961/963 (2 known-base
+  suspect); then incremental rerun at 035d1d948 + window (b) after.
