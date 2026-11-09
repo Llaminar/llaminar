@@ -4,18 +4,23 @@
  *
  * These tests deliberately avoid running attention or creating an OpenMP team.
  * They authenticate the typed production policy over dense ranges of M, K/V
- * context, local head geometry, cache capacity, and positive worker counts so a
- * future tuning-table edit cannot introduce a dispatch hole.
+ * context, local head geometry, compiler/runtime architecture, cache observations
+ * and positive worker counts. ARM's canonical span must not consume fabricated
+ * private-cache data or x86 measured bands. Metadata-only integer/byte extremes
+ * reject overflow without pretending to own enormous tensor allocations.
  */
 
 #include <gtest/gtest.h>
 
 #include "v2/kernels/cpu/attention/CPUFlashAttentionLaunchPolicy.h"
+#include "v2/tensors/BlockStructures.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <utility>
 
 namespace
 {
@@ -30,7 +35,10 @@ namespace
         .cache_line_bytes = 64,
     };
 
-    /** @return Smallest code-generation profile that can expose one runtime ISA. */
+    /** @brief Select the exact synthetic compiler family for a policy-only query.
+     * @param isa Explicit fixture identity; no process capability is changed.
+     * @return Smallest code-generation profile that can expose the runtime ISA.
+     */
     [[nodiscard]] constexpr CPUFA2CodegenISA codegenFor(
         CPUFA2VectorISA isa) noexcept
     {
@@ -42,6 +50,10 @@ namespace
             return CPUFA2CodegenISA::AVX2;
         case CPUFA2VectorISA::AVX512:
             return CPUFA2CodegenISA::AVX512;
+        case CPUFA2VectorISA::NEON:
+            return CPUFA2CodegenISA::NEON;
+        case CPUFA2VectorISA::NEONDotProd:
+            return CPUFA2CodegenISA::NEONDotProd;
         case CPUFA2VectorISA::Invalid:
             return CPUFA2CodegenISA::Invalid;
         }
@@ -102,14 +114,19 @@ namespace
         };
     }
 
-    /** Build exact Q8_1 per-head row geometry for one policy query. */
+    /** @brief Build physical Q8_1 row geometry for one policy query.
+     * @param isa Explicit synthetic runtime identity.
+     * @param head_dim Logical elements in the original head.
+     * @param cache Named observed/synthetic private-cache fixture.
+     * @return Complete block-storage byte geometry, not a decoded FP32 width.
+     */
     [[nodiscard]] constexpr CPUFA2KVTileGeometry q8TileGeometry(
         CPUFA2VectorISA isa,
         int head_dim,
         CPUFA2CacheGeometry cache = kOneMiBPrivateL2)
     {
         const std::size_t row_bytes =
-            8ULL + static_cast<std::size_t>(head_dim);
+            ((static_cast<std::size_t>(head_dim) + 31) / 32) * sizeof(Q8_1Block);
         return {
             .storage_pair = CPUFA2KVStoragePair::Q8_1,
             .vector_isa = isa,
@@ -314,15 +331,13 @@ TEST(Test__CPUFlashAttentionLaunchPolicy,
         CPUFA2KVStoragePair::TQ8_TQ4,
         CPUFA2KVStoragePair::TQ8_TQ8,
     };
-    constexpr std::array<CPUFA2VectorISA, 3> isas{
-        CPUFA2VectorISA::Scalar,
-        CPUFA2VectorISA::AVX2,
-        CPUFA2VectorISA::AVX512,
+    constexpr std::array<CPUFA2VectorISA, 5> isas{
+        CPUFA2VectorISA::Scalar, CPUFA2VectorISA::AVX2, CPUFA2VectorISA::AVX512,
+        CPUFA2VectorISA::NEON, CPUFA2VectorISA::NEONDotProd,
     };
-    constexpr std::array<CPUFA2CodegenISA, 3> codegen_isas{
-        CPUFA2CodegenISA::Scalar,
-        CPUFA2CodegenISA::AVX2,
-        CPUFA2CodegenISA::AVX512,
+    constexpr std::array<CPUFA2CodegenISA, 5> codegen_isas{
+        CPUFA2CodegenISA::Scalar, CPUFA2CodegenISA::AVX2, CPUFA2CodegenISA::AVX512,
+        CPUFA2CodegenISA::NEON, CPUFA2CodegenISA::NEONDotProd,
     };
     constexpr std::array<int, 3> head_dims{64, 128, 256};
     constexpr std::array<int, 18> kv_rows{
@@ -611,4 +626,150 @@ TEST(Test__CPUFlashAttentionLaunchPolicy,
     EXPECT_EQ(checked,
               query_row_samples.size() * contexts.size() * heads.size() *
                   worker_samples.size() * axes.size());
+}
+
+/** @test Compiler/runtime identities cannot cross architectures or silently become scalar. */
+TEST(Test__CPUFlashAttentionLaunchPolicy, NativeISAIdentityRejectsForeignEnvelopes)
+{
+    EXPECT_EQ(compiledCPUFA2CodegenISA(), codegenFor(cpuFA2VectorISAFor(compiledCPUISALevel())));
+    EXPECT_EQ(cpuFA2VectorISAFor(static_cast<ISALevel>(255)), CPUFA2VectorISA::Invalid);
+    for (auto runtime : {CPUFA2VectorISA::NEON, CPUFA2VectorISA::NEONDotProd})
+        for (auto codegen : {CPUFA2CodegenISA::Scalar, CPUFA2CodegenISA::AVX2, CPUFA2CodegenISA::AVX512})
+            EXPECT_FALSE(cpuFA2CodegenSupportsRuntimeISA(codegen, runtime));
+    for (auto codegen : {CPUFA2CodegenISA::NEON, CPUFA2CodegenISA::NEONDotProd})
+        for (auto runtime : {CPUFA2VectorISA::Scalar, CPUFA2VectorISA::AVX2, CPUFA2VectorISA::AVX512})
+            EXPECT_FALSE(cpuFA2CodegenSupportsRuntimeISA(codegen, runtime));
+    EXPECT_TRUE(cpuFA2CodegenSupportsRuntimeISA(CPUFA2CodegenISA::NEON, CPUFA2VectorISA::NEON));
+    EXPECT_FALSE(cpuFA2CodegenSupportsRuntimeISA(CPUFA2CodegenISA::NEON, CPUFA2VectorISA::NEONDotProd));
+    EXPECT_TRUE(cpuFA2CodegenSupportsRuntimeISA(CPUFA2CodegenISA::NEONDotProd, CPUFA2VectorISA::NEON));
+    EXPECT_TRUE(cpuFA2CodegenSupportsRuntimeISA(CPUFA2CodegenISA::NEONDotProd, CPUFA2VectorISA::NEONDotProd));
+    EXPECT_STREQ(cpuFA2VectorISAName(CPUFA2VectorISA::NEON), "neon");
+    EXPECT_STREQ(cpuFA2CodegenISAName(CPUFA2CodegenISA::NEONDotProd), "neon-dotprod");
+    const auto observed = observedCPUFA2PolicyCache();
+    if (cpuFA2UsesCanonicalSpanPolicy(compiledCPUFA2CodegenISA()))
+    {
+        EXPECT_EQ(observed.private_l1d_bytes, 0u);
+        EXPECT_EQ(observed.private_l2_bytes, 0u);
+        EXPECT_EQ(observed.shared_l3_bytes, 0u);
+        EXPECT_EQ(observed.cache_line_bytes, 0u);
+    }
+    else
+    {
+        const auto &cache = cpu_cache_observation();
+        EXPECT_EQ(observed.private_l2_bytes, cache.private_l2_bytes);
+        EXPECT_EQ(observed.cache_line_bytes, cache.cache_line_bytes);
+    }
+}
+
+/** @test Native ARM policy is total over every storage pair without invented cache or x86 timings. */
+TEST(Test__CPUFlashAttentionLaunchPolicy, ARMCanonicalSpanDoesNotBorrowX86CacheEvidence)
+{
+    constexpr std::array<CPUFA2KVStoragePair, 12> pairs{
+        CPUFA2KVStoragePair::FP32, CPUFA2KVStoragePair::FP16, CPUFA2KVStoragePair::BF16,
+        CPUFA2KVStoragePair::Q16_1, CPUFA2KVStoragePair::Q8_1, CPUFA2KVStoragePair::AQ8_Q8_1,
+        CPUFA2KVStoragePair::AQ8_TQ4, CPUFA2KVStoragePair::AQ8_TQ8,
+        CPUFA2KVStoragePair::TQ4_TQ4, CPUFA2KVStoragePair::TQ4_TQ8,
+        CPUFA2KVStoragePair::TQ8_TQ4, CPUFA2KVStoragePair::TQ8_TQ8};
+    const auto row_bytes = [](CPUFA2KVStoragePair pair, int head) -> std::pair<std::size_t, std::size_t>
+    {
+        const auto width = static_cast<std::size_t>(head);
+        const auto q8 = ((width + 31) / 32) * sizeof(Q8_1Block);
+        const auto q16 = ((width + 31) / 32) * sizeof(Q16_1Block);
+        const auto tq4 = 8 + width / 2;
+        const auto tq8 = 8 + width;
+        const auto aq8 = 4 + width;
+        switch (pair)
+        {
+        case CPUFA2KVStoragePair::FP32: return {width * 4, width * 4};
+        case CPUFA2KVStoragePair::FP16:
+        case CPUFA2KVStoragePair::BF16: return {width * 2, width * 2};
+        case CPUFA2KVStoragePair::Q16_1: return {q16, q16};
+        case CPUFA2KVStoragePair::Q8_1: return {q8, q8};
+        case CPUFA2KVStoragePair::AQ8_Q8_1: return {aq8, q8};
+        case CPUFA2KVStoragePair::AQ8_TQ4: return {aq8, tq4};
+        case CPUFA2KVStoragePair::AQ8_TQ8: return {aq8, tq8};
+        case CPUFA2KVStoragePair::TQ4_TQ4: return {tq4, tq4};
+        case CPUFA2KVStoragePair::TQ4_TQ8: return {tq4, tq8};
+        case CPUFA2KVStoragePair::TQ8_TQ4: return {tq8, tq4};
+        case CPUFA2KVStoragePair::TQ8_TQ8: return {tq8, tq8};
+        case CPUFA2KVStoragePair::Invalid: return {0, 0};
+        }
+        return {0, 0};
+    };
+    for (auto codegen : {CPUFA2CodegenISA::NEON, CPUFA2CodegenISA::NEONDotProd})
+        for (auto runtime : {CPUFA2VectorISA::NEON, CPUFA2VectorISA::NEONDotProd})
+        {
+            if (!cpuFA2CodegenSupportsRuntimeISA(codegen, runtime)) continue;
+            for (auto pair : pairs)
+                for (int head : {64, 128, 256})
+                    for (int rows : {1, 4, 31, 256, 257, 8192, std::numeric_limits<int>::max()})
+                    {
+                        const auto [key_bytes, value_bytes] = row_bytes(pair, head);
+                        CPUFA2KVTileGeometry geometry{
+                            .storage_pair = pair, .vector_isa = runtime, .codegen_isa = codegen,
+                            .head_dim = head, .kv_rows = rows,
+                            .key_head_row_bytes = key_bytes, .value_head_row_bytes = value_bytes,
+                            .cache = {.cache_line_bytes = 0}};
+                        ASSERT_TRUE(geometry.valid());
+                        EXPECT_FALSE(geometry.cache.valid());
+                        EXPECT_EQ(cpuFA2EmpiricalTile(pair, runtime, codegen, head), 0);
+                        EXPECT_EQ(selectCPUFA2KVTile(geometry), kCanonicalContextPartitionRows);
+                        EXPECT_EQ(cpuFA2TileWorkingSetBytes(geometry, 256),
+                            std::size_t(head) * sizeof(float) * 2 + 256 * sizeof(float) +
+                            256 * std::max(key_bytes, value_bytes));
+                        for (int tile : kCompiledKVTiles) EXPECT_EQ(selectCPUFA2KVTile(geometry, tile), tile);
+                        // Supplying a named synthetic x86 cache cannot turn
+                        // the ARM policy into a measurement from that socket.
+                        geometry.cache = kOneMiBPrivateL2;
+                        EXPECT_EQ(selectCPUFA2KVTile(geometry), kCanonicalContextPartitionRows);
+                    }
+        }
+}
+
+/** @test Byte-footprint wrap is rejected rather than admitted as a small tile. */
+TEST(Test__CPUFlashAttentionLaunchPolicy, WorkingSetOverflowRejectsWithoutNarrowing)
+{
+    auto geometry = fp32TileGeometry(128, 1024);
+    geometry.key_head_row_bytes = std::numeric_limits<std::size_t>::max();
+    EXPECT_EQ(cpuFA2TileWorkingSetBytes(geometry, 4), 0);
+    EXPECT_EQ(selectCPUFA2KVTile(geometry), 0);
+    EXPECT_EQ(selectCPUFA2KVTile(geometry, 4), 0);
+    geometry.vector_isa = CPUFA2VectorISA::NEON;
+    geometry.codegen_isa = CPUFA2CodegenISA::NEON;
+    geometry.cache = {.cache_line_bytes = 0};
+    EXPECT_EQ(selectCPUFA2KVTile(geometry), 0);
+    geometry.key_head_row_bytes = std::numeric_limits<std::size_t>::max() / 256;
+    EXPECT_GT(cpuFA2TileWorkingSetBytes(geometry, 4), 0);
+    EXPECT_EQ(cpuFA2TileWorkingSetBytes(geometry, 256), 0);
+    EXPECT_EQ(selectCPUFA2KVTile(geometry), 0);
+    EXPECT_EQ(selectCPUFA2KVTile(geometry, 256), 0);
+}
+
+/** @test Original integer geometry is bounded before products and ceiling divisions. */
+TEST(Test__CPUFlashAttentionLaunchPolicy, ParallelGeometryBoundsPrecedeMultiplication)
+{
+    constexpr int limit = std::numeric_limits<int>::max();
+    CPUFA2ParallelGeometry geometry{
+        .batch_size = limit, .query_rows = limit, .local_query_heads = limit,
+        .kv_rows = limit, .physical_workers = limit,
+        .requested_axis = attention::AttentionPrefillParallelAxis::KeyValueContext};
+    EXPECT_FALSE(geometry.valid());
+    EXPECT_FALSE(selectCPUFA2ParallelPlan(geometry).valid);
+    geometry.batch_size = 1;
+    geometry.query_rows = 1;
+    geometry.local_query_heads = 1;
+    auto plan = selectCPUFA2ParallelPlan(geometry);
+    ASSERT_TRUE(plan.valid);
+    EXPECT_EQ(plan.arithmetic_partitions, 8388608);
+    EXPECT_EQ(plan.context_partitions, 8388608);
+    EXPECT_EQ(plan.partial_slots, 8388609);
+    geometry.batch_size = limit;
+    geometry.kv_rows = 512;
+    EXPECT_TRUE(geometry.valid());
+    EXPECT_FALSE(selectCPUFA2ParallelPlan(geometry).valid);
+    geometry.requested_axis = attention::AttentionPrefillParallelAxis::QuerySequence;
+    plan = selectCPUFA2ParallelPlan(geometry);
+    ASSERT_TRUE(plan.valid);
+    EXPECT_EQ(plan.output_rows, limit);
+    EXPECT_EQ(plan.partial_slots, limit);
 }
