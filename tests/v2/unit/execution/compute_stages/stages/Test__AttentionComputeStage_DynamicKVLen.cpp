@@ -1153,7 +1153,7 @@ namespace llaminar2
             }
 
             const std::string cuda_kernels = readFile(
-                root / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu");
+                root / "src/v2/kernels/cuda/attention/CUDAFlashAttentionShardImpl.cu.inc");
             const std::string rocm_kernels = readFile(
                 root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernels.hip");
             ASSERT_FALSE(cuda_kernels.empty());
@@ -1190,7 +1190,7 @@ namespace llaminar2
             const std::string rocm_kernels = readFile(
                 root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernels.hip");
             const std::string cuda_kernels = readFile(
-                root / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu");
+                root / "src/v2/kernels/cuda/attention/CUDAFlashAttentionShardImpl.cu.inc");
             ASSERT_FALSE(rocm_kernels.empty());
             ASSERT_FALSE(cuda_kernels.empty());
             EXPECT_NE(

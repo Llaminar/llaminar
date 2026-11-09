@@ -1,9 +1,21 @@
 /**
- * @file CUDAFlashAttentionKernels.cu
+ * @file CUDAFlashAttentionShardImpl.cu.inc
  * @brief Captured CUDA attention and conditional dispatch to safeguarded tensor prefill.
  *
  * This file contains the CUDA device kernels and extern "C" wrapper functions
- * called from the C++ implementation file.
+ * called from the C++ implementation file. It is compiled as seven physical
+ * shards (CUDAFlashAttentionShard0..6.cu), each a complete deterministic
+ * module; nvcc's compiler-internal --split-compile is not used because its
+ * partitioning, and with it register allocation and the fatal spill guard's
+ * verdict, varies between identical compiles. Each public entrypoint and each
+ * non-template kernel is compiled in exactly one shard, which therefore
+ * instantiates only the template family that entrypoint reaches:
+ *   0-2  ordinary pipelined prefill with FP32, FP16 and BF16 native KV;
+ *   3-5  context-transaction prefill with FP32, FP16 (including the
+ *        partitioned-sequence entry) and BF16 native KV;
+ *   6    decode, device attention parameters and KV conversion kernels.
+ * Shared templates are instantiated only by the shard that uses them; the
+ * linker rejects a missing or duplicated public symbol.
  *
  * Full HD256 FP16 buckets select the native warp-owned tensor-prefill
  * family through a typed host function handle. Graph control retains
@@ -30,6 +42,21 @@
  *
  * @author David Sanftenberg
  */
+
+#ifndef LLAMINAR_CUDA_FLASH_ATTENTION_SHARD
+#error "CUDAFlashAttentionShardImpl.cu.inc requires a physical shard index"
+#endif
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD < 0 || LLAMINAR_CUDA_FLASH_ATTENTION_SHARD > 6
+#error "CUDA flash-attention shard index must be in [0, 6]"
+#endif
+/** True in exactly the shard that owns an entrypoint or non-template kernel. */
+#define LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(INDEX) (LLAMINAR_CUDA_FLASH_ATTENTION_SHARD == (INDEX))
+/** True in the three ordinary pipelined-prefill shards. */
+#define LLAMINAR_CUDA_FLASH_ATTENTION_PREFILL_SHARD \
+    (LLAMINAR_CUDA_FLASH_ATTENTION_SHARD >= 0 && LLAMINAR_CUDA_FLASH_ATTENTION_SHARD <= 2)
+/** True in the three context-transaction shards. */
+#define LLAMINAR_CUDA_FLASH_ATTENTION_CONTEXT_SHARD \
+    (LLAMINAR_CUDA_FLASH_ATTENTION_SHARD >= 3 && LLAMINAR_CUDA_FLASH_ATTENTION_SHARD <= 5)
 
 #include <cuda_runtime.h>
 #include "CUDATensorPrefillKernels.h"
@@ -216,6 +243,7 @@ namespace
     }
 #endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(6) // decode/parameter shard
     /**
      * @brief Derive graph-captured attention params from live KV cache count.
      *
@@ -308,7 +336,9 @@ namespace
                 direct_kv_limit);
 #endif
     }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(6) // decode/parameter shard
     /**
      * @brief Materialize explicit attention geometry directly in device memory.
      *
@@ -350,7 +380,9 @@ namespace
                 direct_kv_limit);
 #endif
     }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(6) // decode/parameter shard
     /**
      * @brief Derive request-major row metadata from independent device KV counts.
      *
@@ -386,6 +418,7 @@ namespace
         out[flat_row].ring_row_origin = 0;
         out[flat_row].ring_row_capacity = 0;
     }
+#endif
 
     /**
      * @brief Compute shared memory size for a given FA2 configuration
@@ -1686,6 +1719,7 @@ namespace
             max(1, kv_len / max(1, min_kv_per_split)));
     }
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(6) // decode/parameter shard
     /**
      * @brief Flash Decoding reduction kernel
      *
@@ -1765,6 +1799,7 @@ namespace
             O_out[d] = O_sum * inv_l;
         }
     }
+#endif
 
     // =========================================================================
     // Flash Decoding kernel — typed native floating-point cache
@@ -1992,6 +2027,7 @@ namespace
         }
     }
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(6) // decode/parameter shard
     /**
      * @brief Reduce grouped verifier partials with each row's serial split count.
      *
@@ -2069,6 +2105,7 @@ namespace
             O_out[d] = O_sum * inv_l;
         }
     }
+#endif
 
     // =========================================================================
     // Flash Decoding kernel — Q8_1 KV cache variant (fused inline dequant)
@@ -2375,6 +2412,7 @@ namespace
 
 namespace
 {
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(6) // decode/parameter shard
     /**
      * @brief Fused TQ8/TQ4 flash decoding kernel.
      *
@@ -2631,9 +2669,11 @@ namespace
             O_out[d] = sum;
         }
     }
+#endif
 
 } // anonymous namespace
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(6) // conversion kernels belong to the decode/utility shard
 // =============================================================================
 // KV Cache Conversion Kernels (FP16→FP32, Q8_1→FP32)
 //
@@ -2782,6 +2822,9 @@ __global__ void dequant_q8_1_to_fp32_dynamic_kernel(
 // Internal template launcher (cannot have extern "C" linkage)
 // =============================================================================
 
+#endif
+
+#if LLAMINAR_CUDA_FLASH_ATTENTION_PREFILL_SHARD // ordinary prefill shards
 /**
  * @brief Internal templated FA2 launcher — dispatches based on head_dim and native KV storage type.
  * Query groups are selected from every compiled width through 6 (HD64), 4
@@ -2986,6 +3029,7 @@ static int fa2_prefill_launch(
     }
     return 0;
 }
+#endif
 
 /**
  * @brief Physical scheduling of fixed logical K/V partitions during capture.
@@ -3050,6 +3094,7 @@ enum class FA2AdaptivePhasePlacement
     ContextIfBody,         ///< Non-zero conditional body publishing summaries.
 };
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_CONTEXT_SHARD // context-transaction shards
 /**
  * @brief Append one compiled FA2 phase kernel to its typed adaptive placement.
  *
@@ -3168,7 +3213,9 @@ static bool appendFA2AdaptivePhaseNode(
         node_params,
         semantic_name);
 }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_CONTEXT_SHARD // context-transaction shards
 /**
  * @brief Append the deterministic ascending-partition reducer to one branch.
  * @tparam DIMENSION_WARPS_PER_ROW Independent output strips per query row.
@@ -3220,7 +3267,9 @@ static bool appendFA2ReducerConditionalNode(
         "deterministic context reducer");
 }
 #endif
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_CONTEXT_SHARD // context-transaction shards
 /**
  * @brief Launch one exact compiled FA2 transaction specialization.
  *
@@ -3609,7 +3658,9 @@ static int launchFA2ContextTransactionSpecialization(
     }
     return 0;
 }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_CONTEXT_SHARD // context-transaction shards
 /**
  * @brief Validate and dispatch one fully device-resident FA2 context transaction.
  *
@@ -3812,8 +3863,10 @@ static int fa2_context_transaction_launch(
            "specialization\n");
     return -1;
 }
+#endif
 
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(6) // decode/parameter shard
 /**
  * @brief Submit two native-KV decode nodes for any row ownership policy.
  *
@@ -3873,7 +3926,9 @@ static int nativeKVDecodeLaunch(
                 num_splits, kv_len, /*min_kv_per_split=*/16, device_params);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(6) // decode/parameter shard
 /** @brief Resolve native storage once on submission, never inside a device row. */
 template <typename Launch>
 static int dispatchNativeKV(llaminar2::TensorType type, Launch launch)
@@ -3890,6 +3945,7 @@ static int dispatchNativeKV(llaminar2::TensorType type, Launch launch)
         return -1;
     }
 }
+#endif
 
 // =============================================================================
 // Extern "C" Wrapper Functions
@@ -3897,6 +3953,7 @@ static int dispatchNativeKV(llaminar2::TensorType type, Launch launch)
 
 extern "C"
 {
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(0) // public entrypoint owner
     int cudaFlashAttn_prefill_fa2(
         const float *Q, const float *K, const float *V, float *O,
         int batch_size, int seq_len, int kv_len,
@@ -3916,7 +3973,9 @@ extern "C"
             static_cast<cudaStream_t>(stream), device_idx,
             head_start, gqa_n_rep);
     }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(1) // public entrypoint owner
     /**
      * @brief Launch FA2 with FP16 K/V inputs (eliminates FP16→FP32→FP16 round-trip)
      *
@@ -3943,7 +4002,9 @@ extern "C"
             static_cast<cudaStream_t>(stream), device_idx,
             head_start, gqa_n_rep);
     }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(2) // public entrypoint owner
     /**
      * @brief Native BF16 FA2 transaction using the canonical tiled producer.
      * Storage remains BF16; only on-chip WMMA operands convert to half, just as
@@ -3969,7 +4030,9 @@ extern "C"
             static_cast<cudaStream_t>(stream), device_idx,
             head_start, gqa_n_rep);
     }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(4) // public entrypoint owner
     /**
      * @brief Launch canonical fixed-context FA2 as ordered captured graph nodes.
      *
@@ -4040,7 +4103,9 @@ extern "C"
             head_start,
             gqa_n_rep);
     }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(3) // public entrypoint owner
     /**
      * @brief Launch canonical fixed-context FA2 with FP32 K/V storage.
      *
@@ -4110,7 +4175,9 @@ extern "C"
             head_start,
             gqa_n_rep);
     }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(4) // public entrypoint owner
     /**
      * @brief Launch canonical fixed-context FA2 with a parallel partition grid.
      *
@@ -4181,7 +4248,9 @@ extern "C"
             head_start,
             gqa_n_rep);
     }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(5) // public entrypoint owner
     /**
      * @brief Native BF16 FA2 transaction using the canonical tiled producer.
      * Storage remains BF16; only on-chip WMMA operands convert to half, just as
@@ -4249,7 +4318,9 @@ extern "C"
             head_start,
             gqa_n_rep);
     }
+#endif
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(6) // decode, device parameters and conversion entrypoints
     /**
      * @brief Launch Flash Decoding kernel (FP32)
      *
@@ -4866,4 +4937,5 @@ extern "C"
         return 0;
     }
 
+#endif
 } // extern "C"
