@@ -529,3 +529,21 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   mid-compile plan change → no receipt. Stand-in emits fresh temps now.
 - Real-data: 10 real GNU-14 jobs pass stricter validation; 81 tests; Mac E2E.
 - Census re-run at 64de475a2 pending.
+
+## SOURCE124 FINAL (2026-11-09) — fold into successor (SOURCE126 scope)
+
+- P1a raw GNU plan equality (temp-name; SOURCE125 narrowly-typed repair, not
+  yet reviewed; preserve semantic fields + validate compiler-output/
+  assembler-input link; normalize ONLY the ephemeral identity; never globally
+  scrub temp strings or skip the second observation).
+- P1b depfile delimiters: ASCII space/tab only — reject non-admitted chars
+  BEFORE generic split (NBSP real/decoy control; fake-compiler deps split
+  care; unrestricted str.split ≠ plain-subset parser).
+- P2 final-observation epoch program_identities→driver_plan order: recheck
+  the complete epoch AFTER the final observation and BEFORE publication
+  (no-receipt on failed epoch; event-plan.txt model; build/verify
+  failure-publication boundary).
+- Nonblocking: relative-driver test precision (compile-db c++ vs absolute
+  args.compiler mismatch).
+- SOURCE124 GNU status = owner-reported FAILURE (census-caught defect);
+  one-of-four Mac failure stays unreproduced/unresolved, no attribution.
