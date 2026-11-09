@@ -44,8 +44,8 @@ mounts. Each job calls `run_develop_image_gate.py --cpu-isa <matrix ISA>` withou
 layers without credentials or registry cache export. Before source compilation,
 both cloud workflows checkpoint `gpu-sdk` and the ISA-specific `toolchain` in
 GitHub Actions cache. Later build/test failures retain completed dependencies;
-PR caches remain scoped to their merge ref. The existing cache storage limit
-is unchanged. Separate PRs run concurrently;
+PR caches remain scoped to their merge ref. Cache capacity is configured in
+GitHub Actions settings. Separate PRs run concurrently;
 new commits cancel older checks on the same PR. The cloud pool admits up to
 four 16-core runners. The matrix disables fail-fast so both ISA results remain
 visible. The driver admits the requested ISA against every visible CPU before

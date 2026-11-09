@@ -1022,7 +1022,8 @@ benchmarks run on this PR. The PR imports public registry layers without
 credentials or registry cache export. Both cloud workflows checkpoint the
 shared GPU SDK and each ISA toolchain in GitHub Actions cache before source
 compilation. PR cache writes stay isolated to that PR's merge ref; publication
-cannot restore them. The cache storage limit is unchanged. Separate PRs run concurrently in a pool of up to
+cannot restore them. Cache capacity is configured in GitHub Actions settings.
+Separate PRs run concurrently in a pool of up to
 four 16-core cloud runners; a new commit cancels older checks on the same PR.
 Production hardware has its own independent queue.
 

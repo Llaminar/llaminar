@@ -142,8 +142,8 @@ therefore retains completed dependency layers. The shared SDK scope is
 `llaminar-toolchain-avx2`. PR entries belong to their merge ref and cannot be
 restored by develop publication or another PR. They remain reusable across
 updates to that PR. Develop exports the same scopes for inbound PRs to read.
-The repository's existing 10 GB cache limit remains unchanged; GitHub owns
-eviction. These checkpoints contain immutable dependency layers, not source
+The repository's cache storage limit is configured in GitHub Actions settings;
+GitHub owns eviction. These checkpoints contain immutable dependency layers, not source
 builds or compiler-object cache mounts. Ccache mounts are shared within a
 build job. Dependency cache steps use cache-only output, and the canonical
 image driver still admits and builds the exact source snapshot. See
