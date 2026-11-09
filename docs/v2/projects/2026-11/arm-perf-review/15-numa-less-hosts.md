@@ -107,3 +107,19 @@ and VMs. It is not needed for the qualified GB10 target.
 - Caveat: unmasking container used default 64 MiB shm; no 36-explanation in
   shm. CSV: /tmp/armqual-b1/15/classification-39c24d8b4.csv (unmasked
   columns). Grace record building (I8MM logs checked for changes).
+
+- G8 WITHDRAWN (not a gap): the activation_arena 'live claim exceeds' line
+  = a DELIBERATE short-budget rejection from
+  CPUGraphArenaDeclarations.SmallActualSchemaMaterializesExactlyAndRejects
+  ShortOwnerBudget (which PASSED) — ctest prints the whole binary's output
+  when a sibling fails. ActivationMemoryEstimator's only failing assertion =
+  T2 literal 4491052224.
+- FINAL unmasked 36 = 4 base + 9 T1 + 9 T2 + 2 M1 + 9 G2 + 1 G1 + 1 G3 +
+  4 G6 + 1 G7 (ExpertGemmRegistry + MemoryPlanner carry two classes each;
+  primary in CSV).
+- I8MM logs (SHA 59e593f3 / 24c87a16, receipt added to raw/dgx/i8mm/):
+  failure set IDENTICAL to NEON (29 Unit, 102 Preflight); ONLY extra =
+  CPUShardFusedFinalAddPreweight_neon_i8mm = I8MM twin of the base NaN-
+  corpus defect → NO I8MM-specific failures on Grace; all newly registered
+  I8MM cells pass. Mac record: resumed after an OOM kill from the lane's own
+  parallel 09 compiles (nothing concurrent now).
