@@ -3117,7 +3117,6 @@ add_v2_test(V2_Integration_OpenMPCapacityOrderedCorePlaces
         --gtest_filter=Test__MPIBootstrap.CorePlacesFollowCapacityWithinTheRankMask:Test__MPIBootstrap.ClusterWorkersOrderFastCoresFirst
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CPU;Bootstrap;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPCapacityOrderedCorePlaces)
 
 # Original native launch command owner: exact observed NUMA mapping, no GPU work.
 add_v2_test(V2_Integration_MPIBootstrapObservedNUMAMapping
@@ -19211,7 +19210,6 @@ add_v2_test(V2_Integration_NativeNEONExactOverlayInstructionIdentity
         NeonExactOverlayTest.test_incomplete_nonexact_duplicate_or_mixed_evidence_fails
     LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;CPU;ARM;DeviceFree;Dispatch;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeNEONExactOverlayInstructionIdentity)
 
 # Native ARM exact-overlay candidate collection: the two numerically neutral
 # NEON schedule dimensions over the canonical exact-overlay shapes. Its rows feed
@@ -29367,6 +29365,11 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoEOverlayTicketRoutingWork
     V2_Integration_PrefixRestoreGDNMovementEpochContract
 )
+# Explicit inventory members registered earlier in this file; appended after the
+# list is (re)initialized above so they are not overwritten.
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_NativeNEONExactOverlayInstructionIdentity
+    V2_Integration_OpenMPCapacityOrderedCorePlaces)
 
 # Exact stage-level regression for external event prejoins and scoped capture retirement.
 add_v2_test(V2_Integration_CUDA_GDNTensorCaptureOwnership REQUIRES_BACKEND CUDA
