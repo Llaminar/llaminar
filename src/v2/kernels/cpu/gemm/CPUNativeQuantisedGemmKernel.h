@@ -111,6 +111,75 @@ namespace llaminar2::cpu::native_quantised
     };
 
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    /**
+     * @brief Publish one semantic launch record per distinct executed native schedule.
+     *
+     * Installed as the native launcher's observer. The record family and its
+     * 21 tags are shared with the x86 launcher, so
+     * PerfStats consumers read one schema. Identity is geometry and policy,
+     * never the member's ordinal in a transient bundle: identical members
+     * share one key and contribute their multiplicity as observations.
+     * @param descriptors Complete executed members.
+     * @param count Positive member count.
+     * @param plan The native schedule the launcher executed.
+     * @param tasks Producer tasks per member, from the bound batches.
+     * @param dot Native dot instruction used for the bundle.
+     */
+    inline void recordNativeNEONFusedLaunches(const FusedVerifierRowsDesc *descriptors, int count,
+        const NativeQuantisedFusedRowsPlan &plan, const std::array<std::int64_t, NativeQuantisedFusedRowsPlan::capacity> &tasks,
+        multi_scale::NEONByteDot dot)
+    {
+        if (!PerfStatsCollector::isDomainEnabled("kernel") || (omp_in_parallel() && omp_get_thread_num() != 0))
+            return;
+        std::vector<std::pair<PerfStatsCollector::Tags, std::uint64_t>> groups;
+        groups.reserve(std::size_t(count));
+        for (int p = 0; p < count; ++p)
+        {
+            const auto &d = descriptors[p];
+            const int rows = plan.rows[p];
+            const int tile = rows == 1 ? 1 : (plan.tiles[p] == NEONProjectionRowTile::Pair ? 2 : 4);
+            const char *effective_verifier = rows == 1 ? verifierRowsPolicyName(d.verifier_schedule)
+                : (tile == 2 ? verifierRowsPolicyName(VerifierRowsPolicy::Pairwise)
+                             : verifierRowsPolicyName(VerifierRowsPolicy::WideRows));
+            PerfStatsCollector::Tags tags{
+                {"m", std::to_string(rows)}, {"n", std::to_string(d.N)},
+                {"policy_n", std::to_string(d.policy_n ? d.policy_n : cpuNativeQuantisedSerialEquivalentPolicyN(d.N))},
+                {"k", std::to_string(d.packed->K)}, {"codebook", std::to_string(d.packed->codebook_id)},
+                {"purpose", d.purpose == ProjectionRowsPurpose::Prefill ? "prefill" : "decode"},
+                {"isa", dot == multi_scale::NEONByteDot::DotProd ? "NEON_DOTPROD" : "NEON"},
+                // ARM register-K tiles traverse full K: one K tile per output owner.
+                {"k_tiles", "1"}, {"k_tile_blocks", std::to_string(d.packed->blocks_per_row)},
+                {"ambient_n_block_chunks", std::to_string(plan.chunks[p])},
+                {"n_block_chunks", std::to_string(plan.chunks[p])},
+                {"requested_decode_policy", decodeSchedulePolicyName(d.decode_schedule)},
+                {"effective_decode_policy", "Nbc" + std::to_string(plan.chunks[p])},
+                {"requested_verifier_policy", verifierRowsPolicyName(d.verifier_schedule)},
+                {"effective_verifier_policy", effective_verifier},
+                {"physical_row_tile", std::to_string(tile)},
+                {"route", rows == 1 ? "decode_neon_full_k_row"
+                    : (tile == 2 ? "grouped_neon_full_k_pair_rows" : "grouped_neon_full_k_four_rows")},
+                {"task_grid", "row_tile_n_block"},
+                {"producer_tasks", std::to_string(tasks[p])},
+                {"reduction_tasks", "0"},
+                {"bundle_scheduler", "layer_global_full_k"}};
+            const auto found = std::find_if(groups.begin(), groups.end(),
+                [&](const auto &group) { return group.first == tags; });
+            if (found == groups.end()) groups.emplace_back(std::move(tags), 1u);
+            else ++found->second;
+        }
+        for (const auto &[tags, observations] : groups)
+            PerfStatsCollector::addCounter("kernel", "cpu_native_quantised_fused_verifier_rows_projection_launch",
+                PerfStatsCollector::CounterObservationBatch{
+                    .observations = observations, .value = static_cast<double>(observations)},
+                "gemm", "cpu", tags);
+    }
+
+    /** Installs the PerfStats publisher in every core program that can issue a native launch. */
+    inline const bool kNativeNEONFusedLaunchEvidenceInstalled =
+        (nativeNEONFusedLaunchObserver().store(&recordNativeNEONFusedLaunches, std::memory_order_release), true);
+#endif
+
     /** @brief Prepared quantized weights with participant-owned invocation scratch. */
     class CPUNativeQuantisedGemmKernel : public ITensorGemm, public CPUInvocationWorkspaceConsumer
     {
