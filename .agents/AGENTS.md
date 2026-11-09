@@ -505,6 +505,15 @@ the canonical image build, not only the locally installed GPU's target. Record
 the target set with the validation evidence. Passing native-device runtime
 tests does not prove register allocation on the other shipped targets.
 
+Spill evidence must also be reproducible. nvcc `--split-compile` partitions a
+module nondeterministically, so identical compiles can allocate registers
+differently and flip the spill verdict. It is forbidden on every project
+target. Large kernel families get compile throughput from persistent
+translation-unit shards instead, as CUDA NativeQuantised decode/prefill and
+flash attention do. `V2_Integration_DeterministicGPUCompilation` in
+`ProductionTestPreflight` checks every CMake declaration and the build's
+actual device compile commands.
+
 Parallel full-LTO RCCL builds use the builder-owned fixed linker installed by
 `scripts/docker/install-rocm-lto-linker.sh`. Its source/patch pins belong to
 `scripts/docker/rocm-release.env`; it recompiles one LLVM backend translation
