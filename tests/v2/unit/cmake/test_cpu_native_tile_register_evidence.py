@@ -35,6 +35,7 @@ DISPATCHED = [(1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), 
 NEON_KEYS = sorted((rows, 0, policy, encoding, nibble_map, minimum)
                    for rows in (1, 2, 3, 4) for policy in (0, 1) for encoding, nibble_map, minimum in DISPATCHED)
 NEON_INVENTORY = "1:ASIMD,2:ASIMD,3:ASIMD,4:ASIMD"
+ELF, MACHO = CHECKER.Dialect(False), CHECKER.Dialect(True)
 FATAL = "_ZN9llaminar23cpu11native_quantised23CPUNativeQuantisedWeightView32rejectOutsideAdmittedPublicationEv"
 CLEAN = "\tstp\tx29, x30, [sp, -16]!\n\tmov\tx29, sp\n\tsdot\tv0.4s, v1.16b, v2.16b\n\tldp\tx29, x30, [sp], 16\n\tret"
 FATAL_BODY = f"{FATAL}:\n\tstp\tx29, x30, [sp, -16]!\n\tmov\tx29, sp\n\tbl\tfwrite\n\tbl\tabort\n"
@@ -76,8 +77,8 @@ def analyse(body: str, extra: dict[str, str] | None = None, macho: bool = False)
     source = (".subsections_via_symbols\n" if macho else "") + "f:\n" + textwrap.dedent(body)
     for symbol, other in (extra or {}).items():
         source += f"\n{symbol}:\n" + textwrap.dedent(other)
-    dialect = CHECKER.Dialect(source)
-    bodies = CHECKER.functions(source)
+    dialect = MACHO if macho else ELF
+    bodies = CHECKER.functions(source, dialect)
     noreturn = CHECKER.noreturn_symbols(bodies, dialect)
     spills, errors = CHECKER.analyse_function("f", bodies, dialect, noreturn)
     return Result(spills, errors, noreturn)
@@ -98,7 +99,7 @@ class ClassificationTest(unittest.TestCase):
     def test_every_base_and_width_is_classified(self) -> None:
         for line in ("str q31, [sp, 160]", "ldr q25, [sp, #0xa0]", "stp q0, q1, [sp, 32]", "stur q0, [x29, -16]",
                      "str q0, [x29, #16]", "str s3, [sp, 12]", "ldr d17, [x29, 40]", "str h2, [sp, 4]",
-                     "st1 {v0.16b}, [sp]", "ldr b1, [sp, 1]", "st1 {v0.16b - v1.16b}, [sp]", "ld1 {v2.s}[1], [sp]",
+                     "st1 {v0.16b}, [sp]", "ldr b1, [sp, 1]", "st1 {v0.16b, v1.16b}, [sp]", "ld1 {v2.s}[1], [sp]",
                      "str q0, [sp, x9]", "ldr q0, [sp, w9, sxtw 4]", "str q0, [sp, -32]!", "ldr q0, [sp], 16"):
             with self.subTest(line=line):
                 self.assertEqual(self.spills(f"\t{line}\n\tret\n"), 1)
@@ -127,7 +128,7 @@ class ClassificationTest(unittest.TestCase):
         self.assertEqual(self.spills("\tmov x9, x1\n\tcbz w0, .Luse\n\tmov x9, x2\n.Luse:\n\tldr q0, [x9]\n\tret\n"), 0)
 
     def test_loops_reach_a_fixed_point(self) -> None:
-        body = "\tmov x9, sp\n.Lloop:\n\tstr q0, [x9], 16\n\tsubs x2, x2, 1\n\tbne .Lloop\n\tret\n"
+        body = "\tmov x9, sp\n.Lloop:\n\tstr q0, [x9], 16\n\tsub x2, x2, 1\n\tcbnz x2, .Lloop\n\tret\n"
         self.assertEqual(self.spills(body), 1)
 
     def test_stack_addresses_stored_in_slots_and_escapes(self) -> None:
@@ -137,6 +138,49 @@ class ClassificationTest(unittest.TestCase):
         self.fatal("\tadd x9, sp, 32\n\tstr x9, [x1]\n\tret\n", "cannot be tracked")
         self.fatal("\tadd x9, sp, 32\n\tstr x9, [sp, x2]\n\tret\n", "cannot be tracked")
         self.fatal("\tmov x9, sp\n\tfmov d0, x9\n\tret\n", "FP/SIMD register")
+
+    def test_unknown_offset_stack_access_with_live_pointer_slots_fails(self) -> None:
+        frame = "\tsub sp, sp, #32\n\tadd x9, sp, #16\n\tstr x9, [sp]\n"
+        for access in ("ldr w11, [sp, x10]", "ldp w10, w11, [sp, x10]", "ldr q1, [sp, x3]", "ldr x11, [sp, x3, lsl 3]"):
+            with self.subTest(access=access):
+                self.fatal(frame + f"\t{access}\n\tadd sp, sp, #32\n\tret\n", "unknown offset")
+        self.assertEqual(self.spills("\tsub sp, sp, #32\n\tldr q1, [sp, x3]\n\tadd sp, sp, #32\n\tret\n"), 1)
+
+    def test_pointer_slot_joins_keep_the_non_stack_alternative(self) -> None:
+        joined = ("\tcbz w0, .La\n\tadd x9, sp, #32\n\tstr x9, [sp, 8]\n\tb .Lj\n.La:\n\tstr x1, [sp, 8]\n.Lj:\n"
+                  "\tldr x10, [sp, 8]\n\tstr q0, [x10]\n\tret\n")
+        self.fatal(joined, "only some paths")
+        self.fatal(joined.replace("\tstr x1, [sp, 8]\n", ""), "only some paths")
+        self.fatal("\tldr x10, [sp]\n\tadd x9, sp, #32\n\tstr x9, [x10]\n\tldr x11, [x1]\n\tstr q0, [x11]\n\tret\n",
+                   "cannot be tracked")
+
+    def test_conditional_transforms_of_stack_addresses_are_not_admitted(self) -> None:
+        for transform in ("csinc x9, x9, x9, eq", "csinv x9, x9, x1, ne", "csneg x9, x9, x9, lt", "cinc x9, x9, eq"):
+            with self.subTest(transform=transform):
+                self.fatal(f"\tmov x9, sp\n\t{transform}\n\tstr q0, [x9]\n\tret\n", "admitted grammar")
+        self.fatal("\tmov x9, sp\n\tcsel x9, x9, x1, eq\n\tstr q0, [x9]\n\tret\n", "only some paths")
+
+    def test_structure_footprints_use_the_exact_lane_and_arrangement(self) -> None:
+        tail = "\tldr x10, [sp, #8]\n\tstr q0, [x10]\n\tadd sp, sp, #32\n\tret\n"
+        frame = "\tsub sp, sp, #32\n\tadd x9, sp, #16\n\tstr x9, [sp, #8]\n"
+        for lane, macho in (("\tst1.s { v0 }[0], [sp]\n", True), ("\tst1 {v0.s}[0], [sp]\n", False),
+                            ("\tst1.2s { v0 }, [sp]\n", True), ("\tst1 {v0.8b}, [sp]\n", False)):
+            with self.subTest(lane=lane):
+                analysis = analyse(frame + lane + tail, macho=macho)
+                self.assertEqual((analysis.spills, analysis.errors), (2, []))
+        for overlap, macho in (("\tadd x11, sp, #12\n\tst1.s { v0 }[0], [x11]\n", True),
+                               ("\tadd x11, sp, #12\n\tst1 {v0.s}[0], [x11]\n", False),
+                               ("\tadd x11, sp, #4\n\tst1.2s { v0 }, [x11]\n", True)):
+            with self.subTest(overlap=overlap):
+                self.assertTrue(any("partial overwrite" in error
+                                    for error in analyse(frame + overlap + tail, macho=macho).errors), overlap)
+        for cover, macho in (("\tst1.4s { v0 }, [sp]\n", True), ("\tst1 {v0.16b}, [sp]\n", False)):
+            with self.subTest(cover=cover):  # A whole 16-byte store retires the slot: x10 is no stack address.
+                analysis = analyse(frame + cover + tail, macho=macho)
+                self.assertEqual((analysis.spills, analysis.errors), (1, []))
+        for unknown in ("\tst1 {v0.16b-v1.16b}, [sp]\n", "\tst1 { v0 }, [sp]\n"):
+            with self.subTest(unknown=unknown):
+                self.fatal("\tsub sp, sp, #32\n" + unknown + "\tadd sp, sp, #32\n\tret\n", "footprint")
 
     def test_merge_definitions_keep_their_destination(self) -> None:
         self.assertEqual(self.spills("\tmov x9, sp\n\tbfi x9, xzr, #0, #1\n\tstr q0, [x9]\n\tret\n"), 1)
@@ -239,9 +283,9 @@ class StructuralTest(unittest.TestCase):
     def test_callees(self) -> None:
         self.assertFatal("\tbl helper\n\tret\n", "unsupported call boundary")
         self.assertFatal("\tb helper\n", "unsupported call boundary")
-        self.assertFatal("\tblr x8\n\tret\n", "indirect")
-        self.assertFatal("\tbr x8\n", "indirect")
-        self.assertFatal("\tret x1\n", "indirect")
+        for indirect in ("\tblr x8\n\tret\n", "\tbr x8\n", "\tret x1\n", "\tblraaz x8\n\tret\n"):
+            with self.subTest(indirect=indirect):
+                self.assertFatal(indirect, "admitted grammar")
         self.assertFatal("\tb .Lnowhere\n", "not code of this function")
         self.assertFatal("\tbl .Llocal\n\tret\n.Llocal:\n\tret\n", "not code of this function")
 
@@ -252,7 +296,9 @@ class StructuralTest(unittest.TestCase):
         self.assertEqual(analyse(caller, {FATAL: both}).errors, [])
         self.assertFatal(f"\tbl {FATAL[:-1]}X\n\tret\n", "unsupported call boundary")
         self.assertFatal(f"\tbl {FATAL}\n\tret\n", "unsupported call boundary")
-        for body in ("\tret\n", ".Lspin:\n\tb .Lspin\n", "\tcbz x0, .Ldone\n.Lspin:\n\tb .Lspin\n.Ldone:\n\tbl abort\n",
+        self.assertFatal("\tbl abort\n", "unsupported call boundary")
+        for body in ("\tret\n", ".Lspin:\n\tb .Lspin\n", "\tmov x8, #93\n\tmov x0, #0\n\tsvc #0\n\tbl abort\n",
+                     "\tbl exit\n\tbl abort\n", "\tb.eq .Lx\n\tbl abort\n\t.section .text.other,\"ax\",@progbits\n.Lx:\n\tret\n", "\tcbz x0, .Ldone\n.Lspin:\n\tb .Lspin\n.Ldone:\n\tbl abort\n",
                      ".Lloop:\n\tstr q0, [sp, -16]!\n\tcbnz x0, .Lloop\n\tbl abort\n", "\tcbz x0, .Lr\n\tbl abort\n.Lr:\n\tret\n",
                      "\tb fputs\n", "\tblr x1\n", "\tbl fputs\n", "\t.byte 0\n\tbl abort\n"):
             with self.subTest(body=body):
@@ -262,10 +308,15 @@ class StructuralTest(unittest.TestCase):
     def test_unclassifiable_code_is_fatal(self) -> None:
         self.assertFatal("\tldr q0, [sp, w1, ror 3]\n\tret\n", "addressing")
         self.assertFatal("\tcasp x0, x1, x2, x3, [sp]\n\tret\n", "admitted grammar")
-        self.assertFatal("\tldr q0, [x1], x2\n\tret\n", "post-index")
+        self.assertFatal("\tldr q0, [x1], x2\n\tret\n", "admitted grammar")
+        self.assertFatal("\tadd\n\tret\n", "admitted grammar")
+        self.assertFatal("\tadd x9\n\tret\n", "admitted grammar")
+        self.assertFatal("\tadd x9, x1, x2, x3\n\tret\n", "admitted grammar")
+        self.assertFatal("\tsmmla\n\tret\n", "admitted grammar")
+        self.assertFatal("\tsvc #0\n\tret\n", "admitted grammar")
         self.assertFatal("\twfi\n\tret\n", "admitted grammar")
         self.assertFatal("\tfrobnicate x9, x1\n\tret\n", "admitted grammar")
-        self.assertFatal("\tadd x9, x1, @@\n\tret\n", "unclassifiable operand")
+        self.assertFatal("\tadd x9, x1, @@\n\tret\n", "admitted grammar")
         self.assertFatal("\tret\n\tstr q0, [sp]\n", "unreachable")
         self.assertFatal("\tmov x0, x1\n", "falls off")
 
@@ -276,7 +327,10 @@ class StructuralTest(unittest.TestCase):
                           "\t.previous", "\t.section .weird"):
             with self.subTest(directive=directive):
                 self.assertTrue(analyse(frame.format(directive)).errors)
-        self.assertEqual(analyse(frame.format("\t.cfi_def_cfa_offset 16\n\t.p2align 4")).errors, [])
+        for alignment in ("\t.p2align 4,0x3d", "\t.p2align 4,0xe0,8", "\t.align 4,0", "\t.balign 16"):
+            with self.subTest(alignment=alignment):
+                self.assertTrue(analyse(frame.format(alignment)).errors)
+        self.assertEqual(analyse(frame.format("\t.cfi_def_cfa_offset 16\n\t.p2align 4\n\t.p2align 4,,11\n\t.align 2")).errors, [])
         data = "\tret\n\t.section .rodata\n.LC0:\n\t.word 0x3d8003e0\n\t.byte 1\n"
         self.assertEqual(analyse(data).errors, [])
         self.assertFatal("\tb .LC0\n\t.section .rodata\n.LC0:\n\t.word 0x3d8003e0\n", "not code of this function")
@@ -284,13 +338,35 @@ class StructuralTest(unittest.TestCase):
         self.assertFatal("\tmov x0, x1\n\t.section .text.cold,\"ax\",@progbits\n\tret\n", "section switch")
         self.assertFatal("\t.section .rodata\n\tstr q0, [sp]\n", "outside an executable section")
 
+    def test_function_entry_section_is_the_actual_one(self) -> None:
+        for section in ("\t.section .rodata", "\t.data", "\t.section .weird", "\t.pushsection .text"):
+            with self.subTest(section=section):
+                bodies = CHECKER.functions(f"{section}\nf:\n\tstr q0, [sp, -16]!\n\tadd sp, sp, 16\n\tret\n", ELF)
+                spills, errors = CHECKER.analyse_function("f", bodies, ELF, set())
+                self.assertTrue(errors, section)
+        bodies = CHECKER.functions('\t.section .text.f,"ax",@progbits\nf:\n\tret\n', ELF)
+        self.assertEqual(CHECKER.analyse_function("f", bodies, ELF, set()), (0, []))
+
+    def test_dialect_is_bound_to_the_compiler_not_the_text(self) -> None:
+        decoy = assembly(extra='\t.section .rodata\n\t.ascii ".subsections_via_symbols __TEXT,__text"\n'
+                               '// .section __TEXT,__text\n')
+        self.assertEqual(len(CHECKER.audit(decoy, "NEON", ELF)), 64)
+        with self.assertRaisesRegex(ValueError, "object format"):
+            CHECKER.audit(decoy, "NEON", MACHO)
+        with self.assertRaisesRegex(ValueError, "object format"):
+            CHECKER.audit(".section __TEXT,__text,regular,pure_instructions\n" + assembly(), "NEON", ELF)
+        self.assertTrue(CHECKER.Dialect.for_identity("AppleClang-21").macho)
+        self.assertFalse(CHECKER.Dialect.for_identity("GNU-14").macho)
+        with self.assertRaises(ValueError):
+            CHECKER.Dialect.for_identity("MSVC-19")
+
     def test_statements_after_a_global_label_are_kept(self) -> None:
         source = f"{name(2, 0, 0, 1, 0, 1)}: str q0, [sp, #-16]!\n\tadd sp, sp, #16\n\tret\n"
-        bodies = CHECKER.functions(source)
-        self.assertEqual(bodies[name(2, 0, 0, 1, 0, 1)][0].strip(), "str q0, [sp, #-16]!")
+        bodies = CHECKER.functions(source, ELF)
+        self.assertEqual(bodies[name(2, 0, 0, 1, 0, 1)][1].strip(), "str q0, [sp, #-16]!")
         counts = CHECKER.audit(assembly({(2, 0, 0, 1, 0, 1): ""}).replace(f"{name(2, 0, 0, 1, 0, 1)}:\n",
                                                                             f"{name(2, 0, 0, 1, 0, 1)}: str q0, [sp, #-16]!\n"
-                                                                            "\tadd sp, sp, #16\n\tret"), "NEON")
+                                                                            "\tadd sp, sp, #16\n\tret"), "NEON", ELF)
         self.assertEqual(counts[name(2, 0, 0, 1, 0, 1)], 1)
 
 
@@ -298,39 +374,39 @@ class InventoryTest(unittest.TestCase):
     """The expected programs derive from the admitted envelope; every deviation is fatal."""
 
     def test_envelope_inventory_matches_the_written_out_keys(self) -> None:
-        counts = CHECKER.audit(assembly(), "NEON")
+        counts = CHECKER.audit(assembly(), "NEON", ELF)
         self.assertEqual(sorted(tuple(map(int, CHECKER.program_key(n).split(":"))) for n in counts), NEON_KEYS)
         self.assertEqual(len(NEON_KEYS), 64)
 
     def test_missing_duplicate_empty_and_unexpected_programs(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing"):
-            CHECKER.audit(assembly(keys=NEON_KEYS[1:]), "NEON")
+            CHECKER.audit(assembly(keys=NEON_KEYS[1:]), "NEON", ELF)
         with self.assertRaisesRegex(ValueError, "twice"):
-            CHECKER.audit(assembly(keys=NEON_KEYS + NEON_KEYS[:1]), "NEON")
+            CHECKER.audit(assembly(keys=NEON_KEYS + NEON_KEYS[:1]), "NEON", ELF)
         with self.assertRaisesRegex(ValueError, "empty"):
-            CHECKER.audit(assembly({NEON_KEYS[3]: ".Ltmp1:\n\t.p2align 2"}), "NEON")
+            CHECKER.audit(assembly({NEON_KEYS[3]: ".Ltmp1:\n\t.p2align 2"}), "NEON", ELF)
         with self.assertRaisesRegex(ValueError, "outside the NEON inventory"):
-            CHECKER.audit(assembly(extra=f"{name(1, 1, 0, 1, 0, 1)}:\n\tstr q0, [sp, -16]!\n\tret\n"), "NEON")
+            CHECKER.audit(assembly(extra=f"{name(1, 1, 0, 1, 0, 1)}:\n\tstr q0, [sp, -16]!\n\tret\n"), "NEON", ELF)
         with self.assertRaisesRegex(ValueError, "unrecognized tile program"):
-            CHECKER.audit(assembly(extra=name(2, 0, 0, 1, 0, 1).replace("3runI", "3runX") + ":\n\tret\n"), "NEON")
+            CHECKER.audit(assembly(extra=name(2, 0, 0, 1, 0, 1).replace("3runI", "3runX") + ":\n\tret\n"), "NEON", ELF)
 
     def test_inventory_string_must_agree_with_the_envelope(self) -> None:
         with self.assertRaisesRegex(ValueError, "inventory"):
-            CHECKER.audit(assembly(inventory="2:ASIMD,3:ASIMD,4:ASIMD"), "NEON")
+            CHECKER.audit(assembly(inventory="2:ASIMD,3:ASIMD,4:ASIMD"), "NEON", ELF)
         with self.assertRaisesRegex(ValueError, "inventory"):
-            CHECKER.audit(assembly(), "NEON_DOTPROD")
+            CHECKER.audit(assembly(), "NEON_DOTPROD", ELF)
         with self.assertRaisesRegex(ValueError, "envelope"):
-            CHECKER.audit(assembly(), "SVE")
+            CHECKER.audit(assembly(), "SVE", ELF)
         with self.assertRaisesRegex(ValueError, "inventory"):
-            CHECKER.audit(assembly().replace("llaminar-native-neon-tile-probe", "other"), "NEON")
+            CHECKER.audit(assembly().replace("llaminar-native-neon-tile-probe", "other"), "NEON", ELF)
 
     def test_structural_failure_is_not_paid_from_a_budget(self) -> None:
         key = (2, 0, 0, 1, 0, 1)
         with self.assertRaisesRegex(ValueError, "structurally"):
-            CHECKER.audit(assembly({key: "\tbl helper\n\tret"}, extra="helper:\n\tret\n"), "NEON")
+            CHECKER.audit(assembly({key: "\tbl helper\n\tret"}, extra="helper:\n\tret\n"), "NEON", ELF)
         with self.assertRaisesRegex(ValueError, "structurally"):
-            CHECKER.audit(assembly({key: "\t.byte 0xe0,0x03,0x80,0x3d\n\tret"}), "NEON")
-        counts = CHECKER.audit(assembly({key: "\tstr q0, [sp, -16]!\n\tadd sp, sp, 16\n\tret"}), "NEON")
+            CHECKER.audit(assembly({key: "\t.byte 0xe0,0x03,0x80,0x3d\n\tret"}), "NEON", ELF)
+        counts = CHECKER.audit(assembly({key: "\tstr q0, [sp, -16]!\n\tadd sp, sp, 16\n\tret"}), "NEON", ELF)
         self.assertEqual(counts[name(*key)], 1)
 
 
@@ -368,7 +444,7 @@ class PolicyTest(unittest.TestCase):
         for identity, envelopes in committed.items():
             if identity.startswith("_"):
                 continue
-            self.assertEqual(sorted(envelopes), ["NEON", "NEON_DOTPROD", "NEON_I8MM"])
+            self.assertEqual(sorted(envelopes), ["NEON", "NEON_DOTPROD"] + (["NEON_I8MM"] if identity == "GNU-14" else []))
             for mode, limits in envelopes.items():
                 self.assertEqual(len(limits), {"NEON": 48, "NEON_DOTPROD": 96, "NEON_I8MM": 144}[mode])
                 self.assertTrue(all(not key.startswith("1:") and value >= 0 for key, value in limits.items()))
@@ -477,6 +553,22 @@ class ProofBindingTest(unittest.TestCase):
         decoy.write_text("// decoy changed\n")
         CHECKER.verify(self.args)
         real.write_text("// real changed\n")
+        with self.assertRaisesRegex(ValueError, "stale tile register input"):
+            CHECKER.verify(self.args)
+
+    def test_probe_source_spelling_through_a_symlink_is_preserved(self) -> None:
+        (self.root / "q" / "sub").mkdir(parents=True)
+        (self.root / "p").mkdir()
+        (self.root / "p" / "link").symlink_to(self.root / "q" / "sub")
+        (self.root / "q" / "probe.cpp").write_text('#include "view.h"\n')
+        (self.root / "p" / "probe.cpp").write_text("// decoy\n")
+        self.args.source = str(self.root / "p" / "link" / ".." / "probe.cpp")
+        (self.tool / "deps.txt").write_text("p/link/../probe.cpp view.h")
+        CHECKER.build(self.args)
+        CHECKER.verify(self.args)
+        (self.root / "p" / "probe.cpp").write_text("// decoy changed\n")
+        CHECKER.verify(self.args)
+        (self.root / "q" / "probe.cpp").write_text("// probe changed\n")
         with self.assertRaisesRegex(ValueError, "stale tile register input"):
             CHECKER.verify(self.args)
 
