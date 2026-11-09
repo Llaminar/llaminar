@@ -485,3 +485,21 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - Driver role binding: driver identity derived from the AUTHENTICATED target
   command + lookup context (not the receipt field); copied-job-as-driver +
   foreign-driver controls.
+
+## SOURCE124 successor 3588d6e36 (2026-11-09)
+
+- 1 PATH exec semantics: empty/relative PATH + program-dir entries REJECTED
+  (build+verify; checker cwd excluded; cwd-difference positive control).
+- 2 epoch before observations: driver identity before --version/observations;
+  plan+programs before -M/-E; post-preprocess/post-compile identity checks;
+  plan re-observed after compile; closure after -M; mid-plan/-E/-c retarget +
+  replacement controls (no receipt).
+- 3 depfile plain-Make subset only (one rule/WS/backslash-newline); any
+  escaping alter fails before binding ($$ pair control rejected); 992-apple
+  deps unchanged.
+- 4 driver role derived from authenticated target command (absolute at
+  build+verify); receipt record compared-only; job0-copy/foreign/relative
+  controls.
+- 80 tests; Mac E2E 3 configs. UNREPRODUCED 1-of-4 tile failure post-rebuild
+  (not captured; 20 subsequent runs green) — watch on GB10; fix-back if
+  recurs. GB10 census pending (first absolute-PATH-enforcement real run).
