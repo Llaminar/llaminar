@@ -198,3 +198,10 @@ the source policy). Dead persistent_state parameter removed.
   deletions (getOrCreateRoPE + 2 dead test sources; unused → no codegen
   impact, A/B stands). Handed to WSL arm-qual for the x86 gate (after addon
   R1 x86); Mac portability re-run on 989b7bada in progress (lane).
+
+## Mac portability on rebased tip 989b7bada (2026-11-09) — GREEN
+
+- AppleClang 21 Release: NEON_DOTPROD 270/270 + NEON 270/270, 0 ctest/gtest
+  skips; ProductionTestPreflight repeat-until-fail:20 NEON_DOTPROD 214/214;
+  RoPE angle-storage source policy clean. Handover drafting; only WSL x86 gate
+  (@989b7bada) before reviewer.
