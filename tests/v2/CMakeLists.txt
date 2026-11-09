@@ -5362,6 +5362,27 @@ foreach(cpu_accounting_gate IN ITEMS Unit Integration)
         PROPERTIES LABELS "${cpu_accounting_labels}" TIMEOUT 30)
 endforeach()
 
+# Prepared CPU NativeQuantised bytes are mutated only by named publication
+# producers; the runtime generation/seal tests own the lifecycle proof.
+foreach(native_publication_gate IN ITEMS Unit Integration)
+    add_test(NAME V2_${native_publication_gate}_NativeQuantisedPublicationWriterPolicy
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/check_native_quantised_publication_writers.py
+            --repo-root ${CMAKE_SOURCE_DIR}/../..)
+    add_test(NAME V2_${native_publication_gate}_NativeQuantisedPublicationWriterPolicyNegativeControls
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_publication_writers.py
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts)
+    set(native_publication_labels "V2;${native_publication_gate};CPU;DeviceFree;NativeQuantised;Metadata;SourcePolicy;Regression")
+    if(native_publication_gate STREQUAL "Integration")
+        list(APPEND native_publication_labels "ProductionTestPreflight")
+    endif()
+    set_tests_properties(
+        V2_${native_publication_gate}_NativeQuantisedPublicationWriterPolicy
+        V2_${native_publication_gate}_NativeQuantisedPublicationWriterPolicyNegativeControls
+        PROPERTIES LABELS "${native_publication_labels}" TIMEOUT 30)
+endforeach()
+
 add_test(NAME V2_Unit_BackendGemmLayoutPolicySelfTest
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/check_backend_gemm_layout_policy.py
@@ -30311,6 +30332,15 @@ add_v2_test(V2_Integration_CPUPreparedNativeReadPublication
     LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;AllFormats;Movement;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUPreparedNativeReadPublication)
+
+# Overlay slot reuse opens a new publication generation at the same address;
+# arrival admission is the only way the slot's engine becomes executable.
+add_v2_test(V2_Integration_CPUNativeQuantisedSlotReuseAdmission
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=CpuExpertSlotPool.AcquisitionWithdrawsAdmissionUntilArrival:CpuExpertSlotPool.PublicationCopyInheritsOnlyACurrentSeal
+    LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;Metadata;Lifecycle;Movement;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeQuantisedSlotReuseAdmission)
 
 # IQ4_XS source-tuple mapping, movement, serialization and arithmetic-generation fences.
 add_v2_test(V2_Integration_IQ4XSTupleFormatContract

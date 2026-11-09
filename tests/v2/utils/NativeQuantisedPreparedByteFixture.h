@@ -54,7 +54,11 @@ public:
 
     /** @return A checked immutable view borrowing the same fixture root. */
     [[nodiscard]] cpu::native_quantised::CPUNativeQuantisedWeightView view() const
-    { return cpu::native_quantised::CPUNativeQuantisedWeightView::fromPublished(descriptor, bytes); }
+    {
+        // Fixture bytes are sealed afresh on every view: tests mutate them freely.
+        return cpu::native_quantised::CPUNativeQuantisedWeightView::fromPublished(descriptor, bytes,
+            cpu::native_quantised::CPUNativeQuantisedMetadataSeal::validate(descriptor, bytes));
+    }
 
     /**
      * @brief Fill live compact/native payloads and source-factor metadata directly.

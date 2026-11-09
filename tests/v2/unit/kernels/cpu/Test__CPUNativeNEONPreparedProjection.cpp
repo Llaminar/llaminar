@@ -575,8 +575,12 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsIncompleteAliasedAndUnalignedExpe
     EXPECT_THROW((void)CPUNativeNEONProjectionTile<1>::bind(tail.view(), tail_input, tail_output, 0), std::invalid_argument);
 }
 
-/** @test Opaque source words cannot hide reserved bits by masking them into a usable coefficient. */
-TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBits)
+/**
+ * @test Opaque source words cannot hide reserved bits by masking them into a
+ * usable coefficient. Publication admission rejects them before any tile or
+ * worker team exists, so no output is ever authored.
+ */
+TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBitsBeforeAnyWrite)
 {
     for (const auto *source : {&native_quantised_formats::IQ2_S, &native_quantised_formats::IQ3_S, &native_quantised_formats::IQ4_XS})
     {
@@ -589,10 +593,10 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBits)
         const std::array<std::span<const Q8_1Block>, 1> input{std::span(activation)};
         std::array<float, 8> result;
         const std::array<std::span<float>, 1> output{std::span(result)};
-        const auto tile = CPUNativeNEONProjectionTile<1>::bind(weights, input, output, 0);
-        tile.execute();
+        CPUNativeNEONProjectionTile<1>::bind(weights, input, output, 0).execute();
         const auto reference = result;
-        for (int bad_column = 0; bad_column < 8; ++bad_column)
+        // Every lane of the unit, including the 56 padding columns past N=8.
+        for (int bad_column = 0; bad_column < 64; ++bad_column)
         {
             SCOPED_TRACE(bad_column);
             std::uint16_t original = 0;
@@ -601,17 +605,14 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBits)
             const std::uint16_t invalid = 0xffff;
             std::memcpy(word, &invalid, sizeof(invalid));
             result.fill(123.0f);
-            EXPECT_THROW(tile.execute(), std::invalid_argument);
-            // Rejection is fatal, not transactional rollback. Earlier vectors
-            // can be authored; the outer stage must never publish failed work.
-            const int failed_vector = bad_column / 4 * 4;
-            for (int column = 0; column < 8; ++column)
-                if (column < failed_vector)
-                    EXPECT_EQ(std::bit_cast<std::uint32_t>(result[column]), std::bit_cast<std::uint32_t>(reference[column]));
-                else
-                    EXPECT_EQ(result[column], 123.0f);
+            EXPECT_THROW((void)fixture.view(), std::invalid_argument);
+            for (const float value : result) EXPECT_EQ(value, 123.0f);
             std::memcpy(word, &original, sizeof(original));
         }
+        result.fill(123.0f);
+        CPUNativeNEONProjectionTile<1>::bind(fixture.view(), input, output, 0).execute();
+        for (int column = 0; column < 8; ++column)
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(result[column]), std::bit_cast<std::uint32_t>(reference[column]));
     }
 }
 

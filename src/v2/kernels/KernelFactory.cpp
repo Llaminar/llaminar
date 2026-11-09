@@ -3511,8 +3511,24 @@ namespace llaminar
                  * native blocks is therefore not a deferred-packing request;
                  * hasInterleavedData() remains the authoritative CPU gate.
                  */
+                auto packed = cpu_pw->takePacked();
+                // Transferred bytes become executable here: admit their
+                // metadata once, before any bank or worker can reach them.
+                if (!packed.native_interleaved.empty() && !packed.publicationSealed())
+                {
+                    try
+                    {
+                        packed.sealPublication();
+                    }
+                    catch (const std::exception &error)
+                    {
+                        LOG_ERROR("[KernelFactory::createExpertGemmFromPackedWeights] "
+                                  "Transferred CPU VNNI metadata rejected: " << error.what());
+                        return nullptr;
+                    }
+                }
                 auto kernel = std::make_shared<llaminar2::cpu::native_quantised::CPUNativeQuantisedGemmKernel>(
-                    cpu_pw->takePacked(),
+                    std::move(packed),
                     llaminar2::CPUProjectionNumericalPolicy::GPUAlignedExpert);
                 if (!kernel->isValid())
                 {

@@ -187,9 +187,9 @@ namespace llaminar2
                     packed.interleaved_block_stride);
             if (requires_dedicated_mapping)
             {
-                packed.native_interleaved =
+                packed.native_interleaved.replace(
                     AlignedVector<std::uint8_t>::pageMappedUninitialized(
-                        destination_bytes);
+                        destination_bytes));
             }
             else
             {
@@ -481,10 +481,14 @@ namespace llaminar2
                     spec,
                     allocation_alignment,
                     requires_dedicated_mapping);
+                /* Slot bytes are never sealed here: each acquisition opens a
+                 * new generation and arrival admits it before publication. */
+                const std::span<std::uint8_t> slot_bytes =
+                    packed.native_interleaved.beginRewrite();
                 if (config.memory_placement.requiresNodeBinding() &&
                     !NUMAAllocator::instance().prepareExternalReceiveRangeOnNode(
-                        packed.native_interleaved.data(),
-                        packed.native_interleaved.size(),
+                        slot_bytes.data(),
+                        slot_bytes.size(),
                         config.memory_placement.node()))
                 {
                     throw std::runtime_error(
@@ -495,7 +499,7 @@ namespace llaminar2
                 }
 
                 /* Moving the vector into the kernel preserves its stable address. */
-                std::uint8_t *destination = packed.native_interleaved.data();
+                std::uint8_t *destination = slot_bytes.data();
                 const std::size_t destination_bytes =
                     packed.native_interleaved.size();
                 const std::size_t allocation_bytes =
@@ -641,11 +645,20 @@ namespace llaminar2
             std::shared_ptr<ITensorGemm> engine(
                 token,
                 static_cast<ITensorGemm *>(projection.engine.get()));
+            std::span<std::uint8_t> destination(
+                projection.destination, projection.destination_bytes);
+            if (!projection.floating_tensor)
+            {
+                /* The epoch rewrites these bytes: they stay unadmitted until arrival. */
+                destination = projection.engine->beginRetiredCPUNativeQuantisedRewrite();
+                if (destination.data() != projection.destination ||
+                    destination.size() != projection.destination_bytes)
+                    throw std::logic_error(
+                        "CPU expert slot engine no longer owns its preallocated final buffer");
+            }
             lease.projections.push_back({
                 .projection = projection.spec.projection,
-                .destination_bytes = std::span<std::uint8_t>(
-                    projection.destination,
-                    projection.destination_bytes),
+                .destination_bytes = destination,
                 .engine = std::move(engine),
             });
         }

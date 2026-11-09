@@ -60,13 +60,10 @@ namespace llaminar2::cpu::native_quantised
             // deliberately selects a narrower leaf: auto-generated code may use
             // any instruction of the envelope (SDOT, or SMMLA in an I8MM build).
             ARMCPUCapabilities::native().requireCompiledEnvelope();
+            requireExecutable(weights);
             if (chunk < 0 || chunk >= weights.N_padded / 64)
                 throw std::invalid_argument("Native NEON projection chunk is outside its matrix");
             const int columns = std::min(64, weights.N - chunk * 64);
-            const int partitions = weights.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
-                ? MoEProjectionNumericalContract::orderedKPartitionsForWidth(weights.K) : 1;
-            if (partitions <= 0)
-                throw std::invalid_argument("Native NEON expert projection requires the canonical aligned K tree");
             for (std::size_t row = 0; row < Rows; ++row)
             {
                 if (!activation[row].data() || activation[row].size() != std::size_t(weights.blocks_per_row) ||
@@ -87,17 +84,53 @@ namespace llaminar2::cpu::native_quantised
                         throw std::invalid_argument("Native NEON projection rows require exclusive output bytes");
                 }
             }
-            return CPUNativeNEONProjectionTile(weights, activation, output, chunk, columns, partitions);
+            return admitted(weights, activation, output, chunk);
+        }
+
+        /**
+         * @brief Reject a publication this tile family cannot execute, before any team exists.
+         * @param weights Sealed publication; its metadata was admitted by the seal.
+         * @throws std::invalid_argument For an unknown policy, an encoding/codebook
+         *         without a native implementation, or a non-canonical expert K tree.
+         * @details After this check every dispatch branch taken by execution is
+         * implemented, so the execution path itself cannot throw.
+         */
+        static void requireExecutable(const CPUNativeQuantisedWeightView &weights)
+        {
+            if (weights.numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert &&
+                weights.numerical_policy != CPUProjectionNumericalPolicy::BackendNative)
+                throw std::invalid_argument("Native NEON projection requires a known arithmetic policy");
+            if (partitionsFor(weights) <= 0)
+                throw std::invalid_argument("Native NEON expert projection requires the canonical aligned K tree");
+            bool implemented = false;
+            switch (weights.encoding)
+            {
+            case Encoding::ExpandedInt8:
+            case Encoding::IQ3SExpandedSourceScale:
+            case Encoding::Q6KNativeDualScale:
+            case Encoding::NibbleLUTSourceScale:
+                implemented = true;
+                break;
+            case Encoding::NibbleLUT:
+                implemented = weights.codebook_id == 0 || weights.codebook_id == 4 || weights.codebook_id == 5;
+                break;
+            case Encoding::CompactMultiScale:
+                switch (weights.codebook_id)
+                {
+                case 9: case 10: case 13: case 14: case 17: implemented = true; break;
+                }
+                break;
+            }
+            if (!implemented)
+                throw std::invalid_argument("Native NEON projection has no exact source/encoding implementation");
         }
 
         /**
          * @brief Execute one explicitly selected native integer instruction family.
          * @tparam Instruction ASIMD widening or separately compiled/admitted DotProd.
-         * @throws std::invalid_argument For an unsupported source/encoding/policy tuple.
+         * @throws std::runtime_error If the machine lacks the requested family.
          * @details Selection occurs once per tile, never inside a byte-dot loop.
-         * Corrupt source data is fatal, not transactional rollback: earlier
-         * vectors may have been authored. Only a successful complete operation
-         * may be published by the outer CPU execution/coherence owner.
+         * bind() admitted the publication, so the arithmetic itself cannot fail.
          */
         template <Dot Instruction = Dot::ASIMD> void execute() const
         {
@@ -105,7 +138,7 @@ namespace llaminar2::cpu::native_quantised
                 ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
             if constexpr (Instruction == Dot::I8MM)
                 ARMCPUCapabilities::native().require(ARMCPUFeature::IntegerMatMul);
-            executeWith<multi_scale::NEONMultiScaleOps<leafInstruction<Instruction>()>>();
+            executeAdmitted<Instruction>();
         }
 
         /**
@@ -114,12 +147,64 @@ namespace llaminar2::cpu::native_quantised
          * derived from one that observes its integer leaf calls.
          * @details Admits the complete compiler envelope itself, so an Ops type
          * cannot run instructions the machine lacks whichever entry is used.
-         * @throws std::invalid_argument For an unsupported source/encoding/policy tuple.
+         * @throws std::runtime_error If the compiled envelope is not supported.
          */
         template <typename Ops> void executeWith() const
         {
             // Every entry, including an observer seam, admits the full envelope.
             ARMCPUCapabilities::native().requireCompiledEnvelope();
+            executeWithAdmitted<Ops>();
+        }
+
+        /**
+         * @brief Execute an admitted family inside a worker team.
+         * @tparam Instruction Family whose CPU features the caller has already admitted.
+         * @details No check can fail here: publication, policy, encoding and
+         * geometry were admitted before the team, and metadata by the seal.
+         */
+        template <Dot Instruction> void executeAdmitted() const noexcept
+        {
+            executeWithAdmitted<multi_scale::NEONMultiScaleOps<leafInstruction<Instruction>()>>();
+        }
+
+        /**
+         * @brief Resolve the exact leaf instruction family one tile executes.
+         * @tparam Instruction Admitted family requested for the whole projection.
+         * @return The requested family, except that a lone I8MM row is the SDOT leaf.
+         * @details SMMLA needs two rows. A single-row tile (M=1 decode or the
+         * odd last row) therefore compiles the very DotProd instantiation, so
+         * it emits no SMMLA and is byte- and code-identical to serial decode.
+         */
+        template <Dot Instruction> static constexpr Dot leafInstruction() noexcept
+        { return Instruction == Dot::I8MM && Rows == 1 ? Dot::DotProd : Instruction; }
+
+        /**
+         * @brief Construct a tile whose publication and geometry an enclosing binding admitted.
+         * @param weights Executable sealed publication (requireExecutable passed).
+         * @param activation Complete Q8 rows of the bound invocation.
+         * @param output Exclusive live output spans of the bound invocation.
+         * @param chunk Physical chunk inside the matrix.
+         * @return Tile ready for executeAdmitted(); no check is repeated per task.
+         */
+        [[nodiscard]] static CPUNativeNEONProjectionTile admitted(CPUNativeQuantisedWeightView weights,
+            const std::array<std::span<const Q8_1Block>, Rows> &activation,
+            const std::array<std::span<float>, Rows> &output, int chunk) noexcept
+        {
+            return CPUNativeNEONProjectionTile(weights, activation, output, chunk,
+                std::min(64, weights.N - chunk * 64), partitionsFor(weights));
+        }
+
+    private:
+        /** @return Canonical arithmetic partition count; zero for an invalid expert K tree. */
+        static constexpr int partitionsFor(const CPUNativeQuantisedWeightView &weights) noexcept
+        {
+            return weights.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                ? MoEProjectionNumericalContract::orderedKPartitionsForWidth(weights.K) : 1;
+        }
+
+        /** @brief Run one admitted tile with an explicit operation set; cannot fail. */
+        template <typename Ops> void executeWithAdmitted() const noexcept
+        {
             if (weights_.usesCompactMultiScale())
             {
                 std::array<const Q8_1Block *, Rows> input;
@@ -135,28 +220,11 @@ namespace llaminar2::cpu::native_quantised
                 return multi_scale::dispatch<4, Rows, Ops>(weights_, input, output,
                     chunk_, 0, weights_.blocks_per_row, false, columns_);
             }
-            switch (weights_.numerical_policy)
-            {
-            case CPUProjectionNumericalPolicy::GPUAlignedExpert:
+            if (weights_.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
                 return dispatch<Ops, CPUProjectionNumericalPolicy::GPUAlignedExpert>();
-            case CPUProjectionNumericalPolicy::BackendNative:
-                return dispatch<Ops, CPUProjectionNumericalPolicy::BackendNative>();
-            }
-            throw std::invalid_argument("Native NEON projection requires a known arithmetic policy");
+            return dispatch<Ops, CPUProjectionNumericalPolicy::BackendNative>();
         }
 
-        /**
-         * @brief Resolve the exact leaf instruction family one tile executes.
-         * @tparam Instruction Admitted family requested for the whole projection.
-         * @return The requested family, except that a lone I8MM row is the SDOT leaf.
-         * @details SMMLA needs two rows. A single-row tile (M=1 decode or the
-         * odd last row) therefore compiles the very DotProd instantiation, so
-         * it emits no SMMLA and is byte- and code-identical to serial decode.
-         */
-        template <Dot Instruction> static constexpr Dot leafInstruction() noexcept
-        { return Instruction == Dot::I8MM && Rows == 1 ? Dot::DotProd : Instruction; }
-
-    private:
         /// Two-row SMMLA accumulator sets per tile; at least one keeps the array type valid.
         static constexpr std::size_t Pairs = Rows / 2 == 0 ? 1 : Rows / 2;
 
@@ -192,9 +260,9 @@ namespace llaminar2::cpu::native_quantised
         /** @brief Select source map and secondary-word semantics before traversal.
          * @tparam Ops Admitted native integer instruction type.
          * @tparam Policy Immutable complete projection arithmetic identity.
-         * @throws std::invalid_argument For a source/encoding mismatch.
+         * @pre requireExecutable() admitted the publication.
          */
-        template <typename Ops, CPUProjectionNumericalPolicy Policy> void dispatch() const
+        template <typename Ops, CPUProjectionNumericalPolicy Policy> void dispatch() const noexcept
         {
             switch (weights_.encoding)
             {
@@ -219,7 +287,8 @@ namespace llaminar2::cpu::native_quantised
             case Encoding::CompactMultiScale:
                 break; // The shared compact implementation was selected before this switch.
             }
-            throw std::invalid_argument("Native NEON projection has no exact source/encoding implementation");
+            // requireExecutable() rejected every other tuple before the team.
+            __builtin_unreachable();
         }
 
         /** @brief Decode four columns' source nibbles entirely in native registers.
@@ -411,7 +480,7 @@ namespace llaminar2::cpu::native_quantised
          */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
                   NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false>
-        LLAMINAR_NEON_PROJECTION_EXACT void run() const
+        LLAMINAR_NEON_PROJECTION_EXACT void run() const noexcept
         {
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -475,11 +544,11 @@ namespace llaminar2::cpu::native_quantised
                                 consume<Ops>(vld1q_s8(reinterpret_cast<const std::int8_t *>(unit + group * 256 + column * 4)),
                                     block, group, low);
                         }
-                        F scale0 = Ops::half(weights_.chunkScales(chunk_, block) + column);
+                        F scale0 = Ops::half(weights_.admittedScales(chunk_, block) + column);
                         F scale1{};
                         if constexpr (Physical == Encoding::Q6KNativeDualScale)
                         {
-                            const I metadata = Ops::words(weights_.chunkMins(chunk_, block) + column);
+                            const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
                             const I low_coefficient = (metadata & 127) - (metadata & 128);
                             const I high_coefficient = ((metadata >> 8) & 127) - ((metadata >> 8) & 128);
                             scale1 = scale0 * __builtin_convertvector(high_coefficient, F);
@@ -487,15 +556,13 @@ namespace llaminar2::cpu::native_quantised
                         }
                         else if constexpr (Physical == Encoding::IQ3SExpandedSourceScale || Physical == Encoding::NibbleLUTSourceScale)
                         {
-                            const I metadata = Ops::words(weights_.chunkMins(chunk_, block) + column);
-                            constexpr std::uint32_t maximum = Physical == Encoding::IQ3SExpandedSourceScale ? 15 : 63;
-                            if (!Ops::metadataFits(metadata, maximum))
-                                throw std::invalid_argument("Native NEON source-scale metadata contains reserved bits");
+                            // The publication seal admitted every coefficient word.
+                            const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
                             const I coefficient = Physical == Encoding::IQ3SExpandedSourceScale ? metadata * 2 + 1 : metadata - 32;
                             scale0 = scale0 * __builtin_convertvector(coefficient, F);
                         }
                         else if constexpr (WithMinimum)
-                            scale1 = Ops::half(weights_.chunkMins(chunk_, block) + column);
+                            scale1 = Ops::half(weights_.admittedMins(chunk_, block) + column);
 #pragma GCC unroll 4
                         for (std::size_t row = 0; row < Rows; ++row)
                         {
