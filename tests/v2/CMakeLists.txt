@@ -26155,7 +26155,7 @@ add_v2_test(V2_Integration_CPUSharedGDNSnapshotLifecycle
 # Short-conv prefill windows wider than the SIMD register program reject before writing.
 add_v2_test(V2_Integration_CPUShortConvPrefillWindowBound
     COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
-        --gtest_filter=Test__GDNKernels.ShortConvPrefillRejectsWindowWiderThanSIMDRegisters:Test__GDNKernels.ShortConvNeonPrefillAndDecodeExactReference
+        --gtest_filter=Test__GDNKernels.ShortConvPrefillRejectsWindowWiderThanSIMDRegisters:CPUGDNKernels.ShortConvNeonPrefillAndDecodeExactReference
     LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GDN;ByteExact;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 # One focused real-CPU regression for completed observation count/sum batching.
