@@ -19093,6 +19093,30 @@ add_v2_test(V2_Perf_CPUNativeQuantised_DispatchSweep
     MPI_PROCS 1
 )
 
+# The native ARM exact-overlay generator is host-independent Python: exact-only,
+# alias-pooled, no-regression emission with fail-closed evidence checks.
+add_v2_test(V2_Unit_NativeNEONExactOverlayGenerator
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_neon_exact_overlay.py
+    LABELS "V2;Unit;NativeQuantised;CPU;ARM;DeviceFree;Dispatch;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+# Native ARM exact-overlay candidate collection: the two numerically neutral
+# NEON schedule dimensions over the canonical exact-overlay shapes. Its rows feed
+# native_quantised_dispatch/neon_exact_overlay.py; x86 keeps its generated tables.
+if(NOT V2_CPU_TARGET_X86)
+    add_executable(v2_perf_cpu_native_neon_exact_overlay
+        performance/kernels/cpu/native_quantised/Perf__CPUNativeNEONExactOverlay.cpp)
+    target_link_libraries(v2_perf_cpu_native_neon_exact_overlay PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    target_include_directories(v2_perf_cpu_native_neon_exact_overlay PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+    target_compile_definitions(v2_perf_cpu_native_neon_exact_overlay PRIVATE
+        LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST}"
+        LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG}")
+endif()
+
 add_executable(v2_perf_cpu_fused_verifier
     performance/kernels/cpu/native_quantised/Perf__CPUFusedVerifier.cpp)
 target_link_libraries(v2_perf_cpu_fused_verifier PRIVATE
