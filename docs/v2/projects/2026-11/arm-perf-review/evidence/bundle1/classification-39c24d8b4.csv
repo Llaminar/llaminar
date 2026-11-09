@@ -1,0 +1,135 @@
+test,suite,dgx,wsl,cls,secondary,verdict,note,unmasked,unmasked_classes
+V2_Integration_AdaptiveFullRAMOwners,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_AdaptiveFullRAMPhysicalSourceGeometry,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_AdaptiveFullRAMTerminalPublication,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_CPUDisabledMTPArenaAdmission,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_CPUExpertShardExecution_QFNOriginalMixedFormatsAndNative320CutsReplay,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_CPUExpertShardExecution_QFNOriginalQ4KQ8_0Native320CutsReplay,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_CPUExpertShardExecution_QFNOriginalQ5KQ8_0Native320CutsReplay,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_CPUFinalEmbeddingStorage,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,,
+V2_Integration_CPUFlashAttentionAQ8NativeEntries,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G2 CPUBackend 4K-aligned mbind
+V2_Integration_CPUFlashAttentionCausalRowOwnership,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G2 CPUBackend 4K-aligned mbind
+V2_Integration_CPUFragmentEpochBankContract,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_CPUFragmentPayloadContract,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_CPUGraphArenaDeclarations,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_CPUJointBoundedNativeFormatWindows,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G6 expert estimate Heap vs anon-page materialization
+V2_Integration_CPUJointBoundedSourceLifecycle,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_CPUJointBufferedSourceEconomy,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,PASS,S1-only (seccomp mask)
+V2_Integration_CPUJointBufferedSourceFailureLifecycle,preflight,True,True,B0 base defect (fails on x86 at same SHA),T2,BASE,not host-attributable,FAIL,B0 base
+V2_Integration_CPUJointColdGraphAdmissionLifecycle,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_CPUJointColocatedSerialArenaLifecycle,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_CPUJointInitialBankPrepassContract,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_CPUJointLateGraphSourceLifecycle,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_CPUJointPreparedSourceContract,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,T2,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,T2 4K-host byte literal
+V2_Integration_CPUJointReusableRegistryBinding,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_CPUJointSerialGeometryContract,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_CPUJointSerialSourceGeometryLifecycle,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_CPUJointSourceAuthorityLifecycle,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G6 expert estimate Heap vs anon-page materialization
+V2_Integration_CPUJointStaticResidencyLifecycle,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G6 expert estimate Heap vs anon-page materialization
+V2_Integration_CPURootedGatherParallelCopyReplay,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,FAIL,B0 base
+V2_Integration_CPUShardFusedFinalAddPreweight_avx2,wsl,False,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_CPUShardFusedFinalAddPreweight_avx512,wsl,False,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_CPUShardFusedFinalAddPreweight_neon,preflight,True,False,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_CPUShardFusedFinalAddPreweight_scalar,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_CPUShardPreparedPackedQFNClasses,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_CPUStartupAffinity,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,FAIL,B0 base
+V2_Integration_CPU_NativeQuantisedWeightPackingAllFormats,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,M1 test iterates CPU-less nodes
+V2_Integration_ClusterInventoryBootstrap,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G7 NUMA detection fallback -> inventory
+V2_Integration_ConsumerLocalSubordinateGeometryContract,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ConsumerLocalTP4AndTP8OriginalService,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_CpuAdaptiveImmutableRowCache,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_CpuAdaptiveImmutableRowCachePinAuthentication,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_CpuAdaptiveImmutableRowCacheReuseAuthentication,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_CpuImmutableLookupOnlyFreeRetentionReplay,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_CpuImmutableLookupOnlyReplay,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_DevelopPRGateContract,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_FrontendAutomaticSelection_MPI,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_FrontendAutomaticSelection_cost-failure_MPI,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_FrontendAutomaticSelection_follower-evaluator_MPI,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_FrontendAutomaticSelection_preparation-failure_MPI,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_FrontendAutomaticSelection_sample-failure_MPI,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_FrontendAutomaticSelection_selected-follower_MPI,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Integration_GPUAdaptiveImmutableLookupCohortGeometry,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_GroupedVerifierRows_CPU_Attention_NonQ16NativeFormats,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G2 CPUBackend 4K-aligned mbind
+V2_Integration_HostAdaptiveImmutableLookupCPUStage,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_HostAdaptiveImmutableLookupProtocol,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_HostAdaptiveModelContext,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,T1,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,T1 test mmap window 4096
+V2_Integration_HostAdaptiveNgramPlanning,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_HostAdaptiveRequestCapacity,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_HostImmutableRowProvider,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_HostImmutableRowRetainedOwnerObservation,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableFutureLookupOnlySourceReplay,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableLookupClosedWorkerGateLifecycle,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableLookupSubordinateCPU,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableLookupSubordinateRequesterIdentityReplay,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableLookupWorkerCancellationReplay,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableLookupWorkerSourceAbortReplay,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableLookup_SharedSourceEarlyTerminalWaitsForLegitimatePeerClose,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableLookup_SharedSourceGroupInterleavesExactFramesAndRepeatedReset,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableLookup_SharedSourceJoinedFailureRemainsObservableBeforePeerRetirement,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableLookup_SharedSourceMissingPeerCloseCancelsConcurrentTerminalWait,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableLookup_SharedSourceOutstandingGrantsKeepOriginalRowsAndPins,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableLookup_SharedSourcePartialAdmissionUsesOriginalGroupCancellation,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableRowTableContiguousGatherAlias,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ImmutableRowTableIndexedWindowReplay,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_MTPSpecCPUBatchedVerifierPlans,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G2 CPUBackend 4K-aligned mbind
+V2_Integration_MappedDispatchTicketFreshZeroAllocation,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_MoEOwnedSharedBackingNativeStartup,wsl,False,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_ModelKLDCanary,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_NativeEmbeddingPreparedOwnership,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G2 CPUBackend 4K-aligned mbind
+V2_Integration_NativeGTestRequiredExecution,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_NativeMPITestLaunchDefaults,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_NativeWeightLoadStagingContract,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_NgramMandatoryExecutionProvision,preflight,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,,
+V2_Integration_OneDNNOriginAuthentication,preflight,True,False,E1 container git: origin probe,,ENVIRONMENT,devcontainer git ownership/probe; not ARM/page related,,
+V2_Integration_OptionalGPUPreflightRegistration,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_ParityFixtureShardOwnership,wsl,False,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_PlanCommandPublication_MPI,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G2 CPUBackend 4K-aligned mbind
+V2_Integration_PooledExpertOriginalSourceFailureLifecycle,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_PooledImmutableOrderingGeometryReplay,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_PooledImmutableSourceCompletionRetirementReplay,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_PooledNativeOriginalTicketAbortReplay,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_PooledSourceOriginalFailureCallback,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,T1,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,T1 test mmap window 4096
+V2_Integration_PreflightDeviceInventoryIsolation,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_Qwen4ExpCPUContracts,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,T1,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,T1 test mmap window 4096
+V2_Integration_Qwen4ExpImmutableHostPlacement,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_Qwen4ExpImmutableLookupStage,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,T1,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,T1 test mmap window 4096
+V2_Integration_Qwen4ExpImmutableRAMNUMA,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,T1,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,T1 test mmap window 4096
+V2_Integration_Qwen4ExpLookupStatistics,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,T1,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,T1 test mmap window 4096
+V2_Integration_Qwen4ExpLookupWindowStatistics,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_Qwen4ExpPLEBuilder,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,T1,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,T1 test mmap window 4096
+V2_Integration_Qwen4ExpPLEPreparedVerifierCPU,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_Qwen4ExpPLEVerifierRowsContract,preflight,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",,
+V2_Integration_ROCmArchitectureIdentityReplay,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_ROCmMoEAutomaticOwnerConfiguration,preflight,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Integration_TensorFactoryAggregateNUMAPolicy,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,,
+V2_Integration_TensorFactoryBoundNUMAPolicy,preflight,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,,
+V2_Unit_ActivationMemoryEstimator,unit,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,FAIL,T2 4K-host byte literal
+V2_Unit_CPUBackend,unit,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G2 CPUBackend 4K-aligned mbind
+V2_Unit_CPUNativeQuantisedGroupedSealedPlan,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_CPUShardRouteCollective,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,FAIL,B0 base
+V2_Unit_DeviceRegistry,unit,True,False,I1 inventory: CPU device per NUMA node dir,,PRODUCT GAP (candidate),DeviceRegistry registers every nodeN incl. CPU-less/zero-memory nodes,FAIL,G3 CPU device per CPU-less/zero node
+V2_Unit_ExpertGemmRegistry,unit,True,False,S1 container seccomp: NUMA syscalls EPERM,T2,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G6 expert estimate Heap vs anon-page materialization;T2 4K-host byte literal
+V2_Unit_MappedHostTransferRegion,unit,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,FAIL,T2 4K-host byte literal
+V2_Unit_MemoryPlanner,unit,True,False,T1 64K page: test mmap window 4096,T2,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",FAIL,T1 test mmap window 4096;T2 4K-host byte literal
+V2_Unit_MoEForbiddenDependencyScan,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_MoEOverlayCapacityResolver,unit,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,FAIL,T2 4K-host byte literal
+V2_Unit_ModelKLDCanary,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_ModelLoaderRowSlice,unit,True,True,B0 base defect (fails on x86 at same SHA),T2,BASE,not host-attributable,,
+V2_Unit_NUMAAllocator,unit,True,False,P1 64K page: NUMAAllocator 4K page constant,S1,PRODUCT GAP,NUMAAllocator.cpp PAGE_SIZE=4096; madvise EINVAL,FAIL,G1 NUMAAllocator 4K page constant;M1 test iterates CPU-less nodes
+V2_Unit_NativeQuantisedCommonDispatchPolicy,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_OneDNNBuildLifecycle,unit,True,False,E1 container git: origin probe,,ENVIRONMENT,devcontainer git ownership/probe; not ARM/page related,,
+V2_Unit_OptionalGPUPreflightRegistration,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_PreparedEmbeddingWeightsLifecycle,unit,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G2 CPUBackend 4K-aligned mbind
+V2_Unit_ProductionParityCampaigns,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_Qwen35MoEGraph,unit,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,PASS,S1-only (seccomp mask)
+V2_Unit_Qwen4ExpPrimitives,unit,True,False,T1 64K page: test mmap window 4096,,TEST ASSUMPTION,"tests pass forStorage(...,4096,...); production default 64 KiB",FAIL,T1 test mmap window 4096
+V2_Unit_ROCmArchitecturePolicy,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_ROCmMoEAutomaticOwnerConfiguration,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_ROCmNativeQuantisedBatchedDecodeTrainerGenerator,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_ROCmNativeQuantisedDecodeTrainerGenerator,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_ROCmNativeQuantisedTrainerCsvValidator,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_ROCmNativeQuantisedTrainerGenerator,unit,True,True,B0 base defect (fails on x86 at same SHA),,BASE,not host-attributable,,
+V2_Unit_TransferEngine,unit,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,FAIL,T2 4K-host byte literal
+V2_Unit_VocabParallelEmbeddingSharding,unit,True,False,S1 container seccomp: NUMA syscalls EPERM,,ENVIRONMENT,Docker default seccomp without CAP_SYS_NICE; masks page/memory-only effects behind it,FAIL,G2 CPUBackend 4K-aligned mbind
+V2_Unit_WeightMemoryEstimator,unit,True,False,T2 64K page: recorded 4K byte constant,,TEST ASSUMPTION,production rounds by sysconf page; test literal derived on 4K host,FAIL,T2 4K-host byte literal
