@@ -299,7 +299,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", workflow)
         policy = yaml.load(workflow, Loader=yaml.BaseLoader)
         self.assertEqual(policy["jobs"]["develop-images"]["runs-on"],
-                         {"group": "Develop CI", "labels": "llaminar-cloud-64"})
+                         {"group": "Develop CI", "labels": "llaminar-cloud-16"})
         self.assertEqual(policy["concurrency"], {
             "group": "llaminar-cloud-develop-images", "cancel-in-progress": "true"})
         self.assertIn("--build-only", workflow)
@@ -331,7 +331,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(reusable["permissions"], {"contents": "read"})
         caller = job
         job = reusable["jobs"]["unit"]
-        self.assertEqual(job["runs-on"], {"group": "Develop CI", "labels": "llaminar-cloud-64"})
+        self.assertEqual(job["runs-on"], {"group": "Develop CI", "labels": "llaminar-cloud-16"})
         self.assertEqual(job["strategy"], {"fail-fast": "false", "max-parallel": "2",
                                            "matrix": {"cpu_isa": ["AVX512", "AVX2"]}})
         self.assertEqual(f"{caller['name']} / {job['name']}",
@@ -342,7 +342,8 @@ class DevelopImageGateTests(unittest.TestCase):
         steps = job["steps"]
         actions = {step["uses"] for step in steps if "uses" in step}
         self.assertEqual(actions, {"actions/checkout@v6", "docker/setup-buildx-action@v4",
-                                   "actions/upload-artifact@v4"})
+                                   "actions/upload-artifact@v4",
+                                   "./.github/actions/cache-develop-toolchain"})
         checkout = next(step for step in steps if step.get("uses") == "actions/checkout@v6")
         self.assertEqual(checkout["with"], {
             "submodules": "false", "lfs": "false", "persist-credentials": "false"})
@@ -350,18 +351,18 @@ class DevelopImageGateTests(unittest.TestCase):
         for key, value in {"driver": "docker-container", "cache-binary": "false"}.items():
             self.assertEqual(buildx["with"][key], value)
         commands = [step["run"] for step in steps if "run" in step]
-        self.assertEqual(len(commands), 1)
+        self.assertEqual(len(commands), 2)
         self.assertNotIn("keep-state", buildx["with"])
         self.assertNotIn("cleanup", buildx["with"])
-        build_step = next(step for step in steps if "run" in step)
+        build_step = next(step for step in steps if "exec python3" in step.get("run", ""))
         self.assertEqual(build_step["env"], {"CPU_ISA": "${{ matrix.cpu_isa }}",
                                             "LLAMINAR_DOCKER_BUILD_CACHE_ACCESS": "import-only"})
-        self.assertIn("LLAMINAR_DOCKER_BUILD_CACHE_IMAGE", commands[0])
+        self.assertIn("LLAMINAR_DOCKER_BUILD_CACHE_IMAGE", commands[-1])
         artifact = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
         self.assertIn("${{ matrix.cpu_isa }}", artifact["with"]["name"])
         self.assertIn("/*/pr-tests/**", artifact["with"]["path"])
         for isa in job["strategy"]["matrix"]["cpu_isa"]:
-            command = shlex.split(commands[0].split("exec ", 1)[1].replace("\\\n", ""))
+            command = shlex.split(commands[-1].split("exec ", 1)[1].replace("\\\n", ""))
             self.assertEqual(command[:2], ["python3", "scripts/ci/run_develop_image_gate.py"])
             arguments = command[2:]
             arguments[arguments.index("--cpu-isa") + 1] = isa

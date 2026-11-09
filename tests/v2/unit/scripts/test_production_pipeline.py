@@ -4384,7 +4384,7 @@ class ImageIdentityTests(unittest.TestCase):
     def test_cpu_isa_does_not_invalidate_generic_cuda_or_rocm_toolchain_layers(self):
         """AVX lanes share external dependencies through BuildKit, not host binds."""
         dockerfile = (ROOT / "Dockerfile").read_text()
-        toolchain = dockerfile.split("FROM ubuntu:24.04 AS toolchain", 1)[1].split(
+        toolchain = dockerfile.split("FROM ubuntu:24.04 AS gpu-sdk", 1)[1].split(
             "FROM toolchain AS builder", 1)[0]
         generic_install_end = toolchain.index("RUN rm -rf /tmp/install-scripts")
         rccl = toolchain.index("ARG RCCL_ENABLE_MSCCL_KERNEL")

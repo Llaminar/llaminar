@@ -62,7 +62,7 @@ ARG LLAMINAR_SOURCE_TREE=
 # =============================================================================
 # Stage 1: Builder
 # =============================================================================
-FROM ubuntu:24.04 AS toolchain
+FROM ubuntu:24.04 AS gpu-sdk
 
 ARG CUTLASS_VERSION
 ARG NINJA_VERSION
@@ -158,6 +158,10 @@ RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
     fi
 # RCCL final-link certification below still consumes the staged linker helper.
 # Retire the shared installer tree only after that certificate is complete.
+
+# Cloud CI exports this completed SDK checkpoint before starting RCCL. A
+# later dependency proof or source compilation failure cannot discard it.
+FROM gpu-sdk AS toolchain
 
 WORKDIR /src
 
