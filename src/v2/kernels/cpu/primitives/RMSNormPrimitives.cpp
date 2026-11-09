@@ -8,6 +8,8 @@
  * tiles retain separately rounded FP32 decode/squares before FP64 accumulation;
  * they share gamma without constructing decoded row banks. Caller-owned tensors, gamma and scratch retain their
  * lifetime/admission authority; synchronous arithmetic creates no new lease.
+ * Generic FP32 rows bind a compiled scalar/AVX publisher before worksharing;
+ * complete fragments and tails retain the same separately rounded products.
  * @author David Sanftenberg
  */
 
@@ -19,6 +21,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <array>
 #include "CPUInt32RMSNormPublication.h"
@@ -382,16 +385,21 @@ namespace llaminar2::primitives
         }
 #endif
 
+        /** @brief Reduce original FP32 words in increasing-column FP64 FMA order.
+         * @param row Original contiguous words; may be null only for an empty row.
+         * @param cols Original logical width; @return Explicit scalar squared summary.
+         * @details A finite FP32 square is exact in FP64. The dependency chain
+         * fixes summation order independently of vector width and instrumentation.
+         */
         double compute_sumsq_scalar(const float *row, std::size_t cols)
         {
-            double s_scalar = 0.0;
-#pragma omp simd reduction(+ : s_scalar)
-            for (long long c = 0; c < (long long)cols; ++c)
+            double sum = 0.0;
+            for (std::size_t c = 0; c < cols; ++c)
             {
-                double v = (double)row[c];
-                s_scalar += v * v;
+                const double value = double(row[c]);
+                sum = std::fma(value, value, sum);
             }
-            return s_scalar;
+            return sum;
         }
 
 #if defined(__aarch64__) && defined(__ARM_NEON)
@@ -406,19 +414,92 @@ namespace llaminar2::primitives
         }
 #endif
 
-// --- ISA stubs for runtime dispatch ---
-#if !defined(__AVX2__)
-        double compute_sumsq_avx2(const float *row, std::size_t cols)
+        /** @brief Original gamma authorship, resolved before entering a worker region. */
+        enum class FP32Gamma { Identity, Original };
+        /** @brief One completed-row publisher over already checked original spans. */
+        using FP32RowApplication = void (*)(std::span<const float>,std::span<const float>,std::span<float>,float);
+
+        /** @brief Publish original FP32 columns with explicit compiled fragments and bounded tails.
+         * @tparam Program Actual compiled row-application ISA, never an absent-ISA alias.
+         * @tparam Gamma Original weights or declared identity.
+         * @param input Complete original row, consumed after its summary is finished.
+         * @param gamma Immutable original weights; empty only for identity.
+         * @param output Original row destination; the caller seals alias/range policy.
+         * @param inverse Completed private FP32 inverse.
+         * @details Each column separately rounds input*inverse before multiplying
+         * original gamma. Vectorization changes no arithmetic edge or reduction.
+         */
+        template<ISALevel Program,FP32Gamma Gamma>
+        void apply_fp32_row(std::span<const float>input,std::span<const float>gamma,
+                            std::span<float>output,float inverse)
         {
-            return compute_sumsq_scalar(row, cols);
-        }
+            static_assert(Program==ISALevel::Scalar
+#if defined(__AVX2__)
+                ||Program==ISALevel::AVX2
 #endif
-#if !defined(__AVX512F__)
-        double compute_sumsq_avx512(const float *row, std::size_t cols)
+#if defined(__AVX512F__)
+                ||Program==ISALevel::AVX512
+#endif
+            );
+            std::size_t column=0;
+#if defined(__AVX512F__)
+            if constexpr(Program==ISALevel::AVX512)
+            {
+                const auto factor=_mm512_set1_ps(inverse);
+                for(;input.size()-column>=16;column+=16)
+                {
+                    auto value=_mm512_mul_ps(_mm512_loadu_ps(input.data()+column),factor);
+                    if constexpr(Gamma==FP32Gamma::Original)
+                        value=_mm512_mul_ps(value,_mm512_loadu_ps(gamma.data()+column));
+                    _mm512_storeu_ps(output.data()+column,value);
+                }
+            }
+#endif
+#if defined(__AVX2__)
+            if constexpr(Program==ISALevel::AVX2)
+            {
+                const auto factor=_mm256_set1_ps(inverse);
+                for(;input.size()-column>=8;column+=8)
+                {
+                    auto value=_mm256_mul_ps(_mm256_loadu_ps(input.data()+column),factor);
+                    if constexpr(Gamma==FP32Gamma::Original)
+                        value=_mm256_mul_ps(value,_mm256_loadu_ps(gamma.data()+column));
+                    _mm256_storeu_ps(output.data()+column,value);
+                }
+            }
+#endif
+            for(;column<input.size();++column)
+            {
+                const float scaled=input[column]*inverse;
+                if constexpr(Gamma==FP32Gamma::Original)output[column]=scaled*gamma[column];
+                else output[column]=scaled;
+            }
+        }
+
+        /** @brief Bind only an actual scalar program or an explicitly compiled native publisher.
+         * @tparam Gamma Already resolved original gamma authorship.
+         * @param isa Authored scalar intent or the actual active native ISA.
+         * @return Persistent function identity for this synchronous invocation.
+         * @details Unsupported ISA requests are fatal before worksharing; no
+         * scalar substitute or forced-vectorizer promise conceals a missing leaf.
+         */
+        template<FP32Gamma Gamma>
+        FP32RowApplication fp32_row_application(ISALevel isa)
         {
-            return compute_sumsq_avx2(row, cols);
-        }
+            switch(isa)
+            {
+            case ISALevel::Scalar:return &apply_fp32_row<ISALevel::Scalar,Gamma>;
+#if defined(__AVX2__)
+            case ISALevel::AVX2:return &apply_fp32_row<ISALevel::AVX2,Gamma>;
 #endif
+#if defined(__AVX512F__)
+            case ISALevel::AVX512:return &apply_fp32_row<ISALevel::AVX512,Gamma>;
+#endif
+            default:
+                std::fputs("ERROR: CPU FP32 RMS publication received an uncompiled ISA\n",stderr);
+                std::abort();
+            }
+        }
 
         __attribute__((always_inline)) inline double compute_sumsq_dispatch(const float *row, std::size_t cols)
         {
@@ -564,6 +645,9 @@ namespace llaminar2::primitives
             return;
         }
 #endif
+        const auto publicationISA=opts.force_scalar?ISALevel::Scalar:activeISALevel();
+        const auto application=bank.gamma().empty()?fp32_row_application<FP32Gamma::Identity>(publicationISA):
+                                                   fp32_row_application<FP32Gamma::Original>(publicationISA);
         // A complete row, its summary and inverse have one elected worker.
         // No TLS matrix, worker-partitioned arithmetic, atomics or detached
         // summary/application phases survive. This also seals the x86 M=1
@@ -588,18 +672,7 @@ namespace llaminar2::primitives
                 float inverse;
                 rmsnorm_compute_inv(&sum,1,cols,epsilon,&inverse);
                 if (inverse==0.0f) std::fill(output.begin(),output.end(),0.0f);
-                else if (gamma)
-                {
-#pragma omp simd
-                    for (std::ptrdiff_t column=0;column<std::ptrdiff_t(cols);++column)
-                        output[std::size_t(column)]=(input[std::size_t(column)]*inverse)*gamma[std::size_t(column)];
-                }
-                else
-                {
-#pragma omp simd
-                    for (std::ptrdiff_t column=0;column<std::ptrdiff_t(cols);++column)
-                        output[std::size_t(column)]=input[std::size_t(column)]*inverse;
-                }
+                else application(input,bank.gamma(),output,inverse);
             }
         };
         OMP_WORKSHARE_REGION_IF(work,omp_in_parallel() || (rows>1 && want_parallel(rows,cols,opts)));
