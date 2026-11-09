@@ -1,215 +1,72 @@
 # Native ARM CPU inference: implementation, numerical proof and tuning plan
 
-Created: 2026-11-04; progress updated 2026-11-06 (late).
-Rebased upstream base: `feat/qfn-ngram-continuation` at `f48c856105f6d1495a4c342ed2cc0c62b4d11273`.
-Working branch: `codex/qfn-ngram-continuation-arm64`. The rebased history is
-committed locally and pushed only to `arm-validation/*` branches on the fork for
-cross-host testing; draft PR #32 still shows the pre-rebase head.
+Created: 2026-11-04; frontier updated 2026-11-07.
+Base: `feat/qfn-ngram-continuation` at `b65ee52fd`. Working branch
+`codex/qfn-ngram-continuation-arm64` (draft PR #32), force-pushed after every
+commit; `arm-validation/<sha9>` branches pin each commit for the Spark hosts.
 
 **Status: implementation in progress, not a completed port or performance certificate.**
-The full objective remains native CPU inference with the robustness of the
-existing Intel path, not merely a successful configure or primitive benchmark.
+The objective remains native CPU inference with the robustness of the Intel
+path, finished by a Release `Perf__` scaling round. Detailed historical
+evidence (K-series snapshots, seals, falsification controls) lives in
+[the evidence record](ARM_CPU_KERNEL_IMPLEMENTATION_EVIDENCE.md).
 
-### Verified frontier — 2026-11-06 (late)
+### Current frontier — 2026-11-07
 
-Committed on the branch since the rebase:
+Installed and verified:
 
-- Scalar FP32 RMS order, explicit FP32 row publishers and whole-indexer
-  totality sweeps (K17): five Mac core-free profiles, 243 tests and 193
-  preflight cells x20 each.
-- RMS numeric corruption as one typed release-safe fatal (helper v7): five
-  profiles, 248 tests and 197 preflight x20, plus generic-gate, throw,
-  terminate, Scalar-override and thread-limit controls.
-- Shared OpenMP helpers reuse lexical retained teams (helper task47): ASIMD and
-  DotProd full matrices green; old-predicate and barrier mutants fail.
-- Every `ISA_DISPATCH_*` kernel now has a NEON leaf (Q8_0/Q8_1 requantize, GDN
-  normalization, sampler top-k, short-conv, TurboQuant dequant), and the
-  shared-memory spin backend builds on ARM. Short-conv prefill rejects windows
-  wider than its SIMD register program.
-- GB10/APU memory: discovery records integrated-GPU backing and
-  PhysicalMemoryAuthority admits each rank's CPU plus pooled GPUs jointly
-  against the shared pool (13 device-free regressions).
-- Core-free whole-team tests declare CTest PROCESSORS; slow sweeps are sharded
-  per format so the unchanged 30 s budget holds under an unrestricted gate.
+- **Kernels.** Native NEON/NEON-DotProd leaves for every former AVX2/AVX512
+  surface: NativeQuantised M=1/grouped/prefill/fused for all 21 source formats,
+  attention (FP32, AQ8, Q8_1, TQ4/TQ8, Q16, sparse/QSA), RoPE, SwiGLU,
+  softmax, RMSNorm (FP32/Q16/INT32), GDN, short-conv, Q8 requantize, sampler
+  top-k, immutable lookup, Qwen4Exp HC residual read.
+- **Batch invariance.** Serial and grouped rows are byte-identical on every
+  ISA: explicit `std::fma` where GCC contraction differed per call site
+  (skinny floating projections, short-conv decode, NativeQuantised BLAS epilogue
+  `fma(alpha, product, round(beta*prior))`).
+- **GB10 runtime.** Joint integrated-GPU + host pool in PMA; dense socket
+  indices; physical cores by thread-sibling sets (tooling and runtime);
+  launched processes keep the OpenMP-admitted CPU set (a non-ARM defect that
+  ran whole teams on one core); cluster workers bound fastest core first;
+  native projection tiles claimed dynamically (byte-safe).
+- **Exact overlays (track K).** Resolver over the two numerically neutral NEON
+  schedule dimensions (row tile, chunks per task) with a compile-time validated
+  exact table; collector `Perf__CPUNativeNEONExactOverlay`; generator
+  `native_quantised_dispatch/neon_exact_overlay.py` (exact-only, alias-pooled,
+  no-regression, fail-closed). The installed table is empty until GB10
+  evidence is generated.
+- **Tests.** ISA-forced cells register `neon`/`neon-dotprod` on ARM; x86-only
+  scheduler tests are x86-gated with ISA-neutral byte sweeps kept; portable
+  all-format thread-scaling `Perf__` with byte authentication and measured
+  grouped/serial amortization.
 
-Real-hardware results so far:
+GB10 (DGX Spark, GCC 14 Integration, canonical test container), head
+`5f7298e3d`: all three gate builds green; Unit 65/1029 and preflight 185/2459
+fail, all in classes outside the ARM work: 235 need a compiled CUDA/ROCm
+backend (Pooled*, native graph geometry, MoE 4/8-device overlay planning), 6
+profiler-surrogate tests need a CUDA device, plus upstream drift fixed in
+`b528bb121` and one upstream-owned Release target-selection test.
 
-- **Spark GB10 complete-engine builds** (GCC 14 SDK, Integration, build
-  only). The first stopped at missing NEON Q8 leaves (now fixed). The second
-  (`1472f1341`, keep-going) linked `libllaminar2_core` and the `llaminar2`
-  application on aarch64; 22 test translation units failed on x86-only test
-  code, and the remaining links ran out of disk. Measured needs for the full
-  app-plus-both-gates Integration build: about 322 GiB of build tree and
-  106 GiB peak memory at 20 jobs, so gate builds now run in two phases.
-  All 22 test units were ported (NEON checks replace x86 chunk leaves, x86-only
-  fixtures are x86-gated, the scalar NativeQuantised oracle is shared) and compile
-  in a local aarch64 GCC 14 container; ISA-forced test cells now register
-  `neon`/`neon-dotprod` on ARM instead of a fatal `avx2`.
-- **x86 (7800X3D, GCC 14 SDK) portability suite** on the RMS head: AVX2 builds
-  clean and all tests pass when not oversubscribed; whole-team timeouts and one
-  GCC 14 AVX512 warning led to the accounting/sharding fixes above. The current
-  head is being rerun for AVX2 and AVX512, followed by a full CPU-only build.
+GB10 scaling evidence (diagnostic Integration builds; Q4_K N=2048 K=4096):
+static 20-core split 78 us decode / 3536 us M=64 prefill; 10 X925 only
+52.7 / 2152 us; 20 cores with dynamic tiles 46.0 / 1450 us. GB10 is two
+clusters of 5 X925 (CPU 5-9, 15-19) + 5 A725 (CPU 0-4, 10-14); an X925 is
+about 2.8x an A725 per thread on these kernels.
 
-Not yet done: a complete ARM engine build and its Unit/preflight run, model and
-HTTP serving with MTP/prefix on ARM, exact NativeQuantised overlays, and the final
-`Perf__` scaling round on Spark (1..20 physical cores) and the Mac.
+Open, in order:
 
-The immutable `4e56c543` successor now has independently audited native x86
-AQ8/value/lookup correctness:24 registrations and12 focused cells×20 per ISA,
-then actual AVX512-built/runtime-AVX2 binaries and three default-ISA byte-auth
-CLI calls. The isolated CLI timings are not economy. The separate ARM normal
-Integration app/gate-target build configures successfully but fails first at
-`CPUQwenSparseAttention.cpp:22` (`immintrin.h`). Its actual immutable-lookup
-object now builds; no engine executable or test execution exists. The complete
-7076-entry source maps are unchanged on both hosts. Both windows are retired.
-See [the evidence record](ARM_CPU_KERNEL_IMPLEMENTATION_EVIDENCE.md) for exact
-archive hashes, raw counts and scope.
-
-INT32 RMS work now closes the original-summary and native publication pipeline
-together: direct full-width FP64 reductions, explicit scalar intent, original
-integer/gamma streaming, private inverse, one row/tile owner and no decoded/TLS
-row banks. The old normalization-only precision caller was a real retirement
-dependency; its actual link failure was reproduced before moving it to the
-admitted public publisher. Native-vector NaN rejection and immediate nonempty
-retained completion have focused regressions; isolated nowait countercopies
-fail at1/3 or2/3 arrivals. Published `3440350` now has independently audited
-native AVX2/AVX512 INT32 correctness:36 registrations and11 focused cells×20
-per ISA, actual AVX512-built/runtime-AVX2 executions, five explicit Scalar
-admission negatives and one exact finite-check countercopy per ISA. The first
-helper failure and later collection/summary metadata errors remain preserved;
-no producer correction or metadata assumption is counted as source validation.
-INT32 factory/PMA, full-engine runtime and economy are still not certified.
-
-The sparse frontier is now implemented in the working tree, not by an include
-guard: the actual complete CPU QSA TU and existing caller TU compile/link/run
-natively using checked original banks, fixed eight-/sixteen-chain scores and
-register-only cache fragments. Its decoded selected-head and full weighted-value
-mirrors are retired. The original TQ codebooks, source/fitted radii and ordered
-inverse-basis FMAs remain explicit. Actual existing all-codec/Q16/ring and
-serial/grouped cases pass; new public admission, exact query alias, immediate
-retained completion and all-positive-worker regressions pass locally. Diagnostic
-old-return/nowait copies falsify the completion tests. The pre-review72 snapshot
-passed218 tests on each of five local profiles and170 preflights×20; fresh genuine
-GNU14 executed27 enabled actual callers and17 focused cells×20. Review then found
-and repaired replay address admission before load/member access across all five
-CPU entries, and added an independent ordered-FMA nonsymmetric TQ4/TQ8 basis/
-query-alias oracle. Exact late-check, reversed-coordinate and zero-value-phase
-copies fail their focused regressions; they are not installed production modes.
-Final source-only closure review73 closes both findings. Fresh post-review
-five-profile runs pass220 registrations each and172 preflights×20; genuine GNU14
-passes24 registrations,19 focused cells×20, all29 enabled actual callers and the
-explicit historical ranking case. Actual18 TUs/six native ELF183 binaries and
-all15672 unchanged source records are independently authenticated. Actual TQ4/8
-value hot loops have native FMAs and no hot stack/calls; this is static ISA, not
-PMU/economy. These remain local kernel/caller proofs, not native-x86 sparse,
-complete-engine/factory/PMA/serving or economical grouped execution certificates.
-
-The independent tester then found two real numerical/lifecycle defects: a669
-GNU14 contracts FP32 indexer RoPE differently from Clang, and c759/K2 recovering
-UBSan reports null-score pointer arithmetic despite GTest success. Old sanitizer
-case counts are not UB-free certificates. The separated native indexer and
-conditional score-address fix pass32 callers with fatal UBSan on sealed K3 and
-genuine GNU14; the original-object and unguarded-score controls fail. K3 resource
-audits still show GNU14 FP16 summary and Clang FP16 table-RoPE vector spills.
-K4 sequences native register lifetimes without changing arithmetic, repairs the
-perf-only registration omission and pins native/mixed rotary16/18 in addition
-to scalar rotary2. Native three-profile/fatal-sanitizer and GNU14 positive/negative
-regressions pass, and actual vector-pressure spills disappear. Scalar position/
-output-pointer spills and policy reloads remain inside table loops, so K4 is not
-zero-spill/economy qualified. Working K5 binds one typed table/analytic source per
-head, borrowing original roots/frequencies rather than output-aliasable policy
-rereads. Its optimized-sanitizer run exposes42 one-ULP FP32 analytic assertions:
-Clang pairs cosf/sinf into a different Apple libm ABI. K5 is preserved RED before
-GNU14/resource work; source ACK79 is not numeric certification. Working K6 seals
-the two separate public host elementary calls with native register dependencies,
-keeps the oracle independent through volatile public-function pointers, and adds
-an explicit public-entry regression using genuine setup frequencies. K6 passes
-the original32 cases but its new fixture's input1 legitimately equals cosf==1,
-so the strict alias-poison precondition fails before that invocation. Working
-K7 uses input2/epsilon2/exact inverse1/2 to retain normalized1/0 and all poison
-checks, with no production change. Native three-profile and GNU14 runs pass33
-callers/32 focused registrations; actual libm closure uses only public unary
-calls, and the old paired-call object fails the new/broad byte regressions.
-K7 analytic-copy/inlined-pool GPR debt is closed by K8's sealed analytic64 and
-outlined native pool phase: actual Clang/GNU14 prepare/pool/rotate call-free
-cycles have zero vector/GPR stack traffic, numerics33/registrations32 pass and
-public libm closure remains exact. K9's isolated original-root score phase fixes
-caller GPR pressure and passes34 callers/33 registrations, but GNU14 hoists an
-entire128-float pool across heads, causing seven q-register and scalar-constant
-spills. K10 closes that RED with an unchanged-root compiler dependency: actual
-native34/33 passes and the29 profiled preparation/scoring caller/helper functions
-have no stack accesses on call-free cycles, with original math/public libm
-retained. Exact identity removal restores the GNU spills while math still passes.
-Tie reversal fails all24 score cells, but head reversal stops at the first FP32
-fatal assertion, leaving actual FP16/BF16 negatives unobserved in that first
-attempt. K11 retains every score-word bit check/zero-mismatch requirement with
-nonfatal cell reports; actual rebound head/tie controls now fail24/24 cells on
-all three native validation profiles. Its full core-free five-profile matrix
-passes229 cases and179×20 preflights each, with separate LLVM22/DotProd resource
-proof. The12 non-QSA RMS sanitizer warnings are not waived. No production,
-geometry, expected-word or registration change is introduced by K11. Full
-indexer M/all-worker coverage, complete engine gates and economy remain open;
-static resources are not allocation, lease or runtime-synchronization proofs.
-No complete M1 indexer replay is introduced.
-K12 added twelve independently filterable format/tail integration cells for
-all M1..16/31/33 and caller-admitted positive teams, with original-source gold
-and retained checks before the outer join. Only configure/metadata policy checks
-ran:241 registrations,191 preflight, no native compilation. Source85 found its
-source value-equality checks insufficient to prove signed-zero preservation.
-Unverified K13 uses exact word checks, position/pair-varying supplied rotary
-planes, synthetic-input naming and honest unmeasured timeout wording. The
-existing registered lifetime test also covers delayed indexer/selector arrival
-at short/ranking and live/empty frontiers in every representation. Gold is
-computed once and persistent fixture banks are reused; named team-resource
-ownership avoids internal oversubscription without worker caps or timeout
-changes. Production code is unchanged; no K13 native/negative-control result or
-tested totality claim exists yet. The frozen published2ff7 packet remains the
-earlier independently audited checkpoint. The old-base K13 Mac scoped matrix
-subsequently passed; no GNU or countercontrols ran for that epoch. After the
-operator-requested conflict-free rebase, exact K14 workspacea97be2f7 is separately
-bound to local HEADfe4d37d1 atop upstreamf48c8561; its fresh baseline compile and
-first two native cells passed. Remaining current-base gates require fresh runs,
-not relabelled K13 evidence; the PR has not been force-pushed.
-K15 fixed increasing-column scalar FP64 FMA order with an exact existing-detail
-seam regression and explicit preflight. Its three Mac RMS profiles passed; old
-Release-object controls failed while legitimate serial O0/SAN controls passed.
-The remaining sanitizer warnings are six generic apply-loop transform warnings;
-no GNU/x86 or economy certificate follows. Unverified K16 installs explicit
-compiled FP32 row publishers, retires the two uncompiled summary alias stubs and
-adds public rounded-product/tail/alias/retained checks with focused preflight.
-Native ARM's shared-row program and all native summary trees are unchanged.
-K16's first focused native case and three sanitizer RMS compilations passed
-without warnings; broader compiler/resource/runtime proof is pending. Source89's
-two test-authentication findings are addressed in unverified K17: self-admit the
-native profile and assert the actual retained3-worker team with restored dynamic
-policy. The separate scalar-summary diagnostic still permits Scalar positives.
-Collective numeric-error handling and complete engine/serving gates remain open.
-Its standalone issue tracker was consolidated into this active work, not closed
-as proof of completion. RMS numeric/lifecycle and half-policy work remains active
-in the isolated helper lane; no issue flood is used as a substitute for fixing it.
-The operator-assigned arm-sparks session owns all Spark/related remote
-coordination, with verified DATA-only handoffs and no inherited execution or
-resource grant. Historical WSL SDK/intake paths are not assumed live after
-reported cleanup; fresh restoration/owner/window admission is required. The
-user-designated tester owns all local builds/long checks on immutable snapshots;
-Main retains implementation/source publication. See the evidence record for
-exact snapshots and retained first failures.
-
-A separate source audit confirms the handoff's UMA concern is an implementation
-gap, not a solved feature: CPU and CUDA observations become separate `(rank,
-device)` resources and admission checks each BOM independently. One registry
-therefore does not constrain their joint GB10 LPDDR footprint. Shared-capacity
-work (task39, blocking target15) must add typed physical-pool constraints inside
-PMA, preserve allocator-specific limits/RAII/backing identities and test combined
-CPU+GPU pressure before mixed-overlay/model admission. Actual CUDA-free versus
-host/file-cache observations remain unverified on hardware. No second ledger,
-blind capacity minimum or duplicate residency credit is an acceptable repair.
-
-Finish optimized compiler/resource/economy and native-x86 validation; retain the
-same-head in-place indexer and representation programs. Obtain a separately
-reviewed app/gate-target build-only window using one exact sealed source and
-fully authenticated offline dependency closure. No old source token/window,
-metadata-only closure, model admission or full-engine pass is inherited.
+1. Diagnose the later 20-thread M=1 regression on mixed cores (309 us with
+   fast-first explicit places) and the GDN grouped verifier being slower than
+   serial on mixed cores; settle the GB10 default worker policy from data.
+2. Clean CPU-only gate: register GPU-backend-dependent tests only when a GPU
+   backend is compiled (or validate GB10 as a CUDA+CPU build).
+3. Collect and install GB10 exact overlays for the canonical model formats
+   (Qwen3.6-27B: Q4_K/Q5_K/Q6_K; Qwen3.6-35B-A3B: Q6_K/IQ2_S/IQ3_S/IQ4_XS).
+4. Real CPU serving on GB10: plan/benchmark/serve for Qwen3-0.6B, Qwen2.5-0.5B,
+   Qwen3.6-27B dense and 35B-A3B MoE, MTP off and dynamic, HTTP prefix reuse.
+5. Live GB10 joint-pool validation.
+6. Final Release `Perf__` round: all families and formats, 1..20 cores on GB10
+   (fast-only, slow-only, mixed), plus the M1 Mac.
 
 ## 1. Mandate and completion criteria
 
