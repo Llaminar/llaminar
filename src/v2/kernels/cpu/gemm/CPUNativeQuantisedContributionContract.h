@@ -8,6 +8,8 @@
  * boundaries or placement can change a sampled token. This file expresses the
  * device contribution program with AVX2 and AVX-512 intrinsics while retaining
  * the established fused CPU program for non-expert, backend-native matrices.
+ * Ordered CPU additions also retain serial operand precedence for adversarial
+ * prequantized NaN scales; FP16 decoding alone does not define that precedence.
  */
 
 #pragma once
@@ -81,13 +83,54 @@ namespace llaminar2::cpu::native_quantised
     inline __m512 persistRoundedAVX512(__m512 value) noexcept
     {
 #if defined(__GNUC__) || defined(__clang__)
-        asm volatile("" : "+x"(value));
+        // This existing value boundary may use all32 EVEX vector registers.
+        // Restricting it to the lower SSE register bank forces otherwise
+        // unnecessary moves after AVX-512 products. The empty asm still only
+        // materializes the same value: v adds no arithmetic or rounding edge.
+        asm volatile("" : "+v"(value));
         return value;
 #else
         alignas(64) volatile float rounded[16];
         _mm512_store_ps(const_cast<float *>(rounded), value);
         return _mm512_load_ps(const_cast<const float *>(rounded));
 #endif
+    }
+#endif
+
+    /**
+     * @brief Add AVX2 lanes with the original serial accumulator as source one.
+     *
+     * A fixed expression tree alone does not fix which distinct NaN payload
+     * wins: a compiler may exchange commutative intrinsic operands. One VADDPS
+     * with explicit source order preserves the original serial first-K payload
+     * while retaining exactly the same finite arithmetic and rounding edge.
+     * This is the arithmetic instruction, not a compiler barrier or NaN test.
+     *
+     * @param accumulator Earlier rounded value in the ordered K traversal.
+     * @param contribution Later independently rounded value.
+     * @return Rounded sum; the earlier payload wins when both operands are NaNs.
+     */
+    inline __m256 addOrderedAVX2(__m256 accumulator, __m256 contribution) noexcept
+    {
+        __m256 result;
+        asm("vaddps {%2, %1, %0|%0, %1, %2}"
+            : "=x"(result) : "x"(accumulator), "x"(contribution));
+        return result;
+    }
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Add AVX-512 lanes with the same serial NaN operand precedence.
+     * @param accumulator Earlier rounded value in the ordered K traversal.
+     * @param contribution Later independently rounded value.
+     * @return One rounded sum, retaining the earlier of two NaN payloads.
+     */
+    inline __m512 addOrderedAVX512(__m512 accumulator, __m512 contribution) noexcept
+    {
+        __m512 result;
+        asm("vaddps {%2, %1, %0|%0, %1, %2}"
+            : "=v"(result) : "v"(accumulator), "v"(contribution));
+        return result;
     }
 #endif
 
@@ -126,7 +169,7 @@ namespace llaminar2::cpu::native_quantised
                 _mm256_mul_ps(activation, weight_scale));
             const __m256 contribution = persistRoundedAVX2(
                 _mm256_mul_ps(combined_scale, dot_fp32));
-            return _mm256_add_ps(accumulator, contribution);
+            return addOrderedAVX2(accumulator, contribution);
         }
         const __m256 combined_scale =
             _mm256_mul_ps(activation, weight_scale);
@@ -173,8 +216,8 @@ namespace llaminar2::cpu::native_quantised
                     scaled_min,
                     _mm256_set1_ps(static_cast<float>(activation_sum))));
             const __m256 completed_block = persistRoundedAVX2(
-                _mm256_add_ps(dot_contribution, correction));
-            return _mm256_add_ps(accumulator, completed_block);
+                addOrderedAVX2(dot_contribution, correction));
+            return addOrderedAVX2(accumulator, completed_block);
         }
 
         accumulator = _mm256_fmadd_ps(
@@ -217,7 +260,7 @@ namespace llaminar2::cpu::native_quantised
                 _mm512_mul_ps(activation, weight_scale));
             const __m512 contribution = persistRoundedAVX512(
                 _mm512_mul_ps(combined_scale, dot_fp32));
-            return _mm512_add_ps(accumulator, contribution);
+            return addOrderedAVX512(accumulator, contribution);
         }
         const __m512 combined_scale =
             _mm512_mul_ps(activation, weight_scale);
@@ -264,8 +307,8 @@ namespace llaminar2::cpu::native_quantised
                     scaled_min,
                     _mm512_set1_ps(static_cast<float>(activation_sum))));
             const __m512 completed_block = persistRoundedAVX512(
-                _mm512_add_ps(dot_contribution, correction));
-            return _mm512_add_ps(accumulator, completed_block);
+                addOrderedAVX512(dot_contribution, correction));
+            return addOrderedAVX512(accumulator, completed_block);
         }
 
         accumulator = _mm512_fmadd_ps(

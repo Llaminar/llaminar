@@ -22,6 +22,9 @@
  * RootCombinePreweightReadyRecordEconomy separately measures the exact CPU
  * arithmetic on PMA/NUMA cached outputs. It is an authored mechanism control,
  * not a mapped-ticket, gather, topology or full-model speed certificate.
+ * An explicit sampled-profile repeat isolates only current fused/live3208 work
+ * after the original proof/warmup. External perf still observes process setup
+ * and final byte checks; no canonical timing samples are emitted in that mode.
  */
 
 #include <gtest/gtest.h>
@@ -43,6 +46,7 @@
 #include "../../fixtures/collective/CPUExpertDomainSocketMembership.h"
 #include "collective/backends/ShmemSpinBackend.h"
 #include "collective/backends/UPIBackend.h"
+#include "../../utils/CPUPerfStatsTimingCollectionScope.h"
 
 #include <algorithm>
 #include <array>
@@ -51,6 +55,8 @@
 #include <span>
 #include <variant>
 #include <chrono>
+#include <charconv>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -814,6 +820,16 @@ namespace llaminar2::test
         constexpr size_t slots=size_t(maximum_rows)*top_k,live_max=3208,record_width=columns+1;
         const int workers=omp_get_max_threads();
         ASSERT_GT(workers,0);
+        int profile_repetitions=0;
+        if(const char* raw=std::getenv("LLAMINAR_CPU_ROOTED_PUBLICATION_PROFILE_ITERATIONS")) {
+            const std::string_view value(raw);
+            const auto parsed=std::from_chars(value.data(),value.data()+value.size(),profile_repetitions);
+            ASSERT_TRUE(parsed.ec==std::errc{} && parsed.ptr==value.data()+value.size() &&
+                        profile_repetitions>0 && profile_repetitions<=2000)
+                <<"Explicit root-publication profile iterations must be1..2000";
+            ASSERT_EQ(workers,28)<<"This bounded diagnostic requires28actual physical workers";
+            ASSERT_EQ(omp_get_level(),0)<<"Serial map validation retains standalone production entry";
+        }
         const auto affinity=NUMATopology::detectLocalNUMANode();
         ASSERT_TRUE(affinity.detection_succeeded);
         const auto observed=observeSystemMemoryCapacity();
@@ -857,6 +873,7 @@ namespace llaminar2::test
         RecordProperty("route_provenance","authored_ready_records_not_route_replay");
         RecordProperty("workers",workers);RecordProperty("numa_node",affinity.local_numa_node);
         for(const size_t live:{size_t{453},live_max}) {
+            if(profile_repetitions && live!=live_max)continue;
             // Retained maximum storage is not the logical incoming chunk.
             // These live-count scales correspond to M64 and M448 respectively.
             const int rows=live==453?64:maximum_rows;
@@ -896,6 +913,43 @@ namespace llaminar2::test
             ASSERT_TRUE(run(0));ASSERT_TRUE(run(1));
             ASSERT_EQ(std::memcmp(raw0.data(),raw1.data(),raw0.size()*sizeof(float)),0);
             ASSERT_EQ(std::memcmp(weighted0.data(),weighted1.data(),weighted0.size()*sizeof(float)),0);
+            if(profile_repetitions) {
+                {
+                    CPUExactTimingCollectionScope recording_pause;
+                    for(int warm=0;warm<warmups;++warm)ASSERT_TRUE(run(1));
+                }
+                ASSERT_TRUE(run(1)); // Fresh original bytes, outside repeat body.
+                ASSERT_EQ(std::memcmp(raw0.data(),raw1.data(),raw0.size()*sizeof(float)),0);
+                ASSERT_EQ(std::memcmp(weighted0.data(),weighted1.data(),weighted0.size()*sizeof(float)),0);
+                {
+                    CPUExactTimingCollectionScope recording_pause;
+                    // Exactly one unchanged operation is repeated. Do not put
+                    // an outer parallel region around it: map validation is
+                    // serial, then the original reducer opens its own team.
+                    // This mode has no Clock interval or canonical samples.
+                    for(int iteration=0;iteration<profile_repetitions;++iteration)
+                        ASSERT_TRUE(run(1))<<"fused profile iteration="<<iteration;
+                }
+                ASSERT_EQ(std::memcmp(raw0.data(),raw1.data(),raw0.size()*sizeof(float)),0);
+                ASSERT_EQ(std::memcmp(weighted0.data(),weighted1.data(),weighted0.size()*sizeof(float)),0);
+                RecordProperty("profile_body_calls",profile_repetitions);
+                RecordProperty("profile_live_records_per_participant",live);
+                RecordProperty("profile_output_storage","cached_PMA_root_mechanism_control");
+                std::cout<<"ROOT_COMBINE_PREWEIGHT_PROFILE,candidate=fused,profile_kind=sampled_IP_repeat"
+                    <<",profile_body_calls="<<profile_repetitions
+                    <<",live="<<live<<",H="<<columns<<",M="<<rows<<",top_k="<<top_k
+                    <<",participants=2,workers="<<actual_workers
+                    <<",team_entry=standalone,live_slot_extent="<<live_slot_extent
+                    <<",storage_slots="<<slots<<",preconditioning_calls="<<warmups
+                    <<",fused_proof_calls=2,control_proof_calls=1"
+                    <<",gather_calls=0,ticket_publication_calls=0"
+                    <<",sampling_scope=whole_lifetime_setup_and_oracles_included"
+                    <<",body_scope=ready_record_map_validation_reduce_preweight"
+                    <<",output_storage=cached_PMA_root_mechanism_control"
+                    <<",route_provenance=authored_ready_records_not_route_replay"
+                    <<",both_outputs_byte_exact=1,canonical_timing_samples=0\n";
+                return; // Original two-shape/two-arm timing path remains below.
+            }
             for(int warm=0;warm<warmups;++warm){ASSERT_TRUE(run(warm%2));}
             std::array<std::array<double,samples>,2> timings{};
             for(int sample=0;sample<samples;++sample)for(int offset=0;offset<2;++offset) {

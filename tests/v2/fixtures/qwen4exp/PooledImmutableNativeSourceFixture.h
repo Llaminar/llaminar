@@ -11,7 +11,7 @@
 namespace llaminar2::test::pooled_source_fixture {
 namespace n=qwen4exp::pooled_native;
 /** @brief Nominal recorded-boundary operation; unsupported source-only decisions fail the component trace. */
-enum class Action:std::uint32_t {PoisonCache,DeliverPins,DeliverFree,DeliverVictims,SourceHeader,DeliverSource,ReadRows,CorruptIdentity};
+enum class Action:std::uint32_t {PoisonCache,DeliverPins,DeliverFree,DeliverVictims,SourceHeader,DeliverSource,ReadRows,CorruptIdentity,CorruptFrequencyEpoch,DeliverFailedFree};
 /** @brief Immutable rejection trace; only the diagnostic producer may corrupt its selected live input. */
 enum class IdentityFault:std::uint32_t {None,DuplicateRow,DuplicateUnique,DuplicateSlot,ForeignOwner,ForeignInterval,PinSlotBounds,PinOrdinal,PinCommitFlags};
 /** @brief Exact private persistent diagnostic staging, separately admitted to the fixture PMA. */
@@ -29,6 +29,8 @@ struct Args {
     IdentityFault identity_fault=IdentityFault::None; ///< Closed fault author, never a serving policy.
     std::uint32_t identity_position=0; ///< Original live command/grant position to corrupt.
     bool retained_identity=false; ///< Select retained original grants instead of incoming Pin commands.
+    std::byte* coordinator_cache=nullptr; ///< Original test-retained coordinator policy root for an authored fatal fault.
+    std::uint32_t frequency_fault_cell=qwen4exp::adaptive_lookup::None; ///< Exact scalar-oracle-authored cell; never a serving parameter.
 
 };
 /** @brief Submit one diagnostic producer on its exact non-default original CUDA stream. */

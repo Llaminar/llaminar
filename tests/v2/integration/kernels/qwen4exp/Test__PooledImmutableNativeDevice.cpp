@@ -22,6 +22,7 @@
 #include "kernels/qwen4exp/AdaptiveImmutablePhysicalSlot.h"
 #include "memory/BufferArena.h"
 #include "fixtures/qwen4exp/PooledImmutableNativeSourceFixture.h"
+#include "fixtures/qwen4exp/PooledImmutableScalarPolicyReplay.h"
 #include "transfer/TransferEngine.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -29,6 +30,9 @@
 #include <cstring>
 #include <iostream>
 #include <numeric>
+#include <optional>
+#include <cmath>
+#include <nlohmann/json.hpp>
 namespace llaminar2::test {
 namespace {
 namespace q=qwen4exp;namespace n=q::pooled_native;namespace p=q::adaptive_lookup::pooled;
@@ -75,7 +79,8 @@ public:
         prepared_->validate();std::uint64_t h=1469598103934665603ULL;const auto mix=[&](std::uint64_t x){h=(h^x)*1099511628211ULL;};
         mix(1);mix(0x736f75726365ULL);mix(static_cast<unsigned>(action_));mix(prepared_->preparedIdentity());mix(args_.owner.identity);mix(args_.coordinator.identity);
         for(const auto value:{args_.offsets.header,args_.offsets.record_bytes,args_.offsets.payload_bytes,args_.offsets.records,args_.offsets.payload,args_.offsets.bytes})mix(value);
-        mix(args_.source_rows);mix(args_.maximum_original);return h?h:1;
+        mix(args_.source_rows);mix(args_.maximum_original);
+        mix(reinterpret_cast<std::uintptr_t>(args_.coordinator_cache));mix(args_.frequency_fault_cell);return h?h:1;
     }
     /** @return The fixture is explicitly a native phase, never a selectable source implementation. */
     ComputeStageType type()const override{return ComputeStageType::QWEN4EXP_POOLED_NATIVE_PHASE;}
@@ -89,6 +94,15 @@ public:
         if(action_==f::Action::DeliverPins || action_==f::Action::DeliverFree || action_==f::Action::DeliverVictims || action_==f::Action::DeliverSource)
             contract.addPreallocatedOutput(BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,"INT8");
         if(action_==f::Action::SourceHeader || action_==f::Action::DeliverSource)contract.addPreallocatedInOut(BufferId::QFN_NGRAM_LOOKUP_STATE,"INT8");
+        if(action_==f::Action::CorruptFrequencyEpoch){
+            contract.addInput(BufferId::QFN_POOLED_OWNER_NATIVE,"INT8");
+            contract.addPreallocatedInOut(BufferId::QFN_POOLED_COORDINATOR_POLICY,"INT8");
+            contract.addPreallocatedInOut(BufferId::QFN_POOLED_COORDINATOR_NATIVE,"INT8");
+        }
+        if(action_==f::Action::DeliverFailedFree){
+            contract.addInput(BufferId::QFN_POOLED_COORDINATOR_NATIVE,"INT8");
+            contract.addPreallocatedOutput(BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,"INT8");
+        }
         if(action_==f::Action::DeliverSource){contract.addInput(BufferId::QFN_POOLED_OWNER_FRAME,"INT8");contract.addWeight(source_.get());}
         if(action_==f::Action::ReadRows)contract.addInput(BufferId::QFN_POOLED_OWNER_CACHE,"INT8").addPreallocatedOutput(BufferId::QFN_NGRAM_NATIVE_ROWS,"INT8");
         return contract;
@@ -106,12 +120,33 @@ private:
 };
 /** @brief The two component gates retain distinct coverage and qualification scopes. */
 enum class RecordedTrace {PlanCancellation,SuccessfulSource};
+/** @brief Contract certification and opt-in transaction timing remain distinct diagnostic uses. */
+enum class NativeReplayIntent {ContractReplay,TransactionTiming,FailedEpochReplay};
+/** @brief Raw event observation becomes valid only after the original scalar/terminal checks pass. */
+struct NativeTransactionEventSample {
+    float elapsed_ms=0;
+    bool valid=false;
+    std::uint32_t unique_rows=0,initial_hit_rows=0,source_rows=0,free_rows=0,victim_rows=0;
+    std::uint64_t source_native_bytes=0;
+};
 /** @brief Actual one-GPU diagnostic family; independent placement is covered by device-free protocol replay. */
 class NativeReplay {
 public:
-    /** @brief Declare exact PMA roots and one general executable before any materialization. */
-    NativeReplay(DeviceId device,PreparedNativeLookupFixture& session,std::uint32_t maximum,std::uint32_t slots,RecordedTrace mode=RecordedTrace::PlanCancellation,n::OriginalIdWidth width=n::OriginalIdWidth::UInt64,bool declarationOnly=false):device(device),worker(*session.permit(device).worker()),
-        backend(getBackendFor(device)),stream(ExplicitGPUStream(worker.defaultStream()).get()),maximum(maximum),slots(slots),mode(mode),originalWidth(width)
+    /**
+     * @brief Declare exact PMA roots and one general executable before any materialization.
+     * @param device Original native participant.
+     * @param session Existing prepared/admitted fixture owner.
+     * @param maximum Original query bound retained by every replay.
+     * @param slots Original physical owner capacity.
+     * @param mode Recorded cancellation or successful-source transaction.
+     * @param width Actual original input producer's UInt32/UInt64 width.
+     * @param declarationOnly Declare the same BOM without native materialization.
+     * @param policyProof Retain the independent serial-position policy oracle for terminal comparisons.
+     * @param aging Exact immutable arithmetic policy period, identical in native and oracle declarations.
+     * @param intent Explicit contract replay or separately selected opt-in transaction timing.
+     */
+    NativeReplay(DeviceId device,PreparedNativeLookupFixture& session,std::uint32_t maximum,std::uint32_t slots,RecordedTrace mode=RecordedTrace::PlanCancellation,n::OriginalIdWidth width=n::OriginalIdWidth::UInt64,bool declarationOnly=false,bool policyProof=false,std::uint64_t aging=65536,NativeReplayIntent intent=NativeReplayIntent::ContractReplay):device(device),worker(*session.permit(device).worker()),
+        backend(getBackendFor(device)),stream(ExplicitGPUStream(worker.defaultStream()).get()),maximum(maximum),slots(slots),mode(mode),originalWidth(width),intent(intent)
     {
         // Ownership/admission stays on the original control thread. Only native
         // storage preparation and recording marshal onto the exact worker.
@@ -129,7 +164,7 @@ public:
             {{{participant,ImmutableRowStorage::VRAM},0,slots,{}}},{participant},{},
             {{host,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped)}},{},slots?std::optional(participant):std::nullopt,16);
         const auto physical=q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,std::array{participant},participant);
-        const auto geometry=q::PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},maximum);
+        const auto geometry=q::PooledImmutableCoordinatorGeometry::fromOwners(physical,{aging,1,2},maximum);
         auto ownerPlan=q::PooledImmutableOwnerNativePlan::fromGeometry(physical,geometry,0,701,17);
         auto coordinatorPlan=q::PooledImmutableCoordinatorNativePlan::fromGeometry(physical,geometry,701,17);
         const auto& gpu=session.resource(device);const auto& cpu=session.resource(DeviceId::cpu());
@@ -156,6 +191,27 @@ public:
         if(sourceBytes){bom.add(gpu,PhysicalMemoryOwner::ImmutableTableStorage,sourceBytes);bom.add(cpu,PhysicalMemoryOwner::ImmutableTableStorage,sourceBytes);}
         declaredBOM=bom.build();
         if(declarationOnly)return;
+        if(policyProof){
+            requireNative(mode==RecordedTrace::SuccessfulSource ||
+                (intent==NativeReplayIntent::TransactionTiming && slots==0),
+                "Policy oracle requires successful source replay or explicit zero-capacity timing control");
+            scalarPolicy=std::make_unique<pooled_scalar_replay::Pool>(physical,maximum,q::adaptive_lookup::Policy{aging,1,2});
+            scalarPolicy->frequency_mode=pooled_scalar_replay::FrequencyObservationMode::ScalarPositions;
+        }
+        if(intent==NativeReplayIntent::FailedEpochReplay){
+            requireNative(policyProof && slots==4 && aging==17,"Fatal epoch replay has incompatible immutable geometry");
+            pooled_scalar_replay::Pool probe(physical,maximum,q::adaptive_lookup::Policy{aging,1,2});
+            probe.frequency_mode=pooled_scalar_replay::FrequencyObservationMode::ScalarPositions;
+            probe.begin(std::array<std::uint64_t,1>{35});
+            probe.all<n::OwnerAction::Availability>();
+            const auto receipts=probe.headers<n::Availability>();probe.args.input.frontier=receipts.data();
+            probe.run<n::CoordinatorAction::PlanFree>();
+            const auto view=probe.view();
+            for(std::uint32_t at=3*view.parameters.laneWidth();at<4*view.parameters.laneWidth();++at){
+                if(view.frequency_counts[at])frequencyFaultCell=at;
+            }
+            requireNative(frequencyFaultCell!=q::adaptive_lookup::None,"Scalar fault author did not identify its exact live cell");
+        }
         memory=session.memory();materialized=true;
         gpuInputs=memory->claimNewAllocation(device,PhysicalMemoryOwner::ActivationArena,inputBytes);
         hostInputs=memory->claimNewAllocation(DeviceId::cpu(),PhysicalMemoryOwner::ActivationArena,inputBytes);
@@ -269,9 +325,11 @@ public:
     /** @return Exact actual native addresses plus the separately admitted diagnostic source/IO roots. */
     f::Args fixtureArgs()const{
         const auto oroot=owner->roots(),croot=coordinator->roots();
-        return {owner->plan().parameters(),coordinator->plan().parameters(),static_cast<std::byte*>(oroot.cache->gpu_data_ptr()),static_cast<std::byte*>(oroot.frame->gpu_data_ptr()),static_cast<std::byte*>(oroot.native->gpu_data_ptr()),
+        f::Args args{owner->plan().parameters(),coordinator->plan().parameters(),static_cast<std::byte*>(oroot.cache->gpu_data_ptr()),static_cast<std::byte*>(oroot.frame->gpu_data_ptr()),static_cast<std::byte*>(oroot.native->gpu_data_ptr()),
             static_cast<std::byte*>(croot.frame->gpu_data_ptr()),static_cast<std::byte*>(croot.native->gpu_data_ptr()),static_cast<std::byte*>(io->gpu_data_ptr()),static_cast<std::byte*>(trace->gpu_data_ptr()),
             static_cast<std::byte*>(output->gpu_data_ptr()),static_cast<const std::byte*>(source->gpu_data_ptr()),ioOffsets,1024,maximum};
+        args.coordinator_cache=croot.cache?static_cast<std::byte*>(croot.cache->gpu_data_ptr()):nullptr;
+        args.frequency_fault_cell=frequencyFaultCell;return args;
     }
     /** @brief Add a diagnostic producer, distinct in code/resource identity from every production owner/coordinator operation. */
     void add(f::Action action){
@@ -286,8 +344,13 @@ public:
         add(n::OwnerAction::SealPins);
         if(mode==RecordedTrace::SuccessfulSource)add(n::CoordinatorAction::AcquirePins);
         add(n::CoordinatorAction::SealPins);add(n::OwnerAction::AcquirePins,sizeof(p::PinHeader));
-        add(n::OwnerAction::Availability);add(n::CoordinatorAction::PlanFree);
-        if(mode==RecordedTrace::PlanCancellation){
+        add(n::OwnerAction::Availability);
+        if(intent==NativeReplayIntent::FailedEpochReplay)add(f::Action::CorruptFrequencyEpoch);
+        add(n::CoordinatorAction::PlanFree);
+        if(intent==NativeReplayIntent::FailedEpochReplay){
+            add(f::Action::DeliverFailedFree);add(n::OwnerAction::AcceptFree);
+            add(n::CoordinatorAction::Cancel); // Ordinary cancellation must retain the first fatal error.
+        }else if(mode==RecordedTrace::PlanCancellation){
             add(n::OwnerAction::CancelFree);add(n::CoordinatorAction::CompleteFree);add(n::OwnerAction::Release);add(n::OwnerAction::Retire);add(n::CoordinatorAction::Cancel);
         }else{
             add(f::Action::DeliverFree);add(n::OwnerAction::AcceptFree);add(n::OwnerAction::ExecuteFree);add(n::CoordinatorAction::AcquireFree);add(n::OwnerAction::FreeReceipt);
@@ -336,8 +399,31 @@ public:
         requireNative(backend->deviceToHostOnStream(result.data(),root+offset,count*sizeof(T),device.ordinal,stream),"Native diagnostic terminal read failed");
         requireNative(backend->synchronizeStream(stream,device.ordinal),"Native diagnostic terminal read did not retire");return result;
     }
-    /** @brief Replay large/small/empty traces and byte-check actual stable coalescing/permutation and retired C0 state. */
-    void replay(std::uint64_t sequence,std::span<const std::uint64_t> original){
+    /**
+     * @brief Replay one original captured transaction and validate its terminal output/state outside event timing.
+     * @param sequence Original monotonically increasing lookup sequence.
+     * @param original Exact live ordered inputs, including partial/empty work.
+     * @param sample Optional raw transaction event output, valid only after scalar/terminal checks pass.
+     * @note Opt-in timing validates/advances the independent scalar oracle before recording its start event.
+     */
+    void replay(std::uint64_t sequence,std::span<const std::uint64_t> original,NativeTransactionEventSample* sample=nullptr){
+        if(sample)sample->valid=false;
+        if(intent==NativeReplayIntent::TransactionTiming){
+            requireNative(original.size()<=maximum,"Timing input count exceeds its admitted original bound");
+            const auto sourceRows=coordinator->plan().parameters().policy.sourceRows();
+            for(const auto row:original)requireNative(row<sourceRows,"Timing input row exceeds its declared original source extent");
+            requireNative(bool(scalarPolicy),"Opt-in timing requires its independent original scalar oracle");
+            if(mode==RecordedTrace::SuccessfulSource){
+                scalarPolicy->complete(original,sequence>=3?2u:1u);
+                const auto expected=scalarPolicy->view();
+                const auto& ownerArgs=scalarPolicy->owners.front()->args;
+                const auto pins=n::at<p::OwnerFrame>(ownerArgs.frame,ownerArgs.plan.frame.control)->initial_pin_count;
+                requireNative(pins+expected.frame->free_planned+expected.frame->victim_planned==expected.frame->unique_rows,
+                    "Authored timing history requires unsupported source-only payload; refusing before event timing");
+            }else{
+                advanceZeroCapacityScalarPolicy(original);
+            }
+        }
         inputTrace(sequence,original);
         struct Timing {IBackend* backend;DeviceId device;void* stream;void* start=nullptr;void* stop=nullptr;
             ~Timing(){if(!backend->synchronizeStream(stream,device.ordinal))std::terminate();if(stop)backend->destroyEvent(stop,device.ordinal);if(start)backend->destroyEvent(start,device.ordinal);}} timing{backend,device,stream};
@@ -351,7 +437,11 @@ public:
         if(mode==RecordedTrace::SuccessfulSource)for(const auto& root:{io,trace,output})TransferEngine::publishDeviceWrite(root.get(),device,stream);
         requireNative(backend->recordEvent(timing.stop,device.ordinal,stream) && backend->waitForEvent(timing.stop,device.ordinal),"Native diagnostic stop event failed");
         float elapsed=0;requireNative(backend->eventElapsedTimeMs(timing.start,timing.stop,device.ordinal,&elapsed),"Native diagnostic elapsed event unavailable");
-        std::cout<<"POOLED_NATIVE_TIMING trace="<<(mode==RecordedTrace::PlanCancellation?"plan_cancel":"successful_source")<<" original_bits="<<(originalWidth==n::OriginalIdWidth::UInt32?32:64)<<" maximum_original="<<maximum<<" original="<<original.size()<<" owner_slots="<<slots<<" captured_transaction_us="<<elapsed*1000<<" input_upload_and_terminal_observation_timed=0 profile=unqualified\n";
+        if(intent==NativeReplayIntent::ContractReplay)std::cout<<"POOLED_NATIVE_TIMING trace="<<(mode==RecordedTrace::PlanCancellation?"plan_cancel":"successful_source")<<" original_bits="<<(originalWidth==n::OriginalIdWidth::UInt32?32:64)<<" maximum_original="<<maximum<<" original="<<original.size()<<" owner_slots="<<slots<<" captured_transaction_us="<<elapsed*1000<<" input_upload_and_terminal_observation_timed=0 profile=unqualified\n";
+        if(scalarPolicy){
+            if(intent==NativeReplayIntent::ContractReplay)scalarPolicy->complete(original,sequence>=3?2u:1u);
+            compareScalarPolicy();
+        }
         const auto root=coordinator->roots();const auto& plan=coordinator->plan().parameters();const auto* frame=static_cast<const std::byte*>(root.frame->gpu_data_ptr());
         const auto state=read<p::LookupFrame>(frame,plan.frame.control,1).front();
         ASSERT_EQ(state.phase,p::LookupPhase::Idle);ASSERT_EQ(state.status,q::adaptive_lookup::Status::Success);ASSERT_EQ(state.interval.sequence,sequence);
@@ -368,7 +458,12 @@ public:
         EXPECT_EQ(ownerFrame.held_pins,0u);EXPECT_EQ(ownerFrame.reservations,0u);
         if(slots){const auto actualOwner=read<p::PhysicalOwnerControl>(static_cast<const std::byte*>(owner->roots().cache->gpu_data_ptr()),ownerPlan.cache.control,1).front();
             if(mode==RecordedTrace::PlanCancellation){EXPECT_EQ(actualOwner.filled,0u);EXPECT_EQ(actualOwner.next_slot_generation,0u);}
-            else{EXPECT_EQ(actualOwner.filled,sequence==1?2u:4u);EXPECT_EQ(actualOwner.next_slot_generation,sequence==1?2u:5u);}}
+            else if(scalarPolicy){
+                const auto& expectedOwner=scalarPolicy->owners.front()->args;
+                const auto& expected=*n::at<p::PhysicalOwnerControl>(expectedOwner.cache,expectedOwner.plan.cache.control);
+                EXPECT_EQ(actualOwner.filled,expected.filled);
+                EXPECT_EQ(actualOwner.next_slot_generation,expected.next_slot_generation);
+            }else{EXPECT_EQ(actualOwner.filled,sequence==1?2u:4u);EXPECT_EQ(actualOwner.next_slot_generation,sequence==1?2u:5u);}}
         EXPECT_EQ(memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableTableStorage,PhysicalMemoryMaterializationKind::NewAllocation),owner->plan().parameters().cache.bytes+coordinator->plan().parameters().cache.bytes+(source?source->size_bytes():0));
         if(mode==RecordedTrace::SuccessfulSource){
             for(std::size_t i=0;i<original.size();++i)std::copy_n(static_cast<const std::byte*>(source->raw_data())+original[i]*90,90,expectedOutput.data()+i*90);
@@ -391,15 +486,231 @@ public:
                 for(unsigned i=0;i<3;++i){EXPECT_EQ(grants[i].row,rows[i]);EXPECT_EQ(grants[i].generation,i+3);EXPECT_EQ(grants[i].destination_token,i+1);EXPECT_EQ(accepted[i].row,rows[i]);
                     EXPECT_EQ(accepted[i].kind,i<2?p::CommandKind::ReserveFree:p::CommandKind::ReserveVictim);}
             }
-            if(sequence>=3){EXPECT_EQ(state.free_planned,0u);EXPECT_EQ(state.victim_planned,0u);}
+            if(sequence>=3 && !scalarPolicy){EXPECT_EQ(state.free_planned,0u);EXPECT_EQ(state.victim_planned,0u);}
             const auto sourceFrontier=read<n::SourceFrontier>(static_cast<const std::byte*>(trace->gpu_data_ptr()),64,1).front();
-            EXPECT_EQ(sourceFrontier.disposition,sequence<=2?n::SourceDisposition::Consumed:n::SourceDisposition::Unpublished);
+            const auto expectedProduced=scalarPolicy?scalarPolicy->view().frame->free_planned+scalarPolicy->view().frame->victim_planned:
+                sequence==1?2u:sequence==2?3u:0u;
+            EXPECT_EQ(sourceFrontier.disposition,expectedProduced?n::SourceDisposition::Consumed:n::SourceDisposition::Unpublished);
             const auto records=read<std::uint64_t>(static_cast<const std::byte*>(io->gpu_data_ptr()),ioOffsets.record_bytes,1).front();
             const auto payloadBytes=read<std::uint64_t>(static_cast<const std::byte*>(io->gpu_data_ptr()),ioOffsets.payload_bytes,1).front();
-            const auto produced=sequence==1?2u:sequence==2?3u:0u;EXPECT_EQ(records,produced*sizeof(n::Fill));EXPECT_EQ(payloadBytes,produced*90u);
+            const auto produced=expectedProduced;EXPECT_EQ(records,produced*sizeof(n::Fill));EXPECT_EQ(payloadBytes,produced*90u);
             EXPECT_EQ(state.interval.admission,sequence>=3?2u:1u);
         }
+        if(sample){
+            sample->elapsed_ms=elapsed;
+            sample->unique_rows=state.unique_rows;
+            sample->initial_hit_rows=ownerFrame.initial_pin_count;
+            sample->free_rows=state.free_planned;
+            sample->victim_rows=state.victim_planned;
+            sample->source_rows=mode==RecordedTrace::SuccessfulSource?state.free_planned+state.victim_planned:0;
+            sample->source_native_bytes=std::uint64_t{sample->source_rows}*ownerPlan.row_bytes;
+            sample->valid=std::isfinite(elapsed) && elapsed>=0 && !::testing::Test::HasFailure();
+        }
     }
+    /** @brief Prove actual captured failure headers, sticky poison and rejection of retained failed reuse.
+     * @note Authored late corruption has no rollback contract. Terminal reads are outside captured execution.
+     */
+    void replayFailedEpoch(){
+        requireNative(intent==NativeReplayIntent::FailedEpochReplay && scalarPolicy,"Missing fatal-epoch scalar/native owner");
+        const std::array<std::uint64_t,3> original{31,35,31};
+        auto& oracle=*scalarPolicy;
+        oracle.begin(original);oracle.all<n::OwnerAction::Availability>();
+        const auto receipts=oracle.headers<n::Availability>();oracle.args.input.frontier=receipts.data();
+        oracle.view().frequency_epochs[frequencyFaultCell]=UINT32_MAX;
+        EXPECT_THROW(oracle.run<n::CoordinatorAction::PlanFree>(),std::logic_error);
+        EXPECT_EQ(oracle.view().frame->status,q::adaptive_lookup::Status::Invariant);
+        ASSERT_EQ(oracle.view().policy->logical_clock,2u); // Row31 really completed before the bad row35 cell.
+        const auto& plan=coordinator->plan().parameters();const auto cr=coordinator->roots();
+        const auto& ownerPlan=owner->plan().parameters();const auto oroot=owner->roots();
+        for(std::uint64_t attempt=1;attempt<=2;++attempt){
+            inputTrace(attempt,original);
+            requireNative(RetainedParticipantGraphExecutableFixtureAccess::submit(graphOwner,++submissionOrdinal),"Fatal-epoch retained native replay failed");
+            for(const auto& storage:{oroot,cr})for(const auto& root:{storage.cache,storage.frame,storage.native}){
+                if(root)TransferEngine::publishDeviceWrite(root.get(),device,stream);
+            }
+            TransferEngine::publishDeviceWrite(io.get(),device,stream);
+            const auto state=read<p::LookupFrame>(static_cast<const std::byte*>(cr.frame->gpu_data_ptr()),plan.frame.control,1).front();
+            EXPECT_EQ(state.status,q::adaptive_lookup::Status::Invariant);EXPECT_EQ(state.phase,p::LookupPhase::Availability);
+            EXPECT_EQ(state.ordinal,1u);EXPECT_EQ(state.interval.sequence,1u);EXPECT_FALSE(state.observed);
+            EXPECT_EQ(state.free_planned,0u);EXPECT_EQ(state.outstanding,0u);
+            const auto policy=read<p::CoordinatorPolicyControl>(static_cast<const std::byte*>(cr.cache->gpu_data_ptr()),plan.cache.control,1).front();
+            EXPECT_NE(policy.flags&q::adaptive_lookup::OwnerFailed,0u);
+            const auto counts=read<std::uint16_t>(static_cast<const std::byte*>(cr.cache->gpu_data_ptr()),plan.cache.counts,3*plan.policy.laneWidth());
+            EXPECT_TRUE(std::any_of(counts.begin(),counts.end(),[](auto value){return value!=0;}));
+            const auto headers=read<n::FreePlanHeader>(static_cast<const std::byte*>(cr.native->gpu_data_ptr()),plan.native.free_headers,plan.policy.participants());
+            const auto slices=read<n::DirectedSlice>(static_cast<const std::byte*>(cr.native->gpu_data_ptr()),plan.native.free_slices,plan.policy.participants());
+            for(unsigned ownerIndex=0;ownerIndex<headers.size();++ownerIndex){
+                EXPECT_EQ(headers[ownerIndex].version,n::Version);EXPECT_EQ(headers[ownerIndex].status,q::adaptive_lookup::Status::Invariant);
+                const auto expected=receipts[ownerIndex].lease;
+                EXPECT_EQ(headers[ownerIndex].lease.owner,expected.owner);
+                EXPECT_EQ(headers[ownerIndex].lease.free_slots,expected.free_slots);
+                EXPECT_EQ(headers[ownerIndex].lease.interval.table,expected.interval.table);
+                EXPECT_EQ(headers[ownerIndex].lease.interval.admission,expected.interval.admission);
+                EXPECT_EQ(headers[ownerIndex].lease.interval.sequence,expected.interval.sequence);
+                EXPECT_EQ(headers[ownerIndex].decision_bytes,0u);EXPECT_EQ(slices[ownerIndex].live_bytes,0u);
+                EXPECT_EQ(slices[ownerIndex].byte_offset,plan.frame.decisions);
+            }
+            const auto delivered=read<n::FreePlanHeader>(static_cast<const std::byte*>(io->gpu_data_ptr()),ioOffsets.header,1).front();
+            EXPECT_EQ(delivered.status,q::adaptive_lookup::Status::Invariant);EXPECT_EQ(delivered.decision_bytes,0u);
+            EXPECT_EQ(delivered.lease.interval.sequence,1u);EXPECT_EQ(delivered.version,n::Version);
+            EXPECT_EQ(read<std::uint64_t>(static_cast<const std::byte*>(io->gpu_data_ptr()),ioOffsets.record_bytes,1).front(),0u);
+            const auto ownerFrame=read<p::OwnerFrame>(static_cast<const std::byte*>(oroot.frame->gpu_data_ptr()),ownerPlan.frame.control,1).front();
+            EXPECT_EQ(ownerFrame.status,q::adaptive_lookup::Status::Invariant);
+            EXPECT_EQ(ownerFrame.held_pins,0u);EXPECT_EQ(ownerFrame.reservations,0u);
+            const auto allocation=read<p::AllocationFrame>(static_cast<const std::byte*>(oroot.frame->gpu_data_ptr()),ownerPlan.frame.allocation_control,1).front();
+            EXPECT_EQ(allocation.phase,p::AllocationPhase::Leased);EXPECT_EQ(allocation.count,0u);
+            const auto physical=read<p::PhysicalOwnerControl>(static_cast<const std::byte*>(oroot.cache->gpu_data_ptr()),ownerPlan.cache.control,1).front();
+            EXPECT_EQ(physical.filled,0u);EXPECT_EQ(physical.next_slot_generation,0u);
+            EXPECT_EQ(identity,coordinator->captureIdentity());
+        }
+        EXPECT_THROW(code->initialize(*coordinator,stream),std::logic_error);
+        std::cout<<"POOLED_NATIVE_FAILED_EPOCH actual_algorithm="<<((code->codeIdentity()>>32)&0xffU)
+            <<" original_scalar_late_clock=2 fresh_compact_error_headers=1 failed_replay_rejected=1 rollback_required=0\n";
+    }
+    /**
+     * @brief Replay the exact zero-capacity cancellation transaction through original scalar operations.
+     * @param original Same recorded input order submitted to the native transaction.
+     * @note This is a no-source protocol control, never a cold RAM/SSD or cache-hit timing claim.
+     */
+    void advanceZeroCapacityScalarPolicy(std::span<const std::uint64_t> original){
+        requireNative(slots==0 && mode==RecordedTrace::PlanCancellation,
+            "Zero-capacity scalar timing control received a foreign source/owner mode");
+        auto& oracle=*scalarPolicy;
+        oracle.begin(original,1);
+        oracle.all<n::OwnerAction::Availability>();
+        const auto available=oracle.headers<n::Availability>();
+        oracle.args.input.frontier=available.data();
+        oracle.run<n::CoordinatorAction::PlanFree>();
+        oracle.args.input={};
+        oracle.all<n::OwnerAction::CancelFree>();
+        const auto cancelled=oracle.headers<p::FreeAllocationReceipt>();
+        oracle.args.input.frontier=cancelled.data();
+        oracle.run<n::CoordinatorAction::CompleteFree>();
+        oracle.args.input={};
+        oracle.all<n::OwnerAction::Release>();
+        oracle.all<n::OwnerAction::Retire>();
+        const n::SourceFrontier source{oracle.view().frame->interval,{},n::SourceDisposition::Unpublished,
+            q::adaptive_lookup::Status::Success,n::Version};
+        oracle.args.input.source=&source;
+        oracle.run<n::CoordinatorAction::Cancel>();
+        oracle.args.input={};
+        const auto retired=oracle.headers<p::RetiredHeader>();
+        oracle.args.input.frontier=retired.data();
+        oracle.run<n::CoordinatorAction::Finish>();
+        oracle.args.input={};
+    }
+    /**
+     * @brief Compare complete terminal policy cells and real accepted free/victim plans with independent scalar replay.
+     *
+     * All reads occur after the retained transaction terminal, outside its timed
+     * interval. They never select a branch, repair device state or upload the
+     * oracle. Directory/radix/queue fields, including unoccupied canonical
+     * metadata, are test outputs needed for exact later-victim policy proof.
+     */
+    void compareScalarPolicy(){
+        auto expected=scalarPolicy->view();
+        const auto& plan=coordinator->plan().parameters();
+        const auto* frame=static_cast<const std::byte*>(coordinator->roots().frame->gpu_data_ptr());
+        if(!plan.policy.entries()){
+            EXPECT_EQ(expected.policy,nullptr);
+            const auto actual=read<p::LookupFrame>(frame,plan.frame.control,1).front();
+            // Compare the complete typed state, rather than depending on
+            // host/device object padding being initialized identically.
+            const auto& reference=*expected.frame;
+            EXPECT_EQ(actual.interval.table,reference.interval.table);
+            EXPECT_EQ(actual.interval.admission,reference.interval.admission);
+            EXPECT_EQ(actual.interval.sequence,reference.interval.sequence);
+            EXPECT_EQ(actual.source.table,reference.source.table);
+            EXPECT_EQ(actual.source.generation,reference.source.generation);
+            EXPECT_EQ(actual.source.sequence,reference.source.sequence);
+            EXPECT_EQ(actual.ordinal,reference.ordinal);
+            EXPECT_EQ(actual.command_ordinal,reference.command_ordinal);
+            EXPECT_EQ(actual.source_storage_generation,reference.source_storage_generation);
+            EXPECT_EQ(actual.initial_clock,reference.initial_clock);
+            EXPECT_EQ(actual.phase,reference.phase);
+            EXPECT_EQ(actual.status,reference.status);
+            EXPECT_EQ(actual.original_ids,reference.original_ids);
+            EXPECT_EQ(actual.unique_rows,reference.unique_rows);
+            EXPECT_EQ(actual.outstanding,reference.outstanding);
+            EXPECT_EQ(actual.free_planned,reference.free_planned);
+            EXPECT_EQ(actual.victim_planned,reference.victim_planned);
+            for(unsigned list=0;list<3;++list)EXPECT_EQ(actual.eligible_cursor[list],reference.eligible_cursor[list]);
+            EXPECT_EQ(actual.purpose,reference.purpose);
+            EXPECT_EQ(actual.observed,reference.observed);
+            EXPECT_EQ(actual.queues_applied,reference.queues_applied);
+            EXPECT_EQ(actual.free_exhausted,reference.free_exhausted);
+            EXPECT_EQ(actual.cancelled_completion,reference.cancelled_completion);
+            return;
+        }
+        const auto* cache=static_cast<const std::byte*>(coordinator->roots().cache->gpu_data_ptr());
+        const auto actual=read<p::CoordinatorPolicyControl>(cache,plan.cache.control,1).front();
+        EXPECT_EQ(actual.logical_clock,expected.policy->logical_clock);
+        EXPECT_EQ(actual.directory_root,expected.policy->directory_root);
+        EXPECT_EQ(actual.node_free,expected.policy->node_free);
+        EXPECT_EQ(actual.protected_count,expected.policy->protected_count);
+        EXPECT_EQ(actual.flags,expected.policy->flags);
+        EXPECT_EQ(actual.aging_accesses,expected.policy->aging_accesses);
+        EXPECT_EQ(actual.lane_width,expected.policy->lane_width);
+        EXPECT_EQ(actual.protected_limit,expected.policy->protected_limit);
+        for(unsigned list=0;list<3;++list){
+            EXPECT_EQ(actual.head[list],expected.policy->head[list]);
+            EXPECT_EQ(actual.tail[list],expected.policy->tail[list]);
+        }
+        const auto cells=std::size_t{4}*plan.policy.laneWidth();
+        const auto epochs=read<std::uint32_t>(cache,plan.cache.epochs,cells);
+        const auto counts=read<std::uint16_t>(cache,plan.cache.counts,cells);
+        EXPECT_TRUE(std::equal(epochs.begin(),epochs.end(),expected.frequency_epochs));
+        EXPECT_TRUE(std::equal(counts.begin(),counts.end(),expected.frequency_counts));
+        EXPECT_LT(plan.policy.laneWidth(),7u); // Seven distinct recorded rows force collisions in every lane.
+        if(actual.aging_accesses==17 && actual.logical_clock>17){
+            EXPECT_TRUE(std::any_of(epochs.begin(),epochs.end(),[](auto epoch){return epoch>0;}));
+        }
+        if(actual.aging_accesses==(1ull<<32) && actual.logical_clock>65535){
+            EXPECT_TRUE(std::any_of(counts.begin(),counts.end(),[](auto count){return count==65535;}));
+        }
+        const auto entries=read<p::DirectoryEntry>(cache,plan.cache.entries,plan.policy.entries());
+        for(std::size_t i=0;i<entries.size();++i){
+            const auto& a=entries[i];const auto& b=expected.entries[i];
+            EXPECT_EQ(a.locator.row,b.locator.row);EXPECT_EQ(a.locator.generation,b.locator.generation);
+            EXPECT_EQ(a.locator.owner,b.locator.owner);EXPECT_EQ(a.locator.slot,b.locator.slot);
+            EXPECT_EQ(a.touched,b.touched);EXPECT_EQ(a.observed_frame,b.observed_frame);
+            EXPECT_EQ(a.previous,b.previous);EXPECT_EQ(a.next,b.next);
+            EXPECT_EQ(a.stream,b.stream);EXPECT_EQ(a.present,b.present);
+        }
+        const auto nodes=read<q::adaptive_lookup::RadixNode>(cache,plan.cache.nodes,plan.policy.entries()-1);
+        for(std::size_t i=0;i<nodes.size();++i){
+            EXPECT_EQ(nodes[i].child[0],expected.nodes[i].child[0]);
+            EXPECT_EQ(nodes[i].child[1],expected.nodes[i].child[1]);
+            EXPECT_EQ(nodes[i].split_bit,expected.nodes[i].split_bit);
+        }
+        const auto state=read<p::LookupFrame>(frame,plan.frame.control,1).front();
+        EXPECT_EQ(state.free_planned,expected.frame->free_planned);
+        EXPECT_EQ(state.victim_planned,expected.frame->victim_planned);
+        const auto decisions=std::size_t{state.free_planned}+state.victim_planned;
+        const auto actualDecisions=read<p::AllocationDecision>(frame,plan.frame.decisions,decisions);
+        const auto& ownerPlan=owner->plan().parameters();
+        const auto* ownerFrame=static_cast<const std::byte*>(owner->roots().frame->gpu_data_ptr());
+        const auto accepted=read<p::AllocationDecision>(ownerFrame,ownerPlan.frame.accepted_plan,decisions);
+        for(std::size_t i=0;i<decisions;++i){
+            const auto& b=expected.decisions[i];
+            for(const auto* a:{&actualDecisions[i],&accepted[i]}){
+                EXPECT_EQ(a->row,b.row);EXPECT_EQ(a->unique,b.unique);EXPECT_EQ(a->kind,b.kind);
+                EXPECT_EQ(a->victim.row,b.victim.row);EXPECT_EQ(a->victim.generation,b.victim.generation);
+                EXPECT_EQ(a->victim.owner,b.victim.owner);EXPECT_EQ(a->victim.slot,b.victim.slot);
+                EXPECT_EQ(a->ordinal.value,b.ordinal.value);
+            }
+        }
+        // Repeated/mixed requests make this frame's frequency/queue state
+        // determine the next real native victim, beyond payload correctness.
+        const auto ownerPlans=read<p::CoordinatorOwnerPlan>(frame,plan.frame.owner_plans,plan.policy.participants());
+        for(std::size_t i=0;i<ownerPlans.size();++i){
+            const auto& a=ownerPlans[i];const auto& b=expected.owner_plans[i];
+            EXPECT_EQ(a.free_count,b.free_count);EXPECT_EQ(a.victim_count,b.victim_count);
+            EXPECT_EQ(a.free_received,b.free_received);EXPECT_EQ(a.victim_received,b.victim_received);
+            EXPECT_EQ(a.free_offset,b.free_offset);EXPECT_EQ(a.victim_offset,b.victim_offset);
+        }
+    }
+    std::unique_ptr<pooled_scalar_replay::Pool> scalarPolicy; ///< Independent host oracle; never a device state mirror.
     DeviceId device;IWorkerGPUContext& worker;IBackend* backend;void* stream;std::uint32_t maximum,slots;
     std::shared_ptr<PhysicalMemoryAuthority> memory;
     PhysicalMemoryAllocationLease gpuInputs,hostInputs,sourceGPU,sourceHost;
@@ -407,6 +718,7 @@ public:
     bool materialized=false;
     std::shared_ptr<RetainedParticipantGraphExecutable> graphOwner;
     std::uint64_t submissionOrdinal=0;
+    std::uint32_t frequencyFaultCell=q::adaptive_lookup::None; ///< Exact independent scalar-authored last-lane fault cell.
     std::shared_ptr<q::PooledImmutableOwnerPreparedStorage> owner;
     std::shared_ptr<q::PooledImmutableCoordinatorPreparedStorage> coordinator;
     std::shared_ptr<TensorBase> ids,count,trace,source,io,output;
@@ -414,6 +726,7 @@ public:
     f::IO ioOffsets;
     RecordedTrace mode;
     n::OriginalIdWidth originalWidth;
+    NativeReplayIntent intent;
     BufferArena arena;
     std::shared_ptr<const q::IPooledImmutableNativeKernels> code;
     std::unique_ptr<IDeviceContext> context;
@@ -445,6 +758,24 @@ void nativeReplay(DeviceId device){
         const bool inspected=replay.graph->inspectKernelNodes(nodes,&detail);
         requireNative(inspected,detail.c_str());
         EXPECT_EQ(nodes.size(),(maximum<=512?16u:63u)+(slots?1u:0u));
+        const bool hasFrequency=replay.coordinator->plan().parameters().policy.entries()!=0;
+        const auto action=std::to_string(static_cast<std::uint32_t>(n::CoordinatorAction::PlanFree));
+        const auto mangledAction="CoordinatorActionE"+action+"E";
+        const auto demangledAction="CoordinatorAction)"+action+">";
+        unsigned planFreeNodes=0;
+        for(const auto& node:nodes){
+            const bool fourLane=node.name.find("coordinatorPlanFree")!=std::string::npos;
+            const bool scalar=node.name.find("coordinatorPhase")!=std::string::npos &&
+                (node.name.find(mangledAction)!=std::string::npos ||
+                 node.name.find(demangledAction)!=std::string::npos ||
+                 node.name.find("CoordinatorAction::PlanFree")!=std::string::npos);
+            if(!fourLane && !scalar)continue;
+            ++planFreeNodes;
+            EXPECT_EQ(fourLane,hasFrequency);
+            EXPECT_EQ(node.grid_x,1u);EXPECT_EQ(node.grid_y,1u);EXPECT_EQ(node.grid_z,1u);
+            EXPECT_EQ(node.block_x,hasFrequency?4u:1u);EXPECT_EQ(node.block_y,1u);EXPECT_EQ(node.block_z,1u);
+        }
+        EXPECT_EQ(planFreeNodes,1u);
         for(const auto& node:nodes){requireNative(node.valid(),"Native diagnostic kernel resource inventory incomplete");
             std::cout<<"POOLED_NATIVE_NODE name="<<node.name<<" threads="<<node.block_x<<" registers="<<node.registers_per_thread<<" local_bytes="<<node.local_memory_bytes_per_thread<<" shared_bytes="<<node.static_shared_memory_bytes+node.dynamic_shared_memory_bytes<<" active_blocks_per_sm="<<node.max_active_blocks_per_sm<<'\n';}
         std::cout<<"POOLED_NATIVE_REPLAY maximum_original="<<maximum<<" unique=3 owner_slots="<<slots<<" graph_nodes="<<nodes.size()<<" serving=unqualified source_transport=decoded_fixture\n";
@@ -479,28 +810,53 @@ void narrowBoundaryReplay(DeviceId device){
     }
     session->requirePayloadRetired();session->retire();
 }
-/** @brief Actual admitted original rows and ACKs drive successful free+victim, Ready, reader and retained-hit frames. */
-void successfulNativeReplay(DeviceId device){
+/**
+ * @brief Actual admitted original rows and ACKs drive successful free+victim, Ready, reader and retained-hit frames.
+ * @param device Original explicitly requested CUDA or ROCm participant.
+ * @param policyProof Add the complete scalar policy witness and pressure/aging/saturation trace.
+ */
+void successfulNativeReplay(DeviceId device,bool policyProof=false){
     auto* backend=getBackendFor(device);requireNative(backend && backend->deviceCount()>device.ordinal,"Explicit pooled successful native backend unavailable");
     if(!hasCPUBackend())initCPUBackend(-1);
     auto session=PreparedNativeLookupFixture::prepare(std::array{device});
     auto& worker=*session->permit(device).worker();
     PhysicalMemoryPlanBuilder plan;
-    for(const auto maximum:{32u,32768u})for(const auto width:{n::OriginalIdWidth::UInt32,n::OriginalIdWidth::UInt64}){
-        NativeReplay declaration(device,*session,maximum,4,RecordedTrace::SuccessfulSource,width,true);
+    const std::vector<std::uint64_t> periods=policyProof?std::vector<std::uint64_t>{17,1ull<<32}:std::vector<std::uint64_t>{65536};
+    const std::vector<n::OriginalIdWidth> widths=policyProof?std::vector{n::OriginalIdWidth::UInt64}:
+        std::vector{n::OriginalIdWidth::UInt32,n::OriginalIdWidth::UInt64};
+    for(const auto maximum:{32u,32768u})for(const auto width:widths)for(const auto aging:periods){
+        NativeReplay declaration(device,*session,maximum,4,RecordedTrace::SuccessfulSource,width,true,policyProof,aging);
         for(const auto& row:declaration.declaration().resources())plan.add(row);
     }
     session->admit(plan.build());
-    for(const auto maximum:{32u,32768u})for(const auto width:{n::OriginalIdWidth::UInt32,n::OriginalIdWidth::UInt64}){
-        NativeReplay replay(device,*session,maximum,4,RecordedTrace::SuccessfulSource,width);
+    for(const auto maximum:{32u,32768u})for(const auto width:widths)for(const auto aging:periods){
+        NativeReplay replay(device,*session,maximum,4,RecordedTrace::SuccessfulSource,width,false,policyProof,aging);
         worker.submitAndWait([&]{
         std::vector<std::uint64_t> original(maximum,900);original[0]=700;original[1]=701;
         replay.replay(1,std::array<std::uint64_t,2>{101,102});replay.replay(2,original);replay.replay(3,std::array<std::uint64_t,1>{900});replay.replay(4,{});replay.replay(5,original);
+        if(policyProof){
+            replay.replay(6,original);
+            std::vector<std::uint64_t> pressure(maximum);
+            for(std::size_t i=0;i<pressure.size();++i)pressure[i]=901+i%2;
+            pressure[0]=900;
+            replay.replay(7,pressure);
+            replay.replay(8,pressure);
+        }
         // Resource inspection follows all unprofiled timing records; source/diagnostic kernels have their own class.
         std::vector<GPUGraphKernelNodeInfo> nodes;std::string detail;
         const bool inspected=replay.graph->inspectKernelNodes(nodes,&detail);
         requireNative(inspected,detail.c_str());
         EXPECT_EQ(nodes.size(),maximum<=512?47u:76u);
+        if(policyProof){
+            const auto writers=std::count_if(nodes.begin(),nodes.end(),[](const auto& node){
+                return node.name.find("coordinatorPlanFree")!=std::string::npos &&
+                    node.grid_x==1 && node.grid_y==1 && node.grid_z==1 &&
+                    node.block_x==4 && node.block_y==1 && node.block_z==1;
+            });
+            EXPECT_EQ(writers,1);
+            EXPECT_EQ((replay.code->codeIdentity()>>25)&0x7fU,4u);
+            EXPECT_EQ((replay.code->codeIdentity()>>32)&0xffU,6u);
+        }
         for(const auto& node:nodes){requireNative(node.valid(),"Native successful kernel resource inventory incomplete");
             const std::array coordinatorNames{"coordinator","Original","radix","coalesceSmall","seedKeys","markGroups","scanGroups","materializeGroups","materializeUnique"};
             const auto scope=node.name.find("pooled_source_fixture")!=std::string::npos?"diagnostic_source":
@@ -511,13 +867,234 @@ void successfulNativeReplay(DeviceId device){
     }
     session->requirePayloadRetired();session->retire();
 }
+/** @brief Capture the production failure frontier with one original prepared owner/session.
+ * @param device Explicit CUDA/ROCm participant; absent hardware is a hard native test failure.
+ * @note The test accepts actual original-scalar scheduling for its control; v5 must fail stale-header assertions.
+ */
+void failedEpochNativeReplay(DeviceId device){
+    auto* backend=getBackendFor(device);
+    requireNative(backend && backend->deviceCount()>device.ordinal,"Explicit fatal-epoch replay backend unavailable");
+    if(!hasCPUBackend())initCPUBackend(-1);
+    auto session=PreparedNativeLookupFixture::prepare(std::array{device});
+    auto& worker=*session->permit(device).worker();
+    PhysicalMemoryPlanBuilder plan;
+    NativeReplay declaration(device,*session,32,4,RecordedTrace::SuccessfulSource,n::OriginalIdWidth::UInt64,true,true,17,NativeReplayIntent::FailedEpochReplay);
+    for(const auto& row:declaration.declaration().resources())plan.add(row);
+    session->admit(plan.build());
+    {
+        NativeReplay replay(device,*session,32,4,RecordedTrace::SuccessfulSource,n::OriginalIdWidth::UInt64,false,true,17,NativeReplayIntent::FailedEpochReplay);
+        worker.submitAndWait([&]{replay.replayFailedEpoch();});
+    }
+    session->requirePayloadRetired();session->retire();
+}
+/** @brief Distinct request histories retain their authored arithmetic policy and source scope. */
+enum class TransactionTimingHistory {WarmRepeat,WarmInterleaved,ChangingPressure,ZeroCapacity};
+/** @brief One exact opt-in timing cell; no code identity or production dispatch is selected here. */
+struct TransactionTimingCase {
+    std::uint32_t live_ids;
+    TransactionTimingHistory history;
+    /** @return Exact physical query bound; empty work still retains its declared control graph. */
+    std::uint32_t maximum()const{return live_ids?live_ids:16;}
+    /** @return Original physical owner capacity; C0 is an explicit no-source cancellation control. */
+    std::uint32_t slots()const{return history==TransactionTimingHistory::ZeroCapacity?0:4;}
+    /** @return Authored policy: pressure controls age every original observation to admit actual changing cold rows. */
+    std::uint64_t aging()const{return history==TransactionTimingHistory::ChangingPressure?1:65536;}
+    /** @return Existing complete source/owner transaction used by this cell. */
+    RecordedTrace trace()const{return slots()?RecordedTrace::SuccessfulSource:RecordedTrace::PlanCancellation;}
+    /** @return Stable literal metadata name; it never changes actual native code identity. */
+    const char* name()const{
+        switch(history){
+        case TransactionTimingHistory::WarmRepeat:return live_ids?"warm_repeat":"empty_positive_capacity";
+        case TransactionTimingHistory::WarmInterleaved:return "warm_interleaved";
+        case TransactionTimingHistory::ChangingPressure:return "changing_hot_cold_pressure_aging1";
+        case TransactionTimingHistory::ZeroCapacity:return live_ids?"zero_capacity_no_source_plan_cancel":"empty_zero_capacity_plan_cancel";
+        }
+        throw std::logic_error("Unknown transaction timing history");
+    }
+};
+/**
+ * @brief Author the exact first successful-source conditioning input already certified by NativeReplay.
+ * @param count Actual positive original-ID count.
+ * @return Original [700,701,900,...] ordering, including its duplicate observations.
+ */
+std::vector<std::uint64_t> timingWarmRows(std::uint32_t count){
+    std::vector<std::uint64_t> rows(count,900);
+    if(count>0)rows[0]=700;
+    if(count>1)rows[1]=701;
+    return rows;
+}
+/**
+ * @brief Author consumed current inputs; these are diagnostic histories rather than inferred model ngrams.
+ * @param cell Exact declared capacity/policy/history cell.
+ * @param ordinal Original zero-based history position, continuing across warmups and measurements.
+ * @return Exactly cell.live_ids rows; no padding is a live work item.
+ */
+std::vector<std::uint64_t> timingRows(const TransactionTimingCase& cell,std::uint32_t ordinal){
+    if(cell.history==TransactionTimingHistory::WarmRepeat)return timingWarmRows(cell.live_ids);
+    if(cell.history==TransactionTimingHistory::WarmInterleaved){
+        constexpr std::array<std::uint64_t,3> hot{700,701,900};
+        std::vector<std::uint64_t> rows(cell.live_ids);
+        for(std::size_t i=0;i<rows.size();++i)rows[i]=hot[i%hot.size()];
+        return rows;
+    }
+    std::vector<std::uint64_t> rows(cell.live_ids,901+ordinal%4);
+    if(!rows.empty())rows[0]=900; // This genuine retained hot row stays pinned while cold/pressure rows rotate.
+    return rows;
+}
+/**
+ * @brief Preserve every original input through compact typed run records, without hashes or omitted observations.
+ * @param rows Exact ordered consumed request inputs.
+ * @return [row,positive-repeat-count] records covering every original position.
+ */
+nlohmann::json timingInputRuns(std::span<const std::uint64_t> rows){
+    auto result=nlohmann::json::array();
+    for(std::size_t first=0;first<rows.size();){
+        auto end=first+1;
+        while(end<rows.size() && rows[end]==rows[first])++end;
+        result.push_back({rows[first],end-first});
+        first=end;
+    }
+    return result;
+}
+/**
+ * @brief Collect opt-in complete transaction intervals through the actual production native owner.
+ * @param device Explicit CUDA or ROCm participant; unavailable hardware fails rather than skips.
+ * @param selected Optional isolated WarmInterleaved/N7168 cell; absent preserves the complete 26-cell trajectory.
+ * @note Generic timing reports its actual bundle identity and accepts coherent original-scheduling/current-common-arithmetic
+ *       and candidate builds. The separate four-lane geometry regression remains identity-specific.
+ */
+void transactionTiming31(DeviceId device,std::optional<TransactionTimingCase> selected=std::nullopt){
+    constexpr unsigned warmups=5,samples=31,conditioning=2;
+    auto* backend=getBackendFor(device);
+    requireNative(backend && backend->deviceCount()>device.ordinal,"Explicit native transaction timing backend unavailable");
+    if(!hasCPUBackend())initCPUBackend(-1);
+    std::vector<TransactionTimingCase> cells;
+    if(selected){
+        requireNative(selected->live_ids==7168 && selected->history==TransactionTimingHistory::WarmInterleaved,
+            "Isolated native profiling requires the authored WarmInterleaved/N7168 cell");
+        cells.push_back(*selected);
+    }else{
+        for(const auto n:{16u,32u,48u,64u,1024u,7168u}){
+            cells.push_back({n,TransactionTimingHistory::WarmRepeat});
+            cells.push_back({n,TransactionTimingHistory::WarmInterleaved});
+            cells.push_back({n,TransactionTimingHistory::ChangingPressure});
+            cells.push_back({n,TransactionTimingHistory::ZeroCapacity});
+        }
+        cells.push_back({0,TransactionTimingHistory::WarmRepeat});
+        cells.push_back({0,TransactionTimingHistory::ZeroCapacity});
+    }
+    // The process root admits one original source/worker authority. Each
+    // independently initialized cell owns a sequential payload/graph lifetime
+    // under that same session, as in successfulNativeReplay above.
+    auto session=PreparedNativeLookupFixture::prepare(std::array{device});
+    auto& worker=*session->permit(device).worker();
+    PhysicalMemoryPlanBuilder plan;
+    for(const auto cell:cells){
+        NativeReplay declaration(device,*session,cell.maximum(),cell.slots(),cell.trace(),n::OriginalIdWidth::UInt64,
+            true,true,cell.aging(),NativeReplayIntent::TransactionTiming);
+        for(const auto& resource:declaration.declaration().resources())plan.add(resource);
+    }
+    session->admit(plan.build());
+    for(const auto cell:cells){
+        {
+            NativeReplay replay(device,*session,cell.maximum(),cell.slots(),cell.trace(),n::OriginalIdWidth::UInt64,
+                false,true,cell.aging(),NativeReplayIntent::TransactionTiming);
+            worker.submitAndWait([&]{
+                std::vector<GPUGraphKernelNodeInfo> kernels;
+                std::string detail;
+                const bool inspected=replay.graph->inspectKernelNodes(kernels,&detail);
+                requireNative(inspected,detail.c_str());
+                auto manifest=nlohmann::json::array();
+                for(const auto& kernel:kernels){
+                    requireNative(kernel.valid(),"Transaction timing has incomplete actual native kernel metadata");
+                    manifest.push_back({{"name",kernel.name},{"function_identity",kernel.function_identity},
+                        {"grid",{kernel.grid_x,kernel.grid_y,kernel.grid_z}},
+                        {"block",{kernel.block_x,kernel.block_y,kernel.block_z}},
+                        {"registers_per_thread",kernel.registers_per_thread},
+                        {"local_memory_bytes_per_thread",kernel.local_memory_bytes_per_thread},
+                        {"static_shared_memory_bytes",kernel.static_shared_memory_bytes},
+                        {"dynamic_shared_memory_bytes",kernel.dynamic_shared_memory_bytes},
+                        {"max_active_blocks_per_sm",kernel.max_active_blocks_per_sm}});
+                }
+                const nlohmann::json metadata{{"schema","qfn.native_transaction_timing.v1"},{"case",cell.name()},
+                    {"device",device.toString()},{"target_live_ids",cell.live_ids},{"maximum_original",cell.maximum()},
+                    {"owner_slots",cell.slots()},{"aging_accesses",cell.aging()},{"warmups",warmups},{"measurements",samples},
+                    {"conditioning_requests",conditioning},{"matrix_cells",cells.size()},
+                    {"initial_state","fresh original owner/coordinator metadata; no policy upload or reset"},
+                    {"source_lifetime","one original prepared session admitted for the complete timing matrix"},
+                    {"actual_code_identity",replay.code->codeIdentity()},{"actual_native_algorithm",(replay.code->codeIdentity()>>32)&0xffU},
+                    {"encoded_planfree_lane_field",(replay.code->codeIdentity()>>25)&0x7fU},
+                    {"actual_capture_identity",replay.coordinator->captureIdentity()},{"kernel_manifest",manifest},
+                    {"source_scope",cell.slots()?"admitted diagnostic IQ4_NL rows, not RAM/SSD transport":"no-source C0 planned-cancellation protocol"},
+                    {"timer_scope","complete retained native transaction event interval; not isolated PlanFree"},
+                    {"scalar_reference","original serial-position observations; terminal checks outside event interval"},
+                    {"full_path_launch_economy_qualified",false}};
+                std::cout<<"POOLED_NATIVE_TRANSACTION_METADATA "<<metadata.dump()<<'\n';
+                std::uint64_t sequence=0;
+                auto observe=[&](const char* phase,unsigned index,std::span<const std::uint64_t> rows){
+                    NativeTransactionEventSample event;
+                    replay.replay(++sequence,rows,&event);
+                    requireNative(event.valid,"Transaction timing scalar/terminal checks failed; no valid sample was published");
+                    if(cell.history==TransactionTimingHistory::WarmInterleaved && sequence>conditioning){
+                        requireNative(event.unique_rows==3 && event.initial_hit_rows==3 && event.source_rows==0,
+                            "Warm-interleaved timing requires all three actual retained hot rows and no source fetch");
+                    }
+                    const auto admission=cell.slots() && sequence>=3?2u:1u;
+                    const nlohmann::json record{{"schema","qfn.native_transaction_timing.v1"},{"case",cell.name()},
+                        {"device",device.toString()},{"target_live_ids",cell.live_ids},{"owner_slots",cell.slots()},
+                        {"aging_accesses",cell.aging()},{"actual_code_identity",replay.code->codeIdentity()},
+                        {"phase",phase},{"index",index},{"sequence",sequence},{"admission",admission},
+                        {"actual_live_ids",rows.size()},{"input_runs",timingInputRuns(rows)},
+                        {"event_ms",event.elapsed_ms},{"event_us",double(event.elapsed_ms)*1000.0},
+                        {"initial_hit_unique_rows",event.initial_hit_rows},{"completed_unique_rows",event.unique_rows},
+                        {"free_planned_rows",event.free_rows},{"victim_planned_rows",event.victim_rows},
+                        {"source_rows",event.source_rows},{"source_native_bytes",event.source_native_bytes},
+                        {"scalar_and_terminal_checks_passed",true},{"timer_scope","complete retained native transaction"}};
+                    std::cout<<"POOLED_NATIVE_TRANSACTION_SAMPLE "<<record.dump()<<'\n';
+                    return event.elapsed_ms;
+                };
+                observe("conditioning",0,std::array<std::uint64_t,2>{101,102});
+                const auto seed=timingWarmRows(cell.maximum());
+                observe("conditioning",1,seed);
+                for(unsigned index=0;index<warmups;++index){
+                    const auto rows=timingRows(cell,index);
+                    observe("warmup",index,rows);
+                }
+                std::vector<float> raw;raw.reserve(samples);
+                for(unsigned index=0;index<samples;++index){
+                    const auto rows=timingRows(cell,warmups+index);
+                    raw.push_back(observe("measurement",index,rows));
+                }
+                requireNative(raw.size()==samples,"Transaction timing raw sample count is incomplete");
+                const nlohmann::json complete{{"schema","qfn.native_transaction_timing.v1"},{"case",cell.name()},
+                    {"device",device.toString()},{"target_live_ids",cell.live_ids},{"owner_slots",cell.slots()},
+                    {"actual_code_identity",replay.code->codeIdentity()},{"actual_capture_identity",replay.coordinator->captureIdentity()},
+                    {"completed_measurements",raw.size()},{"raw_event_ms",raw},{"no_recapture",true},
+                    {"lookup_leaf_latency_measured",false},{"profile_qualification",false}};
+                std::cout<<"POOLED_NATIVE_TRANSACTION_COMPLETE "<<complete.dump()<<'\n';
+            });
+        }
+    }
+    session->requirePayloadRetired();
+    session->retire();
+}
+
 }
 #ifdef HAVE_CUDA
+TEST(PooledImmutableNativeDevice,DISABLED_CUDAActualIdentityTransactionTiming31){transactionTiming31(DeviceId::cuda(0));}
+TEST(PooledImmutableNativeDevice,CUDAPlanFreeFailedEpochCapturedReplay){failedEpochNativeReplay(DeviceId::cuda(0));}
+TEST(PooledImmutableNativeDevice,CUDAFourFrequencyLanePolicyCapturedReplay){successfulNativeReplay(DeviceId::cuda(0),true);}
 TEST(PooledImmutableNativeDevice,CUDAUInt32DispatchBoundaryReplay){narrowBoundaryReplay(DeviceId::cuda(0));}
 TEST(PooledImmutableNativeDevice,CUDACapturedSuccessfulSourceReplay){successfulNativeReplay(DeviceId::cuda(0));}
 TEST(PooledImmutableNativeDevice,CUDACapturedPlanCancelLargeSmallEmptyReplay){nativeReplay(DeviceId::cuda(0));}
 #endif
 #ifdef HAVE_ROCM
+TEST(PooledImmutableNativeDevice,DISABLED_ROCmActualIdentityTransactionTiming31){transactionTiming31(DeviceId::rocm(0));}
+TEST(PooledImmutableNativeDevice,DISABLED_ROCmWarmInterleaved7168TransactionTiming31){
+    transactionTiming31(DeviceId::rocm(0),TransactionTimingCase{7168,TransactionTimingHistory::WarmInterleaved});
+}
+TEST(PooledImmutableNativeDevice,ROCmPlanFreeFailedEpochCapturedReplay){failedEpochNativeReplay(DeviceId::rocm(0));}
+TEST(PooledImmutableNativeDevice,ROCmFourFrequencyLanePolicyCapturedReplay){successfulNativeReplay(DeviceId::rocm(0),true);}
 TEST(PooledImmutableNativeDevice,ROCmUInt32DispatchBoundaryReplay){narrowBoundaryReplay(DeviceId::rocm(0));}
 TEST(PooledImmutableNativeDevice,ROCmCapturedSuccessfulSourceReplay){successfulNativeReplay(DeviceId::rocm(0));}
 TEST(PooledImmutableNativeDevice,ROCmCapturedPlanCancelLargeSmallEmptyReplay){nativeReplay(DeviceId::rocm(0));}

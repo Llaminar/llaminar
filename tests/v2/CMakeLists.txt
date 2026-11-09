@@ -891,6 +891,9 @@ add_executable(v2_test_qwen4exp_primitives
     unit/loaders/Test__ImmutableRowTableNUMA.cpp
 )
 target_link_libraries(v2_test_qwen4exp_primitives PRIVATE llaminar2_core GTest::gtest_main)
+# This original owner also builds independently in selected Release mode,
+# where the ordinary all-Unit target setup does not supply fixture includes.
+target_include_directories(v2_test_qwen4exp_primitives PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_v2_test(V2_Unit_Qwen4ExpPrimitives
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
     LABELS "V2;Unit;Qwen4Exp;Kernels;Loaders"
@@ -37634,6 +37637,13 @@ if(TARGET v2_test_qwen4exp_primitives)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledImmutableNativePhaseReplay)
+    add_v2_test(V2_Integration_PooledImmutableFourFrequencyLaneReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableNative.ParallelStableRunsMatchEveryScalarFrequencyCellAcrossAgingSaturationAndCollisions:PooledImmutableNative.FourIndependentFrequencyLanes*:PooledImmutableNative.MalformedRunPartitionRejectsBeforeAnyFrequencyCellOrClockMutation
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledImmutableFourFrequencyLaneReplay)
 endif()
 # Explicit native gates execute captured production phase callers; no source/transport eligibility is implied.
 if((HAVE_CUDA OR HAVE_ROCM) AND TARGET v2_test_qwen4exp_device_primitives)
@@ -37679,6 +37689,18 @@ foreach(QFN_POOLED_SUCCESS_BACKEND IN ITEMS CUDA ROCm)
             LABELS "V2;Integration;ProductionTestPreflight;${QFN_POOLED_SUCCESS_BACKEND};Ngram;Ownership;TraceReplay;Capture;Component;ByteExact;Regression"
             MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${QFN_POOLED_SUCCESS_LOCK} TIMEOUT 30 ENVIRONMENT ${QFN_POOLED_SUCCESS_ENV})
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${QFN_POOLED_SUCCESS_BACKEND}_PooledImmutableNativeSuccessfulSourceReplay)
+        add_v2_test(V2_Integration_${QFN_POOLED_SUCCESS_BACKEND}_PooledImmutableFourFrequencyLaneCapturedReplay
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=PooledImmutableNativeDevice.${QFN_POOLED_SUCCESS_BACKEND}FourFrequencyLanePolicyCapturedReplay
+            LABELS "V2;Integration;ProductionTestPreflight;${QFN_POOLED_SUCCESS_BACKEND};Ngram;Ownership;TraceReplay;Capture;Component;ByteExact;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${QFN_POOLED_SUCCESS_LOCK} TIMEOUT 30 ENVIRONMENT ${QFN_POOLED_SUCCESS_ENV})
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${QFN_POOLED_SUCCESS_BACKEND}_PooledImmutableFourFrequencyLaneCapturedReplay)
+        add_v2_test(V2_Integration_${QFN_POOLED_SUCCESS_BACKEND}_PooledImmutablePlanFreeFailedEpochReplay
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=PooledImmutableNativeDevice.${QFN_POOLED_SUCCESS_BACKEND}PlanFreeFailedEpochCapturedReplay
+            LABELS "V2;Integration;ProductionTestPreflight;${QFN_POOLED_SUCCESS_BACKEND};Ngram;Ownership;TraceReplay;Capture;Component;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${QFN_POOLED_SUCCESS_LOCK} TIMEOUT 30 ENVIRONMENT ${QFN_POOLED_SUCCESS_ENV})
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${QFN_POOLED_SUCCESS_BACKEND}_PooledImmutablePlanFreeFailedEpochReplay)
     endif()
 endforeach()
 

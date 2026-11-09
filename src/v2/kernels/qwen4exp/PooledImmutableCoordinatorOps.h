@@ -18,6 +18,37 @@ namespace llaminar2::qwen4exp::adaptive_lookup::pooled
 class CoordinatorOperations final
 {
 public:
+    /**
+     * @brief One structurally authorized independent frequency lane, bound to this exact live policy/frame.
+     *
+     * Only the original private authorizer can create a usable grant. The four
+     * grants name disjoint physical lane banks; they carry no writable policy
+     * shadow and cannot advance the canonical clock or publish a plan.
+     */
+    class FrequencyLaneGrant final {
+    public:
+        /** @return Whether this lane's immutable frame, bank and lane binding is valid. */
+        QFN_ADAPTIVE_HD bool valid() const { return valid_; }
+    private:
+        friend class CoordinatorOperations;
+        /**
+         * @brief Bind one structural authorization to the original policy/frame generation.
+         * @param policy Sole original policy control address.
+         * @param frame Original retained lookup frame address.
+         * @param ordinal Actual original lookup ordinal.
+         * @param clock Original policy clock before observations.
+         * @param lane Exclusive physical lane coordinate.
+         * @param valid Whether the structural lane authorization succeeded.
+         */
+        QFN_ADAPTIVE_HD FrequencyLaneGrant(const CoordinatorPolicyControl* policy,const LookupFrame* frame,
+            std::uint64_t ordinal,std::uint64_t clock,std::uint32_t lane,bool valid)
+            :policy_(policy),frame_(frame),ordinal_(ordinal),clock_(clock),lane_(lane),valid_(valid){}
+        const CoordinatorPolicyControl* policy_;
+        const LookupFrame* frame_;
+        std::uint64_t ordinal_,clock_;
+        std::uint32_t lane_;
+        bool valid_;
+    };
     /** @brief Copy and validate immutable root layout once; live pointees remain checked on every operation. */
     QFN_ADAPTIVE_HD explicit CoordinatorOperations(CoordinatorView view) : v_(view), layout_(v_) {}
     /**
@@ -397,8 +428,13 @@ public:
 
 private:
     friend struct CoordinatorCoalescingAccess;
-    /** @brief Execute the canonical free-plan policy using actual scalar observations or the native stable run producer. */
-    QFN_ADAPTIVE_HD bool planFreeImpl(const AvailabilityLease *leases,std::uint32_t count,const OriginalObservationRuns* runs)
+    /** @brief Authenticate exact leases and the complete run stream before any frequency mutation.
+     * @param leases Exact original owner-authored availability prefix.
+     * @param count Original declared participant count, including empty owners.
+     * @param runs Complete authored stable run stream, or null for scalar original-position observations.
+     * @return True only after all leases and supplied runs validate; failure retains the first error.
+     */
+    QFN_ADAPTIVE_HD bool preparePlanFree(const AvailabilityLease *leases,std::uint32_t count,const OriginalObservationRuns* runs)
     {
         if (!healthy(LookupPhase::Availability) || !leases || count != v_.parameters.participants() ||
             aliases(leases,std::size_t{count}*sizeof(AvailabilityLease)))
@@ -407,13 +443,20 @@ private:
             if (!same(leases[i].interval,interval()) || leases[i].owner != i || leases[i].free_slots > v_.owners[i].slots)
                 return fail(Status::Invariant);
         for (std::uint32_t i = 0; i < count; ++i) v_.owner_plans[i].lease = leases[i];
-        if(v_.frame->purpose==LookupPurpose::FutureLookupOnly){
-            buildPlans(false);
-            v_.frame->phase=LookupPhase::FreePlanned;
-            return true;
-        }
+        return v_.frame->purpose==LookupPurpose::FutureLookupOnly || !runs || validateRuns(*runs);
+    }
+    /** @brief Execute the CPU/reference observation order and publish its original compact plan.
+     * @param leases Original owner-authored availability prefix.
+     * @param count Exact declared owner count.
+     * @param runs Authored stable runs, or null for the serial-position oracle.
+     * @return True after exact frequency observations and compact plan publication; false on the original sticky failure.
+     */
+    QFN_ADAPTIVE_HD bool planFreeImpl(const AvailabilityLease *leases,std::uint32_t count,const OriginalObservationRuns* runs)
+    {
+        if(!preparePlanFree(leases,count,runs))return false;
+        if(v_.frame->purpose==LookupPurpose::FutureLookupOnly)return finishPlanFree();
         if(runs){
-            if(!observeRuns(*runs))return false;
+            if(!observeValidatedRuns(*runs))return false;
         }else{
         for (std::uint32_t pos = 0; pos < v_.frame->original_ids; ++pos)
         {
@@ -427,13 +470,26 @@ private:
             }
         }
         }
+        return finishPlanFree();
+    }
+    /** @brief Publish only the original compact plans after all exact observation writers joined.
+     * @return True after the original phase transition and compact decisions, or false on invariant failure.
+     */
+    QFN_ADAPTIVE_HD bool finishPlanFree()
+    {
+        if(v_.frame->purpose==LookupPurpose::FutureLookupOnly){
+            buildPlans(false);
+            v_.frame->phase=LookupPhase::FreePlanned;
+            return true;
+        }
         v_.frame->observed = true;
+        const auto count=v_.parameters.participants();
         std::uint32_t cursor = 0;
         for (std::uint32_t i = 0; i < v_.frame->unique_rows; ++i)
         {
             auto &r = v_.unique[i];
             if (r.phase == UniquePhase::Read) continue;
-            while (cursor < count && v_.owner_plans[cursor].free_count == leases[cursor].free_slots) ++cursor;
+            while (cursor < count && v_.owner_plans[cursor].free_count == v_.owner_plans[cursor].lease.free_slots) ++cursor;
             if (cursor == count) continue;
             r.decision = {r.row,i,CommandKind::ReserveFree,{},nextCommand()};
             r.allocation_owner = cursor;
@@ -451,8 +507,10 @@ private:
      * @brief Validate every authored stable run before mutating a frequency cell or policy clock.
      * @note Equal-row repeats commute only within one aging epoch. Hash-colliding
      * distinct rows retain their exact original run order, including partition boundaries.
+     * @param runs Exact authored bank pointers and partition counts.
+     * @return True for complete positive runs covering each live partition; false before frequency/clock mutation otherwise.
      */
-    QFN_ADAPTIVE_HD bool observeRuns(OriginalObservationRuns runs)
+    QFN_ADAPTIVE_HD bool validateRuns(OriginalObservationRuns runs)
     {
         if(runs.records!=v_.sort_a || runs.partitions!=v_.sort_b)return fail(Status::Invariant);
         constexpr auto width=OriginalObservationRuns::PartitionRows;
@@ -469,6 +527,16 @@ private:
             }
             if(position!=end)return fail(Status::Invariant);
         }
+        return true;
+    }
+    /** @brief Apply the validated stable stream in the original CPU scalar lane order.
+     * @param runs Exact original banks already authenticated by validateRuns.
+     * @return True after exact scalar observations, or false after the original first-error publication.
+     */
+    QFN_ADAPTIVE_HD bool observeValidatedRuns(OriginalObservationRuns runs)
+    {
+        constexpr auto width=OriginalObservationRuns::PartitionRows;
+        const auto partitions=(std::uint64_t{v_.frame->original_ids}+width-1)/width;
         if(!capacity())return true;
         for(std::uint32_t part=0;part<partitions;++part){
             const auto first=part*width,count=runs.partitions[part].unique;
@@ -476,10 +544,9 @@ private:
                 while(remaining){
                     // The first observation increments the clock before computing
                     // its epoch. Stop exactly before the next original epoch.
-                    const auto first_clock=v_.policy->logical_clock+1;
-                    const auto room=v_.parameters.agingAccesses()-first_clock%v_.parameters.agingAccesses();
-                    const auto observed=room<remaining?static_cast<std::uint32_t>(room):remaining;
-                    v_.policy->logical_clock+=observed;
+                    const auto chunk=frequencyChunk(v_.policy->logical_clock,remaining);
+                    const auto observed=chunk.observations;
+                    v_.policy->logical_clock=chunk.clock;
                     frequency(run.row,true,observed);
                     if(v_.frame->status!=Status::Success)return false;
                     remaining-=observed;
@@ -489,6 +556,71 @@ private:
         return true;
     }
 
+    /** @brief Bind one disjoint lane after the sole writer authenticated the complete run stream.
+     * @param lane Original count-min lane in [0,4).
+     * @param runs Exact immutable banks authenticated by preparePlanFree before the preparation join.
+     * @return Structural frame/clock/lane authorization; cell epochs are checked during the sole mutation walk.
+     * @note A future cell epoch is a fatal invariant error, not a rollback transaction.
+     */
+    QFN_ADAPTIVE_HD FrequencyLaneGrant authorizeFrequencyLane(std::uint32_t lane,OriginalObservationRuns runs) const
+    {
+        const auto clock=capacity()?v_.policy->logical_clock:0;
+        const bool valid=lane<4 && healthy(LookupPhase::Availability) &&
+            runs.records==v_.sort_a && runs.partitions==v_.sort_b;
+        return {v_.policy,v_.frame,v_.frame->ordinal,clock,lane,valid};
+    }
+    /** @brief Apply one authorized lane in exact original run/epoch order; no other lane or control is writable.
+     * @param grant Original structural authorization bound to this live frame.
+     * @param runs Same immutable run banks, retained until the final publication join.
+     * @return False on a foreign/stale grant or future cell epoch; lane workers never mutate first-error/control words.
+     */
+    QFN_ADAPTIVE_HD bool applyFrequencyLane(const FrequencyLaneGrant& grant,OriginalObservationRuns runs)
+    {
+        if(!grant.valid_ || grant.lane_>=4 || runs.records!=v_.sort_a || runs.partitions!=v_.sort_b ||
+           grant.policy_!=v_.policy || grant.frame_!=v_.frame || grant.ordinal_!=v_.frame->ordinal ||
+           grant.clock_!=(capacity()?v_.policy->logical_clock:0))return false;
+        return v_.frame->purpose==LookupPurpose::FutureLookupOnly || !capacity() ||
+            walkFrequencyLane(grant.lane_,runs,grant.clock_);
+    }
+    /** @brief Advance the sole clock once and publish plans only after all four lane grants complete.
+     * @return True after the sole clock/plan publication; false on an original plan invariant failure.
+     */
+    QFN_ADAPTIVE_HD bool finishIndependentPlanFree()
+    {
+        if(capacity() && v_.frame->purpose==LookupPurpose::CurrentDemand)
+            v_.policy->logical_clock+=v_.frame->original_ids;
+        return finishPlanFree();
+    }
+    /** @brief Walk one lane with original epoch cuts; admission already forbids clock/epoch overflow.
+     * @param lane Exact disjoint physical lane in [0,4).
+     * @param runs Original validated run banks, unchanged through the final join.
+     * @param clock Original policy clock before the first observation; used only as a local arithmetic cursor.
+     * @return True after the complete lane walk, or false on a future cell epoch without writing a first-error word.
+     */
+    QFN_ADAPTIVE_HD bool walkFrequencyLane(std::uint32_t lane,OriginalObservationRuns runs,
+        std::uint64_t clock) const
+    {
+        constexpr auto width=OriginalObservationRuns::PartitionRows;
+        const auto partitions=(std::uint64_t{v_.frame->original_ids}+width-1)/width;
+        for(std::uint32_t part=0;part<partitions;++part){
+            const auto first=part*width;
+            const auto count=runs.partitions[part].unique;
+            for(std::uint32_t i=0;i<count;++i){
+                const auto& run=runs.records[first+i];
+                auto remaining=run.unique;
+                while(remaining){
+                    const auto chunk=frequencyChunk(clock,remaining);
+                    const auto observed=chunk.observations;
+                    clock=chunk.clock;
+                    if(!frequencyLane(run.row,lane,clock,observed).valid){
+                        return false;
+                    }
+                    remaining-=observed;
+                }
+            }
+        }
+        return true;
+    }
     /** @brief Initialize one independent setup directory record; native callers parallelize these disjoint writers. */
     QFN_ADAPTIVE_HD void initializeEntry(std::uint32_t i)
     { v_.entries[i]={{},0,0,None,None,Stream::None,0}; }
@@ -1019,26 +1151,65 @@ private:
         n *= 0x94d049bb133111ebULL;
         return n ^ (n >> 31);
     }
-    /** @return Four-lane lazy-aged frequency, with fixed saturating integer arithmetic. */
-    QFN_ADAPTIVE_HD std::uint16_t frequency(std::uint64_t row, bool observe,std::uint32_t observations=1)
+    /** @brief Exact original run prefix terminating before the next aging epoch. */
+    struct FrequencyChunk {std::uint64_t clock;std::uint32_t observations;};
+    /**
+     * @brief Derive the sole original run/epoch partition for scalar and independent walks.
+     * @param clock Exact admitted clock before the next positive run prefix.
+     * @param remaining Positive unconsumed observations in the authored run.
+     * @return Updated original clock and exact observation count before the next epoch boundary.
+     */
+    QFN_ADAPTIVE_HD FrequencyChunk frequencyChunk(std::uint64_t clock,std::uint32_t remaining) const
     {
-        if (!capacity()) return 0;
-        const auto epoch = static_cast<std::uint32_t>(v_.policy->logical_clock / v_.parameters.agingAccesses());
-        std::uint16_t result = 0xffffU;
-        for (std::uint64_t lane = 0; lane < 4; ++lane)
-        {
-            const auto at = lane * v_.parameters.laneWidth() +
-                (hash(row + lane * 0x9e3779b97f4a7c15ULL) & (v_.parameters.laneWidth() - 1));
-            if (v_.frequency_epochs[at] > epoch) { fail(Status::Invariant); return 0; }
-            const auto elapsed = epoch - v_.frequency_epochs[at];
-            auto count = static_cast<std::uint16_t>(v_.frequency_counts[at] >> (elapsed < 16 ? elapsed : 16));
-            if (observe){
-                const auto sum=std::uint64_t{count}+observations;
-                count=static_cast<std::uint16_t>(sum<0xffffU?sum:0xffffU);
+        const auto firstClock=clock+1;
+        const auto room=v_.parameters.agingAccesses()-firstClock%v_.parameters.agingAccesses();
+        const auto observed=room<remaining?static_cast<std::uint32_t>(room):remaining;
+        return {clock+observed,observed};
+    }
+    /** @brief Result of one lane operation; invalid epochs never publish that cell. */
+    struct FrequencyLaneResult {bool valid;std::uint16_t count;};
+    /**
+     * @brief Apply the sole hash/epoch/aging/saturation definition for one physical lane.
+     * @param row Original immutable source row.
+     * @param lane Count-min lane, validated in [0,4) by its caller.
+     * @param clock Exact admitted original observation clock.
+     * @param observations Positive demand repeats, or zero for an aged nonobserving query.
+     * @return Invalid for a future cell epoch; otherwise the updated lane count.
+     */
+    QFN_ADAPTIVE_HD FrequencyLaneResult frequencyLane(std::uint64_t row,std::uint32_t lane,
+        std::uint64_t clock,std::uint32_t observations) const
+    {
+        const auto epoch=static_cast<std::uint32_t>(clock/v_.parameters.agingAccesses());
+        const auto at=std::uint64_t{lane}*v_.parameters.laneWidth()+
+            (hash(row+std::uint64_t{lane}*0x9e3779b97f4a7c15ULL)&(v_.parameters.laneWidth()-1));
+        if(v_.frequency_epochs[at]>epoch)return {false,0};
+        const auto elapsed=epoch-v_.frequency_epochs[at];
+        auto count=static_cast<std::uint16_t>(v_.frequency_counts[at]>>(elapsed<16?elapsed:16));
+        const auto sum=std::uint64_t{count}+observations;
+        count=static_cast<std::uint16_t>(sum<0xffffU?sum:0xffffU);
+        v_.frequency_epochs[at]=epoch;
+        v_.frequency_counts[at]=count;
+        return {true,count};
+    }
+    /**
+     * @brief Read or observe all four lanes in the original scalar first-error order.
+     * @param row Original immutable source row.
+     * @param observe Whether this demand adds observations after lazy aging.
+     * @param observations Exact positive demand repeat count when observing.
+     * @return Minimum updated lane count, or zero after publishing the original sticky invariant error.
+     */
+    QFN_ADAPTIVE_HD std::uint16_t frequency(std::uint64_t row,bool observe,std::uint32_t observations=1)
+    {
+        if(!capacity())return 0;
+        std::uint16_t result=0xffffU;
+        for(std::uint32_t lane=0;lane<4;++lane){
+            const auto update=frequencyLane(row,lane,v_.policy->logical_clock,
+                observe?observations:0);
+            if(!update.valid){
+                fail(Status::Invariant);
+                return 0;
             }
-            v_.frequency_epochs[at] = epoch;
-            v_.frequency_counts[at] = count;
-            if (count < result) result = count;
+            if(update.count<result)result=update.count;
         }
         return result;
     }

@@ -707,6 +707,42 @@ struct CoordinatorCoalescingAccess
     /** @brief Consume only the exact stable native run banks after their complete ordered producer. */
     QFN_ADAPTIVE_HD static bool planFree(CoordinatorOperations& op,const AvailabilityLease* leases,std::uint32_t count,OriginalObservationRuns runs)
     {return op.planFreeImpl(leases,count,&runs);}
+    /** @brief Authenticate the original phase and complete run stream before independent native writers start.
+     * @param op Sole original coordinator borrower.
+     * @param leases Actual owner-authored availability prefix.
+     * @param count Exact declared owner count.
+     * @param runs Complete authored original run banks.
+     * @return True only after original leases and runs validate.
+     */
+    QFN_ADAPTIVE_HD static bool preparePlanFree(CoordinatorOperations& op,const AvailabilityLease* leases,std::uint32_t count,OriginalObservationRuns runs)
+    {return op.preparePlanFree(leases,count,&runs);}
+    /**
+     * @brief Authorize one disjoint original frequency lane without a cell walk.
+     * @param op Original retained coordinator borrower.
+     * @param lane Original count-min lane in [0,4).
+     * @param runs Complete original authored run stream.
+     * @return A structural frame/clock/bank-bound grant; apply checks each live cell epoch exactly once.
+     */
+    QFN_ADAPTIVE_HD static auto frequencyLane(CoordinatorOperations& op,std::uint32_t lane,OriginalObservationRuns runs)
+    {return op.authorizeFrequencyLane(lane,runs);}
+    /** @brief Execute only the exact lane authorized by its original validation.
+     * @param op Original exclusive coordinator borrower.
+     * @param grant Structural grant bound to the original policy/frame/clock.
+     * @param runs Same retained immutable run banks.
+     * @return True after exact lane writes; false on a rejected or foreign grant without cross-lane mutation.
+     */
+    QFN_ADAPTIVE_HD static bool applyFrequencyLane(CoordinatorOperations& op,const CoordinatorOperations::FrequencyLaneGrant& grant,OriginalObservationRuns runs)
+    {return op.applyFrequencyLane(grant,runs);}
+    /** @brief Publish original clock and free plans after the four lane writers joined.
+     * @param op Sole original coordinator publication owner.
+     * @return True after clock and original plan publication, or false on invariant failure.
+     */
+    QFN_ADAPTIVE_HD static bool finishPlanFree(CoordinatorOperations& op){return op.finishIndependentPlanFree();}
+    /** @brief Retain sticky original failure on a rejected lane; failed state cannot continue.
+     * @param op Sole original first-error publication owner.
+     * @return False after retaining the original invariant failure.
+     */
+    QFN_ADAPTIVE_HD static bool rejectPlanFree(CoordinatorOperations& op){return op.fail(Status::Invariant);}
     /** @brief Initialize one actual independent directory setup record. */
     QFN_ADAPTIVE_HD static void entry(CoordinatorOperations& op,std::uint32_t i){op.initializeEntry(i);}
     /** @brief Initialize one actual independent radix-node setup record. */
@@ -901,6 +937,24 @@ template<CoordinatorAction Action> QFN_ADAPTIVE_HD bool importLocalFrontier(cons
     at<Header>(a.native,a.plan.native.ingress_frontier)[owner]=h;
     return true;
 }
+/**
+ * @brief Authenticate actual availability receipts and retain their exact leases; no policy clock changes.
+ * @param a Original checked roots and owner-authored availability frontier.
+ * @return True for complete matching receipts, or false after preserving the original first error.
+ */
+QFN_ADAPTIVE_HD inline bool preparePlanFreeLeases(const CoordinatorArgs& a)
+{
+    const auto v=coordinatorView(a);const auto participants=a.plan.policy.participants();
+    if(!phase(a,p::LookupPhase::Availability) || !a.input.frontier)return fail(a);
+    const auto* receipts=static_cast<const Availability*>(a.input.frontier);
+    for(std::uint32_t owner=0;owner<participants;++owner)
+        if(receipts[owner].version!=Version || receipts[owner].status!=Status::Success ||
+            receipts[owner].lease.owner!=owner || !same(receipts[owner].lease.interval,v.frame->interval) ||
+            receipts[owner].lease.free_slots>v.owners[owner].slots)return fail(a);
+    auto* leases=at<p::AvailabilityLease>(a.native,a.plan.native.availability);
+    for(std::uint32_t owner=0;owner<participants;++owner)leases[owner]=receipts[owner].lease;
+    return true;
+}
 /** @brief Execute one ordered coordinator metadata phase; Begin's independent data work is a fixed cooperative bundle. */
 template<CoordinatorAction Action> QFN_ADAPTIVE_HD bool coordinator(const CoordinatorArgs& a)
 {
@@ -945,14 +999,8 @@ template<CoordinatorAction Action> QFN_ADAPTIVE_HD bool coordinator(const Coordi
     {return op.sealPins(static_cast<const p::PinHeader*>(a.input.frontier),participants);}
     else if constexpr(Action==CoordinatorAction::PlanFree)
     {
-        if(!phase(a,p::LookupPhase::Availability) || !a.input.frontier)return fail(a);
-        const auto* receipts=static_cast<const Availability*>(a.input.frontier);
-        for(std::uint32_t owner=0;owner<participants;++owner)
-            if(receipts[owner].version!=Version || receipts[owner].status!=Status::Success ||
-                receipts[owner].lease.owner!=owner || !same(receipts[owner].lease.interval,v.frame->interval) ||
-                receipts[owner].lease.free_slots>v.owners[owner].slots)return fail(a);
+        if(!preparePlanFreeLeases(a))return false;
         auto* leases=at<p::AvailabilityLease>(a.native,a.plan.native.availability);
-        for(std::uint32_t owner=0;owner<participants;++owner)leases[owner]=receipts[owner].lease;
         const bool ok=p::CoordinatorCoalescingAccess::planFree(op,leases,participants,{v.sort_a,v.sort_b});directedPlans<false>(a);return ok;
     }
     else if constexpr(Action==CoordinatorAction::CompleteFree)

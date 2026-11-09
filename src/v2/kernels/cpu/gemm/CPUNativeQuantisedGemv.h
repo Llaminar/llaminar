@@ -33,8 +33,9 @@
  *   4 comp loads + 4 mullo + 4 sub (bias correction)
  *   4 scale loads + 4 mul + 4 fmadd (FP32 accumulation)
  *
- * Unsigned expanded five-bit pair dots retain signed activations and exchange
- * VNNI operand roles, eliminating only the exact integer bias compensation.
+ * Unsigned expanded five-bit and identity-nibble ordered pair dots retain
+ * signed activations and exchange VNNI operand roles, eliminating only the
+ * exact integer bias compensation; signed Q4_0/LUT coefficient paths do not change.
  * Fused prefix/LUT stack storage initializes only admitted live descriptors;
  * inactive fixed-capacity slots never enter searches or microkernel arguments.
  * Execution plans likewise default-construct only live projections in caller-owned
@@ -1920,12 +1921,36 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Load scales using the original nibble dispatcher's immutable decoder.
+     * @tparam DecodeKind Existing linear/identity/LUT decode semantics.
+     * @param packed Original admitted prepared operand; no layout is reinterpreted.
+     * @param primary Original aligned inline scale words.
+     * @return Identical effective FP32 scale values without unused source-factor work.
+     *
+     * Preparation maps codebooks0/5 to ordinary NibbleLUT and the dispatcher
+     * maps them to linear/identity. IQ4_XS factors require codebook4 and keep
+     * LUT; IQ3_S factors require ExpandedInt8 source-scale execution. Thus only
+     * linear kinds can statically widen plain halves. LUT retains the generic
+     * source-factor equation and validation; no source scale is rounded/repacked.
+     */
+    template <NibbleDecodeKind DecodeKind>
+    inline __m512 load_native_avx512_nibble_scales(
+        const CPUNativeQuantisedPackedWeights &packed,const uint16_t *primary)
+    {
+        if constexpr (DecodeKind == NibbleDecodeKind::Q4_0_LINEAR ||
+                      DecodeKind == NibbleDecodeKind::Q4_1_IDENTITY)
+            return CPUNativeQuantisedPackedWeights::loadPlainFP16Scales512(primary);
+        else
+            return packed.loadScales512(primary);
+    }
+
+    /**
      * @brief Append one native-nibble K block to four 16-lane accumulators.
      *
-     * This is the sole AVX-512 one-row block implementation used by both a
-     * regular full-K projection and the heterogeneous ordered-partition tree.
-     * Keeping the block primitive shared prevents the economical register-only
-     * reducer from acquiring a second arithmetic implementation.
+     * The heterogeneous register-only ordered tree uses this block primitive.
+     * The ordinary chunk below retains its separate FP-accumulator lifetime;
+     * both entries specialize only the proven identity-nibble integer program,
+     * preserving their original FP publication and partition boundaries.
      *
      * @tparam DecodeKind Immutable nibble decoder of the prepared tensor.
      * @tparam Policy Immutable FP publication policy of the prepared tensor.
@@ -1956,6 +1981,22 @@ namespace llaminar2::cpu::native_quantised
         __m512 &fp_acc2,
         __m512 &fp_acc3)
     {
+        // Only the canonical identity decoder proves unsigned B in [0,15].
+        // Swap VNNI roles to consume unchanged signed Q8 bytes directly; the
+        // exact32-value integer dot is in [-61440,60960]. No FP term or tree
+        // changes. Signed Q4_0/nonlinear LUT retain their original compensation.
+        constexpr bool unsigned_identity = DecodeKind == NibbleDecodeKind::Q4_1_IDENTITY;
+        const auto activation_word = [](const Q8_1Block &activation, int first)
+        {
+            if constexpr (unsigned_identity)
+            {
+                int32_t word;
+                std::memcpy(&word, activation.qs + first, sizeof(word));
+                return word;
+            }
+            else
+                return pack_q8_1_unsigned_word(activation, first);
+        };
         const __m512i mask_0F = _mm512_set1_epi8(0x0F);
         const __m512i q4_zero_offset = _mm512_set1_epi8(8);
         __m512i int_acc0 = _mm512_setzero_si512();
@@ -1976,20 +2017,21 @@ namespace llaminar2::cpu::native_quantised
                 const __m512i low =                                            \
                     decode_low_nibbles_avx512_static<DecodeKind>(              \
                         raw, decode_lut, mask_0F, q4_zero_offset);              \
-                ACC = _mm512_dpbusd_epi32(                                     \
-                    ACC,                                                       \
-                    _mm512_set1_epi32(                                         \
-                        pack_q8_1_unsigned_word(a_blk, group * 4)),            \
-                    low);                                                       \
+                const __m512i a_low = _mm512_set1_epi32(                       \
+                    activation_word(a_blk, group * 4));                       \
+                if constexpr (unsigned_identity)                              \
+                    ACC = _mm512_dpbusd_epi32(ACC, low, a_low);                \
+                else                                                           \
+                    ACC = _mm512_dpbusd_epi32(ACC, a_low, low);                \
                 const __m512i high =                                           \
                     decode_high_nibbles_avx512_static<DecodeKind>(             \
                         raw, decode_lut, mask_0F, q4_zero_offset);              \
-                ACC = _mm512_dpbusd_epi32(                                     \
-                    ACC,                                                       \
-                    _mm512_set1_epi32(                                         \
-                        pack_q8_1_unsigned_word(                               \
-                            a_blk, group * 4 + 16)),                           \
-                    high);                                                      \
+                const __m512i a_high = _mm512_set1_epi32(                      \
+                    activation_word(a_blk, group * 4 + 16));                  \
+                if constexpr (unsigned_identity)                              \
+                    ACC = _mm512_dpbusd_epi32(ACC, high, a_high);              \
+                else                                                           \
+                    ACC = _mm512_dpbusd_epi32(ACC, a_high, high);              \
             }
             NIBBLE_BLOCK_SUBCHUNK(0, int_acc0)
             NIBBLE_BLOCK_SUBCHUNK(1, int_acc1)
@@ -1998,38 +2040,41 @@ namespace llaminar2::cpu::native_quantised
 #undef NIBBLE_BLOCK_SUBCHUNK
         }
 
-        const __m512i bias_128_i32 = _mm512_set1_epi32(128);
-        const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
-        int_acc0 = _mm512_sub_epi32(
-            int_acc0,
-            _mm512_mullo_epi32(
-                bias_128_i32,
-                _mm512_cvtepi16_epi32(_mm256_load_si256(
-                    reinterpret_cast<const __m256i *>(comp_ptr)))));
-        int_acc1 = _mm512_sub_epi32(
-            int_acc1,
-            _mm512_mullo_epi32(
-                bias_128_i32,
-                _mm512_cvtepi16_epi32(_mm256_load_si256(
-                    reinterpret_cast<const __m256i *>(comp_ptr + 16)))));
-        int_acc2 = _mm512_sub_epi32(
-            int_acc2,
-            _mm512_mullo_epi32(
-                bias_128_i32,
-                _mm512_cvtepi16_epi32(_mm256_load_si256(
-                    reinterpret_cast<const __m256i *>(comp_ptr + 32)))));
-        int_acc3 = _mm512_sub_epi32(
-            int_acc3,
-            _mm512_mullo_epi32(
-                bias_128_i32,
-                _mm512_cvtepi16_epi32(_mm256_load_si256(
-                    reinterpret_cast<const __m256i *>(comp_ptr + 48)))));
+        if constexpr (!unsigned_identity)
+        {
+            const __m512i bias_128_i32 = _mm512_set1_epi32(128);
+            const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
+            int_acc0 = _mm512_sub_epi32(
+                int_acc0,
+                _mm512_mullo_epi32(
+                    bias_128_i32,
+                    _mm512_cvtepi16_epi32(_mm256_load_si256(
+                        reinterpret_cast<const __m256i *>(comp_ptr)))));
+            int_acc1 = _mm512_sub_epi32(
+                int_acc1,
+                _mm512_mullo_epi32(
+                    bias_128_i32,
+                    _mm512_cvtepi16_epi32(_mm256_load_si256(
+                        reinterpret_cast<const __m256i *>(comp_ptr + 16)))));
+            int_acc2 = _mm512_sub_epi32(
+                int_acc2,
+                _mm512_mullo_epi32(
+                    bias_128_i32,
+                    _mm512_cvtepi16_epi32(_mm256_load_si256(
+                        reinterpret_cast<const __m256i *>(comp_ptr + 32)))));
+            int_acc3 = _mm512_sub_epi32(
+                int_acc3,
+                _mm512_mullo_epi32(
+                    bias_128_i32,
+                    _mm512_cvtepi16_epi32(_mm256_load_si256(
+                        reinterpret_cast<const __m256i *>(comp_ptr + 48)))));
+        }
 
         const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-        const __m512 scale0 = packed.loadScales512(b_scales);
-        const __m512 scale1 = packed.loadScales512(b_scales + 16);
-        const __m512 scale2 = packed.loadScales512(b_scales + 32);
-        const __m512 scale3 = packed.loadScales512(b_scales + 48);
+        const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales);
+        const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 16);
+        const __m512 scale2 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 32);
+        const __m512 scale3 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 48);
         const float a_scale = nativeQuantisedFP16ScaleToFP32(a_blk.d);
 
         if constexpr (IsAsymmetric)
@@ -2121,6 +2166,22 @@ namespace llaminar2::cpu::native_quantised
         __m512 fp_acc2 = accumulate ? _mm512_loadu_ps(C + 32) : _mm512_setzero_ps();
         __m512 fp_acc3 = accumulate ? _mm512_loadu_ps(C + 48) : _mm512_setzero_ps();
 
+        // Only the canonical identity decoder proves unsigned B in [0,15].
+        // Swap VNNI roles to consume unchanged signed Q8 bytes directly; the
+        // exact32-value integer dot is in [-61440,60960]. No FP term or tree
+        // changes. Signed Q4_0/nonlinear LUT retain their original compensation.
+        constexpr bool unsigned_identity = DecodeKind == NibbleDecodeKind::Q4_1_IDENTITY;
+        const auto activation_word = [](const Q8_1Block &activation, int first)
+        {
+            if constexpr (unsigned_identity)
+            {
+                int32_t word;
+                std::memcpy(&word, activation.qs + first, sizeof(word));
+                return word;
+            }
+            else
+                return pack_q8_1_unsigned_word(activation, first);
+        };
         const __m512i bias_128_i32 = _mm512_set1_epi32(128);
         const __m512i mask_0F = _mm512_set1_epi8(0x0F);
         const __m512i q4_zero_offset = _mm512_set1_epi8(8);
@@ -2156,18 +2217,24 @@ namespace llaminar2::cpu::native_quantised
                     const __m512i raw = _mm512_load_si512(                     \
                         packed.interleavedB(chunk, kb, group, Z));             \
                     const __m512i a_low = _mm512_set1_epi32(                   \
-                        pack_q8_1_unsigned_word(a_blk, group * 4));            \
+                        activation_word(a_blk, group * 4));                    \
                     const __m512i low =                                        \
                         decode_low_nibbles_avx512_static<DecodeKind>(          \
                             raw, decode_lut, mask_0F, q4_zero_offset);          \
-                    ACC = _mm512_dpbusd_epi32(ACC, a_low, low);                \
+                    if constexpr (unsigned_identity)                          \
+                        ACC = _mm512_dpbusd_epi32(ACC, low, a_low);            \
+                    else                                                       \
+                        ACC = _mm512_dpbusd_epi32(ACC, a_low, low);            \
                     const __m512i a_high = _mm512_set1_epi32(                  \
-                        pack_q8_1_unsigned_word(                               \
+                        activation_word(                                      \
                             a_blk, group * 4 + 16));                           \
                     const __m512i high =                                       \
                         decode_high_nibbles_avx512_static<DecodeKind>(         \
                             raw, decode_lut, mask_0F, q4_zero_offset);          \
-                    ACC = _mm512_dpbusd_epi32(ACC, a_high, high);              \
+                    if constexpr (unsigned_identity)                          \
+                        ACC = _mm512_dpbusd_epi32(ACC, high, a_high);          \
+                    else                                                       \
+                        ACC = _mm512_dpbusd_epi32(ACC, a_high, high);          \
                 }
                 NIBBLE_1ROW_SUBCHUNK(0, int_acc0)
                 NIBBLE_1ROW_SUBCHUNK(1, int_acc1)
@@ -2176,25 +2243,28 @@ namespace llaminar2::cpu::native_quantised
 #undef NIBBLE_1ROW_SUBCHUNK
             }
 
-            // Bias correction: corrected = int_acc - 128 * comp
-            // comp is INT16 (halved metadata); load via sign-extend to INT32
-            const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
-            __m512i comp0 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
-            __m512i comp1 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
-            __m512i comp2 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 32)));
-            __m512i comp3 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 48)));
+            if constexpr (!unsigned_identity)
+            {
+                // Bias correction: corrected = int_acc - 128 * comp
+                // comp is INT16 (halved metadata); load via sign-extend to INT32
+                const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
+                __m512i comp0 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
+                __m512i comp1 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
+                __m512i comp2 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 32)));
+                __m512i comp3 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 48)));
 
-            int_acc0 = _mm512_sub_epi32(int_acc0, _mm512_mullo_epi32(bias_128_i32, comp0));
-            int_acc1 = _mm512_sub_epi32(int_acc1, _mm512_mullo_epi32(bias_128_i32, comp1));
-            int_acc2 = _mm512_sub_epi32(int_acc2, _mm512_mullo_epi32(bias_128_i32, comp2));
-            int_acc3 = _mm512_sub_epi32(int_acc3, _mm512_mullo_epi32(bias_128_i32, comp3));
+                int_acc0 = _mm512_sub_epi32(int_acc0, _mm512_mullo_epi32(bias_128_i32, comp0));
+                int_acc1 = _mm512_sub_epi32(int_acc1, _mm512_mullo_epi32(bias_128_i32, comp1));
+                int_acc2 = _mm512_sub_epi32(int_acc2, _mm512_mullo_epi32(bias_128_i32, comp2));
+                int_acc3 = _mm512_sub_epi32(int_acc3, _mm512_mullo_epi32(bias_128_i32, comp3));
+            }
 
             // Convert exact integer dots through the selected publication tree.
             const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-            const __m512 scale0 = packed.loadScales512(b_scales);
-            const __m512 scale1 = packed.loadScales512(b_scales + 16);
-            const __m512 scale2 = packed.loadScales512(b_scales + 32);
-            const __m512 scale3 = packed.loadScales512(b_scales + 48);
+            const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales);
+            const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 16);
+            const __m512 scale2 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 32);
+            const __m512 scale3 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 48);
 
             // Asymmetric correction: acc += a_scale * sum_qs * b_min[n]
             // Formula: weight = scale * int_val + min, so the offset term
@@ -2312,10 +2382,10 @@ namespace llaminar2::cpu::native_quantised
             }
             else
             {
-                reduced0 = _mm512_add_ps(reduced0, partial0);
-                reduced1 = _mm512_add_ps(reduced1, partial1);
-                reduced2 = _mm512_add_ps(reduced2, partial2);
-                reduced3 = _mm512_add_ps(reduced3, partial3);
+                reduced0 = addOrderedAVX512(reduced0, partial0);
+                reduced1 = addOrderedAVX512(reduced1, partial1);
+                reduced2 = addOrderedAVX512(reduced2, partial2);
+                reduced3 = addOrderedAVX512(reduced3, partial3);
             }
         }
 
@@ -2373,6 +2443,16 @@ namespace llaminar2::cpu::native_quantised
      *
      * @tparam DecodeKind Immutable nibble decoder of the prepared tensor.
      * @tparam IsAsymmetric Whether scale-and-min correction is present.
+     * @param packed Original prepared layout and scale/minimum authority.
+     * @param A_q8_row0 First row's original signed Q8 blocks.
+     * @param A_q8_row1 Second row's original signed Q8 blocks.
+     * @param C_row0 First64-column output, or caller-owned physical tail scratch.
+     * @param C_row1 Second64-column output, or caller-owned physical tail scratch.
+     * @param chunk Original64-column prepared panel index.
+     * @param K_blocks Complete32-value K block count.
+     * @param k_tiles Original fixed partition count, including empty partitions.
+     * @param k_blocks_per_tile Original consecutive blocks in each partition.
+     * @param decode_lut Original nonlinear decoder; identity does not consume it.
      */
     template <NibbleDecodeKind DecodeKind, bool IsAsymmetric>
     inline void gemm_2row_native_avx512_ordered_partitions(
@@ -2387,6 +2467,25 @@ namespace llaminar2::cpu::native_quantised
         int k_blocks_per_tile,
         const __m512i decode_lut)
     {
+        // The identity decoder emits the literal nibble in [0,15]. VNNI may
+        // therefore consume B as unsigned and the unchanged Q8 bytes as signed.
+        // A full32-value dot lies in [-61440,60960]; neither it nor the original
+        // biased intermediate (at most122400) can overflow INT32. This changes
+        // no FP conversion, scale/minimum expression or fixed partition fold.
+        // Q4_0's signed offset and the non-linear signed LUT retain A+128 plus
+        // the ORIGINAL packed compensation. Asymmetry alone proves no range.
+        constexpr bool unsigned_identity = DecodeKind == NibbleDecodeKind::Q4_1_IDENTITY;
+        const auto activation_word = [](const Q8_1Block &activation, int first)
+        {
+            if constexpr (unsigned_identity)
+            {
+                int32_t word;
+                std::memcpy(&word, activation.qs + first, sizeof(word));
+                return word;
+            }
+            else
+                return pack_q8_1_unsigned_word(activation, first);
+        };
         const __m512i mask_0F = _mm512_set1_epi8(0x0F);
         const __m512i q4_zero_offset = _mm512_set1_epi8(8);
         const __m512i bias_128_i32 = _mm512_set1_epi32(128);
@@ -2455,41 +2554,53 @@ namespace llaminar2::cpu::native_quantised
                                 mask_0F,
                                 q4_zero_offset);
 
+#define ORDERED_2ROW_DOT_HALF(ROW, A, B0, B1)                                \
+                        if constexpr (unsigned_identity)                      \
+                        {                                                      \
+                            int##ROW##_0 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_0, B0, A);                         \
+                            int##ROW##_1 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_1, B1, A);                         \
+                        }                                                      \
+                        else                                                   \
+                        {                                                      \
+                            int##ROW##_0 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_0, A, B0);                         \
+                            int##ROW##_1 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_1, A, B1);                         \
+                        }
 #define ORDERED_2ROW_DOT(ROW, BLOCK)                                           \
                         {                                                      \
                             const __m512i a_low = _mm512_set1_epi32(           \
-                                pack_q8_1_unsigned_word(BLOCK, group * 4));    \
-                            int##ROW##_0 = _mm512_dpbusd_epi32(                \
-                                int##ROW##_0, a_low, low0);                    \
-                            int##ROW##_1 = _mm512_dpbusd_epi32(                \
-                                int##ROW##_1, a_low, low1);                    \
+                                activation_word(BLOCK, group * 4));           \
+                            ORDERED_2ROW_DOT_HALF(ROW, a_low, low0, low1)      \
                             const __m512i a_high = _mm512_set1_epi32(          \
-                                pack_q8_1_unsigned_word(                       \
-                                    BLOCK, group * 4 + 16));                   \
-                            int##ROW##_0 = _mm512_dpbusd_epi32(                \
-                                int##ROW##_0, a_high, high0);                  \
-                            int##ROW##_1 = _mm512_dpbusd_epi32(                \
-                                int##ROW##_1, a_high, high1);                  \
+                                activation_word(BLOCK, group * 4 + 16));      \
+                            ORDERED_2ROW_DOT_HALF(ROW, a_high, high0, high1)   \
                         }
                         ORDERED_2ROW_DOT(0, a0)
                         ORDERED_2ROW_DOT(1, a1)
 #undef ORDERED_2ROW_DOT
+#undef ORDERED_2ROW_DOT_HALF
                     }
 
-                    const int16_t *comp =
-                        packed.chunkComp(chunk, kb) + zbase * 16;
-                    const __m512i bias0 = _mm512_mullo_epi32(
-                        bias_128_i32,
-                        _mm512_cvtepi16_epi32(_mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(comp))));
-                    const __m512i bias1 = _mm512_mullo_epi32(
-                        bias_128_i32,
-                        _mm512_cvtepi16_epi32(_mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(comp + 16))));
-                    int0_0 = _mm512_sub_epi32(int0_0, bias0);
-                    int0_1 = _mm512_sub_epi32(int0_1, bias1);
-                    int1_0 = _mm512_sub_epi32(int1_0, bias0);
-                    int1_1 = _mm512_sub_epi32(int1_1, bias1);
+                    if constexpr (!unsigned_identity)
+                    {
+                        const int16_t *comp =
+                            packed.chunkComp(chunk, kb) + zbase * 16;
+                        const __m512i bias0 = _mm512_mullo_epi32(
+                            bias_128_i32,
+                            _mm512_cvtepi16_epi32(_mm256_load_si256(
+                                reinterpret_cast<const __m256i *>(comp))));
+                        const __m512i bias1 = _mm512_mullo_epi32(
+                            bias_128_i32,
+                            _mm512_cvtepi16_epi32(_mm256_load_si256(
+                                reinterpret_cast<const __m256i *>(comp + 16))));
+                        int0_0 = _mm512_sub_epi32(int0_0, bias0);
+                        int0_1 = _mm512_sub_epi32(int0_1, bias1);
+                        int1_0 = _mm512_sub_epi32(int1_0, bias0);
+                        int1_1 = _mm512_sub_epi32(int1_1, bias1);
+                    }
 
                     const uint16_t *scales =
                         packed.chunkScales(chunk, kb) + zbase * 16;
@@ -2589,10 +2700,10 @@ namespace llaminar2::cpu::native_quantised
                 }
                 else
                 {
-                    reduced0_0 = _mm512_add_ps(reduced0_0, partial0_0);
-                    reduced0_1 = _mm512_add_ps(reduced0_1, partial0_1);
-                    reduced1_0 = _mm512_add_ps(reduced1_0, partial1_0);
-                    reduced1_1 = _mm512_add_ps(reduced1_1, partial1_1);
+                    reduced0_0 = addOrderedAVX512(reduced0_0, partial0_0);
+                    reduced0_1 = addOrderedAVX512(reduced0_1, partial0_1);
+                    reduced1_0 = addOrderedAVX512(reduced1_0, partial1_0);
+                    reduced1_1 = addOrderedAVX512(reduced1_1, partial1_1);
                 }
             }
 
@@ -2846,12 +2957,12 @@ namespace llaminar2::cpu::native_quantised
                 }
                 else
                 {
-                    reduced0_0 = _mm512_add_ps(reduced0_0, partial0_0);
-                    reduced0_1 = _mm512_add_ps(reduced0_1, partial0_1);
-                    reduced1_0 = _mm512_add_ps(reduced1_0, partial1_0);
-                    reduced1_1 = _mm512_add_ps(reduced1_1, partial1_1);
-                    reduced2_0 = _mm512_add_ps(reduced2_0, partial2_0);
-                    reduced2_1 = _mm512_add_ps(reduced2_1, partial2_1);
+                    reduced0_0 = addOrderedAVX512(reduced0_0, partial0_0);
+                    reduced0_1 = addOrderedAVX512(reduced0_1, partial0_1);
+                    reduced1_0 = addOrderedAVX512(reduced1_0, partial1_0);
+                    reduced1_1 = addOrderedAVX512(reduced1_1, partial1_1);
+                    reduced2_0 = addOrderedAVX512(reduced2_0, partial2_0);
+                    reduced2_1 = addOrderedAVX512(reduced2_1, partial2_1);
                 }
             }
 
@@ -3285,6 +3396,7 @@ namespace llaminar2::cpu::native_quantised
     /**
      * @brief Reduce one 64-column K-tile partial stream in decode order.
      *
+     * @tparam Policy Prepared arithmetic; only GPUAligned pins NaN operands.
      * @param base          Address of tile zero. Consecutive tiles are 64
      *                      floats apart.
      * @param destination   Final output address for this N chunk.
@@ -3302,7 +3414,8 @@ namespace llaminar2::cpu::native_quantised
      * must execute AVX2 instructions throughout the kernel rather than quietly
      * using an AVX512 reduction compiled into the binary.
      */
-    inline void reduceNativeQuantisedKTilePartialsExact(
+    template <CPUProjectionNumericalPolicy Policy>
+    inline void reduceNativeQuantisedKTilePartialsExactImpl(
         const float *base,
         float *destination,
         int valid_columns,
@@ -3319,10 +3432,18 @@ namespace llaminar2::cpu::native_quantised
             for (int kt = 1; kt < k_tiles; ++kt)
             {
                 const float *src = base + static_cast<size_t>(kt) * 64;
-                sum0 = _mm512_add_ps(sum0, _mm512_loadu_ps(src));
-                sum1 = _mm512_add_ps(sum1, _mm512_loadu_ps(src + 16));
-                sum2 = _mm512_add_ps(sum2, _mm512_loadu_ps(src + 32));
-                sum3 = _mm512_add_ps(sum3, _mm512_loadu_ps(src + 48));
+                sum0 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX512(sum0, _mm512_loadu_ps(src))
+                    : _mm512_add_ps(sum0, _mm512_loadu_ps(src)));
+                sum1 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX512(sum1, _mm512_loadu_ps(src + 16))
+                    : _mm512_add_ps(sum1, _mm512_loadu_ps(src + 16)));
+                sum2 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX512(sum2, _mm512_loadu_ps(src + 32))
+                    : _mm512_add_ps(sum2, _mm512_loadu_ps(src + 32)));
+                sum3 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX512(sum3, _mm512_loadu_ps(src + 48))
+                    : _mm512_add_ps(sum3, _mm512_loadu_ps(src + 48)));
             }
 
             if (valid_columns < 64)
@@ -3361,14 +3482,30 @@ namespace llaminar2::cpu::native_quantised
         for (int kt = 1; kt < k_tiles; ++kt)
         {
             const float *src = base + static_cast<size_t>(kt) * 64;
-            sum0 = _mm256_add_ps(sum0, _mm256_loadu_ps(src));
-            sum1 = _mm256_add_ps(sum1, _mm256_loadu_ps(src + 8));
-            sum2 = _mm256_add_ps(sum2, _mm256_loadu_ps(src + 16));
-            sum3 = _mm256_add_ps(sum3, _mm256_loadu_ps(src + 24));
-            sum4 = _mm256_add_ps(sum4, _mm256_loadu_ps(src + 32));
-            sum5 = _mm256_add_ps(sum5, _mm256_loadu_ps(src + 40));
-            sum6 = _mm256_add_ps(sum6, _mm256_loadu_ps(src + 48));
-            sum7 = _mm256_add_ps(sum7, _mm256_loadu_ps(src + 56));
+            sum0 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX2(sum0, _mm256_loadu_ps(src))
+                    : _mm256_add_ps(sum0, _mm256_loadu_ps(src)));
+            sum1 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX2(sum1, _mm256_loadu_ps(src + 8))
+                    : _mm256_add_ps(sum1, _mm256_loadu_ps(src + 8)));
+            sum2 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX2(sum2, _mm256_loadu_ps(src + 16))
+                    : _mm256_add_ps(sum2, _mm256_loadu_ps(src + 16)));
+            sum3 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX2(sum3, _mm256_loadu_ps(src + 24))
+                    : _mm256_add_ps(sum3, _mm256_loadu_ps(src + 24)));
+            sum4 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX2(sum4, _mm256_loadu_ps(src + 32))
+                    : _mm256_add_ps(sum4, _mm256_loadu_ps(src + 32)));
+            sum5 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX2(sum5, _mm256_loadu_ps(src + 40))
+                    : _mm256_add_ps(sum5, _mm256_loadu_ps(src + 40)));
+            sum6 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX2(sum6, _mm256_loadu_ps(src + 48))
+                    : _mm256_add_ps(sum6, _mm256_loadu_ps(src + 48)));
+            sum7 = (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? addOrderedAVX2(sum7, _mm256_loadu_ps(src + 56))
+                    : _mm256_add_ps(sum7, _mm256_loadu_ps(src + 56)));
         }
 
         if (valid_columns < 64)
@@ -3398,6 +3535,28 @@ namespace llaminar2::cpu::native_quantised
             _mm256_storeu_ps(destination + 48, sum6);
             _mm256_storeu_ps(destination + 56, sum7);
         }
+    }
+
+    /**
+     * @brief Select the original native or serial-operand expert K fold once.
+     * @param base Address of the first 64-column partition.
+     * @param destination Final output row slice.
+     * @param valid_columns Live columns in [1,64].
+     * @param k_tiles Positive ordered partition count.
+     * @param use_avx512 Actual runtime SIMD selection.
+     * @param policy Original prepared matrix arithmetic policy.
+     */
+    inline void reduceNativeQuantisedKTilePartialsExact(
+        const float *base, float *destination, int valid_columns,
+        int k_tiles, bool use_avx512,
+        CPUProjectionNumericalPolicy policy)
+    {
+        if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+            reduceNativeQuantisedKTilePartialsExactImpl<CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                base, destination, valid_columns, k_tiles, use_avx512);
+        else
+            reduceNativeQuantisedKTilePartialsExactImpl<CPUProjectionNumericalPolicy::BackendNative>(
+                base, destination, valid_columns, k_tiles, use_avx512);
     }
 
     /**
@@ -3642,7 +3801,7 @@ namespace llaminar2::cpu::native_quantised
                     const float *base = partial_sums +
                                         static_cast<size_t>(chunk_idx) * k_tiles * 64;
                     reduceNativeQuantisedKTilePartialsExact(
-                        base, C + n_start, n_cols, k_tiles, use_avx512);
+                        base, C + n_start, n_cols, k_tiles, use_avx512, packed.numerical_policy);
                 }
             };
 
@@ -4563,10 +4722,10 @@ namespace llaminar2::cpu::native_quantised
                 }
                 else
                 {
-                    reduced0_0 = _mm512_add_ps(reduced0_0, partial0_0);
-                    reduced0_1 = _mm512_add_ps(reduced0_1, partial0_1);
-                    reduced1_0 = _mm512_add_ps(reduced1_0, partial1_0);
-                    reduced1_1 = _mm512_add_ps(reduced1_1, partial1_1);
+                    reduced0_0 = addOrderedAVX512(reduced0_0, partial0_0);
+                    reduced0_1 = addOrderedAVX512(reduced0_1, partial0_1);
+                    reduced1_0 = addOrderedAVX512(reduced1_0, partial1_0);
+                    reduced1_1 = addOrderedAVX512(reduced1_1, partial1_1);
                 }
             }
 
@@ -4647,7 +4806,7 @@ namespace llaminar2::cpu::native_quantised
                 destination + segment * 16,
                 first_partition
                     ? value
-                    : _mm512_add_ps(
+                    : addOrderedAVX512(
                           _mm512_loadu_ps(destination + segment * 16),
                           value));
         }
@@ -6647,7 +6806,7 @@ namespace llaminar2::cpu::native_quantised
                             k_tiles * 64;
                     float *dst = C + static_cast<size_t>(row) * ldc + n_start;
                     reduceNativeQuantisedKTilePartialsExact(
-                        base, dst, n_cols, k_tiles, use_avx512);
+                        base, dst, n_cols, k_tiles, use_avx512, packed.numerical_policy);
                 }
             };
             OMP_WORKSHARE_REGION(do_kpar_partial_rows);
@@ -9453,7 +9612,7 @@ namespace llaminar2::cpu::native_quantised
                                         n_start,
                                     n_columns,
                                     plan.k_tiles,
-                                    use_avx512);
+                                    use_avx512, descriptor.packed->numerical_policy);
                             }
                         }
                         }
@@ -9576,7 +9735,7 @@ namespace llaminar2::cpu::native_quantised
                             n_start,
                         n_columns,
                         plan.k_tiles,
-                        use_avx512);
+                        use_avx512, descriptor.packed->numerical_policy);
                 }
 
                 publish_layer_bias();
@@ -9706,7 +9865,7 @@ namespace llaminar2::cpu::native_quantised
                             d.output + n_start,
                             n_columns,
                             k_tiles,
-                            use_avx512);
+                            use_avx512, packed.numerical_policy);
                     }
 
                     if (d.bias)
@@ -9887,7 +10046,7 @@ namespace llaminar2::cpu::native_quantised
                         float *dst =
                             d.output + static_cast<size_t>(row) * d.ldc + n_start;
                         reduceNativeQuantisedKTilePartialsExact(
-                            base, dst, n_cols, k_tiles, use_avx512);
+                            base, dst, n_cols, k_tiles, use_avx512, packed.numerical_policy);
                     }
 
                     if (d.bias)

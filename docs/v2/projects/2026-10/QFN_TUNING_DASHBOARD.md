@@ -7,7 +7,7 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Release 512/256: **292.594 P /39.764 D**; after-prefill **39.609 D**.
+Release 512/256: **303.365 P /39.901 D**; after-prefill **39.745 D**.
 CPU scheduling: **+3.44% P** versus fresh control; all768 IDs/MTP/placement match.
 Short-prefill indexer elision saves **36 kernels/chunk/GPU**; its matched
 control showed **+7.09% P**, with unchanged output IDs/MTP.
@@ -27,10 +27,10 @@ CPU Auto: all21 byte-exact; mixed FFN improves **2.5–14%** in16 formats,
 five within **+2.5%**. QFN-shaped FFN saves **26–31%** in both row orders.
 Cache/work block sizes1–4 pass; model uses Auto. CPU-result readiness remains next.
 [All-format evidence](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md).
-Mixed3-row gate saves **3.4–3.9% target FFN**; small-team/aspect regressions
-block promotion. [Row policies](../2026-11/QFN_CPU_ORDERED_THREE_PREFILL_20261109.md).
-Prepared-Q8 MT16: **9–25% component gain**, unpromoted. Root combine/weight
-worksharing: **~2× M64, 3–6% M448**; shared gather **~3× at16MiB**.
+**Latest scoped checkpoint:** **+2.45% P /-0.72% D** versus fresh control;
+all768 IDs/MTP/placement match. CPU14 + ngram23 focused gates pass. Ngram error
+publication is repaired. Next: remaining CPU spills and final add/weight fusion.
+[Evidence](../2026-11/QFN_UNSIGNED_NIBBLE_AND_FREQUENCY_LANES_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
 [timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md),
 [root phases](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md),

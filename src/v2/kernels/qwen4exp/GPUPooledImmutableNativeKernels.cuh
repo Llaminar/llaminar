@@ -4,8 +4,10 @@
  *
  * All live counts remain device-owned. Independent initialization, coalescing
  * and native-byte copies are parallel; one ordered writer retains policy and
- * physical mutation authority. Every launch is fixed before capture, with no
- * allocation, host callbacks, host count reads, synchronization or transport.
+ * physical mutation authority. Four disjoint count-min lane writers join that
+ * policy authority before its single clock/plan publication. Every launch is
+ * fixed before capture, with no allocation, host callbacks, host count reads,
+ * blocking host synchronization or transport.
  */
 #pragma once
 #if defined(QFN_POOLED_NATIVE_CUDA)
@@ -42,6 +44,9 @@
 #include "GPUPooledImmutableOwnerValidation.cuh"
 namespace llaminar2::qwen4exp::QFN_NATIVE_NAMESPACE
 {
+/** @brief One submitted logical thread per disjoint count-min lane; hardware supplies only unavoidable warp/wave rounding. */
+inline constexpr unsigned PlanFreeLanes=4;
+static_assert(PlanFreeLanes<128 && Threads<512);
 /** @brief Seed mandatory owner controls once; no physical slot is made Ready or zero-filled. */
 template<class Slot> __global__ void seedOwnerKernel(n::OwnerArgs a){n::seedOwner<Slot>(a);}
 /** @brief Independent virgin slot initialization, ordered before the one canonical owner seal. */
@@ -181,6 +186,63 @@ __global__ void sealCoordinatorKernel(n::CoordinatorSetupArgs a)
 /** @brief One ordered policy/consensus operation; independent coalescing and payload copies use their own producers. */
 template<n::CoordinatorAction Action> __global__ void coordinatorPhase(n::CoordinatorArgs a)
 {n::submitCoordinator<Action>(a);}
+/**
+ * @brief Update the four independent count-min lanes once before one canonical plan publication.
+ *
+ * The CTA joins at preparation and final publication boundaries.
+ * Every lane preserves original run/aging/collision order. Invalid epochs poison the coordinator after all
+ * disjoint writers join; partially changed failed metadata cannot be reused.
+ * @param a Original immutable roots, phase, run-bank and availability producer bindings.
+ */
+__global__ __launch_bounds__(PlanFreeLanes,2) void coordinatorPlanFree(n::CoordinatorArgs a)
+{
+    __shared__ unsigned ready,laneValid[PlanFreeLanes];
+    auto v=n::coordinatorView(a);auto op=p::CoordinatorOperations(v);
+    const p::OriginalObservationRuns runs{v.sort_a,v.sort_b};
+    if(threadIdx.x==0){
+        ready=0;
+        const auto gate=n::sourceGate(a.input.condition,a.input.outcome,v.frame->interval,a.plan.table,v.frame->source);
+        if(gate==n::SourceGate::Invalid){
+            n::fail(a,adaptive_lookup::Status::SourceFailure);
+        }else if(gate==n::SourceGate::Run && n::preparePlanFreeLeases(a)){
+            const auto* leases=n::at<p::AvailabilityLease>(a.native,a.plan.native.availability);
+            ready=p::CoordinatorCoalescingAccess::preparePlanFree(op,leases,a.plan.policy.participants(),runs)?1u:0u;
+            if(!ready){
+                // Original scalar PlanFree publishes error headers after its
+                // policy/run preparation rejects, once leases were acquired.
+                n::directedPlans<false>(a);
+            }
+            if(ready && v.frame->original_ids==0){
+                // No frequency cell is live in these transactions. The same
+                // canonical finisher retains purpose/clock/observed semantics
+                // and publishes required owner plans before the first join.
+                p::CoordinatorCoalescingAccess::finishPlanFree(op);
+                n::directedPlans<false>(a);
+                ready=0; // Authorization for lane work, not the canonical frame's success state.
+            }
+        }
+    }
+    __syncthreads();
+    if(!ready)return;
+    const auto grant=p::CoordinatorCoalescingAccess::frequencyLane(op,threadIdx.x,runs);
+    if(threadIdx.x<PlanFreeLanes)laneValid[threadIdx.x]=p::CoordinatorCoalescingAccess::applyFrequencyLane(op,grant,runs)?1u:0u;
+    __syncthreads();
+    if(threadIdx.x==0){
+        bool complete=true;
+        for(unsigned lane=0;lane<PlanFreeLanes;++lane){
+            complete=complete && laneValid[lane];
+        }
+        if(complete){
+            p::CoordinatorCoalescingAccess::finishPlanFree(op);
+            n::directedPlans<false>(a);
+        }else{
+            p::CoordinatorCoalescingAccess::rejectPlanFree(op);
+            // Original scalar PlanFree also publishes zero-byte error headers
+            // after an observation failure. Owners must never see stale Success.
+            n::directedPlans<false>(a);
+        }
+    }
+}
 /** @brief Reject default streams and foreign current contexts before any enqueue; no context guessing or substitution. */
 void require(DeviceId device,void* stream)
 {
@@ -206,7 +268,7 @@ public:
     DeviceType backend()const noexcept override{return QFN_NATIVE_BACKEND;}
     /** @return Version, exact identity algorithm, thread geometry and deterministic coalescing policy are immutable capture identity. */
     std::uint64_t codeIdentity()const noexcept override
-    {return (n::Version<<48)|(static_cast<std::uint64_t>(QFN_NATIVE_BACKEND)<<40)|(std::uint64_t{1}<<32)|(std::uint64_t{Threads}<<16)|SmallRows;}
+    {return (n::Version<<48)|(static_cast<std::uint64_t>(QFN_NATIVE_BACKEND)<<40)|(std::uint64_t{6}<<32)|(std::uint64_t{PlanFreeLanes}<<25)|(std::uint64_t{Threads}<<16)|SmallRows;}
 protected:
     /** @brief Initialize one checked owner once on its exact setup stream. */
     void initializeOwner(const n::OwnerArgs& a,void* exact)const override
@@ -264,7 +326,14 @@ protected:
         QFN_COORDINATOR_CASE(SealPins)
         case n::CoordinatorAction::PlanFree:
             observationRuns<<<static_cast<unsigned>((std::uint64_t{a.plan.policy.maximumOriginal()}+Threads-1)/Threads),Threads,0,stream>>>(a);checked();
-            coordinatorPhase<n::CoordinatorAction::PlanFree><<<1,1,0,stream>>>(a);checked();return;
+            // C0 is an immutable no-frequency configuration: its original
+            // scalar control writer remains a first-class captured program.
+            if(a.plan.policy.entries()==0){
+                coordinatorPhase<n::CoordinatorAction::PlanFree><<<1,1,0,stream>>>(a);
+            }else{
+                coordinatorPlanFree<<<1,PlanFreeLanes,0,stream>>>(a);
+            }
+            checked();return;
         QFN_COORDINATOR_CASE(AcquireFree)
         QFN_COORDINATOR_CASE(CompleteFree)
         QFN_COORDINATOR_CASE(PlanVictims)

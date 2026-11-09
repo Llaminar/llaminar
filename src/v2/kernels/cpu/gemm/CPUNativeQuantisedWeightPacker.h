@@ -406,8 +406,11 @@ namespace llaminar2::cpu::native_quantised
          *
          * General source-factor formats still call loadScales512. Direct use
          * requires a prepared-type proof that the scale plane contains plain
-         * halves: the unsigned-five-bit domain guarantees ordinary ExpandedInt8,
-         * excluding IQ3_S/IQ4_XS restoration and rotated/asymmetric mismatches.
+         * halves: the unsigned-five-bit domain guarantees ordinary ExpandedInt8.
+         * The original nibble dispatcher also proves plain NibbleLUT for its
+         * Q4_0 linear and Q4_1/Q4_K identity decoder kinds. IQ4_XS remains LUT
+         * with source factors; IQ3_S and rotated operands use expanded paths.
+         * Neither asymmetry nor a model name supplies this layout proof.
          */
         [[nodiscard]] static inline __m512 loadPlainFP16Scales512(const uint16_t *primary)
         {

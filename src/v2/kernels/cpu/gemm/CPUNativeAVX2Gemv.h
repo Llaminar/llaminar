@@ -6,6 +6,8 @@
  * (CPUNativeQuantisedGemv.h). Each 64-byte ZMM slot is processed as two 32-byte
  * YMM halves, and 8 YMM accumulators cover the same 64 columns that 4 ZMM
  * accumulators cover in AVX512.
+ * GPU-aligned K folds retain the original serial NaN operand precedence as
+ * well as the fixed finite arithmetic tree; native FMA paths remain unchanged.
  *
  * Both AVX512 and AVX2 paths are always compiled (no #ifdef gates) so they
  * can be tested against each other on AVX512 hardware via runtime dispatch.
@@ -728,7 +730,7 @@ namespace llaminar2::cpu::native_quantised
                 destination + segment * 8,
                 first_partition
                     ? value
-                    : _mm256_add_ps(
+                    : addOrderedAVX2(
                           _mm256_loadu_ps(destination + segment * 8),
                           value));
         }
@@ -813,7 +815,7 @@ namespace llaminar2::cpu::native_quantised
                         _mm256_setzero_ps());
                     reduced = k_tile == 0
                         ? partial
-                        : _mm256_add_ps(reduced, partial);
+                        : addOrderedAVX2(reduced, partial);
                 }
                 _mm256_storeu_ps(output + segment * 8, reduced);
             }
@@ -936,8 +938,8 @@ namespace llaminar2::cpu::native_quantised
                     }
                     else
                     {
-                        reduced0 = _mm256_add_ps(reduced0, partial0);
-                        reduced1 = _mm256_add_ps(reduced1, partial1);
+                        reduced0 = addOrderedAVX2(reduced0, partial0);
+                        reduced1 = addOrderedAVX2(reduced1, partial1);
                     }
                 }
                 _mm256_storeu_ps(output0 + segment * 8, reduced0);

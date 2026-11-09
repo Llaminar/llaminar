@@ -81,6 +81,37 @@ __global__ void corruptIdentity(Args x)
         else n::at<a::Slot64>(x.cache,x.owner.cache.slots)[bad.target.slot].flags|=0x80000000u;
     }
 }
+/** @brief Author one future cell epoch and an adversarial stale Success before actual PlanFree.
+ * @param x Original roots and scalar-authored cell selected before capture.
+ * @note The fault cannot re-poison or overwrite a fresh error header on failed replay.
+ */
+__global__ void corruptFrequencyEpoch(Args x)
+{
+    const auto& frame=*n::at<p::LookupFrame>(x.coordinator_frame,x.coordinator.frame.control);
+    if(frame.status!=a::Status::Success || frame.phase!=p::LookupPhase::Availability)return;
+    n::at<std::uint32_t>(x.coordinator_cache,x.coordinator.cache.epochs)[x.frequency_fault_cell]=UINT32_MAX;
+    auto stale=n::at<n::Availability>(x.owner_native,x.owner.native.header)->lease;
+    --stale.interval.sequence;
+    *n::at<n::FreePlanHeader>(x.coordinator_native,x.coordinator.native.free_headers)=
+        {stale,sizeof(p::AllocationDecision),a::Status::Success,n::Version};
+    *n::at<n::DirectedSlice>(x.coordinator_native,x.coordinator.native.free_slices)=
+        {x.coordinator.frame.decisions,sizeof(p::AllocationDecision)};
+}
+/** @brief Transport the actual failure-path header and compact extent without rewriting its status.
+ * @param x Original diagnostic directed plan producer/consumer roots.
+ * @note Bounded stale-success bytes are deliberately retained for the original-v5 negative control.
+ */
+__global__ void failedFreePlan(Args x)
+{
+    const auto h=*n::at<n::FreePlanHeader>(x.coordinator_native,x.coordinator.native.free_headers);
+    const auto slice=*n::at<n::DirectedSlice>(x.coordinator_native,x.coordinator.native.free_slices);
+    *n::at<n::FreePlanHeader>(x.io,x.offsets.header)=h;
+    *n::at<std::uint64_t>(x.io,x.offsets.record_bytes)=slice.live_bytes;
+    const auto bound=std::uint64_t{x.owner.native.reply_capacity}*sizeof(p::AllocationDecision);
+    if(slice.live_bytes>bound || slice.byte_offset>x.coordinator.frame.bytes ||
+        slice.live_bytes>x.coordinator.frame.bytes-slice.byte_offset)return;
+    for(std::uint64_t i=0;i<slice.live_bytes;++i)x.io[x.offsets.records+i]=x.coordinator_frame[slice.byte_offset+i];
+}
 /** @brief Deliver only actual directed pin bytes and preserve every unused record byte. */
 __global__ __launch_bounds__(256,2) void pins(Args x){
     const auto slice=n::at<n::DirectedSlice>(x.coordinator_native,x.coordinator.native.pin_slices)[0];
@@ -160,8 +191,13 @@ void QFN_FIXTURE_FUNCTION(Action action,const Args& x,void* exact){
             (x.identity_fault==IdentityFault::ForeignOwner || x.identity_fault==IdentityFault::ForeignInterval))))
         throw std::invalid_argument("Native identity fault has incompatible original role/geometry");
     if(action==Action::ReadRows && x.owner.owner.rowWidth()!=a::RowKeyWidth::UInt32)throw std::invalid_argument("Native diagnostic byte reader requires its declared UInt32 source trace");
+    if(action==Action::CorruptFrequencyEpoch && (!x.coordinator_cache || x.coordinator.policy.participants()!=1 ||
+        x.frequency_fault_cell>=std::uint64_t{4}*x.coordinator.policy.laneWidth()))
+        throw std::invalid_argument("Native frequency fault needs one original owner and an exact scalar-authored cell");
     const auto stream=static_cast<QFN_FIXTURE_STREAM>(exact);
     switch(action){
+    case Action::CorruptFrequencyEpoch:corruptFrequencyEpoch<<<1,1,0,stream>>>(x);break;
+    case Action::DeliverFailedFree:failedFreePlan<<<1,1,0,stream>>>(x);break;
     case Action::CorruptIdentity:corruptIdentity<<<1,1,0,stream>>>(x);break;
     case Action::PoisonCache:poison<<<1,256,0,stream>>>(x);break;
     case Action::DeliverPins:pins<<<1,256,0,stream>>>(x);break;
