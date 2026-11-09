@@ -410,3 +410,18 @@ the source policy). Dead persistent_state parameter removed.
   non-interference claim; owner evidence boundaries; merge authority = Main.
   Fix commit (4 unit regressions) = new tip → quick test-delta re-ACK →
   WSL (5'').
+
+## Fix 0b32f8edd (2026-11-09) — test-only; 4 regressions resolved
+
+- +85/−11, 6 test files, no src/scripts-docker. (1) ComputeStage ×3 bound
+  (stage-sweep found 2 more: 1316 norm-preservation hidden GTEST_SKIP now
+  bound; RoPEGraphCaptureNoH2D CPU ref bound). (2)(3) estimator/planner
+  expectations add canonical cpu_rope_workspace::requirements (3520/786944/
+  24640/1576960 — match WSL actuals exactly). (4) provisioning dpkg shim +
+  exactly-one os-release + replay cases (amd64/arm64 × 22.04/24.04 URLs;
+  ppc64el/'', 20.04 fail pre-curl).
+- HONEST LIMIT: Mac can't configure src/v2 (libnuma) → full V2_Unit_* gate
+  NOT runnable on Mac (explains the slip); lane ran provisioning 4/4 vs real
+  installer (HEAD 3/3 fail), gcc-16 syntax (2 macOS-env only), byte-exact
+  contract compile. WSL (5'') = first real execution; reviewer test-delta
+  pass + WSL in flight.
