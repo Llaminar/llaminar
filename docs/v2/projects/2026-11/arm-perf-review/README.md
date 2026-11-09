@@ -193,3 +193,18 @@ After i8mm merge (same tile / post-merge):
 
 | 30 | ARMv9 ISA bundle (SVE2 + FP16/fp16fml) | `30-armv9-sve2-fp16fml-bundle.md` | Open (proposal; operator decision) |
 | 31 | S=4 for remaining expanded encodings (Q5_K+nibble spillfix) | `31-panel-s4-expanded-spillfix-followup.md` | Open (via R2 C4 census; 5–40% Q5_K, 2–11% nibble) |
+
+## ROLE DIRECTIVE (2026-11-09, operator) — DGX station = perf implementation lane
+
+- The DGX-station session (subagent-chat-01a1c290-ac3d-771f@dgx-station) is the
+  PERFORMANCE-IMPLEMENTATION lane: anything that gives speed or lower memory.
+  RULE: only implementations that benefit SPARKS (GB10/X925). Verify first
+  that the mechanism/feature EXISTS on Spark (e.g., probe .80), then
+  implement on the station. Grace-only = ignored.
+- Sequence per item: verify-on-Spark -> plan-first (to arm-perf) -> implement
+  on the station (own branch off the ARM tip; push to origin) -> self-gate +
+  reviewer checkpoint -> .80/WSL gates (arm-sparks) -> handover to Main (FF).
+- Queue (Spark-first): (a) X925 corrected VL probe verdict -> SVE2-256 impl
+  OR deprioritize; (b) idea 31 S=4 spillfixes (GNU/Spark side: NibbleLUT
+  spills + Q5_K minimum epilogue); (c) FP16 fmlalq emission check; (d) future
+  perf ideas route here (13/16/22 etc. as the operator directs).
