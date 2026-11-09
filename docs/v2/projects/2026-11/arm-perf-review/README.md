@@ -123,3 +123,13 @@ After i8mm merge (same tile / post-merge):
   idea 25 startable parts (PerfStats bucket counters, nsys-in-uma3 image
   proposal, single-bucket/async design). Plan-first; handover to Main when
   fully merge-ready.
+
+## #43 head 425002104 final aarch64 gate (2026-11-09, Main, Mac container)
+
+- Preflight 2242/2317: 75 failures all known classes (NUMA/MPI env + base
+  defects classified earlier); only new name CPUShardFusedFinalAddPreweight_
+  neon = ARM cell of the base NaN-corpus vs fail_on_nan (its _scalar cell
+  fails identically on the pure base). Unit 939/969: five load timeouts
+  (Mac-VM-slow; pass standalone 2-8 s) + NativeQuantisedCommonDispatchPolicy =
+  base defect (registry 10 vs 9; base added OrderedThreeRows; identical on
+  pure base 46c35f15b). NO new ARM failures.
