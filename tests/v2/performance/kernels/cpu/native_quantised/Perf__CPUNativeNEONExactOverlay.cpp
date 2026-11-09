@@ -242,7 +242,10 @@ TEST(Perf__CPUNativeNEONExactOverlay, CollectAuthenticatedCandidates)
                 {
                     auto sorted = samples[index];
                     std::sort(sorted.begin(), sorted.end());
-                    output << "neon-exact-overlay-v1," << isaLevelName(activeISALevel()) << ','
+                    // The build envelope, not the shared arithmetic level, identifies
+                    // the measured leaves: NEON_DOTPROD (SDOT) and NEON_I8MM (SMMLA
+                    // row pairs) share NEONDotProd yet time different instructions.
+                    output << "neon-exact-overlay-v1," << compiledNativeQuantisedBuildISAName() << ','
                            << static_cast<int>(packed.codebook_id) << ',' << (packed.is_superblock ? 1 : 0) << ','
                            << format->label << ',' << shape.name << ',' << shape.N << ',' << shape.K << ','
                            << m << ',' << workers << ',' << tileName(candidates[index].tile) << ','

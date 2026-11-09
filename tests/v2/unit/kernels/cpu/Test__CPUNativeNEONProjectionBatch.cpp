@@ -53,6 +53,9 @@ protected:
 #if defined(__ARM_FEATURE_DOTPROD)
         cpu::ARMCPUCapabilities::native().require(cpu::ARMCPUFeature::DotProd);
 #endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+        cpu::ARMCPUCapabilities::native().require(cpu::ARMCPUFeature::IntegerMatMul);
+#endif
     }
 };
 
@@ -207,6 +210,15 @@ TEST_F(CPUNativeNEONProjectionBatchTest, DotProdAllSourcesAndPoliciesM1Through16
 }
 #endif
 
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+/** @test Row-pair SMMLA grouped rows are byte-identical to the actual serial M=1 SDOT leaf. */
+TEST_F(CPUNativeNEONProjectionBatchTest, I8MMAllSourcesAndPoliciesM1Through16And31)
+{
+    const TeamBudget budget;
+    sweep<Dot::I8MM>();
+}
+#endif
+
 /** @test Worker geometry affects ownership only, including odd/larger grouped capacities. */
 TEST_F(CPUNativeNEONProjectionBatchTest, AllPositiveWorkersThroughTenRetainSerialBytes)
 {
@@ -219,6 +231,9 @@ TEST_F(CPUNativeNEONProjectionBatchTest, AllPositiveWorkersThroughTenRetainSeria
                 verify<Dot::ASIMD>(*source.metadata, rows, policy, budgets, rows >= 16 ? 33 : 8);
 #if defined(__ARM_FEATURE_DOTPROD)
                 verify<Dot::DotProd>(*source.metadata, rows, policy, budgets, rows >= 16 ? 33 : 8);
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                verify<Dot::I8MM>(*source.metadata, rows, policy, budgets, rows >= 16 ? 33 : 8);
 #endif
             }
 }
