@@ -4497,6 +4497,34 @@ class ImageIdentityTests(unittest.TestCase):
             self.assertEqual((destination / "src/implementation.cpp").read_text(), "// source\n")
             self.assertFalse((destination / "tests/v2/integration/parity/results/run/stages.csv").exists())
 
+    def test_cuda_installer_selects_the_image_repository_and_rejects_others(self):
+        """x86 and sbsa images resolve their own NVIDIA repository; others fail closed."""
+        installer = (ROOT / "scripts/docker/install-cuda.sh").read_text(encoding="utf-8")
+        function = "cuda_repository_path() {" + installer.split(
+            "cuda_repository_path() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+
+        def resolve(release, architecture):
+            return subprocess.run(
+                ["bash", "-c", function + 'cuda_repository_path "$1" "$2"', "probe",
+                 release, architecture],
+                capture_output=True, text=True)
+
+        for release, architecture, expected in (
+                ("24.04", "amd64", "ubuntu2404/x86_64"),
+                ("24.04", "arm64", "ubuntu2404/sbsa"),
+                ("22.04", "arm64", "ubuntu2204/sbsa")):
+            result = resolve(release, architecture)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), expected)
+        for release, architecture in (("20.04", "amd64"), ("24.04", "armhf"), ("24.04", "")):
+            result = resolve(release, architecture)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+        self.assertIn('"https://developer.download.nvidia.com/compute/cuda/repos/'
+                      '${CUDA_REPOSITORY}/cuda-keyring_1.1-1_all.deb"', installer)
+        self.assertNotIn("ubuntu2404/x86_64", installer)
+        self.assertIn("full|runtime|profilers) ;;", installer)
+
     def test_cuda_installer_aligns_nccl_fatbins_with_the_application_contract(self):
         """Cold NCCL builds must not compile architectures absent from Llaminar."""
         installer = (ROOT / "scripts/docker/install-cuda.sh").read_text(encoding="utf-8")
