@@ -2066,7 +2066,7 @@ size_t exactKVConversionWorkspaceBytes(
  * inverse frequencies, and a device-owned replay parameter; the same contract
  * is returned by every CUDA/ROCm precision specialization. CPU RoPE owns one
  * shared set of angle planes for the largest graph invocation's rows at the
- * physical head width, priced by the same function the kernel declares.
+ * effective rotated width, priced by the same function the kernel declares.
  */
 size_t exactRoPEWorkspaceBytes(
     const ModelMemoryProfile& profile,
@@ -2090,7 +2090,7 @@ size_t exactRoPEWorkspaceBytes(
             "CPU RoPE angle rows");
         return cpu_rope_workspace::requirements({
                    .graph_rows = rows,
-                   .head_dim = profile.head_dim,
+                   .rotary_dim = profile.effectiveRotaryDimension(),
                })
             .total_bytes_with_alignment();
     }

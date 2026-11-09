@@ -255,12 +255,13 @@ namespace llaminar2
         /**
          * @brief Declare the kernel's workspace for this stage's graph rows.
          * @param m Maximum rows one invocation of this graph rotates.
-         * @param n Ignored: RoPE consumers receive the physical head width instead.
+         * @param n Ignored: RoPE consumers receive the effective rotated width instead.
          * @param k Forwarded unchanged.
-         * @return The kernel's requirements; CPU angle planes depend on m and head_dim.
+         * @return The kernel's requirements; CPU angle planes depend on m and the rotated width.
          *
          * GPU RoPE kernels ignore n. CPU kernels size their angle planes from
-         * the stage's head geometry, so admission and runtime use one extent.
+         * the same effective width execute() rotates, so admission and runtime
+         * use one extent.
          */
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 

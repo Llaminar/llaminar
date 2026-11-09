@@ -227,6 +227,28 @@ TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsArchitecture)
     EXPECT_EQ(profile.max_seq_len, 32768);
 }
 
+/** @test The declared partial rotary width is retained, wire-stable, and bounds the effective width. */
+TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsPartialRotaryDimension)
+{
+    auto model = createTestModel();
+    auto undeclared = ModelMemoryProfile::fromGGUF(model);
+    EXPECT_EQ(undeclared.rope_dimension_count, 0);
+    EXPECT_EQ(undeclared.effectiveRotaryDimension(), 64);
+
+    setUInt32Metadata(model, "qwen2.rope.dimension_count", 32);
+    const auto partial = ModelMemoryProfile::fromGGUF(model);
+    EXPECT_EQ(partial.rope_dimension_count, 32);
+    EXPECT_EQ(partial.effectiveRotaryDimension(), 32);
+    const auto wire = partial.serialize();
+    const auto restored = ModelMemoryProfile::deserialize(wire.data(), wire.size());
+    EXPECT_EQ(restored.rope_dimension_count, 32);
+    EXPECT_EQ(restored.effectiveRotaryDimension(), 32);
+
+    // A declared width that is not a proper prefix rotates the full head.
+    setUInt32Metadata(model, "qwen2.rope.dimension_count", 64);
+    EXPECT_EQ(ModelMemoryProfile::fromGGUF(model).effectiveRotaryDimension(), 64);
+}
+
 TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsExactMoEGeometry)
 {
     auto model = createTestModel();

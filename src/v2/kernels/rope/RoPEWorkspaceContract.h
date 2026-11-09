@@ -72,27 +72,28 @@ namespace llaminar2::cpu_rope_workspace
     struct Geometry
     {
         int graph_rows = 0; ///< Maximum rows one graph invocation rotates.
-        int head_dim = 0;   ///< Physical head width; rotated pairs never exceed head_dim / 2.
+        int rotary_dim = 0; ///< Effective rotated width (partial RoPE prefix, or the full head).
     };
 
     /**
      * @brief Build the exact CPU RoPE angle workspace descriptor.
-     * @param geometry Maximum graph rows and physical head width.
+     * @param geometry Maximum graph rows and effective rotated width.
      * @return One named buffer, merged by name across the graph's RoPE stages.
      * @throws std::invalid_argument On nonpositive or odd geometry.
      *
      * The extent depends only on graph rows and head geometry, never on the
-     * worker count: one team fills one shared set of planes. Partial RoPE uses
-     * a prefix of the head-width capacity, so runtime and admission agree.
+     * worker count: one team fills one shared set of planes. Partial RoPE
+     * rows hold only the rotated prefix's pairs; runtime and admission call
+     * this same function.
      */
     inline WorkspaceRequirements requirements(const Geometry &geometry)
     {
-        if (geometry.graph_rows <= 0 || geometry.head_dim <= 0 || geometry.head_dim % 2 != 0)
-            throw std::invalid_argument("CPU RoPE workspace requires positive rows and an even head width");
+        if (geometry.graph_rows <= 0 || geometry.rotary_dim <= 0 || geometry.rotary_dim % 2 != 0)
+            throw std::invalid_argument("CPU RoPE workspace requires positive rows and an even rotated width");
         WorkspaceRequirements result;
         result.buffers.emplace_back(
             RoPEWorkspaceBuffers::CPU_ANGLES,
-            primitives::rope_angle_layout(geometry.graph_rows, geometry.head_dim / 2).bytes,
+            primitives::rope_angle_layout(geometry.graph_rows, geometry.rotary_dim / 2).bytes,
             primitives::kRoPEAnglePlaneAlignment,
             true);
         return result;

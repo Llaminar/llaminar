@@ -33,7 +33,7 @@ namespace llaminar2::test
          * @tparam Kernel A CPURoPEKernelT specialization.
          * @param kernel Kernel that borrows the planes until this binding retires.
          * @param rows Maximum rows of any call made through this kernel.
-         * @param head_dim Maximum physical head width of those calls.
+         * @param head_dim Maximum rotated width (full head) of those calls.
          */
         template <class Kernel>
         explicit CPURoPETestBinding(Kernel &kernel, int rows = kDefaultRows, int head_dim = kDefaultHeadDim)
@@ -41,7 +41,7 @@ namespace llaminar2::test
             if constexpr (std::is_base_of_v<CPURoPEAngleWorkspaceConsumer, Kernel>)
             {
                 workspace_ = std::make_unique<CPUProjectionTestWorkspace>(
-                    cpu_rope_workspace::requirements({.graph_rows = rows, .head_dim = head_dim}));
+                    cpu_rope_workspace::requirements({.graph_rows = rows, .rotary_dim = head_dim}));
                 kernel.bindWorkspace(workspace_->get());
             }
         }

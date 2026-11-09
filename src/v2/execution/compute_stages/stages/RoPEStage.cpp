@@ -16,6 +16,7 @@
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/Assertions.h"
 #include "../../../kernels/cpu/primitives/RoPEPrimitives.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -79,7 +80,14 @@ namespace llaminar2
             return nullptr;
 
         const int tensor_type = static_cast<int>(Q_base->native_type());
-        if (!owned_kernel_ || cached_kernel_tensor_type_ != tensor_type)
+        // The operand is fixed at construction, so its element type cannot
+        // change: the stage-owned kernel and its workspace binding are created
+        // exactly once. A different type is an invalid state, never a rebuild.
+        if (owned_kernel_ && cached_kernel_tensor_type_ != tensor_type)
+            LLAMINAR_UNREACHABLE("[RoPEStage] stage-owned RoPE kernel was created for tensor type "
+                                 << cached_kernel_tensor_type_ << " but the operand now reports type "
+                                 << tensor_type << " (" << Q_base->dtype_name() << ")");
+        if (!owned_kernel_)
         {
             try
             {
@@ -89,12 +97,6 @@ namespace llaminar2
                     params_.device_id.ordinal);
                 cached_kernel_ = owned_kernel_.get();
                 cached_kernel_tensor_type_ = tensor_type;
-                // A recreated kernel inherits the stage's admitted binding; it
-                // must never execute against an unbound or stale workspace.
-                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(cached_kernel_);
-                if (bound_workspace_ && consumer &&
-                    consumer->workspaceBindingPolicy() == WorkspaceBindingPolicy::PreparedEngine)
-                    consumer->bindWorkspace(bound_workspace_);
             }
             catch (const std::exception &e)
             {
@@ -841,7 +843,14 @@ namespace llaminar2
         auto *consumer = const_cast<RoPEStage *>(this)->getKernelAsWorkspaceConsumer();
         if (!consumer)
             return {};
-        return consumer->getWorkspaceRequirements(m, params_.head_dim, k);
+        // Same effective width as execute(): a proper partial prefix, or the full head.
+        const int requested_rotary_dim = static_cast<int>(
+            static_cast<float>(params_.head_dim) * params_.partial_rotary_factor);
+        const int effective_rotary_dim =
+            requested_rotary_dim > 0 && requested_rotary_dim < params_.head_dim
+                ? requested_rotary_dim
+                : params_.head_dim;
+        return consumer->getWorkspaceRequirements(m, effective_rotary_dim, k);
     }
 
     StageBufferContract RoPEStage::bufferContract() const

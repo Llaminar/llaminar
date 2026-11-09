@@ -225,7 +225,7 @@ public:
      * @param profile Parsed model geometry; zero without a full-attention layer.
      * @param geometry Participant device, rows and owned layer interval.
      * @return GPU publication buffers, or the CPU angle planes for the largest
-     *         graph invocation's rows at the physical head width.
+     *         graph invocation's rows at the effective rotated width.
      */
     static size_t ropeWorkspaceBytes(
         const ModelMemoryProfile& profile,

@@ -61,7 +61,7 @@ namespace llaminar2
         /** @brief Stable marker preceding every serialized memory profile. */
         constexpr uint32_t kProfileWireMagic = 0x4C4D5032U; // "LMP2"
         /** @brief Current profile layout, including exact MoE geometry. */
-        constexpr uint32_t kProfileWireVersion = 6U;
+        constexpr uint32_t kProfileWireVersion = 7U;
 
         /** Exact stable order of fixed-width Flash Next geometry scalars. */
         constexpr std::array<uint32_t Qwen4ExpMemoryGeometry::*, 18> kFlashNextFields{
@@ -425,6 +425,7 @@ namespace llaminar2
             profile.n_heads = config.sparseAttention().query_heads;
             profile.n_kv_heads = config.sparseAttention().kv_heads;
             profile.head_dim = config.sparseAttention().head_dimension;
+            profile.rope_dimension_count = static_cast<int>(config.sparseAttention().rotary_dimension);
             profile.vocab_size = config.vocabularySize();
             profile.max_seq_len = config.contextLength();
             profile.expert_count = config.experts().count;
@@ -471,6 +472,9 @@ namespace llaminar2
             profile.full_attention_interval = firstPositiveMetadataInt(
                 model,
                 {model.architecture + ".full_attention_interval"});
+            profile.rope_dimension_count = firstPositiveMetadataInt(
+                model,
+                {model.architecture + ".rope.dimension_count"});
             profile.gdn_conv_kernel_size = firstPositiveMetadataInt(
                 model,
                 {model.architecture + ".ssm.conv_kernel"});
@@ -701,6 +705,7 @@ namespace llaminar2
         writeVal<int32_t>(buf, n_heads);
         writeVal<int32_t>(buf, n_kv_heads);
         writeVal<int32_t>(buf, head_dim);
+        writeVal<int32_t>(buf, rope_dimension_count);
         writeVal<int32_t>(buf, vocab_size);
         writeVal<int32_t>(buf, max_seq_len);
         writeVal<int32_t>(buf, expert_count);
@@ -787,6 +792,7 @@ namespace llaminar2
         p.n_heads = readVal<int32_t>(ptr, end);
         p.n_kv_heads = readVal<int32_t>(ptr, end);
         p.head_dim = readVal<int32_t>(ptr, end);
+        p.rope_dimension_count = readVal<int32_t>(ptr, end);
         p.vocab_size = readVal<int32_t>(ptr, end);
         p.max_seq_len = readVal<int32_t>(ptr, end);
         p.expert_count = readVal<int32_t>(ptr, end);

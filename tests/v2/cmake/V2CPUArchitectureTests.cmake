@@ -981,6 +981,14 @@ v2_add_core_free_test(V2_Integration_CPURoPESharedAngleFill
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.SharedAngleFillCompletesBeforeRotationInRetainedTeams
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE ByteExact Ownership Regression)
+v2_add_core_free_test(V2_Integration_CPURoPEQ8OneRowTeamHeadOwnership
+    COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
+        --gtest_filter=CPURoPEWorkshare.Q8OneRowRetainedTeamRotatesEachHeadOnce
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Q8_1 ByteExact Ownership Regression)
+v2_add_core_free_test(V2_Integration_CPURoPEQ8OneRowNegativePosition
+    COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
+        --gtest_filter=CPURoPEWorkshare.Q8OneRowNegativePositionIsIndependentOfPriorCall
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Q8_1 ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPURoPEAngleBindingRejection
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.AngleRowsRejectMissingOrUndersizedPlanes
