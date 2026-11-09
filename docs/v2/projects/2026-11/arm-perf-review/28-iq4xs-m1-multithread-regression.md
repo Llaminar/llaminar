@@ -678,3 +678,21 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   Unit 979/13, Preflight 2360/12, Cells 222/1 — all base/env (A/B/C/D);
   census 12/12, proof 242/1274, lifecycle 1, 9/9 cells 0 mismatches.
   Spot-check cancelled; .80 free. R1 remaining = WSL (4') only.
+
+## New-base preflight notes (WSL (4'), 2026-11-09)
+
+- Unit: addon Unit-clean; 425002104 basecheck failed all 14 by name (13
+  identical; ModelLoaderRowSlice = missing-exe artifact + known /proc/self/io
+  WSL); nothing green-base/red-addon. Explicit addon cells 16/16.
+- Preflight 2344/2360: WSL-known 4; target-selection FAILURES NOW PASS; 12
+  new all classified base (ROCm CSV fixtures = rename -f force-add miss,
+  B-class harness, CommonDispatchPolicy, GroupedSealedPlan,
+  ProductionParityCampaigns, KLDCanary, FusedFinalAdd trio, DevelopPRGate
+  Contract, NativeGTestRequiredExecution, PreflightDeviceInventoryIsolation,
+  NativeMPITestLaunchDefaults, ROCmArchitectureIdentityReplay/OptionalGPU/
+  ROCmMoE).
+- CPURootedGatherParallelCopyReplay: NEW preflight member needing ≥2
+  PHYSICAL sockets (validCPUExpertSocketMembership(endpoints,2); single-
+  socket hosts fail hard) — flagged to Main (gate as ≥2-socket precondition).
+- Preflight basecheck at 425002104 running (formal control); (5') b199ccfa0
+  building alongside (-j2/7GB).
