@@ -7,8 +7,8 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Release 512/256: **286.040 P /39.074 D with passive counters**.
-Root combine/preweight: **+2.05% P /+1.40% D**; all768 IDs/MTP match.
+Release 512/256: **285.983 P /40.013 D**; after-prefill **39.857 D**.
+Filtered-counter guards: **+2.40% D**, P flat; all768 IDs/MTP match.
 Short-prefill indexer elision saves **36 kernels/chunk/GPU**; its matched
 control showed **+7.09% P**, with unchanged output IDs/MTP.
 Paired retained graphs cost eight GPU expert slots: **8066 total, 4033/card**.
@@ -25,7 +25,7 @@ qualification remain open; previous broad-tree passes are not that certificate.
 and11 grouped cells. M1 is installed; paid evidence resumes unchanged.
 Four/two/one panel scheduling gives **1.62× CPU FFN over two-pair**. Live-plan
 initialization saves **2.3% MTP /2.5% prefill** in AVX512 components.
-Installed M3 overlay: mixed Auto gate/up **11% faster**, model flat.
+M3 overlay: **11% component gain**, model flat.
 Prepared-Q8 N64/MT16 passes MI50/XTX byte gates; **9–25% faster than N64/MT32**,
 unpromoted. HIP ingress: **8–12% small-case gain**, bulk/model flat. Root combine/weight
 worksharing: **~2× M64, 3–6% M448** component gain; model result above.

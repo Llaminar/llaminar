@@ -4822,20 +4822,25 @@ namespace llaminar2
                 : PerfStatsCollector::Clock::time_point{};
         if (cpu_grouped_route_slots_.empty())
         {
-            PerfStatsCollector::addCounter(
-                verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill"),
-                verifier_rows
-                    ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
-                    : (decode_rows
-                           ? "moe_routed_grouped_decode_rows"
-                           : "moe_routed_grouped_decode_equivalent_prefill_rows"),
-                static_cast<double>(seq_len),
-                grouped_phase,
-                params_.device_id.toString(),
-                {{"stage", "routed_expert"},
-                 {"route", "cpu_expert_slot_grouped"},
-                 {"local_route_slots", "0"},
-                 {"active_experts", "0"}});
+            // Consult the original immutable domain policy BEFORE constructing
+            // counter strings/tags; the collector cannot undo argument work.
+            if (PerfStatsCollector::isDomainEnabled(verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill")))
+            {
+                PerfStatsCollector::addCounter(
+                    verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill"),
+                    verifier_rows
+                        ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
+                        : (decode_rows
+                               ? "moe_routed_grouped_decode_rows"
+                               : "moe_routed_grouped_decode_equivalent_prefill_rows"),
+                    static_cast<double>(seq_len),
+                    grouped_phase,
+                    params_.device_id.toString(),
+                    {{"stage", "routed_expert"},
+                     {"route", "cpu_expert_slot_grouped"},
+                     {"local_route_slots", "0"},
+                     {"active_experts", "0"}});
+            }
             return true;
         }
 
@@ -5123,20 +5128,23 @@ namespace llaminar2
                         << " d_model=" << d_model);
                     return false;
                 }
-                PerfStatsCollector::addCounter(
-                    "moe_overlay",
-                    "cpu_transport_router_q8_publications",
-                    1.0,
-                    grouped_phase,
-                    params_.device_id.toString(),
-                    {{"layer", std::to_string(params_.layer_idx)},
-                     {"source_rows",
-                      std::to_string(
-                          sparse_overlay_cpu_hidden_source_row_capacity_)},
-                     {"route_rows", std::to_string(local_route_rows)},
-                     {"d_model", std::to_string(d_model)},
-                     {"layout", "expert_major"},
-                     {"source", "fixed_capacity_ticket"}});
+                if (PerfStatsCollector::isDomainEnabled("moe_overlay"))
+                {
+                    PerfStatsCollector::addCounter(
+                        "moe_overlay",
+                        "cpu_transport_router_q8_publications",
+                        1.0,
+                        grouped_phase,
+                        params_.device_id.toString(),
+                        {{"layer", std::to_string(params_.layer_idx)},
+                         {"source_rows",
+                          std::to_string(
+                              sparse_overlay_cpu_hidden_source_row_capacity_)},
+                         {"route_rows", std::to_string(local_route_rows)},
+                         {"d_model", std::to_string(d_model)},
+                         {"layout", "expert_major"},
+                         {"source", "fixed_capacity_ticket"}});
+                }
                 record_cpu_moe_phase(
                     "transported_router_q8_expert_major_publication",
                     router_q8_prepare_start);
@@ -5313,17 +5321,20 @@ namespace llaminar2
                 "native_quantised_grouped_ffn_transaction",
                 grouped_ffn_start);
 
-            PerfStatsCollector::addCounter(
-                "kernel",
-                "cpu_moe_native_quantised_layer_batched_expert_calls",
-                1.0,
-                grouped_phase,
-                "cpu",
-                {{"layer", std::to_string(params_.layer_idx)},
-                 {"active_experts",
-                  std::to_string(cpu_grouped_active_experts_.size())},
-                 {"local_route_rows", std::to_string(local_route_rows)},
-                 {"team_lifetime", "complete_moe_ffn"}});
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_moe_native_quantised_layer_batched_expert_calls",
+                    1.0,
+                    grouped_phase,
+                    "cpu",
+                    {{"layer", std::to_string(params_.layer_idx)},
+                     {"active_experts",
+                      std::to_string(cpu_grouped_active_experts_.size())},
+                     {"local_route_rows", std::to_string(local_route_rows)},
+                     {"team_lifetime", "complete_moe_ffn"}});
+            }
         }
         else
         {
@@ -5557,39 +5568,45 @@ namespace llaminar2
                 : "ordered_topk_accumulation",
             accumulate_start);
 
-        PerfStatsCollector::addCounter(
-            verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill"),
-            verifier_rows
-                ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
-                : (decode_rows
-                       ? "moe_routed_grouped_decode_rows"
-                       : "moe_routed_grouped_decode_equivalent_prefill_rows"),
-            static_cast<double>(seq_len),
-            grouped_phase,
-            params_.device_id.toString(),
-            {{"stage", "routed_expert"},
-             {"route", "cpu_expert_slot_grouped"},
-             {"local_route_slots", std::to_string(cpu_grouped_route_slots_.size())},
-             {"active_experts", std::to_string(cpu_grouped_active_experts_.size())},
-             {"seq_len", std::to_string(seq_len)},
-             {"top_k", std::to_string(top_k)}});
-        if (all_native_bundles)
+        if (PerfStatsCollector::isDomainEnabled(verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill")))
         {
             PerfStatsCollector::addCounter(
-                "kernel",
+                verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill"),
                 verifier_rows
-                    ? "cpu_moe_grouped_verifier_router_q8_reuse_calls"
+                    ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
                     : (decode_rows
-                           ? "cpu_moe_grouped_decode_router_q8_reuse_calls"
-                           : "cpu_moe_prefill_router_q8_reuse_calls"),
-                1.0,
-                "moe",
-                "cpu",
-                {{"seq_len", std::to_string(seq_len)},
-                 {"top_k", std::to_string(top_k)},
-                 {"active_experts", std::to_string(cpu_grouped_active_experts_.size())},
+                           ? "moe_routed_grouped_decode_rows"
+                           : "moe_routed_grouped_decode_equivalent_prefill_rows"),
+                static_cast<double>(seq_len),
+                grouped_phase,
+                params_.device_id.toString(),
+                {{"stage", "routed_expert"},
                  {"route", "cpu_expert_slot_grouped"},
-                 {"purpose", grouped_phase}});
+                 {"local_route_slots", std::to_string(cpu_grouped_route_slots_.size())},
+                 {"active_experts", std::to_string(cpu_grouped_active_experts_.size())},
+                 {"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)}});
+        }
+        if (all_native_bundles)
+        {
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    verifier_rows
+                        ? "cpu_moe_grouped_verifier_router_q8_reuse_calls"
+                        : (decode_rows
+                               ? "cpu_moe_grouped_decode_router_q8_reuse_calls"
+                               : "cpu_moe_prefill_router_q8_reuse_calls"),
+                    1.0,
+                    "moe",
+                    "cpu",
+                    {{"seq_len", std::to_string(seq_len)},
+                     {"top_k", std::to_string(top_k)},
+                     {"active_experts", std::to_string(cpu_grouped_active_experts_.size())},
+                     {"route", "cpu_expert_slot_grouped"},
+                     {"purpose", grouped_phase}});
+            }
         }
         return true;
     }
@@ -5624,21 +5641,24 @@ namespace llaminar2
             LOG_ERROR("[MoEExpertComputeStage] Decode-equivalent verifier prefill requires prepared expert engines");
             return false;
         }
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "moe_decode_equivalent_verifier_prefill_runs",
-            1.0,
-            "verifier",
-            params_.device_id.toString(),
-            {{"stage", "routed_expert"},
-             {"route", seq_len == 1
-                           ? (is_gpu ? "grouped_prefill"
-                                     : "single_row_decode")
-                           : (is_gpu ? "grouped_prefill"
-                                     : "cpu_expert_slot_grouped")},
-             {"layer", std::to_string(params_.layer_idx)},
-             {"seq_len", std::to_string(params_.seq_len)},
-             {"top_k", std::to_string(params_.top_k)}});
+        if (PerfStatsCollector::isDomainEnabled("mtp"))
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "moe_decode_equivalent_verifier_prefill_runs",
+                1.0,
+                "verifier",
+                params_.device_id.toString(),
+                {{"stage", "routed_expert"},
+                 {"route", seq_len == 1
+                               ? (is_gpu ? "grouped_prefill"
+                                         : "single_row_decode")
+                               : (is_gpu ? "grouped_prefill"
+                                         : "cpu_expert_slot_grouped")},
+                 {"layer", std::to_string(params_.layer_idx)},
+                 {"seq_len", std::to_string(params_.seq_len)},
+                 {"top_k", std::to_string(params_.top_k)}});
+        }
         if (top_k > 16)
         {
             LOG_ERROR("[MoEExpertComputeStage] Decode-equivalent verifier prefill top_k="

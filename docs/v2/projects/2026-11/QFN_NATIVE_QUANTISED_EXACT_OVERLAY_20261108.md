@@ -1173,3 +1173,36 @@ retired run-owned prefix files (727,912,509 bytes), without payload reads/hashes
 Evidence: `/tmp/qfn-cpu-root-combine-preweight-r1125/` (focused/native/ISA and raw
 paired economy) and `/tmp/qfn-cpu-root-fusion-model-r1125/` (matched model,
 configuration, resources, driver observation and retirement).
+
+
+### Avoid argument work for disabled MoE counter domains
+
+Six existing MoE stage counter sites now consult the existing immutable domain
+policy before constructing strings and tag maps. The collector previously
+rejected these observations after their caller arguments had been constructed.
+Enabled names, tags, values, phases and epoch behavior are unchanged. There is
+no new counter API, cached policy, changed environment/filter, inference math,
+kernel, placement, transport, graph or precision choice.
+
+The current passive filter excludes those sites' kernel/MTP/decode/prefill/
+moe_overlay domains. The complete original collector Unit owner and actual
+all-format CPU stage aliases pass for runtime AVX2/AVX512. Captured verifier
+lifecycle checks pass on CUDA, MI50 and gfx1100: six registrations total, zero
+skips. Existing sweep scope/reuse owners also pass62 device-free cases; they
+start no new sweeps and preserve the modern-only collection policy.
+
+Matched Release **285.982848 P /40.013313 benchmark D** versus286.040438 /
+39.074346 gives **−0.02% P /+2.40% D**. The after-prefill255-token denominator is
+**39.857011 D**; individual benchmark decode rates are39.9402,39.9667,40.1337.
+This crosses40 only in the benchmark aggregate, not a robust sustained40 gate.
+All768 IDs, MTP work, normalized configuration and initial placement match the
+immediately preceding root-combine checkpoint. The same original512/256,
+one-warmup/three-measurement controls remain. No competing build/profile ran.
+
+The222 passive samples show maximum individual RSS82.833GB and per-client VRAM
+32.528/32.279GB. These are comparable short-run maxima, not summed physical
+memory or a leak certificate. All processes retire,208 driver snapshots show
+zero findings, and18 run-owned prefix files (727,912,504 bytes) are removed
+using metadata only. Full preflight is still outside this iteration; the500/40
+goal remains open. Evidence: `/tmp/qfn-cpu-filtered-stage-telemetry-r1126/` and
+`/tmp/qfn-cpu-filtered-stage-model-r1126/`.
