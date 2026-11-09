@@ -75,6 +75,8 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedCoefficientDomainContract)
         EXPECT_FALSE(metadata.usesNibbleLUT());
     }
 #endif
+#if defined(__AVX2__)
+    // addOrderedAVX2/AVX512 are x86 instruction-order helpers.
     // The original serial witness retains the earlier K payload. Exercise
     // the actual ordinary add on each selected runtime ISA, not a NaN-aware
     // oracle path. Integer bit construction never quiets a signaling input.
@@ -107,6 +109,7 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedCoefficientDomainContract)
         }
 #endif
     }
+#endif
     CPUNativeQuantisedPackedWeights packed;
     packed.encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
     packed.is_asymmetric = true;
@@ -401,6 +404,8 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                             }
                             const auto plan = planNativeQuantisedFusedRows(
                                 descriptors, max_rows, workers, ISAPath::AUTO);
+#if !defined(__aarch64__)
+                            // x86 planner K-partition/row-tile identity; ARM tiles are full-K.
                             if (source_identity_nibble &&
                                 policy == CPUProjectionNumericalPolicy::GPUAlignedExpert && rows > 1)
                             {
@@ -408,6 +413,7 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                                 EXPECT_EQ(plan.projections[0].effective_verifier_schedule, VerifierRowsPolicy::Pairwise);
                                 EXPECT_EQ(plan.projections[0].verifier_resolution.physical_row_tile, 2);
                             }
+#endif
                             NativeQuantisedTestPartialStorage partials(plan.sharedPartialFloats());
                             ASSERT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(
                                 input.data(), descriptors.data(), partials.span(), 2,
