@@ -26,7 +26,8 @@ namespace llaminar2::cpu::native_quantised
         AVX2,   // Force AVX2 emulated-VNNI path
         SCALAR, // Independent diagnostic oracle on the x86 implementation only.
         NEON,   // Native AArch64 ASIMD signed-byte implementation.
-        NEON_DOTPROD // Native AArch64 SDOT implementation; requires compiled/hardware support.
+        NEON_DOTPROD, // Native AArch64 SDOT implementation; requires compiled/hardware support.
+        NEON_I8MM // Native AArch64 row-pair SMMLA family; requires the NEON_I8MM envelope/hardware.
     };
 
     /** @brief Reject a foreign/uncompiled ISA before planning or execution.
@@ -41,6 +42,9 @@ namespace llaminar2::cpu::native_quantised
         if (path == ISAPath::AUTO || path == ISAPath::NEON) return;
 #if defined(__ARM_FEATURE_DOTPROD)
         if (path == ISAPath::NEON_DOTPROD) return;
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+        if (path == ISAPath::NEON_I8MM) return;
 #endif
 #else
         if (path == ISAPath::AUTO || path == ISAPath::AVX2 || path == ISAPath::AVX512 || path == ISAPath::SCALAR) return;

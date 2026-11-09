@@ -103,9 +103,23 @@ namespace llaminar2::cpu::native_quantised
          */
         template <Dot Instruction = Dot::ASIMD> void execute() const
         {
-            if constexpr (Instruction == Dot::DotProd)
+            if constexpr (Instruction == Dot::DotProd || Instruction == Dot::I8MM)
                 ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
-            using Ops = multi_scale::NEONMultiScaleOps<Instruction>;
+            if constexpr (Instruction == Dot::I8MM)
+                ARMCPUCapabilities::native().require(ARMCPUFeature::IntegerMatMul);
+            executeWith<multi_scale::NEONMultiScaleOps<leafInstruction<Instruction>()>>();
+        }
+
+        /**
+         * @brief Execute with one explicit native operation set.
+         * @tparam Ops NEONMultiScaleOps of an admitted family, or a test type
+         * derived from one that observes its integer leaf calls.
+         * @details execute() is the production entry and admits the hardware;
+         * callers of this overload must have admitted Ops' instructions.
+         * @throws std::invalid_argument For an unsupported source/encoding/policy tuple.
+         */
+        template <typename Ops> void executeWith() const
+        {
             if (weights_.usesCompactMultiScale())
             {
                 std::array<const Q8_1Block *, Rows> input;
@@ -131,7 +145,21 @@ namespace llaminar2::cpu::native_quantised
             throw std::invalid_argument("Native NEON projection requires a known arithmetic policy");
         }
 
+        /**
+         * @brief Resolve the exact leaf instruction family one tile executes.
+         * @tparam Instruction Admitted family requested for the whole projection.
+         * @return The requested family, except that a lone I8MM row is the SDOT leaf.
+         * @details SMMLA needs two rows. A single-row tile (M=1 decode or the
+         * odd last row) therefore compiles the very DotProd instantiation, so
+         * it emits no SMMLA and is byte- and code-identical to serial decode.
+         */
+        template <Dot Instruction> static constexpr Dot leafInstruction() noexcept
+        { return Instruction == Dot::I8MM && Rows == 1 ? Dot::DotProd : Instruction; }
+
     private:
+        /// Two-row SMMLA accumulator sets per tile; at least one keeps the array type valid.
+        static constexpr std::size_t Pairs = Rows / 2 == 0 ? 1 : Rows / 2;
+
         /** @brief Seal borrowed spans and a validated arithmetic tree.
          * @param weights Checked immutable matrix publication.
          * @param activation Complete Q8 rows.
@@ -228,6 +256,57 @@ namespace llaminar2::cpu::native_quantised
             }
         }
 
+        /**
+         * @brief Add two adjacent decoded groups to every row with row-pair matrix dots.
+         * @tparam Ops Admitted I8MM operation set.
+         * @param first Four signed source bytes per column for @p group.
+         * @param second The same columns' bytes for @p group + 1.
+         * @param block Logical K block.
+         * @param group Even first group in [0,6]; both groups lie in one scale half.
+         * @param columns01 Exact SMMLA column-0/1 sums, one per row pair.
+         * @param columns23 Exact SMMLA column-2/3 sums, one per row pair.
+         * @param dots Single-row sums; only the odd last row is updated here, with SDOT.
+         */
+        template <typename Ops> void consumePair(int8x16_t first, int8x16_t second, int block, int group,
+            typename Ops::I (&columns01)[Pairs], typename Ops::I (&columns23)[Pairs],
+            typename Ops::I (&dots)[Rows]) const noexcept
+        {
+            using I = typename Ops::I;
+#pragma GCC unroll 2
+            for (std::size_t pair = 0; pair < Rows / 2; ++pair)
+                Ops::pairDot(columns01[pair], columns23[pair],
+                    Ops::activationPair(activation_[2 * pair][block].qs + group * 4,
+                                        activation_[2 * pair + 1][block].qs + group * 4),
+                    std::bit_cast<I>(first), std::bit_cast<I>(second));
+            if constexpr (Rows % 2 != 0)
+            {
+                int word0 = 0, word1 = 0;
+                std::memcpy(&word0, activation_[Rows - 1][block].qs + group * 4, sizeof(word0));
+                std::memcpy(&word1, activation_[Rows - 1][block].qs + group * 4 + 4, sizeof(word1));
+                dots[Rows - 1] = Ops::dot(dots[Rows - 1], std::bit_cast<I>(first), I{} + word0);
+                dots[Rows - 1] = Ops::dot(dots[Rows - 1], std::bit_cast<I>(second), I{} + word1);
+            }
+        }
+
+        /** @brief Add completed row-pair sums into their rows' exact INT32 block dots.
+         * @tparam Ops Admitted I8MM operation set.
+         * @param columns01 Completed column-0/1 sums per pair.
+         * @param columns23 Completed column-2/3 sums per pair.
+         * @param dots Per-row INT32 sums for the same block half.
+         */
+        template <typename Ops> static void publishPairs(const typename Ops::I (&columns01)[Pairs],
+            const typename Ops::I (&columns23)[Pairs], typename Ops::I (&dots)[Rows]) noexcept
+        {
+#pragma GCC unroll 2
+            for (std::size_t pair = 0; pair < Rows / 2; ++pair)
+            {
+                typename Ops::I row0, row1;
+                Ops::splitPair(columns01[pair], columns23[pair], row0, row1);
+                dots[2 * pair] += row0;
+                dots[2 * pair + 1] += row1;
+            }
+        }
+
         /** @brief Expand the selected sixteen Q6_K high-plane bits into source byte positions.
          * @param mask Four high bits per column, packed in increasing source order.
          * @param bit Original six-bit bit-position value, either 16 or 32.
@@ -239,6 +318,87 @@ namespace llaminar2::cpu::native_quantised
             const auto raw = vcombine_u8(vdup_n_u8(static_cast<std::uint8_t>(mask)),
                 vdup_n_u8(static_cast<std::uint8_t>(mask >> 8)));
             return vandq_u8(vtstq_u8(raw, positions), vdupq_n_u8(bit));
+        }
+
+        /** @brief Decode one Q6_K group's six-bit source integers for four columns.
+         * @param unit Prepared interleaved unit of the current block.
+         * @param column First of four output columns.
+         * @param group Four-value group in [0,7].
+         * @return Sixteen centered signed source bytes.
+         */
+        static int8x16_t q6Group(const std::uint8_t *unit, int column, int group) noexcept
+        {
+            const auto raw = vld1q_u8(unit + (group % 4) * 256 + column * 4);
+            auto values = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
+            const auto *planes = unit + 1024 + group * 64 + (column / 16) * 16;
+            std::uint64_t bits0 = 0, bits1 = 0;
+            std::memcpy(&bits0, planes, sizeof(bits0));
+            std::memcpy(&bits1, planes + 8, sizeof(bits1));
+            const int shift = (column % 16) * 4;
+            values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits0 >> shift), 16));
+            values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits1 >> shift), 32));
+            return vsubq_s8(vreinterpretq_s8_u8(values), vdupq_n_s8(32));
+        }
+
+        /**
+         * @brief Compute one block's exact INT32 dots for every row with row-pair SMMLA.
+         * @tparam Ops Admitted I8MM operation set.
+         * @tparam Physical Non-compact execution encoding.
+         * @tparam Map Nibble decoder for nibble encodings.
+         * @param unit Prepared interleaved unit of the current block.
+         * @param column First of four output columns.
+         * @param block Logical K block.
+         * @param low Receives K0..31 dots, or the Q6_K low-scale half K0..15.
+         * @param high Receives the Q6_K high-scale half K16..31; otherwise untouched.
+         * @details Groups are decoded with the same expressions as the single-row
+         * walk and consumed as adjacent pairs that never straddle a scale half.
+         * The FP32 block program that follows is shared and unchanged.
+         */
+        template <typename Ops, Encoding Physical, NibbleMap Map>
+        void pairBlock(const std::uint8_t *unit, int column, int block,
+            typename Ops::I (&low)[Rows], typename Ops::I (&high)[Rows]) const noexcept
+        {
+            using I = typename Ops::I;
+            I low01[Pairs]{}, low23[Pairs]{};
+            if constexpr (Physical == Encoding::Q6KNativeDualScale)
+            {
+                I high01[Pairs]{}, high23[Pairs]{};
+                // Two decoded groups live at a time, the pairwise analogue of
+                // the single-row walk's one-group bound against panel spills.
+#pragma GCC unroll 1
+                for (int group = 0; group < 8; group += 2)
+                {
+                    const auto first = q6Group(unit, column, group);
+                    const auto second = q6Group(unit, column, group + 1);
+                    if (group < 4) consumePair<Ops>(first, second, block, group, low01, low23, low);
+                    else consumePair<Ops>(first, second, block, group, high01, high23, high);
+                }
+                publishPairs<Ops>(high01, high23, high);
+            }
+            else if constexpr (Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale)
+            {
+                // Low nibbles of byte groups q and q+1 are K groups q and q+1;
+                // their high nibbles are K groups q+4 and q+5.
+#pragma GCC unroll 2
+                for (int group = 0; group < 4; group += 2)
+                {
+                    const auto raw0 = vld1q_u8(unit + group * 256 + column * 4);
+                    const auto raw1 = vld1q_u8(unit + (group + 1) * 256 + column * 4);
+                    consumePair<Ops>(nibbles<Map>(vandq_u8(raw0, vdupq_n_u8(15))),
+                        nibbles<Map>(vandq_u8(raw1, vdupq_n_u8(15))), block, group, low01, low23, low);
+                    consumePair<Ops>(nibbles<Map>(vshrq_n_u8(raw0, 4)),
+                        nibbles<Map>(vshrq_n_u8(raw1, 4)), block, group + 4, low01, low23, low);
+                }
+            }
+            else
+            {
+#pragma GCC unroll 4
+                for (int group = 0; group < 8; group += 2)
+                    consumePair<Ops>(vld1q_s8(reinterpret_cast<const std::int8_t *>(unit + group * 256 + column * 4)),
+                        vld1q_s8(reinterpret_cast<const std::int8_t *>(unit + (group + 1) * 256 + column * 4)),
+                        block, group, low01, low23, low);
+            }
+            publishPairs<Ops>(low01, low23, low);
         }
 
         /**
@@ -273,7 +433,9 @@ namespace llaminar2::cpu::native_quantised
                         const auto *unit = weights_.interleavedBase() +
                             (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
                         I low[Rows]{}, high[Rows]{};
-                        if constexpr (Physical == Encoding::Q6KNativeDualScale)
+                        if constexpr (multi_scale::usesRowPairs<Ops>)
+                            pairBlock<Ops, Physical, Map>(unit, column, block, low, high);
+                        else if constexpr (Physical == Encoding::Q6KNativeDualScale)
                         {
                             // Keep one decoded group live at a time. Fully
                             // unrolling all eight groups lets the compiler
@@ -282,16 +444,7 @@ namespace llaminar2::cpu::native_quantised
 #pragma GCC unroll 1
                             for (int group = 0; group < 8; ++group)
                             {
-                                const auto raw = vld1q_u8(unit + (group % 4) * 256 + column * 4);
-                                auto values = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
-                                const auto *planes = unit + 1024 + group * 64 + (column / 16) * 16;
-                                std::uint64_t bits0 = 0, bits1 = 0;
-                                std::memcpy(&bits0, planes, sizeof(bits0));
-                                std::memcpy(&bits1, planes + 8, sizeof(bits1));
-                                const int shift = (column % 16) * 4;
-                                values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits0 >> shift), 16));
-                                values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits1 >> shift), 32));
-                                const auto centered = vsubq_s8(vreinterpretq_s8_u8(values), vdupq_n_s8(32));
+                                const auto centered = q6Group(unit, column, group);
                                 if (group < 4) consume<Ops>(centered, block, group, low);
                                 else consume<Ops>(centered, block, group, high);
                             }

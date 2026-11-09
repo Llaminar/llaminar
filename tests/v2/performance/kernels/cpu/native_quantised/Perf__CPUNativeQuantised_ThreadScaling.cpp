@@ -45,6 +45,12 @@
  * - `LLAMINAR_CPU_THREAD_SCALING_PREFILL_M`
  * - `LLAMINAR_CPU_THREAD_SCALING_WARMUP`
  * - `LLAMINAR_CPU_THREAD_SCALING_ITERS`
+ * - `LLAMINAR_CPU_THREAD_SCALING_GROUPED_M` (CSV grouped verifier depths;
+ *   default `4,15`)
+ * - `LLAMINAR_CPU_THREAD_SCALING_ISA_PATH` (`auto`, or an explicit native leaf
+ *   family compiled into this binary: `neon`, `neon-dotprod`, `neon-i8mm`).
+ *   It selects the timed launches only; the serial byte oracle stays `auto`,
+ *   so an SDOT-vs-SMMLA A/B runs in one binary with identical surrounding code.
  */
 
 #include "../../../../utils/NativeQuantisedTestPartialStorage.h"
@@ -159,6 +165,43 @@ std::vector<const QuantizedVerifierFormatCase *> selectedFormats()
         if (found == formats.end())
             throw std::invalid_argument("Unknown thread-scaling format: " + token);
         result.push_back(&*found);
+    }
+    return result;
+}
+
+/**
+ * @brief Resolve the explicit timed instruction family.
+ * @return Automatic or one explicitly named native ARM leaf; unknown names are fatal.
+ */
+std::pair<ISAPath, std::string> timedISAPath()
+{
+    const char *raw = std::getenv("LLAMINAR_CPU_THREAD_SCALING_ISA_PATH");
+    const std::string request = raw && *raw ? raw : "auto";
+    if (request == "auto") return {ISAPath::AUTO, request};
+    if (request == "neon") return {ISAPath::NEON, request};
+    if (request == "neon-dotprod") return {ISAPath::NEON_DOTPROD, request};
+    if (request == "neon-i8mm") return {ISAPath::NEON_I8MM, request};
+    throw std::invalid_argument("LLAMINAR_CPU_THREAD_SCALING_ISA_PATH must be auto|neon|neon-dotprod|neon-i8mm");
+}
+
+/**
+ * @brief Return the grouped verifier depths to measure.
+ * @return Positive depths, default 4 and 15; each must be at least two.
+ */
+std::vector<int> groupedDepths()
+{
+    const char *raw = std::getenv("LLAMINAR_CPU_THREAD_SCALING_GROUPED_M");
+    if (!raw || *raw == '\0') return {4, 15};
+    std::vector<int> result;
+    std::stringstream stream(raw);
+    std::string token;
+    while (std::getline(stream, token, ','))
+    {
+        char *end = nullptr;
+        const long parsed = std::strtol(token.c_str(), &end, 10);
+        if (token.empty() || *end != '\0' || parsed < 2 || parsed > 256)
+            throw std::invalid_argument("LLAMINAR_CPU_THREAD_SCALING_GROUPED_M entries must be in 2..256");
+        result.push_back(static_cast<int>(parsed));
     }
     return result;
 }
@@ -323,13 +366,15 @@ TEST(Perf__CPUNativeQuantisedThreadScaling, ProductionAutoRoutes)
         std::string_view name;
         int m;
     };
-    const std::vector<Regime> regimes = {
-        {"gemv_decode", 1},
-        {"grouped_decode", 4},
-        {"grouped_decode", 15},
-        {"gemm_prefill", prefill_m},
-    };
-    const int maximum_m = std::max(prefill_m, 15);
+    std::vector<Regime> regimes = {{"gemv_decode", 1}};
+    int maximum_m = prefill_m;
+    for (const int depth : groupedDepths())
+    {
+        regimes.push_back({"grouped_decode", depth});
+        maximum_m = std::max(maximum_m, depth);
+    }
+    regimes.push_back({"gemm_prefill", prefill_m});
+    const auto [timed_path, timed_path_name] = timedISAPath();
 
     std::vector<ScalingPoint> points;
     for (const QuantizedVerifierFormatCase *format : selectedFormats())
@@ -394,7 +439,7 @@ TEST(Perf__CPUNativeQuantisedThreadScaling, ProductionAutoRoutes)
                             packed,
                             activations.data(),
                             output.data(), partial_storage.span(),
-                            ISAPath::AUTO,
+                            timed_path,
                             DecodeSchedulePolicy::Auto);
                         return;
                     }
@@ -406,7 +451,7 @@ TEST(Perf__CPUNativeQuantisedThreadScaling, ProductionAutoRoutes)
                             output.data(), partial_storage.span(),
                             regime.m,
                             n,
-                            ISAPath::AUTO,
+                            timed_path,
                             VerifierRowsPolicy::Auto);
                         return;
                     }
@@ -416,7 +461,7 @@ TEST(Perf__CPUNativeQuantisedThreadScaling, ProductionAutoRoutes)
                         output.data(), partial_storage.span(),
                         regime.m,
                         n,
-                        ISAPath::AUTO,
+                        timed_path,
                         VerifierRowsPolicy::Auto,
                         PrefillSchedulePolicy::Auto);
                 };
@@ -442,7 +487,7 @@ TEST(Perf__CPUNativeQuantisedThreadScaling, ProductionAutoRoutes)
                             gemv_native_quantised_preq(packed,
                                 activations.data() + static_cast<size_t>(row) * packed.blocks_per_row,
                                 output.data() + static_cast<size_t>(row) * n,
-                                serial_partials.span(), ISAPath::AUTO, DecodeSchedulePolicy::Auto);
+                                serial_partials.span(), timed_path, DecodeSchedulePolicy::Auto);
                     };
                     serial_rows_median_us =
                         measureLaunch(warmup_count, iteration_count, serial_launch).median_us;
@@ -491,6 +536,8 @@ TEST(Perf__CPUNativeQuantisedThreadScaling, ProductionAutoRoutes)
         << "\nCPU NativeQuantised production thread scaling"
         << " (N=" << n << " K=" << k
         << ", isa=" << isaLevelName(activeISALevel())
+        << ", build=" << compiledNativeQuantisedBuildISAName()
+        << ", timed_path=" << timed_path_name
         << ", max_threads=" << maximum_threads << ")\n"
         << "format,regime,policy,M,threads,nbc,serial_k_tiles,regime_k_tiles,"
            "median_us,min_us,p95_us,gops,speedup,efficiency_pct,"

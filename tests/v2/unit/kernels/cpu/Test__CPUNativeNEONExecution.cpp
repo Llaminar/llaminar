@@ -217,10 +217,32 @@ TEST_F(CPUNativeNEONExecution, NativeInstructionAndNChunkCandidatesStayExact)
             ISAPath::NEON_DOTPROD, VerifierRowsPolicy::Pairwise, true, chunks);
         bytes(actual, expected);
 #endif
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+        // Explicit SMMLA row pairs, explicit SDOT and ASIMD are all real leaves
+        // of one I8MM binary; none may change a byte of the serial program.
+        for (const auto tile : {VerifierRowsPolicy::Pairwise, VerifierRowsPolicy::WideRows})
+        {
+            std::fill(actual.begin(), actual.end(), 123456.0f);
+            gemm_native_quantised_preq_decode_equivalent_rows(packed, input.data(), actual.data(), {}, 5, 193,
+                ISAPath::NEON_I8MM, tile, true, chunks);
+            bytes(actual, expected);
+        }
+#endif
     }
     std::array<float, 193> output{};
     for (const auto foreign : {ISAPath::AVX2, ISAPath::AVX512, ISAPath::SCALAR})
         EXPECT_THROW(gemv_native_quantised_preq(packed, input.data(), output.data(), {}, foreign), std::invalid_argument);
+#if !LLAMINAR_COMPILED_WITH_NEON_I8MM
+    // SMMLA is never dispatched outside its compiled envelope (for example on M1).
+    EXPECT_THROW(gemv_native_quantised_preq(packed, input.data(), output.data(), {}, ISAPath::NEON_I8MM), std::invalid_argument);
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+    EXPECT_STREQ(compiledNativeQuantisedBuildISAName(), "NEON_I8MM");
+    if (activeISALevel() == ISALevel::NEONDotProd)
+        EXPECT_EQ(neon_execution::instruction(ISAPath::AUTO), multi_scale::NEONByteDot::I8MM);
+    EXPECT_EQ(neon_execution::instruction(ISAPath::NEON_DOTPROD), multi_scale::NEONByteDot::DotProd);
+    EXPECT_EQ(neon_execution::instruction(ISAPath::NEON), multi_scale::NEONByteDot::ASIMD);
+#endif
 }
 
 /** @test Native fused descriptors retain per-member rows/strides/bias and reject sibling aliases. */
