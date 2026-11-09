@@ -19,9 +19,13 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <vector>
+#include <array>
+#include "CPUInt32RMSNormPublication.h"
 
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/CPUFeatures.h"
+#include "../../../utils/Assertions.h"
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include "NEONRMSNormFloatingRows.h"
 #include "NEONRMSNormQ16Rows.h"
@@ -607,74 +611,61 @@ namespace llaminar2::primitives
 
     namespace detail
     {
+        /** @brief Reduce full-width original integers in the declared scalar FP64 program.
+         * @param row Original integer words; @param cols Logical width.
+         * @return Increasing-column FP64 FMA sum, without a lossy FP32 conversion.
+         */
         double compute_rms_sq_int32_scalar(const int32_t *row, std::size_t cols)
         {
             double acc = 0.0;
             for (std::size_t c = 0; c < cols; ++c)
             {
-                double v = (double)row[c];
-                acc += v * v;
+                const double value=double(row[c]);
+                acc=std::fma(value,value,acc);
             }
             return acc;
         }
 
 #if defined(__AVX2__)
+        /** @brief Reduce original INT32 through eight fixed FP64 chains, never FP32.
+         * @param row Complete original integer row; @param cols Logical width.
+         * @return Fixed eight-chain summary with bounded masked original tails.
+         * @details Integer-to-double conversion retains low bits above2^24.
+         * The fold is ((0+2)+(4+6))+((1+3)+(5+7)); no worker partition enters it.
+         */
         double compute_rms_sq_int32_avx2(const int32_t *row, std::size_t cols)
         {
-            double acc = 0.0;
-            long long c = 0;
-            __m256 acc0 = _mm256_setzero_ps();
-            __m256 acc1 = _mm256_setzero_ps();
-
-            for (; c + 16 <= (long long)cols; c += 16)
+            auto low=_mm256_setzero_pd(),high=_mm256_setzero_pd();
+            const auto fragment=[](const int32_t*original,int live,__m256d &sum)
             {
-                __m256i i32_0 = _mm256_loadu_si256((__m256i *)(row + c));
-                __m256i i32_1 = _mm256_loadu_si256((__m256i *)(row + c + 8));
-                __m256 f0 = _mm256_cvtepi32_ps(i32_0);
-                __m256 f1 = _mm256_cvtepi32_ps(i32_1);
-                acc0 = _mm256_fmadd_ps(f0, f0, acc0);
-                acc1 = _mm256_fmadd_ps(f1, f1, acc1);
-            }
-
-            __m256 acc_all = _mm256_add_ps(acc0, acc1);
-            __m128 lo = _mm256_castps256_ps128(acc_all);
-            __m128 hi = _mm256_extractf128_ps(acc_all, 1);
-            __m128 sum2 = _mm_add_ps(lo, hi);
-            __m128 shuf = _mm_movehdup_ps(sum2);
-            __m128 sums = _mm_add_ps(sum2, shuf);
-            shuf = _mm_movehl_ps(shuf, sums);
-            sums = _mm_add_ss(sums, shuf);
-            float partial;
-            _mm_store_ss(&partial, sums);
-            acc += partial;
-
-            for (; c + 8 <= (long long)cols; c += 8)
+                const auto mask=_mm_setr_epi32(live>0?-1:0,live>1?-1:0,live>2?-1:0,live>3?-1:0);
+                const auto words=live==4?_mm_loadu_si128(reinterpret_cast<const __m128i*>(original)):
+                    _mm_maskload_epi32(original,mask);
+                const auto values=_mm256_cvtepi32_pd(words);
+                sum=_mm256_fmadd_pd(values,values,sum);
+            };
+            std::size_t column=0;
+            for(;cols-column>=8;column+=8)
             {
-                __m256i i32 = _mm256_loadu_si256((__m256i *)(row + c));
-                __m256 f = _mm256_cvtepi32_ps(i32);
-                __m256 sq = _mm256_mul_ps(f, f);
-                __m128 lo2 = _mm256_castps256_ps128(sq);
-                __m128 hi2 = _mm256_extractf128_ps(sq, 1);
-                __m128 sumv = _mm_add_ps(lo2, hi2);
-                __m128 sh2 = _mm_movehdup_ps(sumv);
-                __m128 sumv2 = _mm_add_ps(sumv, sh2);
-                sh2 = _mm_movehl_ps(sh2, sumv2);
-                sumv2 = _mm_add_ss(sumv2, sh2);
-                float p;
-                _mm_store_ss(&p, sumv2);
-                acc += p;
+                fragment(row+column,4,low);fragment(row+column+4,4,high);
             }
-
-            for (; c < (long long)cols; ++c)
+            if(column<cols)
             {
-                double v = (double)row[c];
-                acc += v * v;
+                fragment(row+column,int(std::min<std::size_t>(4,cols-column)),low);
+                if(cols-column>4)fragment(row+column+4,int(cols-column-4),high);
             }
-            return acc;
+            const auto first=_mm_add_pd(_mm256_castpd256_pd128(low),_mm256_extractf128_pd(low,1));
+            const auto second=_mm_add_pd(_mm256_castpd256_pd128(high),_mm256_extractf128_pd(high,1));
+            const auto folded=_mm_add_pd(first,second);
+            return _mm_cvtsd_f64(_mm_add_sd(folded,_mm_unpackhi_pd(folded,folded)));
         }
 #endif
 
 #if defined(__AVX512F__)
+        /** @brief Retain the existing sixteen-chain AVX512 FP64 integer summary.
+         * @param row Complete original signed integers; @param cols Logical width.
+         * @return Existing AVX512 reduction tree; not a universal cross-ISA oracle.
+         */
         double compute_rms_sq_int32_avx512(const int32_t *row, std::size_t cols)
         {
             double acc = 0.0;
@@ -713,35 +704,66 @@ namespace llaminar2::primitives
         }
 #endif
 
-#if defined(__aarch64__) && defined(__ARM_NEON)
-        /** @brief Reduce original INT32 without a lossy intermediate FP32 conversion.
-         * @param row Original full-width integers; @param cols Logical count.
-         * @return Native fixed-tree FP64 squared summary.
+#if LLAMINAR_COMPILED_WITH_NEON
+        /** @brief Share original integer traversal across one through four summary rows.
+         * @tparam Rows Live original rows, not padded allocation capacity.
+         * @tparam Bank Typed complete original summary or fused-publication borrow.
+         * @param bank Complete checked original input/output; @param first Original first row.
+         * @return Private fixed-order FP64 summaries, not converted original rows.
+         * @details Every row retains its native eight-chain M1 arithmetic. Only
+         * pointer descriptors are assembled; no integer/FP32 row is copied.
          */
-        double compute_rms_sq_int32_neon(const int32_t *row, std::size_t cols)
+        template<std::size_t Rows,class Bank>
+        std::array<double,Rows> native_int32_summaries(const Bank &bank,std::size_t first)
         {
-            using namespace neon_rmsnorm;
-            return squaredSums(OriginalRows<Storage::Int32, 1>::bind({std::span<const int32_t>(row, cols)}, cols))[0];
+            std::array<std::span<const std::int32_t>,Rows>inputs;
+            for(std::size_t row=0;row<Rows;++row)inputs[row]=bank.sourceRow(first+row);
+            return neon_rmsnorm::squaredSums(
+                neon_rmsnorm::OriginalRows<neon_rmsnorm::Storage::Int32,Rows>::bind(inputs,bank.columns()));
         }
 #endif
-
-// --- ISA stubs for runtime dispatch ---
-#if !defined(__AVX2__)
-        double compute_rms_sq_int32_avx2(const int32_t *row, std::size_t cols)
+        /** @brief Resolve explicit scalar intent or one complete native integer RMS program.
+         * @param options Immutable execution policy; @return Authenticated ISA identity.
+         * @throws std::invalid_argument For undeclared T5 or a foreign/uncompiled native program.
+         */
+        ISALevel int32_rms_program(const RMSNormExecOptions &options)
         {
-            return compute_rms_sq_int32_scalar(row, cols);
+            if(options.t5_compat_mode)throw std::invalid_argument("INT32 RMS has no declared T5 FP32 accumulation program");
+            const auto isa=options.force_scalar?ISALevel::Scalar:activeISALevel();
+            if(isa!=ISALevel::Scalar&&!isNativeCPUExecutionISAPair(compiledCPUISALevel(),isa))
+                throw std::invalid_argument("INT32 RMS has no matching compiled native ISA");
+            return isa;
         }
-#endif
-#if !defined(__AVX512F__)
-        double compute_rms_sq_int32_avx512(const int32_t *row, std::size_t cols)
+        /** @brief Reduce one original row under an already admitted non-NEON program.
+         * @param row Complete original integers; @param isa Explicit scalar or compiled x86 program.
+         * @return Complete fixed-tree FP64 summary, without decoded source storage.
+         */
+        double int32_rms_summary(std::span<const std::int32_t>row,ISALevel isa)
         {
-            return compute_rms_sq_int32_avx2(row, cols);
-        }
+            switch(isa)
+            {
+            case ISALevel::Scalar:return compute_rms_sq_int32_scalar(row.data(),row.size());
+#if defined(__AVX2__)
+            case ISALevel::AVX2:return compute_rms_sq_int32_avx2(row.data(),row.size());
 #endif
+#if defined(__AVX512F__)
+            case ISALevel::AVX512:return compute_rms_sq_int32_avx512(row.data(),row.size());
+#endif
+            default:LLAMINAR_UNREACHABLE("INT32 RMS summary selected an uncompiled instruction program");
+            }
+        }
 
     } // namespace detail
     using namespace detail;
 
+    /** @brief Publish complete full-width INT32 summaries through one lexical team owner.
+     * @param src Original integer bank; @param rows Logical rows; @param cols Original width.
+     * @param row_sumsq Disjoint caller-owned FP64 summaries; @param opts Declared execution/policy.
+     * @throws std::invalid_argument For invalid geometry, source/policy aliases or undeclared T5 intent.
+     * @details Scalar intent is increasing-K FP64 FMA; native arithmetic retains
+     * its declared per-ISA tree. Empty and small retained calls are collective
+     * completion edges, never independent whole-bank replays by every member.
+     */
     void rmsnorm_compute_row_sumsq_int32_vectorized(
         const int32_t *src,
         std::size_t rows,
@@ -749,424 +771,130 @@ namespace llaminar2::primitives
         double *row_sumsq,
         const RMSNormExecOptions &opts)
     {
-        if (!src || !row_sumsq || rows == 0 || cols == 0)
-            return;
-
-        bool parallel = want_parallel(rows, cols, opts);
-
-        auto do_row_work = [&](long long r)
+        const auto bank=rmsnorm_operands::Int32ReductionBorrow::bind(src,row_sumsq,rows,cols);
+        bank.requireMetadataReadOnly(&opts,sizeof(opts));
+        const auto isa=int32_rms_program(opts);
+        if(!::llaminar::v2::beginWorkshare(!bank.empty()))return;
+        const auto tiles=rows/4+(rows%4!=0);
+        auto work=[&]()
         {
-            const int32_t *row = src + (std::size_t)r * cols;
-            double acc = 0.0;
-
-            ISA_DISPATCH_RET(acc, compute_rms_sq_int32, row, cols);
-
-            row_sumsq[r] = acc;
-        };
-
-        if (parallel)
-        {
-            auto do_work = [&]()
-            {
 #pragma omp for schedule(static)
-                for (long long r = 0; r < (long long)rows; ++r)
-                {
-                    do_row_work(r);
-                }
-            };
-            OMP_WORKSHARE_REGION(do_work);
-        }
-        else
-        {
-            // Serial path
-            for (long long r = 0; r < (long long)rows; ++r)
+            for(std::ptrdiff_t tile=0;tile<std::ptrdiff_t(tiles);++tile)
             {
-                do_row_work(r);
+                const auto first=std::size_t(tile)*4;
+                const auto live=std::min<std::size_t>(4,rows-first);
+#if LLAMINAR_COMPILED_WITH_NEON
+                if(isa==ISALevel::NEON||isa==ISALevel::NEONDotProd)
+                {
+                    const auto publish=[&]<std::size_t Count>()
+                    {
+                        const auto sums=native_int32_summaries<Count>(bank,first);
+                        for(std::size_t row=0;row<Count;++row)bank.publish(first+row,sums[row]);
+                    };
+                    switch(live)
+                    {
+                    case 1:publish.template operator()<1>();break;
+                    case 2:publish.template operator()<2>();break;
+                    case 3:publish.template operator()<3>();break;
+                    case 4:publish.template operator()<4>();break;
+                    default:LLAMINAR_UNREACHABLE("INT32 RMS original tile lost its live rows");
+                    }
+                    continue;
+                }
+#endif
+                for(std::size_t row=first;row<first+live;++row)
+                {
+                    bank.publish(row,int32_rms_summary(bank.sourceRow(row),isa));
+                }
             }
-        }
+        };
+        OMP_WORKSHARE_REGION_IF(work,omp_in_parallel()||(tiles>1&&want_parallel(rows,cols,opts)));
     }
 
-    namespace detail
-    {
-        // ========== INT32→INT8 Helper Kernels ==========
-
-        /// INT32→FP32 normalization - Scalar path
-        void int32_to_fp32_normalize_scalar(
-            const int32_t *src,
-            float *dst,
-            float rms_inv,
-            const float *gamma,
-            std::size_t cols)
-        {
-            if (gamma)
-            {
-                for (std::size_t c = 0; c < cols; ++c)
-                {
-                    dst[c] = static_cast<float>(src[c]) * rms_inv * gamma[c];
-                }
-            }
-            else
-            {
-                for (std::size_t c = 0; c < cols; ++c)
-                {
-                    dst[c] = static_cast<float>(src[c]) * rms_inv;
-                }
-            }
-        }
-
-#if defined(__AVX512F__)
-        /// INT32→FP32 normalization - AVX512 path
-        void int32_to_fp32_normalize_avx512(
-            const int32_t *src,
-            float *dst,
-            float rms_inv,
-            const float *gamma,
-            std::size_t cols)
-        {
-            __m512 rms_inv_vec = _mm512_set1_ps(rms_inv);
-            std::size_t c = 0;
-
-            if (gamma)
-            {
-                for (; c + 16 <= cols; c += 16)
-                {
-                    __m512i i32_vec = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(src + c));
-                    __m512 fp32_vec = _mm512_cvtepi32_ps(i32_vec);
-                    __m512 gamma_vec = _mm512_loadu_ps(gamma + c);
-                    __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(fp32_vec, rms_inv_vec), gamma_vec);
-                    _mm512_storeu_ps(dst + c, normalized);
-                }
-            }
-            else
-            {
-                for (; c + 16 <= cols; c += 16)
-                {
-                    __m512i i32_vec = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(src + c));
-                    __m512 fp32_vec = _mm512_cvtepi32_ps(i32_vec);
-                    __m512 normalized = _mm512_mul_ps(fp32_vec, rms_inv_vec);
-                    _mm512_storeu_ps(dst + c, normalized);
-                }
-            }
-
-            // Scalar tail
-            int32_to_fp32_normalize_scalar(src + c, dst + c, rms_inv, gamma ? gamma + c : nullptr, cols - c);
-        }
-
-        /// Find max absolute value - AVX512 path
-        __attribute__((always_inline)) inline float find_max_abs_avx512(const float *data, std::size_t size)
-        {
-            __m512 max_vec = _mm512_setzero_ps();
-            std::size_t i = 0;
-
-            for (; i + 16 <= size; i += 16)
-            {
-                __m512 vec = _mm512_loadu_ps(data + i);
-                __m512 abs_vec = _mm512_abs_ps(vec); // AVX512F has abs
-                max_vec = _mm512_max_ps(max_vec, abs_vec);
-            }
-
-            // Horizontal max reduction
-            float max_val = _mm512_reduce_max_ps(max_vec);
-
-            // Scalar tail
-            for (; i < size; ++i)
-            {
-                max_val = std::max(max_val, std::fabs(data[i]));
-            }
-
-            return max_val;
-        }
-
-        /// FP32→INT8 quantization - AVX512 path
-        __attribute__((always_inline)) inline void fp32_to_int8_quantize_avx512(
-            const float *src,
-            int8_t *dst,
-            float inv_scale,
-            std::size_t cols)
-        {
-            __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
-            __m512 min_val = _mm512_set1_ps(-127.0f);
-            __m512 max_val = _mm512_set1_ps(127.0f);
-            std::size_t c = 0;
-
-            // Process 16 FP32 → 16 INT8 per iteration
-            for (; c + 16 <= cols; c += 16)
-            {
-                __m512 fp32_vec = _mm512_loadu_ps(src + c);
-                __m512 scaled = _mm512_mul_ps(fp32_vec, inv_scale_vec);
-
-                // Clamp to [-127, 127]
-                scaled = _mm512_max_ps(scaled, min_val);
-                scaled = _mm512_min_ps(scaled, max_val);
-
-                // Round to nearest and convert to INT32
-                __m512i i32_vec = _mm512_cvtps_epi32(scaled);
-
-                // Saturate to INT8 range (AVX512BW has efficient pack)
-                __m128i i8_vec = _mm512_cvtsepi32_epi8(i32_vec);
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst + c), i8_vec);
-            }
-
-            // Scalar tail
-            for (; c < cols; ++c)
-            {
-                float scaled = src[c] * inv_scale;
-                scaled = std::max(-127.0f, std::min(127.0f, scaled));
-                dst[c] = static_cast<int8_t>(std::round(scaled));
-            }
-        }
-
-#elif defined(__AVX2__)
-        /// INT32→FP32 normalization - AVX2 path
-        void int32_to_fp32_normalize_avx2(
-            const int32_t *src,
-            float *dst,
-            float rms_inv,
-            const float *gamma,
-            std::size_t cols)
-        {
-            __m256 rms_inv_vec = _mm256_set1_ps(rms_inv);
-            std::size_t c = 0;
-
-            if (gamma)
-            {
-                for (; c + 8 <= cols; c += 8)
-                {
-                    __m256i i32_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src + c));
-                    __m256 fp32_vec = _mm256_cvtepi32_ps(i32_vec);
-                    __m256 gamma_vec = _mm256_loadu_ps(gamma + c);
-                    __m256 normalized = _mm256_mul_ps(_mm256_mul_ps(fp32_vec, rms_inv_vec), gamma_vec);
-                    _mm256_storeu_ps(dst + c, normalized);
-                }
-            }
-            else
-            {
-                for (; c + 8 <= cols; c += 8)
-                {
-                    __m256i i32_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src + c));
-                    __m256 fp32_vec = _mm256_cvtepi32_ps(i32_vec);
-                    __m256 normalized = _mm256_mul_ps(fp32_vec, rms_inv_vec);
-                    _mm256_storeu_ps(dst + c, normalized);
-                }
-            }
-
-            // Scalar tail
-            int32_to_fp32_normalize_scalar(src + c, dst + c, rms_inv, gamma ? gamma + c : nullptr, cols - c);
-        }
-
-        /// Find max absolute value - AVX2 path
-        __attribute__((always_inline)) inline float find_max_abs_avx2(const float *data, std::size_t size)
-        {
-            __m256 max_vec = _mm256_setzero_ps();
-            __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
-            std::size_t i = 0;
-
-            for (; i + 8 <= size; i += 8)
-            {
-                __m256 vec = _mm256_loadu_ps(data + i);
-                __m256 abs_vec = _mm256_and_ps(vec, sign_mask);
-                max_vec = _mm256_max_ps(max_vec, abs_vec);
-            }
-
-            // Horizontal max reduction
-            __m128 lo = _mm256_castps256_ps128(max_vec);
-            __m128 hi = _mm256_extractf128_ps(max_vec, 1);
-            __m128 max4 = _mm_max_ps(lo, hi);
-            __m128 shuf = _mm_movehdup_ps(max4);
-            __m128 maxs = _mm_max_ps(max4, shuf);
-            shuf = _mm_movehl_ps(shuf, maxs);
-            maxs = _mm_max_ss(maxs, shuf);
-
-            float max_val;
-            _mm_store_ss(&max_val, maxs);
-
-            // Scalar tail
-            for (; i < size; ++i)
-            {
-                max_val = std::max(max_val, std::fabs(data[i]));
-            }
-
-            return max_val;
-        }
-
-        /// FP32→INT8 quantization - AVX2 path
-        __attribute__((always_inline)) inline void fp32_to_int8_quantize_avx2(
-            const float *src,
-            int8_t *dst,
-            float inv_scale,
-            std::size_t cols)
-        {
-            __m256 inv_scale_vec = _mm256_set1_ps(inv_scale);
-            __m256 min_val = _mm256_set1_ps(-127.0f);
-            __m256 max_val = _mm256_set1_ps(127.0f);
-            std::size_t c = 0;
-
-            // Process 8 FP32 → 8 INT8 per iteration
-            for (; c + 8 <= cols; c += 8)
-            {
-                __m256 fp32_vec = _mm256_loadu_ps(src + c);
-                __m256 scaled = _mm256_mul_ps(fp32_vec, inv_scale_vec);
-
-                // Clamp to [-127, 127]
-                scaled = _mm256_max_ps(scaled, min_val);
-                scaled = _mm256_min_ps(scaled, max_val);
-
-                // Round to nearest and convert to INT32
-                __m256i i32_vec = _mm256_cvtps_epi32(scaled);
-
-                // Pack INT32 to INT8 (with saturation)
-                // AVX2 doesn't have direct INT32→INT8, need multi-step
-                __m128i i32_lo = _mm256_castsi256_si128(i32_vec);
-                __m128i i32_hi = _mm256_extracti128_si256(i32_vec, 1);
-                __m128i i16_packed = _mm_packs_epi32(i32_lo, i32_hi);
-                __m128i i8_packed = _mm_packs_epi16(i16_packed, i16_packed);
-
-                _mm_storel_epi64(reinterpret_cast<__m128i *>(dst + c), i8_packed);
-            }
-
-            // Scalar tail
-            for (; c < cols; ++c)
-            {
-                float scaled = src[c] * inv_scale;
-                scaled = std::max(-127.0f, std::min(127.0f, scaled));
-                dst[c] = static_cast<int8_t>(std::round(scaled));
-            }
-        }
-#endif
-
-    } // namespace detail
-    using namespace detail;
-
+    /** @brief Normalize/requantize original integer rows without a converted TLS bank.
+     * @param src Original integer bank; @param gamma Optional immutable FP32 weights.
+     * @param inv Complete immutable FP32 row inverses; @param rows Original rows.
+     * @param cols Original width; @param dst_int8 Disjoint signed-code publication.
+     * @param dst_row_scales Disjoint row metadata; @param opts Explicit ISA/execution policy.
+     * @throws std::invalid_argument For malformed geometry, aliases or undeclared policy.
+     * @details Each worker owns its row's maximum, recomputed products, codes and
+     * scale. The native row-INT8 program has no block-Q8/FP32-quantizer floor.
+     */
     void rmsnorm_apply_int32_to_int8_vectorized(
-        const int32_t *src,
-        const float *gamma,
-        const float *inv,
-        std::size_t rows,
-        std::size_t cols,
-        int8_t *dst_int8,
-        float *dst_row_scales,
-        const RMSNormExecOptions &opts)
+        const int32_t *src,const float *gamma,const float *inv,std::size_t rows,std::size_t cols,
+        int8_t *dst_int8,float *dst_row_scales,const RMSNormExecOptions &opts)
     {
-        if (!src || !inv || !dst_int8 || !dst_row_scales || rows == 0 || cols == 0)
-            return;
-
-        bool parallel = want_parallel(rows, cols, opts);
-
-        auto do_row_work = [&](long long r)
+        const auto bank=rmsnorm_operands::Int32QuantizationBorrow::bind(src,gamma,dst_int8,dst_row_scales,rows,cols);
+        bank.requireMetadataReadOnly(&opts,sizeof(opts));
+        rmsnorm_operands::requireBank(inv,bank.empty()?0:rows,sizeof(float));
+        bank.requireMetadataReadOnly(inv,bank.empty()?0:rows*sizeof(float));
+        const auto isa=int32_rms_program(opts);
+        if(!::llaminar::v2::beginWorkshare(!bank.empty()))return;
+        auto work=[&]()
         {
-            const int32_t *row_in = src + (std::size_t)r * cols;
-            int8_t *row_out = dst_int8 + (std::size_t)r * cols;
-            float rms_inv = inv[(std::size_t)r];
-
-            if (rms_inv == 0.0f)
-            {
-                std::fill(row_out, row_out + cols, (int8_t)0);
-                dst_row_scales[r] = 1.0f;
-                return;
-            }
-
-            // Step 1: Normalize INT32 to FP32 and apply gamma (vectorized)
-            thread_local std::vector<float> fp32_buffer;
-            if (fp32_buffer.size() < cols)
-                fp32_buffer.resize(cols);
-
-#if defined(__AVX512F__)
-            int32_to_fp32_normalize_avx512(row_in, fp32_buffer.data(), rms_inv, gamma, cols);
-#elif defined(__AVX2__)
-            int32_to_fp32_normalize_avx2(row_in, fp32_buffer.data(), rms_inv, gamma, cols);
-#else
-            int32_to_fp32_normalize_scalar(row_in, fp32_buffer.data(), rms_inv, gamma, cols);
-#endif
-
-            // Step 2: Find max absolute value (vectorized)
-            float max_abs;
-#if defined(__AVX512F__)
-            max_abs = find_max_abs_avx512(fp32_buffer.data(), cols);
-#elif defined(__AVX2__)
-            max_abs = find_max_abs_avx2(fp32_buffer.data(), cols);
-#else
-            max_abs = 0.0f;
-            for (std::size_t c = 0; c < cols; ++c)
-            {
-                max_abs = std::max(max_abs, std::fabs(fp32_buffer[c]));
-            }
-#endif
-
-            // Compute scale to fit into INT8 range [-127, 127]
-            float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-            dst_row_scales[r] = scale;
-
-            // Step 3: Quantize FP32 to INT8 (vectorized)
-            float inv_scale = 1.0f / scale;
-#if defined(__AVX512F__)
-            fp32_to_int8_quantize_avx512(fp32_buffer.data(), row_out, inv_scale, cols);
-#elif defined(__AVX2__)
-            fp32_to_int8_quantize_avx2(fp32_buffer.data(), row_out, inv_scale, cols);
-#else
-            for (std::size_t c = 0; c < cols; ++c)
-            {
-                float scaled = fp32_buffer[c] * inv_scale;
-                scaled = std::max(-127.0f, std::min(127.0f, scaled));
-                row_out[c] = static_cast<int8_t>(std::round(scaled));
-            }
-#endif
-        };
-
-        if (parallel)
-        {
-            auto do_work = [&]()
-            {
 #pragma omp for schedule(static)
-                for (long long r = 0; r < (long long)rows; ++r)
-                {
-                    do_row_work(r);
-                }
-            };
-            OMP_WORKSHARE_REGION(do_work);
-        }
-        else
+            for(std::ptrdiff_t row=0;row<std::ptrdiff_t(rows);++row)
+                int32_rms_publication::publishRow(bank.row(std::size_t(row)),inv[std::size_t(row)],isa);
+        };
+        OMP_WORKSHARE_REGION_IF(work,omp_in_parallel()||(rows>1&&want_parallel(rows,cols,opts)));
+    }
+
+    /** @brief Fuse original integer summary/inverse/maximum/publication under one tile owner.
+     * @param src Original complete integer bank; @param gamma Optional immutable gamma.
+     * @param dst_int8 Exclusive signed-code output; @param dst_row_scales Exclusive row scales.
+     * @param rows Original row count; @param cols Original logical width.
+     * @param epsilon Finite nonnegative staged FP64-mean policy; @param opts Explicit program/execution intent.
+     * @throws std::invalid_argument For malformed geometry/policy or writable intersections.
+     * @details Native ARM shares the fixed summary traversal across1..4 original
+     * rows. Inverse retains double(sum)/cols+double(epsilon), then one final
+     * float conversion; it is not the separate per-row FP32-mean program.
+     * Original values are streamed twice for publication, never retained as a
+     * decoded row. No scratch resizing, private summary bank or row replay runs.
+     */
+    void rmsnorm_fused_int32_to_int8_vectorized(
+        const int32_t *src,const float *gamma,int8_t *dst_int8,float *dst_row_scales,
+        std::size_t rows,std::size_t cols,float epsilon,const RMSNormExecOptions &opts)
+    {
+        if(!std::isfinite(epsilon)||epsilon<0.0f)
+            throw std::invalid_argument("INT32 RMS requires finite nonnegative original epsilon");
+        const auto bank=rmsnorm_operands::Int32QuantizationBorrow::bind(src,gamma,dst_int8,dst_row_scales,rows,cols);
+        bank.requireMetadataReadOnly(&opts,sizeof(opts));
+        const auto isa=int32_rms_program(opts);
+        if(!::llaminar::v2::beginWorkshare(!bank.empty()))return;
+        const auto tiles=rows/4+(rows%4!=0);
+        auto work=[&]()
         {
-            // Serial path
-            for (long long r = 0; r < (long long)rows; ++r)
+#pragma omp for schedule(static)
+            for(std::ptrdiff_t tile=0;tile<std::ptrdiff_t(tiles);++tile)
             {
-                do_row_work(r);
+                const auto first=std::size_t(tile)*4,live=std::min<std::size_t>(4,rows-first);
+                const auto normalize=[&]<std::size_t Count>()
+                {
+                    std::array<double,Count>sums;
+#if LLAMINAR_COMPILED_WITH_NEON
+                    if(isa==ISALevel::NEON||isa==ISALevel::NEONDotProd)
+                        sums=native_int32_summaries<Count>(bank,first);
+                    else
+#endif
+                        for(std::size_t row=0;row<Count;++row)sums[row]=int32_rms_summary(bank.sourceRow(first+row),isa);
+                    for(std::size_t row=0;row<Count;++row)
+                    {
+                        const double mean=sums[row]/double(cols)+double(epsilon);
+                        const float inverse=mean>0.0?float(1.0/std::sqrt(mean)):0.0f;
+                        int32_rms_publication::publishRow(bank.row(first+row),inverse,isa);
+                    }
+                };
+                switch(live)
+                {
+                case 1:normalize.template operator()<1>();break;
+                case 2:normalize.template operator()<2>();break;
+                case 3:normalize.template operator()<3>();break;
+                case 4:normalize.template operator()<4>();break;
+                default:LLAMINAR_UNREACHABLE("INT32 RMS fused original tile lost its live rows");
+                }
             }
-        }
-    }
-
-    void rmsnorm_fused_int32_to_int8_vectorized(
-        const int32_t *src,
-        const float *gamma,
-        int8_t *dst_int8,
-        float *dst_row_scales,
-        std::size_t rows,
-        std::size_t cols,
-        float epsilon,
-        const RMSNormExecOptions &opts)
-    {
-        thread_local RMSNormScratch tls_scratch;
-        tls_scratch.ensure(rows);
-
-        rmsnorm_compute_row_sumsq_int32_vectorized(src, rows, cols, tls_scratch.row_sumsq.data(), opts);
-        rmsnorm_compute_inv(tls_scratch.row_sumsq.data(), rows, cols, epsilon, tls_scratch.inv.data());
-        rmsnorm_apply_int32_to_int8_vectorized(src, gamma, tls_scratch.inv.data(), rows, cols, dst_int8, dst_row_scales, opts);
-    }
-
-    void rmsnorm_fused_int32_to_int8_vectorized(
-        const int32_t *src,
-        const float *gamma,
-        int8_t *dst_int8,
-        float *dst_row_scales,
-        std::size_t rows,
-        std::size_t cols,
-        float epsilon,
-        RMSNormScratch &scratch,
-        const RMSNormExecOptions &opts)
-    {
-        scratch.ensure(rows);
-        rmsnorm_compute_row_sumsq_int32_vectorized(src, rows, cols, scratch.row_sumsq.data(), opts);
-        rmsnorm_compute_inv(scratch.row_sumsq.data(), rows, cols, epsilon, scratch.inv.data());
-        rmsnorm_apply_int32_to_int8_vectorized(src, gamma, scratch.inv.data(), rows, cols, dst_int8, dst_row_scales, opts);
+        };
+        OMP_WORKSHARE_REGION_IF(work,omp_in_parallel()||(tiles>1&&want_parallel(rows,cols,opts)));
     }
 
     // ========================================================================
