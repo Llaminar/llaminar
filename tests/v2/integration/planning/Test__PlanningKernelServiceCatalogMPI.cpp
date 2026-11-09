@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <iostream>
 #include <omp.h>
+#include <set>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -349,7 +350,16 @@ namespace
         if (mpi->is_root())
         {
             EXPECT_GT(prices, 0u);
-            EXPECT_GT(multi_device_prices, 0u);
+            // CPU endpoints are physical NUMA nodes, not MPI ranks. Ranks that
+            // share one node (a single-NUMA GB10) cannot form a CPU TP group;
+            // the planner must then price no multi-device candidate at all.
+            std::set<std::pair<int, int>> cpu_endpoints;
+            for (const auto &rank : inventory->ranks)
+                cpu_endpoints.emplace(rank.node_id, rank.cpu.numa_node);
+            if (backend != DeviceType::CPU || cpu_endpoints.size() >= 2)
+                EXPECT_GT(multi_device_prices, 0u);
+            else
+                EXPECT_EQ(multi_device_prices, 0u);
             if (backend != DeviceType::CPU) EXPECT_GT(overlay_prices, 0u);
         }
         else EXPECT_EQ(prices, 0u);
