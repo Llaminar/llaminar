@@ -1109,8 +1109,13 @@ if args[-1].startswith("-print-prog-name="):
 if "-###" in args:
     event("plan")
     source = args[args.index("-c") + 1] if "-c" in args else ""
+    # Like GCC, every expansion names a fresh temporary assembly file (cc + six alphanumerics + .s).
+    counter = here / "expansions.txt"
+    count = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(count))
+    temporary = f"/tmp/cc{{count:06d}}.s"
     default = (f" {{here}}/cc1plus -quiet -MD {{value('-MF')}} -MF {{value('-MF')}} -MT probe -H {{source}} "
-               f"-o /tmp/ccTEST.s\\n as -EL -march=armv8-a -o {{value('-o')}} /tmp/ccTEST.s\\n")
+               f"-o {{temporary}}\\n as -EL -march=armv8-a -o {{value('-o')}} {{temporary}}\\n")
     jobs = setting("jobs.txt", default).format(here=here, source=source, obj=value("-o"), deps=value("-MF"))
     sys.stderr.write("Using built-in specs.\\nCOMPILER_PATH=" + str(here) + "\\n" + jobs)
     sys.exit(0)
@@ -1308,15 +1313,15 @@ class ProofBindingTest(unittest.TestCase):
 
     def test_opaque_routes_are_rejected_before_or_by_the_compile(self) -> None:
         here = self.tool
-        cc1 = f" {here}/cc1plus -quiet -MD {{deps}} -MF {{deps}} -MT probe -H {{source}} -o /tmp/ccTEST.s"
-        assembler = " as -EL -o {obj} /tmp/ccTEST.s"
+        cc1 = f" {here}/cc1plus -quiet -MD {{deps}} -MF {{deps}} -MT probe -H {{source}} -o /tmp/ccTEST01.s"
+        assembler = " as -EL -o {obj} /tmp/ccTEST01.s"
         cases = {
             "PCH marker in the translation unit": ("preprocessed.txt", '#pragma GCC pch_preprocess "p.h.gch"\nint a;\n'),
             "PCH used by the compile": ("headers.txt", ". /usr/include/stdio.h\n! /work/probe.h.gch\n"),
             "invalid PCH tried": ("headers.txt", "..x /work/x.h.gch\n"),
             "specs file read": ("jobs.txt", "Reading specs from /tmp/extra.specs\n" + cc1 + "\n" + assembler + "\n"),
             "extra assembler input (renamed asm spec)": ("jobs.txt", cc1 + "\n" + assembler + " /abs/extra.s\n"),
-            "unadmitted assembler option": ("jobs.txt", cc1 + "\n as --defsym x=1 -o {obj} /tmp/ccTEST.s\n"),
+            "unadmitted assembler option": ("jobs.txt", cc1 + "\n as --defsym x=1 -o {obj} /tmp/ccTEST01.s\n"),
             "PCH in the compiler job": ("jobs.txt", cc1.replace("-quiet", "-quiet -include-pch p.pch") + "\n" +
                                         assembler + "\n"),
             "profile in the compiler job": ("jobs.txt", cc1.replace("-quiet", "-quiet -fprofile-use=/p.gcda") + "\n" +
@@ -1467,6 +1472,38 @@ class ProofBindingTest(unittest.TestCase):
                     CHECKER.build(self.args)
                 self.assertFalse(Path(self.args.proof).exists())
 
+    def test_replanning_masks_only_the_shared_driver_temporary(self) -> None:
+        CHECKER.build(self.args)  # Each expansion of the stand-in names a fresh temporary, as GCC does.
+        CHECKER.verify(self.args)
+        jobs = self.proof()["driver_plan"]["jobs"]
+        self.assertRegex(jobs[0][jobs[0].index("-o") + 1], r"^/tmp/cc\d{6}\.s$")
+        plan = {"jobs": jobs, "program_dirs": [], "path": []}
+
+        def renamed(compiler: str, assembler: str, compiler_jobs=None) -> dict:
+            first = [compiler if argument == jobs[1][-1] else argument for argument in (compiler_jobs or jobs[0])]
+            return dict(plan, jobs=[first, jobs[1][:-1] + [assembler]])
+        self.assertEqual(CHECKER.plan_shape(renamed("/tmp/ccAb12Cd.s", "/tmp/ccAb12Cd.s")), CHECKER.plan_shape(plan))
+        self.assertNotEqual(CHECKER.plan_shape(renamed("/var/ccAAAAAA.s", "/var/ccAAAAAA.s")), CHECKER.plan_shape(plan))
+        for label, mutated in (("mismatched names", renamed("/tmp/ccAAAAAA.s", "/tmp/ccBBBBBB.s")),
+                               ("not a driver temporary", renamed("/tmp/probe.s", "/tmp/probe.s")),
+                               ("seven characters", renamed("/tmp/ccAAAAAAA.s", "/tmp/ccAAAAAAA.s")),
+                               ("relative temporary", renamed("ccAAAAAA.s", "ccAAAAAA.s"))):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    CHECKER.plan_shape(mutated)
+        for label, mutated in (("compiler option", [jobs[0][:1] + ["-g"] + jobs[0][1:], jobs[1]]),
+                               ("assembler option", [jobs[0], jobs[1][:1] + ["--gdwarf-5"] + jobs[1][1:]]),
+                               ("compiler program", [["/other/cc1plus"] + jobs[0][1:], jobs[1]])):
+            with self.subTest(label=label):
+                self.assertNotEqual(CHECKER.plan_shape(dict(plan, jobs=mutated)), CHECKER.plan_shape(plan))
+        self.assertNotEqual(CHECKER.plan_shape(dict(plan, path=["/usr/bin"])), CHECKER.plan_shape(plan))
+        (self.tool / "event-compile.txt").write_text(
+            f"write {self.tool / 'jobs.txt'} replanned\n {{here}}/cc1plus -quiet -g -MD {{deps}} -MF {{deps}} -MT probe -H "
+            "{source} -o /tmp/ccXXXXXX.s\n as -EL -o {obj} /tmp/ccXXXXXX.s\n")
+        with self.assertRaisesRegex(ValueError, "driver plan"):
+            CHECKER.build(self.args)
+        self.assertFalse(Path(self.args.proof).exists())
+
     def test_driver_role_comes_from_the_target_command(self) -> None:
         CHECKER.build(self.args)
         path, original = Path(self.args.proof), self.proof()
@@ -1496,9 +1533,9 @@ class ProofBindingTest(unittest.TestCase):
                  "/w/probe.cpp"]
         gnu = [["/usr/libexec/gcc/cc1plus", "-quiet", "-I", "/w/src", "-MD", "/w/out/proof.d", "-MF",
                 "/w/out/proof.deps", "-MT", "probe", "-D_GNU_SOURCE", "-D", "X=1", "/w/probe.cpp", "-march=armv8-a+i8mm",
-                "-g", "-O3", "-dumpdir", "/tmp/", "-dumpbase", "proof.cpp", "-o", "/tmp/cc.s", "-H"],
+                "-g", "-O3", "-dumpdir", "/tmp/", "-dumpbase", "proof.cpp", "-o", "/tmp/ccAb12Cd.s", "-H"],
                ["as", "-I", "/w/src", "--gdwarf-5", "-EL", "-march=armv8-a", "-mabi=lp64", "-o", "/w/out/proof.o",
-                "/tmp/cc.s"]]
+                "/tmp/ccAb12Cd.s"]]
         CHECKER.validate_plan([clang], "AppleClang-21", paths)
         CHECKER.validate_plan(gnu, "GNU-14", paths)
         clang_mutations = {
