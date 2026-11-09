@@ -98,3 +98,22 @@ the per-bucket trace; results → ideas 24/25.
   a62696317 + spec docs + the ARM base). 09e14d3ae stays provenance-only for
   measured numbers. Trace still blocked on nsys in the uma3 image (idea 1
   item 6); .79 GPU slot reserved.
+
+## STRUCTURE-ONLY trace (2026-11-09, cff351901, 35B-MTP UD-IQ3_S, ~2154-token prefill; sealed K14-IDEA25-TRACE-STRUCT-20261109)
+
+- Per-bucket (GPU timing ON): host launch 64→78.2µs / 256→47.7 / 512→38.8;
+  GPU replay **64→63.5ms / 256→191.1ms / 512→340.2ms** (~0.66ms/token; sum
+  ≈3.83s GPU-event). Wall-only: launch 67.6/51.3/39.8µs (same shape).
+- DECISION-RULE READ: prefill wall ≈46s vs GPU replay ≈3.83s → **~91% of the
+  prefill wall is HOST-side/gap, not GPU replay**; per-bucket GPU work scales
+  sublinearly (64→512: ~5.4× for 8× tokens → fixed per-bucket overhead);
+  host launch itself 40–80µs → the gap is CPU-side staging between chunks
+  (lease/maintenance/param staging). Strongly supports IDEA-25 DIRECTION B
+  (async multi-bucket submission / move host boundary work off the critical
+  path); the 25a host timers (not in cff351901 — GPU validation after the
+  94d7cbe2f merge) pinpoint which host term dominates.
+- LABEL: STRUCTURE-ONLY — kernel timings NOT #43-representative (cff351901
+  has demoted kernels; absolute wall includes old-head effects; the split
+  ratio is the structural point). Qwen3.8 numbers await Main's spill fold +
+  fixed tip. Note: the earlier 2160-token filler tokenized to 9690 (rejected
+  at -c8192) → used 480 fillers ≈ 2154 tokens (recorded).
