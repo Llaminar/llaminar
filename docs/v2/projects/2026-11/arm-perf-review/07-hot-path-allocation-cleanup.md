@@ -184,3 +184,11 @@ the source policy). Dead persistent_state parameter removed.
 - Memo-deletion gate condition MET (no regression anywhere: 27B 0.0%/−0.28%,
   35B-mtp +0.31%); prefill no-gain (+0.20% jitter). +0.8% decode = branch
   BONUS (recorded in the handover).
+
+## Rebase onto arm tip 5922cd1f5 (2026-11-09)
+
+- Main retired getOrCreateRoPE + two dead test sources (lane's flagged
+  follow-ups). Trial rebase of 94d7cbe2f: CLEAN (7 commits; trial tip
+  783d07efc). APPROVED (b): force-push rebased tip; WSL x86 gate + Mac
+  portability re-run + reviewer handover all on the rebased tip; A/B economy
+  stands (deletions = unused code, no codegen impact — noted in handover).
