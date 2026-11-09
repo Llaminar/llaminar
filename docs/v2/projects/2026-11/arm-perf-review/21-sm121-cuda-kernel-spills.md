@@ -197,3 +197,21 @@ Evidence: `~/llaminar-spark-results/K14-CUDA-SPILL-MIGRATION-a62696317`.
   GB10 gates once on the merged tip. Tensor-split spec retired in the CUDA
   stack (doc removed; history keeps; commit names fbacc8409). SHA sent when
   the full slice is pushed.
+
+## CUDA stack ready (2026-11-09, Main) — 7 commits, pending ideas FF
+
+- fbacc8409 tensor_prefill 12.x opaque per-step PV (SASS byte-identical);
+  d641463bd prefill 8 codebook-pair shards + host-policy header + dispatcher;
+  5c90b4340 BK256 12.x per-K-step loads; FA 7 shards (0-2 prefill FP32/16/
+  BF16, 3-5 context, 6 decode/utility; guards+docs only); FA HD256 1-PV
+  context ×4-unroll on 12.x = NEVER-SELECTED byte oracle for striped 2/4-warp
+  outputs (shipped 221-224 regs; 12.x >255); V2_Integration_
+  DeterministicGPUCompilation preflight + AGENTS rule (original-code control
+  fails as expected); tensor-split spec retired.
+- EVIDENCE (.79 GNU nvcc 13.0.88 Release): all split-compile-free shards
+  spill-free at 121/120;121/6-arch/shipped; FULL llaminar2 build
+  80;86;89;90;120;121 fatal guard exit 0 @705 s; shard symbol split links
+  clean. Mac source-policy pass (2 known base only).
+- SEQUENCE: ideas FF (5d4e3716a → 39c24d8b4) → CUDA rebase onto 39c24d8b4 →
+  push → GB10 gates (parity/byte, prefill/attention timing, tracked CUDA
+  incl. RoPEGraphCaptureNoH2D, spill re-check, Qwen3.8 trace).
