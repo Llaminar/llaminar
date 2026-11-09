@@ -1,6 +1,6 @@
 /**
  * @file CPURMSNormBorrow.h
- * @brief Complete original floating RMSNorm bank/policy borrows before worksharing.
+ * @brief Complete original floating/compressed RMSNorm bank borrows before worksharing.
  *
  * Geometry, address arithmetic, exact-alias policy and immutable gamma/metadata
  * protection are established before workers can write. These synchronous views
@@ -16,6 +16,7 @@
 #include <span>
 #include <stdexcept>
 #include <type_traits>
+#include "../../../tensors/BlockStructures.h"
 
 namespace llaminar2::primitives::rmsnorm_operands
 {
@@ -126,6 +127,94 @@ private:
     const Word *source_;
     const float *gamma_;
     Word *output_;
+    std::size_t rows_,columns_;
+    float epsilon_;
+};
+/** @brief Checked original Q16-to-FP32 expansion; compressed storage is never an output alias.
+ * @details The physical72-byte source block and128-byte publication fragment
+ * have different geometries. Complete-bank protection precedes worksharing,
+ * including overlaps with future rows, immutable gamma and retained options.
+ * This synchronous borrow neither owns storage nor proves its allocated capacity.
+ */
+class Q16ExpansionBorrow final
+{
+public:
+    /** @brief Bind complete original compressed/input and floating/output banks.
+     * @param source Original Q16 blocks; @param gamma Complete immutable FP32 gamma.
+     * @param output Disjoint writable FP32 bank; @param rows Original logical M.
+     * @param columns Original K, which must be divisible by32; @param epsilon Original finite policy.
+     * @return Checked original coordinates and policy, without decoded storage.
+     * @throws std::invalid_argument For malformed extents, pointers, policy or complete-bank aliases.
+     */
+    static Q16ExpansionBorrow bind(const Q16_1Block *source,const float *gamma,float *output,
+                                   std::size_t rows,std::size_t columns,float epsilon)
+    {
+        constexpr auto bound=std::size_t(std::numeric_limits<std::ptrdiff_t>::max());
+        if(columns%32||rows>bound||columns>bound/sizeof(float)||
+           (columns&&rows>bound/sizeof(float)/columns)||!std::isfinite(epsilon)||epsilon<0.0f)
+            throw std::invalid_argument("Q16 RMS requires complete32-value rows, representable geometry and finite nonnegative epsilon");
+        const auto blocks=columns/32;
+        if(blocks&&rows>bound/sizeof(Q16_1Block)/blocks)
+            throw std::invalid_argument("Q16 RMS original compressed bank exceeds the pointer domain");
+        requireBank(source,rows*blocks,sizeof(Q16_1Block));
+        requireBank(output,rows*columns,sizeof(float));
+        if(rows&&columns)requireBank(gamma,columns,sizeof(float));
+        const auto bytes=rows*columns*sizeof(float);
+        if(overlaps(output,bytes,source,rows*blocks*sizeof(Q16_1Block))||
+           overlaps(output,bytes,gamma,columns*sizeof(float)))
+            throw std::invalid_argument("Q16 RMS expansion aliases original compressed storage or immutable gamma");
+        return Q16ExpansionBorrow(source,gamma,output,rows,columns,epsilon);
+    }
+    /** @return Whether the complete invocation contains no arithmetic rows/columns. */
+    [[nodiscard]] bool empty()const noexcept{return !rows_||!columns_;}
+    /** @return Original row count, not worker-local ownership. */
+    [[nodiscard]] std::size_t rows()const noexcept{return rows_;}
+    /** @return Original logical FP32 width, not physical block count. */
+    [[nodiscard]] std::size_t columns()const noexcept{return columns_;}
+    /** @return Original finite nonnegative epsilon. */
+    [[nodiscard]] float epsilon()const noexcept{return epsilon_;}
+    /** @return Complete immutable original weights; empty work requires no pointer. */
+    [[nodiscard]] std::span<const float> gamma()const noexcept
+    {return empty()?std::span<const float>{}:std::span<const float>(gamma_,columns_);}
+    /** @brief Borrow a complete original compressed row without decoding.
+     * @param row Original row coordinate; @return Original physical blocks.
+     * @throws std::out_of_range For an invalid row coordinate.
+     */
+    [[nodiscard]] std::span<const Q16_1Block> sourceRow(std::size_t row)const
+    {
+        if(row>=rows_)throw std::out_of_range("Q16 RMS source row outside original bank");
+        const auto blocks=columns_/32;
+        return {blocks?source_+row*blocks:source_,blocks};
+    }
+    /** @brief Borrow one disjoint original floating output row.
+     * @param row Original row coordinate; @return Writable logical output.
+     * @throws std::out_of_range For an invalid row coordinate.
+     */
+    [[nodiscard]] std::span<float> outputRow(std::size_t row)const
+    {
+        if(row>=rows_)throw std::out_of_range("Q16 RMS output row outside original bank");
+        return {columns_?output_+row*columns_:output_,columns_};
+    }
+    /** @brief Protect complete retained invocation metadata before publication.
+     * @param metadata Original live descriptor/options; @param bytes Complete metadata extent.
+     * @throws std::invalid_argument For any writable-bank intersection.
+     */
+    void requireMetadataReadOnly(const void *metadata,std::size_t bytes)const
+    {
+        if(overlaps(output_,rows_*columns_*sizeof(float),metadata,bytes))
+            throw std::invalid_argument("Q16 RMS output aliases retained invocation metadata");
+    }
+private:
+    /** @brief Retain only validated original addressing and policy.
+     * @param source Original blocks; @param gamma Original gamma; @param output Disjoint result.
+     * @param rows Original M; @param columns Original K; @param epsilon Original finite policy.
+     */
+    Q16ExpansionBorrow(const Q16_1Block *source,const float *gamma,float *output,
+                       std::size_t rows,std::size_t columns,float epsilon)
+        :source_(source),gamma_(gamma),output_(output),rows_(rows),columns_(columns),epsilon_(epsilon){}
+    const Q16_1Block *source_;
+    const float *gamma_;
+    float *output_;
     std::size_t rows_,columns_;
     float epsilon_;
 };
