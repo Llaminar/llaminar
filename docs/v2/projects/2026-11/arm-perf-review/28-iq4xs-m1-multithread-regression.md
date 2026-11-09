@@ -236,3 +236,23 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   property or reject unproved cycles (no-abort + mixed loop/abort controls).
 - Positives kept; never change production allocation for the checker;
   owner-evidence framing stands.
+
+## SOURCE117 successor e6afa66e8 (2026-11-09) — closures
+
+- P1a structural rejection (only admitted call = exact fatal noreturn symbol;
+  all other boundaries fail; census confirms tiles call nothing else).
+- P1b merge defs read dest; 32-bit view of stack addr fails; slots keep
+  offsets (partial/narrower/sign-ext/FP reloads fail; partial overwrites +
+  untracked/unknown-offset stores fail); ABI exemption = contiguous
+  whole-register d/q str/stp/ldr/ldp at exact slot (ld1 d[1]/l{1}r/2/1.1d/st1/
+  s-views excluded).
+- P1c global-label statements kept; closed grammar; non-code directives only
+  in .text (.byte/.word/.inst/.incbin/.zero/.skip/.fill/.rept fail); data-label
+  branches + fall-through/across-section fail.
+- P1d no lexical normalization (symlink-before-.. resolution; hash at resolved
+  file; depfile resolved; decoy-vs-real control passes/fails correctly).
+- P2a proven-noreturn = acyclic + every path ends in bl abort (spin/mixed/
+  loop+FP/return/tail/blr/ordinary call/.byte disprove; two-path abort proves).
+- Owner: 18 census assemblies zero structural errors + identical counts
+  (budget JSON unchanged); 33 tests; Mac AppleClang E2E green (WeightView.h
+  touch re-runs edge). GNU-14 .80 E2E queued (5-min).
