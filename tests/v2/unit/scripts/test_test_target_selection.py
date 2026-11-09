@@ -1127,7 +1127,11 @@ endif()
                                 r"add_v2_test\((V2_[A-Za-z0-9_]+)(?=[\s)])",
                                 COHORT_REGISTRATION.read_text(encoding="utf-8")))
                             self.assertTrue(cohort_names)
-                            self.assertTrue(cohort_names <= names, cohort_names - names)
+                            if cuda or rocm:
+                                self.assertTrue(cohort_names <= names, cohort_names - names)
+                            else:
+                                # The cohort executable requires a GPU family.
+                                self.assertFalse(cohort_names & names, cohort_names & names)
                             self.assertNotIn("V2_Unit_", names)
                             self.assertNotIn("V2_Integration_", names)
                             required = {"V2_Integration_MPINativeDaemonDiagnosticLifetime",
@@ -1135,8 +1139,8 @@ endif()
                                         "V2_Integration_MPIRetirementDiagnostics",
                                         "V2_Integration_MPIRootRetirementBody"}
                             self.assertTrue(required <= names, required - names)
-                            self.assertTrue(any(name.startswith("V2_Unit_PooledOriginal_")
-                                                for name in names))
+                            self.assertEqual(any(name.startswith("V2_Unit_PooledOriginal_")
+                                                 for name in names), cuda or rocm)
                             for test in tests:
                                 properties = {p["name"]: p["value"] for p in test["properties"]}
                                 self.assertIn("ProcessOwned", properties["LABELS"])
