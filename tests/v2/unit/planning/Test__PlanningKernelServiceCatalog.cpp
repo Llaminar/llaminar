@@ -927,6 +927,9 @@ TEST(PlanningRequestCostModel, TPRequiresNativeEvidenceAndPricesTheTypedDecodePo
     }
 }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @brief Auto admission preserves Dynamic policy for every floating source family. */
 TEST(PlanningRequestCostModel, FloatingHomogeneousMoETPAdmitsDynamicWithoutChangingPolicy)
 {
@@ -942,10 +945,14 @@ TEST(PlanningRequestCostModel, FloatingHomogeneousMoETPAdmitsDynamicWithoutChang
             EXPECT_EQ(candidate.config().moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
         }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 /** @brief Four/eight physical owners use the same scoped request-cost composition. */
 class PipelineRequestCost : public ::testing::TestWithParam<int> {};
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test A later PP expert stage must use its own root, participants and quotas. */
 TEST_P(PipelineRequestCost, HybridMoEUsesStageScopedEvidence)
 {
@@ -1018,9 +1025,13 @@ TEST_P(PipelineRequestCost, HybridMoEUsesStageScopedEvidence)
         EXPECT_THROW(missing_links.evaluate(admitted, {64, 16}), std::invalid_argument);
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
+// Every test of this suite requires a compiled GPU backend family.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 INSTANTIATE_TEST_SUITE_P(DeviceCounts, PipelineRequestCost, ::testing::Values(4, 8),
     [](const auto &info) { return "Devices" + std::to_string(info.param); });
+#endif
 
 TEST(PlanningWeightServiceModel, InterpolatesInvocationTimeAndNeverReusesCachedComputeAsBandwidth)
 {
@@ -1160,6 +1171,9 @@ TEST(PlanningWeightServiceModel, ProjectionWorkChargesDownAtZeroOwnersAllNativeF
     }
 }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @brief Both declared fabrics require their own evidence; timing cannot pick a transport. */
 TEST(PlanningRequestCostModel, ProjectionPolicyRequiresActualFabricAndColumnPublication)
 {
@@ -1211,6 +1225,7 @@ TEST(PlanningRequestCostModel, ProjectionPolicyRequiresActualFabricAndColumnPubl
         }
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 /** @brief TP-only projection searches retain exact host first-touch scopes, unlike whole-expert TP. */
 TEST(PlanningCommunicationService, ProjectionOnlyTPSamplesItsActualHostScopes)
