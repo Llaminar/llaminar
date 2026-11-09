@@ -116,7 +116,7 @@ TEST_F(NEONAttentionMath, FloatingOriginalCacheRowsRetainSerialBytes)
     floating<Storage::BF16,1>();floating<Storage::BF16,2>();floating<Storage::BF16,4>();
     floating<Storage::I16,1>();floating<Storage::I16,2>();floating<Storage::I16,4>();
 }
-/** @brief Verify exact widened integer arithmetic, including cancellation after large partials.
+/** @brief Verify exact int32 arithmetic under the typed reduction bound, including cancellation.
  * @tparam Rows Native one/two/four-row register program.
  */
 template<std::size_t Rows>void integer()
@@ -124,31 +124,77 @@ template<std::size_t Rows>void integer()
     for(int n:{0,1,2,3,4,7,8,9,15,16,17,31,32,33,63,64,65,127,128,129,255,256,257})
         for(int seed=0;seed<16;++seed)
         {
+            const auto bound=cpu::Q16ReductionBound::forTerms(std::max(n,1));
+            const int limit=bound.queryLimit();
             std::vector<std::int16_t> query(n);
             std::array<std::vector<std::int16_t>,Rows> banks;
             std::array<std::span<const std::int16_t>,Rows> keys;
             std::array<std::int64_t,Rows> expected{};
-            for(int i=0;i<n;++i)query[i]=std::int16_t((i*131+seed*37)%2047-1023);
+            for(int i=0;i<n;++i)query[i]=std::int16_t((i*131+seed*37)%(2*limit+1)-limit);
             for(std::size_t row=0;row<Rows;++row)
             {
                 banks[row].resize(n);for(int i=0;i<n;++i){banks[row][i]=std::int16_t(int((std::size_t(i)*71+row*31+seed)%65536)-32768);expected[row]+=std::int64_t(query[i])*banks[row][i];}
                 keys[row]=banks[row];
             }
-            const bool fits=std::all_of(expected.begin(),expected.end(),[](auto x){return x>=std::numeric_limits<std::int32_t>::min()&&x<=std::numeric_limits<std::int32_t>::max();});
-            if(!fits){EXPECT_THROW((native::integerDot<Rows>(query,keys)),std::overflow_error);continue;}
-            const auto actual=native::integerDot<Rows>(query,keys);
-            for(std::size_t row=0;row<Rows;++row){EXPECT_EQ(actual[row],expected[row]);EXPECT_EQ(actual[row],native::integerDot<1>(query,{keys[row]})[0]);}
+            const auto actual=native::integerDot<Rows>(bound,query,keys);
+            for(std::size_t row=0;row<Rows;++row){EXPECT_EQ(actual[row],expected[row]);EXPECT_EQ(actual[row],native::integerDot<1>(bound,query,{keys[row]})[0]);}
         }
-    std::array<std::int16_t,8> query;query.fill(32767);
+    const auto bound=cpu::Q16ReductionBound::forTerms(8);
+    std::array<std::int16_t,8> query;query.fill(std::int16_t(bound.queryLimit()));
     std::array<std::int16_t,8> key{32767,32767,32767,32767,-32767,-32767,-32767,-32767};
     std::array<std::span<const std::int16_t>,Rows> keys;keys.fill(key);
-    for(auto value:native::integerDot<Rows>(query,keys))EXPECT_EQ(value,0);
-    query.fill(-32768);key.fill(-32768);
-    EXPECT_THROW((native::integerDot<Rows>(query,keys)),std::overflow_error);
+    for(auto value:native::integerDot<Rows>(bound,query,keys))EXPECT_EQ(value,0);
 }
-/** @test Exact int64 intermediates prevent wrapped/saturated native grouped integer dots. */
-TEST_F(NEONAttentionMath, IntegerOriginalRowsWidenBeforeAccumulation)
+/** @test Int32 accumulation under the typed bound equals the exact int64 sum for every row program. */
+TEST_F(NEONAttentionMath, IntegerOriginalRowsAccumulateExactlyUnderTheTypedBound)
 {integer<1>();integer<2>();integer<4>();}
+
+/**
+ * @test Worst-case witnesses at the bound's closed form: every sign pattern of
+ * |q| = limit and |k| = 32768 stays exact in int32 for head widths 32..256,
+ * including all-negative keys at the full -32768 magnitude.
+ */
+TEST_F(NEONAttentionMath, Q16BoundWorstCaseWitnessesStayExact)
+{
+    for(int terms:{32,64,128,256})
+    {
+        const auto bound=cpu::Q16ReductionBound::forTerms(terms);
+        ASSERT_LE(bound.worstMagnitude(),std::int64_t(std::numeric_limits<std::int32_t>::max()));
+        for(int pattern=0;pattern<4;++pattern)
+        {
+            std::vector<std::int16_t> query(terms),key(terms);
+            std::int64_t expected=0;
+            for(int i=0;i<terms;++i)
+            {
+                const int q_sign=pattern&1?((i&1)?-1:1):1, k_sign=pattern&2?1:-1;
+                query[i]=std::int16_t(q_sign*bound.queryLimit());
+                key[i]=k_sign<0?std::int16_t(-32768):std::int16_t(32767);
+                expected+=std::int64_t(query[i])*key[i];
+            }
+            const std::array<std::span<const std::int16_t>,4> keys{key,key,key,key};
+            for(const auto value:native::integerDot<4>(bound,query,keys))EXPECT_EQ(value,expected) << terms << "/" << pattern;
+        }
+    }
+    // T=256 at the forbidden limit 256 would reach 2^31: the bound forbids it.
+    EXPECT_EQ(cpu::Q16ReductionBound::forTerms(256).queryLimit(),255);
+    EXPECT_GT(std::int64_t(256)*256*32768,std::int64_t(std::numeric_limits<std::int32_t>::max()));
+}
+
+/** @test The bound rejects wider reductions and is fatal for query codes beyond its limit. */
+TEST_F(NEONAttentionMath, Q16BoundRejectsUnprovenReductions)
+{
+    const auto bound=cpu::Q16ReductionBound::forTerms(64);
+    std::vector<std::int16_t> query(65,1),key(65,1);
+    EXPECT_THROW((native::integerDot<1>(bound,query,{std::span<const std::int16_t>(key)})),std::invalid_argument);
+    query.resize(64);key.resize(64);
+    for(const int position:{0,7,63})
+    {
+        auto beyond=query;beyond[position]=std::int16_t(bound.queryLimit()+1);
+        EXPECT_DEATH((native::integerDot<1>(bound,beyond,{std::span<const std::int16_t>(key)})),"outside its int32 reduction bound");
+        beyond[position]=std::int16_t(-32768);
+        EXPECT_DEATH((native::integerDot<1>(bound,beyond,{std::span<const std::int16_t>(key)})),"outside its int32 reduction bound");
+    }
+}
 
 /** @test Query quantization retains max/limit, inverse, threshold, RNE and bounded original tails. */
 TEST_F(NEONAttentionMath, OriginalQueryQuantizationProgram)

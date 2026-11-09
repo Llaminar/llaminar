@@ -3357,7 +3357,8 @@ namespace llaminar2
         }
 
         /** @brief Runtime dispatch: i16 dot product. */
-        static int32_t dot_i16_i16_i32(const int16_t *a, const int16_t *b, int n)
+        static int32_t dot_i16_i16_i32(const int16_t *a, const int16_t *b, int n,
+            [[maybe_unused]] const cpu::Q16ReductionBound &bound)
         {
             switch (activeISALevel())
             {
@@ -3373,7 +3374,7 @@ namespace llaminar2
             case ISALevel::NEON:
             case ISALevel::NEONDotProd:
             {
-                return cpu::neon_attention::integerDot<1>(cpu::neon_attention::originalRows<std::int16_t,1>({a},n)[0],cpu::neon_attention::originalRows<std::int16_t,1>({b},n))[0];
+                return cpu::neon_attention::integerDot<1>(bound,cpu::neon_attention::originalRows<std::int16_t,1>({a},n)[0],cpu::neon_attention::originalRows<std::int16_t,1>({b},n))[0];
             }
 #endif
             case ISALevel::Scalar:
@@ -3544,7 +3545,8 @@ namespace llaminar2
             const int16_t *k1,
             int n,
             int32_t &out0,
-            int32_t &out1)
+            int32_t &out1,
+            [[maybe_unused]] const cpu::Q16ReductionBound &bound)
         {
             switch (activeISALevel())
             {
@@ -3562,7 +3564,7 @@ namespace llaminar2
             case ISALevel::NEON:
             case ISALevel::NEONDotProd:
             {
-                const auto result=cpu::neon_attention::integerDot<2>(cpu::neon_attention::originalRows<std::int16_t,1>({q},n)[0],cpu::neon_attention::originalRows<std::int16_t,2>({k0,k1},n));
+                const auto result=cpu::neon_attention::integerDot<2>(bound,cpu::neon_attention::originalRows<std::int16_t,1>({q},n)[0],cpu::neon_attention::originalRows<std::int16_t,2>({k0,k1},n));
                 out0=result[0];out1=result[1];return;
             }
 #endif
@@ -3704,7 +3706,8 @@ namespace llaminar2
         static void dot_i16_i16_i32_vnni_4row(
             const int16_t *q, const int16_t *k0, const int16_t *k1,
             const int16_t *k2, const int16_t *k3, int n,
-            int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3)
+            int32_t &out0, int32_t &out1, int32_t &out2, int32_t &out3,
+            [[maybe_unused]] const cpu::Q16ReductionBound &bound)
         {
             switch (activeISALevel())
             {
@@ -3722,7 +3725,7 @@ namespace llaminar2
             case ISALevel::NEON:
             case ISALevel::NEONDotProd:
             {
-                const auto result=cpu::neon_attention::integerDot<4>(cpu::neon_attention::originalRows<std::int16_t,1>({q},n)[0],cpu::neon_attention::originalRows<std::int16_t,4>({k0,k1,k2,k3},n));
+                const auto result=cpu::neon_attention::integerDot<4>(bound,cpu::neon_attention::originalRows<std::int16_t,1>({q},n)[0],cpu::neon_attention::originalRows<std::int16_t,4>({k0,k1,k2,k3},n));
                 out0=result[0];out1=result[1];out2=result[2];out3=result[3];return;
             }
 #endif
@@ -5480,8 +5483,10 @@ namespace llaminar2
             // Native K uses the full int16 range. Bound the complete block dot
             // product, not merely a SIMD lane: horizontal sums must fit too.
             // The same bound feeds scalar, AVX2 and AVX512 grouped/serial paths.
-            const int QMAX = cpu::q16AttentionQueryLimit(
+            // One typed bound feeds the query clamp and every integer dot.
+            const auto q16_bound = cpu::Q16ReductionBound::forTerms(
                 std::min(head_dim, static_cast<int>(block_elems)));
+            const int QMAX = q16_bound.queryLimit();
 
             const cpu::fa2_policy::CPUFA2ParallelPlan partition_plan =
                 cpu::fa2_policy::selectCPUFA2ParallelPlan({
@@ -5612,7 +5617,8 @@ namespace llaminar2
                                 dot0,
                                 dot1,
                                 dot2,
-                                dot3);
+                                dot3,
+                                q16_bound);
                             const float values[4]{
                                 static_cast<float>(dot0) *
                                     scratch.combined_query_scale * scale0,
@@ -5656,7 +5662,7 @@ namespace llaminar2
                                 scratch.query + block * block_elems,
                                 reinterpret_cast<const std::int16_t *>(
                                     stored + QS_OFFSET),
-                                elements);
+                                elements, q16_bound);
                             score += static_cast<float>(dot) *
                                      scratch.combined_query_scale *
                                      stored_scale;
@@ -5934,7 +5940,7 @@ namespace llaminar2
                                         int32_t dot0, dot1, dot2, dot3;
                                         dot_i16_i16_i32_vnni_4row(
                                             q_i16_buf, k_qs0, k_qs1, k_qs2, k_qs3,
-                                            head_dim, dot0, dot1, dot2, dot3);
+                                            head_dim, dot0, dot1, dot2, dot3, q16_bound);
 
                                         float s0 = static_cast<float>(dot0) * qk_combined_scale * kd0;
                                         float s1 = static_cast<float>(dot1) * qk_combined_scale * kd1;
@@ -5955,7 +5961,7 @@ namespace llaminar2
                                     float kd;
                                     std::memcpy(&kd, blk_s, sizeof(float));
                                     const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_s + QS_OFFSET);
-                                    int32_t dot = dot_i16_i16_i32(q_i16_buf, k_qs, head_dim);
+                                    int32_t dot = dot_i16_i16_i32(q_i16_buf, k_qs, head_dim, q16_bound);
                                     float s = static_cast<float>(dot) * qk_combined_scale * kd;
                                     block_scores[static_cast<size_t>(k - k0)] = s;
                                     block_max = std::max(block_max, s);
@@ -5975,7 +5981,7 @@ namespace llaminar2
                                         const int elem_count = static_cast<int>(
                                             std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
                                         int32_t dot = dot_i16_i16_i32(
-                                            q_i16_buf + bi * block_elems, k_qs, elem_count);
+                                            q_i16_buf + bi * block_elems, k_qs, elem_count, q16_bound);
                                         s += static_cast<float>(dot) * q_scale * kd;
                                     }
                                     s *= scale;

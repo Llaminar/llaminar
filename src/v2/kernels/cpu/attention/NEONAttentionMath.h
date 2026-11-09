@@ -5,8 +5,10 @@
  * Fixed one/two/four-row register programs share original query loads without
  * packing keys or mirroring decoded heads. Floating dots retain two four-lane
  * FMA chains and one fixed fold; weighted updates retain original increasing-row
- * FMA order. Integer products widen before summation and reject an unrepresentable
- * int32 result. Spans are synchronous borrows, not capacity or cache-lease proofs.
+ * FMA order. Integer dots accumulate in int32 under a typed Q16ReductionBound
+ * whose closed form makes every partial sum exact; a query code outside the
+ * bound is fatal at the point of use, never an exception that could strand a
+ * worker team. Spans are synchronous borrows, not capacity or cache-lease proofs.
  */
 #pragma once
 #if !defined(__aarch64__) || !defined(__ARM_NEON)
@@ -14,6 +16,7 @@
 #endif
 #include "../../../tensors/FP16Utils.h"
 #include "../../../tensors/NEONFP16.h"
+#include "CPUQ16AttentionMath.h"
 #include <arm_neon.h>
 #include <algorithm>
 #include <array>
@@ -21,6 +24,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -28,6 +33,11 @@
 
 namespace llaminar2::cpu::neon_attention
 {
+/** @brief Reject corrupt consumed attention data inside a worker team without unwinding.
+ * @param what Exact consumed quantity, preserved in the fatal diagnostic.
+ */
+[[noreturn]] inline void rejectAttentionData(const char*what)noexcept
+{std::fputs("ERROR: CPU native attention consumed invalid ",stderr);std::fputs(what,stderr);std::fputc('\n',stderr);std::abort();}
 /** @brief Original cache scalar encoding; no decoded shadow storage is implied. */
 enum class Storage : std::uint8_t { FP32,FP16,BF16,I16 };
 /** @brief Exact original physical scalar type for each cache role. */
@@ -177,44 +187,51 @@ inline void accumulate(std::span<float>output,const std::array<std::span<const U
 #pragma GCC unroll 4
         for(std::size_t row=0;row<Rows;++row)output[coordinate]=std::fma(scalar<Format>(values[row][coordinate]),weights[row],output[coordinate]);
 }
-/** @brief Share original int16 query loads while widening every product before accumulation.
+/** @brief Share original int16 query loads across rows with exact int32 accumulation.
  * @tparam Rows Native one/two/four-row register program.
+ * @param bound Typed reduction proof whose limit quantized @p query.
  * @param query Original quantized query; @param keys Complete original native int16 key rows.
- * @return Exact original-row int32 dots, never a wrapped/saturated approximation.
- * @throws std::invalid_argument For malformed original geometry.
- * @throws std::overflow_error If an exact result exceeds the declared int32 output domain.
+ * @return Exact original-row int32 dots, equal to the int64 sums.
+ * @throws std::invalid_argument For malformed geometry or more products than the bound admits.
+ * @details Under the bound, sum(|q*k|) <= bound.worstMagnitude() <= INT32_MAX,
+ * so every int32 lane partial and the fold are exact. The query magnitude is
+ * folded into the loop (one saturating abs/max per eight codes, shared by all
+ * rows); a code beyond the bound is fatal, since the sum could have wrapped.
  */
 template<std::size_t Rows>
-inline std::array<std::int32_t,Rows> integerDot(std::span<const std::int16_t>query,
+inline std::array<std::int32_t,Rows> integerDot(const Q16ReductionBound&bound,std::span<const std::int16_t>query,
     const std::array<std::span<const std::int16_t>,Rows>&keys)
 {
     static_assert(Rows==1||Rows==2||Rows==4);
     requireSpan(query);
     for(auto key:keys){requireSpan(key);if(key.size()!=query.size())throw std::invalid_argument("CPU native integer attention row geometry mismatch");}
-    int64x2_t sums[Rows];for(auto&sum:sums)sum=vdupq_n_s64(0);
+    if(query.size()>std::size_t(bound.terms()))
+        throw std::invalid_argument("CPU native integer attention reduction exceeds its proven int32 term count");
+    int32x4_t sums[Rows];for(auto&sum:sums)sum=vdupq_n_s32(0);
+    int16x8_t peak=vdupq_n_s16(0);
     std::size_t coordinate=0;
     for(;coordinate+8<=query.size();coordinate+=8)
     {
         const auto q=vld1q_s16(query.data()+coordinate);
+        peak=vmaxq_s16(peak,vqabsq_s16(q));
 #pragma GCC unroll 4
         for(std::size_t row=0;row<Rows;++row)
         {
             const auto key=vld1q_s16(keys[row].data()+coordinate);
-            sums[row]=vaddq_s64(sums[row],vpaddlq_s32(vmull_s16(vget_low_s16(q),vget_low_s16(key))));
-            sums[row]=vaddq_s64(sums[row],vpaddlq_s32(vmull_s16(vget_high_s16(q),vget_high_s16(key))));
+            sums[row]=vmlal_s16(sums[row],vget_low_s16(q),vget_low_s16(key));
+            sums[row]=vmlal_high_s16(sums[row],q,key);
         }
     }
-    std::array<std::int64_t,Rows> exact;
-    for(std::size_t row=0;row<Rows;++row)exact[row]=vaddvq_s64(sums[row]);
-    for(;coordinate<query.size();++coordinate)
-        for(std::size_t row=0;row<Rows;++row)exact[row]+=std::int64_t(query[coordinate])*keys[row][coordinate];
     std::array<std::int32_t,Rows> result;
-    for(std::size_t row=0;row<Rows;++row)
+    for(std::size_t row=0;row<Rows;++row)result[row]=vaddvq_s32(sums[row]);
+    int magnitude=vmaxvq_s16(peak);
+    for(;coordinate<query.size();++coordinate)
     {
-        if(exact[row]<std::numeric_limits<std::int32_t>::min()||exact[row]>std::numeric_limits<std::int32_t>::max())
-            throw std::overflow_error("CPU native integer attention exact dot exceeds int32 output domain");
-        result[row]=std::int32_t(exact[row]);
+        // -32768 has no positive int16 magnitude; widening first keeps it out of bound.
+        magnitude=std::max(magnitude,std::abs(int(query[coordinate])));
+        for(std::size_t row=0;row<Rows;++row)result[row]+=std::int32_t(query[coordinate])*keys[row][coordinate];
     }
+    if(magnitude>bound.queryLimit())rejectAttentionData("Q16 query code outside its int32 reduction bound");
     return result;
 }
 /** @brief Quantize one original FP32 query with the existing max/qmax, inverse, RNE program.
