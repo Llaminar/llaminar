@@ -38,7 +38,7 @@ namespace llaminar2::cpu::neon_attention
  * @param what Exact consumed quantity, preserved in the fatal diagnostic.
  */
 [[noreturn]] inline void rejectAttentionData(const char*what)noexcept
-{std::fputs("ERROR: CPU native attention consumed invalid ",stderr);std::fputs(what,stderr);std::fputc('\n',stderr);std::abort();}
+{std::fprintf(stderr,"ERROR: CPU native attention consumed invalid %s\n",what);std::abort();} // One stdio call: no interleaving with other workers.
 /** @brief Original cache scalar encoding; no decoded shadow storage is implied. */
 enum class Storage : std::uint8_t { FP32,FP16,BF16,I16 };
 /** @brief Exact original physical scalar type for each cache role. */
