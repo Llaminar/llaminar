@@ -10,6 +10,12 @@ def body(s,key):
  return s[a:j]
 main=r'''
 #include <csignal>
+// __builtin_trap() raises the host ISA's trap: ud2/SIGILL on x86-64, brk/SIGTRAP on AArch64.
+#if defined(__aarch64__)
+constexpr int kNativeTrapSignal=SIGTRAP;
+#else
+constexpr int kNativeTrapSignal=SIGILL;
+#endif
 unsigned char* failedOutput=nullptr;size_t failedOutputSize=0;
 void expectedTrap(int){for(size_t i=0;i<failedOutputSize;++i)if(failedOutput[i]!=0xa5)_exit(67);_exit(66);}
 int main(){
@@ -57,7 +63,7 @@ int main(){
  for(auto slice:{ncclLlaminarSourceSlice{bank+1,0},{bank,1},{UINT64_MAX,1},{64,65},{0,cap+1},{UINT64_MAX-1,5}}){
   const auto pid=fork();assert(pid>=0);
   if(!pid){
-   std::memset(dest,0xa5,cap);failedOutput=dest;failedOutputSize=cap;std::signal(SIGILL,expectedTrap);
+   std::memset(dest,0xa5,cap);failedOutput=dest;failedOutputSize=cap;std::signal(kNativeTrapSignal,expectedTrap);
    ncclDevWorkColl work{};work.root=rootRank;work.oneNode=1;work.sendbuff=source;work.recvbuff=dest;
    work.llaminarPayload.binding.slice={&slice,bank,&completion};work.llaminarPayload.kind=ncclLlaminarPayloadKind::CompletedSourceSlice;
    ncclShmem.channel.ring.userRanks[0]=rootRank;ncclShmem.channel.ring.userRanks[1]=3;admittedCapacity=cap;
@@ -87,7 +93,7 @@ int main(){
  for(auto absolute : {ncclLlaminarSourceSlice{18,0},{0,1},{UINT64_MAX,1}}){
   const auto pid=fork();assert(pid>=0);
   if(!pid){
-   std::memset(dest,0xa5,cap);failedOutput=dest;failedOutputSize=cap;std::signal(SIGILL,expectedTrap);
+   std::memset(dest,0xa5,cap);failedOutput=dest;failedOutputSize=cap;std::signal(kNativeTrapSignal,expectedTrap);
    ncclDevWorkColl work{};work.root=rootRank;work.oneNode=1;work.sendbuff=source;work.recvbuff=dest;
    work.llaminarPayload.binding.slice={&absolute,bank,&completion};work.llaminarPayload.kind=ncclLlaminarPayloadKind::CompletedSourceSlice;
    work.llaminarSourceOffsetOrigin=19;
