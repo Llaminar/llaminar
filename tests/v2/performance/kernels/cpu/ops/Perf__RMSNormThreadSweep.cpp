@@ -64,6 +64,9 @@ protected:
         // Prepare data
         std::vector<float> fp32_input(size);
         std::vector<float> gamma(d_model, 1.0f);
+        // The primitive consumes the kernel's Q11 gamma; quantize once outside the timed loop.
+        std::vector<int16_t> gamma_q11(gamma.size());
+        primitives::quantize_rmsnorm_gamma_q11(gamma.data(), gamma_q11.data(), gamma.size());
         std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
         for (auto &v : fp32_input)
             v = dist(rng_);
@@ -85,7 +88,7 @@ protected:
             {
                 // Direct call to primitive with forced parallelization
                 primitives::rmsnorm_q8_1_pure_integer(
-                    input.data(), gamma.data(), output.data(),
+                    input.data(), gamma_q11.data(), output.data(),
                     seq_len, blocks_per_row, 1e-6f,
                     {.allow_parallel = (nthreads > 1)});
             }
@@ -100,7 +103,7 @@ protected:
                 auto start = std::chrono::high_resolution_clock::now();
 
                 primitives::rmsnorm_q8_1_pure_integer(
-                    input.data(), gamma.data(), output.data(),
+                    input.data(), gamma_q11.data(), output.data(),
                     seq_len, blocks_per_row, 1e-6f,
                     {.allow_parallel = (nthreads > 1)});
 

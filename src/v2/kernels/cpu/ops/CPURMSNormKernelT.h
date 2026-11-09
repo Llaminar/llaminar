@@ -701,7 +701,7 @@ namespace llaminar2
             auto *q8_in = static_cast<const Q8_1Tensor *>(input);
             auto *q8_out = static_cast<Q8_1Tensor *>(output);
             return apply_typed(q8_in->typed_data(), weight->data(), q8_out->mutable_typed_data(),
-                               rows, cols, epsilon, device_idx);
+                               rows, cols, epsilon, device_idx, weight->weak_from_this());
         }
 
         // ===== Typed API =====
@@ -714,6 +714,10 @@ namespace llaminar2
          * 3. Quantize FP32 output to Q8_1 blocks (find scale, quantize)
          *
          * Note: cols must be a multiple of 32 (Q8_1 block size)
+         *
+         * @param gamma_owner Control-block identity of gamma's owning weight.
+         *        Pure-integer builds cache quantized gamma only for a live owner;
+         *        an empty owner requantizes on every call and is never stale.
          */
         bool apply_typed(
             const Q8_1Block *input,
@@ -722,7 +726,8 @@ namespace llaminar2
             int rows,
             int cols,
             float epsilon = 1e-6f,
-            int device_idx = -1);
+            int device_idx = -1,
+            const std::weak_ptr<const void> &gamma_owner = {});
 
         /**
          * @brief Apply RMSNorm with fused Q8_1 residual addition
