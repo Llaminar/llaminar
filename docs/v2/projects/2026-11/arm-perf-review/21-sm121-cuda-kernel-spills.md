@@ -85,3 +85,19 @@ closed PR #44 (branch deleted):
 STILL OPEN on 12.x: BK256 non-ordered variants at 4–8 bytes (per-K A loads
 reverted — didn't help), and `tensor_prefill` (the signed-off split spec).
 Evidence: `~/llaminar-spark-results/K14-CUDA-SPILL-MIGRATION-a62696317`.
+
+## REOPENED/INCOMPLETE (2026-11-09, arm-sparks) — fold partial for sm_121
+
+- Building Release CUDA arch 121 at 7e709d60e SPILLS: ptxas 'Registers are
+  spilled' in CUDANativeVNNIPrefillKernels.cu nativeVnniTC_BK64<...>
+  (h0/h4/h24, 256-wide staging) + CUDAFlashAttentionKernels.cu (code=255,
+  build stops).
+- Evidence: 7e709d60e's CUDANativeVNNIPrefillKernels.cu differs from the
+  spill-verified bd9dcd12a (17+/4-; TinyProjectionSharedKernel.cuh 24+/4-) —
+  the fold took a DIFFERENT/PARTIAL version; bd9dcd12a's BK64/BK256
+  unroll-roll fix is NOT fully present upstream.
+- RECOMMENDED: fold bd9dcd12a's kernel content (or remaining rolls) into #43
+  (that version probes 0 spills at sm_120+121). Current arm branch
+  (302318f1e) contains 7e709d60e → Release CUDA sm_121 builds fail there
+  until fixed. Idea-25 trace substitution: cff351901 (523230ab0 + bd9dcd12a;
+  U2✓ U5✓) sealed.
