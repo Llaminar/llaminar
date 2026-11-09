@@ -11,10 +11,11 @@ Input rows come from ``Perf__CPUNativeNEONExactOverlay`` (schema
 ``neon-exact-overlay-v1``). For each runtime key (execution codebook, source
 superblock layout, N, K, physical M, workers) every measured source alias must
 provide the complete candidate set with byte-exact output. Every ``--csv`` is
-one independent replica (a separate collector process); each replica must
-measure every key it shares with the others, and at least ``--min-replicas``
-replicas are required (default 2) so a single run's winner's-curse noise cannot
-install an overlay. Every (alias, replica) measurement of a runtime key is
+one independent replica (a separate collector process), usually of one source
+format. Every (runtime key, source alias) must be measured by at least
+``--min-replicas`` distinct replicas (default 2), so a single run's
+winner's-curse noise cannot install an overlay; an alias missing from a
+partial replica therefore fails closed. Every (alias, replica) measurement of a runtime key is
 pooled by the geometric mean of its median latency normalised to the total
 policy. An entry is emitted only when:
 
@@ -105,7 +106,7 @@ def read_rows(paths: Sequence[Path]) -> tuple[list[tuple[int, dict[str, str]]], 
     return rows, digests
 
 
-def collect(rows: Iterable[tuple[int, Mapping[str, str]]], replicas: int):
+def collect(rows: Iterable[tuple[int, Mapping[str, str]]], min_replicas: int):
     """Group authenticated rows by runtime key, (alias, replica) and candidate."""
 
     isas = set()
@@ -136,8 +137,8 @@ def collect(rows: Iterable[tuple[int, Mapping[str, str]]], replicas: int):
     for key, sources in grouped.items():
         for alias in {source for source, _ in sources}:
             present = sorted(replica for source, replica in sources if source == alias)
-            if present != list(range(replicas)):
-                raise OverlayError(f"{key} {alias} measured by replicas {present}, not all {replicas}")
+            if len(present) < min_replicas:
+                raise OverlayError(f"{key} {alias} measured by replicas {present}, fewer than {min_replicas}")
     return grouped, isas.pop()
 
 
@@ -211,7 +212,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.min_replicas < 1 or len(args.csv) < args.min_replicas:
         raise OverlayError(f"{len(args.csv)} replica(s) supplied; at least {args.min_replicas} required")
     rows, digests = read_rows(args.csv)
-    grouped, isa = collect(rows, len(args.csv))
+    grouped, isa = collect(rows, args.min_replicas)
     entries, decisions = decide(grouped, args.min_improvement)
     rendered = render(entries, isa)
     args.output.write_text(rendered, encoding="utf-8")
