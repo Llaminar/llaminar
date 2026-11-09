@@ -18930,54 +18930,75 @@ foreach(V2_FUSED_COMPLETION_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;Decode;${V2_FUSED_COMPLETION_ISA};ByteExact;Replay;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
-    add_v2_test(V2_Integration_CPU_NativeQuantisedOrderedThreeRowNibble_${V2_FUSED_COMPLETION_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
-            --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedOrderedThreeRowNibbleByteLifecycle
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;MTP;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
-        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
-    add_v2_test(V2_Integration_CPU_NativeQuantisedPrefillOrderedThreeTile_${V2_FUSED_COMPLETION_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
-            --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedPrefillOrderedThreeRowTile*
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
-        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
+    # x86 fused-rows planner schedule; ARM executes its own NEON tiles.
+    if(V2_CPU_TARGET_X86)
+        add_v2_test(V2_Integration_CPU_NativeQuantisedOrderedThreeRowNibble_${V2_FUSED_COMPLETION_ISA}
+            COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+                --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedOrderedThreeRowNibbleByteLifecycle
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;MTP;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+            ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
+    endif()
+    # x86 fused-rows planner schedule; ARM executes its own NEON tiles.
+    if(V2_CPU_TARGET_X86)
+        add_v2_test(V2_Integration_CPU_NativeQuantisedPrefillOrderedThreeTile_${V2_FUSED_COMPLETION_ISA}
+            COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+                --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedPrefillOrderedThreeRowTile*
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+            ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
+    endif()
     add_v2_test(V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_${V2_FUSED_COMPLETION_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
             --gtest_filter=CPUNativeQuantisedFusedCompletion.UnsignedCoefficientDomainContract:CPUNativeQuantisedFusedCompletion.UnsignedWeightDotAllFormatByteLifecycle
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
-    add_v2_test(V2_Integration_CPU_NativeQuantisedPairwiseContiguousOwnership_${V2_FUSED_COMPLETION_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
-            --gtest_filter=CPUNativeQuantisedFusedCompletion.PairwiseContiguousOwnership*
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
-        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
-    add_v2_test(V2_Integration_CPU_NativeQuantisedPrefillContiguousMixedPolicies_${V2_FUSED_COMPLETION_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
-            --gtest_filter=CPUNativeQuantisedFusedCompletion.PrefillContiguousOwnershipMixedPoliciesAllFormatLifecycle:CPUNativeQuantisedFusedCompletion.PairwiseContiguousOwnershipPhaseAdmissionAndReset:CPUNativeQuantisedFusedCompletion.OutputWorkerStaticRangeContract:CPUNativeQuantisedFusedCompletion.PrefillPanelBlocksMixedPoliciesAllFormatLifecycle:CPUNativeQuantisedFusedCompletion.AutoPanelBlocksContract:CPUNativeQuantisedFusedCompletion.PrefillAutoPanelBlocksMixedPoliciesAllFormatLifecycle
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
-        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
-    add_v2_test(V2_Integration_CPU_NativeQuantisedSamePanelPairRunReplay_${V2_FUSED_COMPLETION_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
-            --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedPrefillSamePanelPairRunReplay
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Replay;Regression"
-        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
-    add_v2_test(V2_Integration_CPU_NativeQuantisedLivePlanFill_${V2_FUSED_COMPLETION_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
-            --gtest_filter=CPUNativeQuantisedFusedCompletion.LivePlanFillValueAndPrefixReset:CPUNativeQuantisedFusedCompletion.LivePrefixStorageLargeSmallReset
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
-        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
-    add_v2_test(V2_Integration_CPU_NativeQuantisedFusedLivePrefix_${V2_FUSED_COMPLETION_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
-            --gtest_filter=CPUNativeQuantisedFusedCompletion.LivePrefixStorageLargeSmallReset
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
-        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
+    # x86 fused-rows planner schedule; ARM executes its own NEON tiles.
+    if(V2_CPU_TARGET_X86)
+        add_v2_test(V2_Integration_CPU_NativeQuantisedPairwiseContiguousOwnership_${V2_FUSED_COMPLETION_ISA}
+            COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+                --gtest_filter=CPUNativeQuantisedFusedCompletion.PairwiseContiguousOwnership*
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+            ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
+    endif()
+    # x86 fused-rows planner schedule; ARM executes its own NEON tiles.
+    if(V2_CPU_TARGET_X86)
+        add_v2_test(V2_Integration_CPU_NativeQuantisedPrefillContiguousMixedPolicies_${V2_FUSED_COMPLETION_ISA}
+            COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+                --gtest_filter=CPUNativeQuantisedFusedCompletion.PrefillContiguousOwnershipMixedPoliciesAllFormatLifecycle:CPUNativeQuantisedFusedCompletion.PairwiseContiguousOwnershipPhaseAdmissionAndReset:CPUNativeQuantisedFusedCompletion.OutputWorkerStaticRangeContract:CPUNativeQuantisedFusedCompletion.PrefillPanelBlocksMixedPoliciesAllFormatLifecycle:CPUNativeQuantisedFusedCompletion.AutoPanelBlocksContract:CPUNativeQuantisedFusedCompletion.PrefillAutoPanelBlocksMixedPoliciesAllFormatLifecycle
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+            ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
+    endif()
+    # x86 fused-rows planner schedule; ARM executes its own NEON tiles.
+    if(V2_CPU_TARGET_X86)
+        add_v2_test(V2_Integration_CPU_NativeQuantisedSamePanelPairRunReplay_${V2_FUSED_COMPLETION_ISA}
+            COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+                --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedPrefillSamePanelPairRunReplay
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Replay;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+            ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
+    endif()
+    # x86 fused-rows planner schedule; ARM executes its own NEON tiles.
+    if(V2_CPU_TARGET_X86)
+        add_v2_test(V2_Integration_CPU_NativeQuantisedLivePlanFill_${V2_FUSED_COMPLETION_ISA}
+            COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+                --gtest_filter=CPUNativeQuantisedFusedCompletion.LivePlanFillValueAndPrefixReset:CPUNativeQuantisedFusedCompletion.LivePrefixStorageLargeSmallReset
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+            ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
+    endif()
+    # x86 fused-rows planner schedule; ARM executes its own NEON tiles.
+    if(V2_CPU_TARGET_X86)
+        add_v2_test(V2_Integration_CPU_NativeQuantisedFusedLivePrefix_${V2_FUSED_COMPLETION_ISA}
+            COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+                --gtest_filter=CPUNativeQuantisedFusedCompletion.LivePrefixStorageLargeSmallReset
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+            ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
+    endif()
     add_v2_test(V2_Integration_CPU_NativeQuantisedFusedCompletion_${V2_FUSED_COMPLETION_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion> --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;AllFormats;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
@@ -36579,6 +36600,8 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedMoE
 
 # Source factors are raw typed coefficient words for several codebooks, even
 # when their arithmetic is symmetric. Trainer fixtures must obey those codecs.
+# The fixture is the x86 dispatch-evidence GEMV harness.
+if(V2_CPU_TARGET_X86)
 foreach(_source_factor_isa IN ITEMS AVX2 AVX512)
     if(_source_factor_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
         continue()
@@ -36595,6 +36618,7 @@ foreach(_source_factor_isa IN ITEMS AVX2 AVX512)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_CPU_NativeQuantisedSourceFactors_${_source_factor_isa})
 endforeach()
+endif()
 
 # Exact overlays must include the physically aligned QFN TP shards in every
 # applicable execution phase; nominal dimensions cannot stand in for tail ranks.
@@ -38260,16 +38284,16 @@ if(NOT V2_PERF_TESTS_ONLY)
             V2_Integration_CPURouterQ8UniqueSourceStageReplay_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedFusedProjectionEvidenceIdentity_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedOrderedNibbleReplay_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeQuantisedOrderedThreeRowNibble_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeQuantisedPrefillOrderedThreeTile_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeQuantisedLivePlanFill_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeQuantisedFusedLivePrefix_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeQuantisedPairwiseContiguousOwnership_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeQuantisedPrefillContiguousMixedPolicies_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeQuantisedSamePanelPairRunReplay_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_${_cpu_checkpoint_isa})
         if(V2_CPU_TARGET_X86)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_CPU_NativeQuantisedOrderedThreeRowNibble_${_cpu_checkpoint_isa}
+                V2_Integration_CPU_NativeQuantisedPrefillOrderedThreeTile_${_cpu_checkpoint_isa}
+                V2_Integration_CPU_NativeQuantisedLivePlanFill_${_cpu_checkpoint_isa}
+                V2_Integration_CPU_NativeQuantisedFusedLivePrefix_${_cpu_checkpoint_isa}
+                V2_Integration_CPU_NativeQuantisedPairwiseContiguousOwnership_${_cpu_checkpoint_isa}
+                V2_Integration_CPU_NativeQuantisedPrefillContiguousMixedPolicies_${_cpu_checkpoint_isa}
+                V2_Integration_CPU_NativeQuantisedSamePanelPairRunReplay_${_cpu_checkpoint_isa}
                 V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_gate_${_cpu_checkpoint_isa}
                 V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_down_${_cpu_checkpoint_isa})
         endif()
