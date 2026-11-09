@@ -123,3 +123,25 @@ separate (shared) path with the same pattern but different owners.
 - OWED (booked): .80 Integration NEON_I8MM full run + core-linked
   slot/movement/serialization; WSL x86 Unit+preflight; economy evidence
   (IQ3_S/IQ4_XS R1-vs-ea5402a54 M1+grouped ABBA; 35B decode ABBA).
+
+## Interim .80 run + seal semantics refinement (2026-11-09)
+
+- Run (a) @46c9ffc58 (Integration NEON_I8MM, gcc-14, all targets): Unit
+  960/963, Preflight 2303/2309, focused 82/83; failures = 2 known base + 3
+  target-selection-known + NEW-MINE (MoEOverlayPhysicalResidencyFabric,
+  MoEOverlayLivePreparedWeightBytes, MoEPipelineStagePhysicalResidency,
+  MoEPipelineCPUHostMaintenance) — all from the TEST FIXTURE.
+- 2a301e392 (fixture): makeSourceExpertAtLayer filled streams with
+  seed+byte·13 (reserved bits) and never admitted sources before CPU service
+  measurement → now masks coefficients into domains + admits.
+- e0d2a0fd3 (PRODUCTION seal semantics, reviewer attention): ExpertOverlay
+  movement transfers LIVE columns only → partial 64-column chunk padding keeps
+  slot content; seal now admits every LIVE column (column < N), padding NOT
+  admitted; vector lanes past N computed independently + discarded.
+  Coverage: reserved bits in last LIVE column rejected; arbitrary padding
+  accepted. Proof: 0xffff padding → published bytes identical (IQ2_S/IQ3_S/
+  IQ4_XS). x86 per-block checks unchanged. Zero-fill alternative REJECTED
+  (allocation/first-touch change).
+- 4 'outside-diff' BUILD failures = classes fixed by Main's 302318f1e (branch
+  predates it) → LANE REBASES onto 302318f1e before final R1 close.
+- Reviewer SOURCE111 recheck requested on e0d2a0fd3.
