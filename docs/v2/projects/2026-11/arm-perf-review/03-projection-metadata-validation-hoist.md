@@ -84,3 +84,22 @@ separate (shared) path with the same pattern but different owners.
   one word (0x0010, mid unit, col 17) and must fail; epochs 1/2 admit, keep
   root + seal on republish. Core-linked run (.80) pending;
   V2_Integration_CPUNativeVNNISlotReuseAdmission is the cell.
+
+## Reviewer final (SOURCE109, 09cba9963 vs ea5402a54) — P2s into R1
+
+- P2a: MetadataSeal::rebound PUBLIC + extent-only check → can rebound a valid
+  seal to a corrupt same-sized stream (fromPublished admits w/o scan); make
+  private/friend to the deep-copy owner or require an unforgeable copy
+  receipt. Public Tile::admitted bypasses requireExecutable/geometry (div0 for
+  GPUAligned K) → confine to the admitted batch builder. API hardening (no
+  observed exploit).
+- P2b: nonfinite-weight death test must prove child nonpublication: SIGABRT +
+  escaped-exception/terminate discriminators, child-visible/shared output
+  witness + write-before-reject negative; Rows1/2/4; single diagnostic stdio.
+- Wording: 'every whole-head integer reduction' (multi-block combine in FP32).
+- Positive: seal rules per-lane coverage correct; Q16 bound sound (whole-head
+  calls incl. :5964 guarded; 5661/5983 reduce ≤ block_elems, FP32 combine);
+  no FP32 tree/clamp change; comments substantive.
+- R1 CLOSE GATES: successor native byte/geometry/team paths (.80), core-linked
+  slot/movement/serialization (.80), x86 WSL Unit/preflight, resource/economy
+  evidence. No merge/execution grant from reviewer.
