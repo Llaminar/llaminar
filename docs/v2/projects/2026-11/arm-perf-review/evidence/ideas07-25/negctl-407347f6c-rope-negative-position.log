@@ -1,0 +1,1648 @@
+Running main() from googletest/src/gtest_main.cc
+Note: Google Test filter = *OrdinaryNegative*
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from CPURoPEWorkshare
+[ RUN      ] CPURoPEWorkshare.OrdinaryNegativePositionsIgnoreDirtyAngleWorkspace
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-1 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=1 first=-3 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-1 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=8 first=-3 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-1 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=0 rows=40 first=-3 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-1 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=1 first=-3 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-1 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=8 first=-3 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-1 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=1 rows=40 first=-3 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-1 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=1 first=-3 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-1 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=1 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=1 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=2 rows=40 first=-3 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-1 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=1 first=-3 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-1 workspace=3 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=0 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=0 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=1 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=1 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=2 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=2 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=2 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=2 team=3: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=3 team=1: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=3 team=1: differs from per-row rotation
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:844: Failure
+Value of: run.raw == clean.raw
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=3 team=3: raw bytes differ from a clean workspace
+
+/Users/floriankinder/repo/llaminar-hotpath/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp:846: Failure
+Value of: run.canonical == expected
+  Actual: false
+Expected: true
+call=3 rows=40 first=-3 workspace=3 team=3: differs from per-row rotation
+
+[  FAILED  ] CPURoPEWorkshare.OrdinaryNegativePositionsIgnoreDirtyAngleWorkspace (151 ms)
+[----------] 1 test from CPURoPEWorkshare (151 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (151 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] CPURoPEWorkshare.OrdinaryNegativePositionsIgnoreDirtyAngleWorkspace
+
+ 1 FAILED TEST
