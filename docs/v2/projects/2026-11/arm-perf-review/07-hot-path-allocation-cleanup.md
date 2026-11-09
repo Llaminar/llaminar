@@ -236,3 +236,14 @@ the source policy). Dead persistent_state parameter removed.
   53 failures = IDENTICAL on pure 425002104 (base defects). A/B stands.
 - Pending: reviewer pass at 8ba25fc28; WSL (5'); handover draft
   /tmp/armqual/hotpath-handover.md.
+
+## Orphan decision (2026-11-09): DELETE Perf__RMSNormParallelSweep.cpp
+
+- Stale, not distinct: setenv sweep is a no-op (debugEnv() static singleton,
+  read once; DebugEnv.h:4358); no kernel reads the four threshold fields
+  (git grep empty in src/v2/kernels/cpu); never registered; ThreadSweep
+  covers thread-count scaling. Lane adds a SEPARATE BOTTOM commit
+  'test(perf): retire the orphan RMSNorm parallel-threshold sweep';
+  20d85fa31 then edits only compiled code. New tip SHA follows; production
+  deltas unchanged. Dead DebugEnv threshold fields = Main follow-up
+  (handover list; lane didn't remove).
