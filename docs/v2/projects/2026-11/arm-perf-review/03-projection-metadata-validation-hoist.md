@@ -169,3 +169,24 @@ separate (shared) path with the same pattern but different owners.
   (N%4=1/2/3, chunk tails, grouped I8MM/SDOT/ASIMD, poisoned ADJACENT lanes
   actually loaded, output guards) — N=8/Rows1 proof didn't load cols 8..63.
   Old pre-seal checks were NOT strictly live-only for N%4!=0 (withdrawn).
+
+## SOURCE111 FINAL (2026-11-09) — amended-contract requirements (binding)
+
+- HOLD on P1 (shared-seal/x86-consumer): SOURCE110 approval NOT inherited
+  (different all-lane contract). Fix direction CONFIRMED with requirements:
+  1) publication-time normalization inside the owned rewrite generation,
+     after live writes, before sealing/reachability; descriptor-owned
+     planes/extents; live-only communication retained + extents asserted.
+  2) tests DISTINGUISH raw poison rejection vs normalized-arrival acceptance.
+  3) READER contract proved (x86 AVX2/512 IQ3/IQ4 loaders + IQ2 dispatch see
+     benign padding — WSL x86 control).
+  4) no new allocation inherently; owner evidence for unchanged
+     first-touch/NUMA/economy (.80/WSL).
+  5) P2 proof amplitude: mixed live/padding vectors, final-chunk cases, all
+     families (grouped I8MM/SDOT/ASIMD) + policies, poisoned adjacent lanes
+     actually loaded, output guards, focused preflight. Fix stale 'padding
+     lanes included' prose in seal test/CMake.
+- Positives: fabric fixture + post-write publication OK; live loop covers N
+  bound incl. chunk last live word; 4fb400ecb closes the Q16 precision notes.
+- Amend → separate successor SHA for re-review; owner/runtime/WSL/economy
+  evidence still required.
