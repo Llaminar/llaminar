@@ -2150,12 +2150,18 @@ namespace
                 const std::string &task_grid = record.tags.at("task_grid");
                 const int row_tile =
                     std::stoi(record.tags.at("physical_row_tile"));
-                if (route.rfind("grouped_neon_full_k_", 0) == 0)
+                if (route.rfind("grouped_neon_", 0) == 0)
                 {
                     // ARM native shared-row tiles (two or four physical rows).
+                    // An I8MM build must prove its automatic row-pair SMMLA ran.
+                    const std::string family =
+                        LLAMINAR_COMPILED_WITH_NEON_I8MM && activeISALevel() == ISALevel::NEONDotProd
+                        ? "grouped_neon_i8mm_" : "grouped_neon_full_k_";
                     EXPECT_EQ(task_grid, "row_tile_n_block");
-                    EXPECT_EQ(route, row_tile == 2 ? "grouped_neon_full_k_pair_rows"
-                                                   : "grouped_neon_full_k_four_rows");
+                    EXPECT_EQ(route, family + (row_tile == 2 ? "pair_rows" : "four_rows"));
+                    EXPECT_EQ(record.tags.at("isa"),
+                              family == "grouped_neon_i8mm_" ? "NEON_I8MM"
+                              : activeISALevel() == ISALevel::NEONDotProd ? "NEON_DOTPROD" : "NEON");
                     EXPECT_TRUE(row_tile == 2 || row_tile == 4) << row_tile;
                 }
                 else if (route == "grouped_full_k_row_chunk_grid")

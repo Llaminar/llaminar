@@ -100,4 +100,17 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
             --gtest_filter=CPUNativeNEONPreparedProjection.RejectsReservedSourceCoefficientBits
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Metadata Regression)
+    # Row-pair SMMLA exists only in the I8MM envelope. These focused gates
+    # prove its operands are the serial SDOT walk's product terms and that its
+    # N-tail/odd-row bytes, including canaries past N, equal SDOT's.
+    if(LLAMINAR_CPU_ISA_UPPER STREQUAL "NEON_I8MM")
+        v2_add_core_free_test(V2_Integration_CPUNativeNEONI8MMOperandGrouping
+            COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
+                --gtest_filter=*I8MMOperandGroupingMatchesSerialSDOTWalk:*I8MMRowPairPrimitivePlacesEveryProduct
+            LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised I8MM ByteExact Regression)
+        v2_add_core_free_test(V2_Integration_CPUNativeNEONI8MMTailsMatchSDOT
+            COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
+                --gtest_filter=*I8MMRowPairsMatchSDOTAcrossNTailsAndOddRows
+            LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised I8MM ByteExact AllFormats Regression)
+    endif()
 endif()

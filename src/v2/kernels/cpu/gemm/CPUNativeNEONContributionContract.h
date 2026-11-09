@@ -71,6 +71,45 @@ namespace llaminar2::cpu::native_quantised
     }
 #endif
 
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    /**
+     * @brief Add two rows' exact eight-value dots for four columns with two SMMLA.
+     * @param columns01 Running [r0c0, r0c1, r1c0, r1c1] INT32 sums.
+     * @param columns23 Running [r0c2, r0c3, r1c2, r1c3] INT32 sums.
+     * @param activation_pair Eight consecutive K bytes of row 0, then of row 1.
+     * @param weights_first Four K bytes per column for the first four-value group.
+     * @param weights_second The same columns' next four K bytes.
+     * @details The prepared stream holds four bytes per column per group, so
+     * zipping two adjacent groups' 32-bit words yields each column's eight
+     * consecutive K bytes, the SMMLA B operand. SMMLA accumulates the same
+     * signed products as two SDOTs per row, without saturation; every lane's
+     * magnitude stays below 2^19 for one 32-value block, so the INT32 sums
+     * are exact and identical to dotFourColumnsDotProd.
+     */
+    [[gnu::always_inline]] inline void dotRowPairI8MM(int32x4_t &columns01, int32x4_t &columns23,
+        int8x16_t activation_pair, int8x16_t weights_first, int8x16_t weights_second) noexcept
+    {
+        const int32x4_t first = vreinterpretq_s32_s8(weights_first);
+        const int32x4_t second = vreinterpretq_s32_s8(weights_second);
+        columns01 = vmmlaq_s32(columns01, activation_pair, vreinterpretq_s8_s32(vzip1q_s32(first, second)));
+        columns23 = vmmlaq_s32(columns23, activation_pair, vreinterpretq_s8_s32(vzip2q_s32(first, second)));
+    }
+
+    /**
+     * @brief Recover per-row four-column sums from a completed SMMLA row pair.
+     * @param columns01 Completed [r0c0, r0c1, r1c0, r1c1] sums.
+     * @param columns23 Completed [r0c2, r0c3, r1c2, r1c3] sums.
+     * @param row0 Receives [r0c0, r0c1, r0c2, r0c3].
+     * @param row1 Receives [r1c0, r1c1, r1c2, r1c3].
+     */
+    [[gnu::always_inline]] inline void splitRowPairI8MM(int32x4_t columns01, int32x4_t columns23,
+        int32x4_t &row0, int32x4_t &row1) noexcept
+    {
+        row0 = vcombine_s32(vget_low_s32(columns01), vget_low_s32(columns23));
+        row1 = vcombine_s32(vget_high_s32(columns01), vget_high_s32(columns23));
+    }
+#endif
+
     /**
      * @brief Append one symmetric 32-value block to four output columns.
      * @param accumulator Running FP32 column sums.
