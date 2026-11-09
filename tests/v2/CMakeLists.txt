@@ -19013,7 +19013,7 @@ foreach(V2_ORDERED_EXPERT_ISA_CELL IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     set(V2_ORDERED_EXPERT_TEST "V2_Integration_CPU_GPUAlignedExpertMultiBlockTree_AllFormats_${V2_ORDERED_EXPERT_ISA_LABEL}")
     add_v2_test(${V2_ORDERED_EXPERT_TEST}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
-                --gtest_filter=CPUNativeQuantisedGemvTest.GPUAlignedExpertMultiBlockPartitionsAllFormatsRuntimeMMatchSerialDecode:CPUNativeQuantisedGemvTest.CompactOrderedPartitionsMatchIndependentScalarDecoder
+                --gtest_filter=CPUNativeQuantisedGemvTest.GPUAlignedExpertMultiBlockPartitionsAllFormatsRuntimeMMatchSerialDecode:CPUNativeQuantisedGemvTest.CompactOrderedPartitionsMatchIndependentScalarDecoder:CPUNativeQuantisedGemvTest.CompactEmptyTrailingKTilePublishesWithoutReading
                 --gtest_brief=1
         LABELS "V2;Integration;CPU;MoE;MTP;ExpertOverlay;GPUAlignedExpert;${V2_ORDERED_EXPERT_ISA_LABEL};AllFormats;AllCodebooks;BatchInvariant;ByteExact;Regression"
         MPI_PROCS 1

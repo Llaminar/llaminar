@@ -14,6 +14,7 @@
  * @note Run with Integration build: ctest -R V2_Integration_CPUNativeQuantised_GEMV
  */
 #include "../../../../utils/NativeQuantisedTestPartialStorage.h"
+#include <bit>
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <omp.h>
@@ -1580,6 +1581,48 @@ namespace
                     EXPECT_THROW(invalid(blocks, 1, 1), std::invalid_argument);
                 }
             }
+        }
+    }
+
+    /**
+     * Fixed-count K tiles leave empty trailing tiles on a short K: their start
+     * lies at or beyond the matrix while the clamped end does not. Such a span
+     * must publish zero (or retain the accumulator) without a weight read;
+     * a nonempty span outside the matrix remains fatal.
+     */
+    TEST_F(CPUNativeQuantisedGemvTest, CompactEmptyTrailingKTilePublishesWithoutReading)
+    {
+        for (const auto &format : quantizedMoEVerifierFormats())
+        {
+            auto weights = format.create({64u, 768u}, 0xE47Fu);
+            CPUNativeQuantisedGemmKernel kernel(weights.get(), 0, -1,
+                CPUProjectionNumericalPolicy::GPUAlignedExpert);
+            const auto &packed = kernel.packedWeights();
+            if (!packed.usesCompactMultiScale())
+                continue;
+            SCOPED_TRACE(format.label);
+            const int blocks = packed.blocks_per_row;
+            std::vector<Q8_1Block> activation(static_cast<size_t>(blocks));
+            std::array<float, 64> output{};
+            const auto run = [&](int begin, int end, bool accumulate) {
+                multi_scale::dispatch<kCompactLanes>(packed,
+                    std::array<const Q8_1Block *, 1>{activation.data()},
+                    std::array<float *, 1>{output.data()}, 0, begin, end, accumulate);
+            };
+            // A 24-block K split into 16 tiles of 2 yields tiles [26, 24) etc.
+            for (const int begin : {blocks, blocks + 2, blocks + 6})
+            {
+                output.fill(-7.0f);
+                ASSERT_NO_THROW(run(begin, blocks, false));
+                for (const float value : output)
+                    ASSERT_EQ(std::bit_cast<uint32_t>(value), 0u);
+                output.fill(-7.0f);
+                ASSERT_NO_THROW(run(begin, blocks, true));
+                for (const float value : output)
+                    ASSERT_EQ(value, -7.0f);
+            }
+            EXPECT_THROW(run(blocks - 1, blocks + 1, false), std::invalid_argument);
+            EXPECT_THROW(run(-1, 1, false), std::invalid_argument);
         }
     }
 
