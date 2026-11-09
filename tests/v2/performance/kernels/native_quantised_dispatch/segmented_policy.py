@@ -8312,6 +8312,7 @@ def fit_generic_policy(
         Callable[[GenericDomain], str] | None
     ) = None,
     profiler_feature_catalog: ProfilerFeatureCatalog | None = None,
+    profiler_surrogate_devices: tuple[str, ...] | None = None,
 ) -> GenericPolicy:
     """Cross-validate leaf complexity, then optionally fit each final tree once.
 
@@ -8329,6 +8330,10 @@ def fit_generic_policy(
     preserve that domain's complete identity. A cached lazy projection must
     also provide ``domain_corpus_digest_provider`` so cache lookup never trusts
     a projection whose inputs cannot be identified without materializing it.
+    ``profiler_surrogate_devices=None`` discovers the visible CUDA devices for
+    profiler surrogate fitting and fails without one; device-free tests pass an
+    explicit ``("cpu",)`` inventory, which selects identical XGBoost semantics
+    without GPU work. An explicit inventory is never replaced by discovery.
     """
 
     global _PARALLEL_CV_TASKS
@@ -9085,6 +9090,7 @@ def fit_generic_policy(
                 if fit_cache is not None
                 else None
             ),
+            surrogate_devices=profiler_surrogate_devices,
         )
     else:
         profiler_models_started = time.perf_counter()
