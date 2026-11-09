@@ -324,3 +324,15 @@ failures GONE at this base. RE-GATE GO to arm-sparks.
 - DECISION PENDING Main: accept as gcc-14 scheduling noise (byte-identity
   claim = same-compiler-only) or investigate the 4 leaves (readable diff
   available) → possible follow-up commit on PR #43.
+
+## FINAL VERDICT (2026-11-09) — gcc-14 96/96 IDENTICAL
+
+- The earlier 4-diff was arm-sparks' PARSER artifact (per-section
+  'Disassembly of section' preambles appended to the preceding function).
+  Clean extraction: ea5402a54 vs 79c1f62ab, g++-14 STRICT, DOTPROD — all 96
+  run<> leaves (incl. Tile<1..4>::run<DotProd,Policy0,Encoding0,NibbleMap1,
+  true>) instruction-for-instruction identical (0 differing lines), opcode
+  histograms match per leaf (no arithmetic/vector/shift/load-store delta).
+- VERDICT: ACCEPT — byte-identity claim holds for AppleClang + gcc-16 + gcc-14;
+  NO commit; i8mm codegen claim closed. Sealed:
+  K14-I8MM-OBJDUMP-GCC14-20261109/RESULT-FINAL.txt (supersedes 4-diff note).
