@@ -75,6 +75,51 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                 std::bit_cast<int8x16_t>(activation), std::bit_cast<int8x16_t>(weights)));
         }
 
+        /**
+         * @brief One row's 32 activation bytes of a K block, loaded once.
+         * @details Group g (four values) is lane g % 4 of low (g < 4) or high
+         * (g >= 4). A panel loads each row's block once and every strip of the
+         * panel reads its groups by lane, instead of reloading and broadcasting
+         * the four-byte word per strip.
+         */
+        struct ActivationBlock
+        {
+            I low;  ///< Groups 0..3 (K 0..15).
+            I high; ///< Groups 4..7 (K 16..31).
+        };
+
+        /** @brief Load one row's complete K block as two 16-byte registers.
+         * @param qs Thirty-two readable signed activation bytes in original K order.
+         */
+        static ActivationBlock activationBlock(const std::int8_t *qs) noexcept
+        { return {std::bit_cast<I>(vld1q_s8(qs)), std::bit_cast<I>(vld1q_s8(qs + 16))}; }
+
+        /** @brief Accumulate four exact signed column dots against one lane of a loaded block.
+         * @tparam Group Four-value activation group in [0, 7].
+         * @param acc Existing INT32 dots.
+         * @param weights Four signed bytes per column.
+         * @param block Row block from activationBlock().
+         * @return dot(acc, weights, broadcast of group @p Group), bit for bit.
+         * @details DotProd and the I8MM single-row leaf use the indexed SDOT form;
+         * ASIMD duplicates the selected lane and runs its widening program. The
+         * integer sums are exact, so the lane source cannot change any result.
+         */
+        template <int Group> static I dotLane(I acc, I weights, const ActivationBlock &block) noexcept
+        {
+            static_assert(Group >= 0 && Group < 8);
+            const auto source = std::bit_cast<int8x16_t>(Group < 4 ? block.low : block.high);
+#if defined(__ARM_FEATURE_DOTPROD)
+            if constexpr (Dot == NEONByteDot::DotProd || Dot == NEONByteDot::I8MM)
+                return std::bit_cast<I>(vdotq_laneq_s32(std::bit_cast<int32x4_t>(acc),
+                    std::bit_cast<int8x16_t>(weights), source, Group % 4));
+#else
+            static_assert(Dot == NEONByteDot::ASIMD, "DotProd operations require a DotProd-targeted compiler envelope");
+#endif
+            const auto word = vreinterpretq_s8_s32(vdupq_laneq_s32(vreinterpretq_s32_s8(source), Group % 4));
+            return std::bit_cast<I>(dotFourColumnsASIMD(std::bit_cast<int32x4_t>(acc), word,
+                std::bit_cast<int8x16_t>(weights)));
+        }
+
 #if defined(__ARM_FEATURE_MATMUL_INT8)
         /** @brief Load two rows' eight consecutive activation bytes as one SMMLA A operand.
          * @param row0 First row's eight readable signed bytes in original K order.
