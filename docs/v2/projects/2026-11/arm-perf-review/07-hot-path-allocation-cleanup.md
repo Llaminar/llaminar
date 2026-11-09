@@ -451,3 +451,15 @@ the source policy). Dead persistent_state parameter removed.
   position_ids-override 3 stages UNBOUND (regex missed digit names — lane's
   error, acknowledged) — bound. Correct re-sweep: 33 RoPEStage constructions,
   all accounted. Mac gcc-16 -Wall 0 diagnostics; WSL (5'') = first execution.
+
+## 912d0107 FINAL source ACK (2026-11-09)
+
+- Narrow source-only ACK; 0b32f8edd RoPE test-proof HOLD CLOSED. Exact
+  parent + two-file test-only; no production/installer change. All five CPU
+  RoPE cases assert directly; position-override 3 stages bound (declaration
+  sized, lifetime covers checks); both fixtures CPU; 33-site re-inventory
+  clean (unbound = metadata/null-context/rejected/GPU/later-bound/intentional
+  lifecycle negatives; GPURoPEProbeStage GPU graph-owned). Scope note:
+  unrelated RMSNorm/GEMM catch-skip wrappers remain (not in scope).
+  SOURCE COMPLETE. Remaining: WSL (5'') + handover (lane preparing doc) +
+  N2/N3 (arm tip, independent).
