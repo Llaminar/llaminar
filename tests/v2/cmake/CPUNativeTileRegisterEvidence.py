@@ -11,11 +11,14 @@ configured objdump and audit the instructions actually assembled.
   Apple's abbreviated printer), so every operand is visible; assembler-level
   controls (macros, conditionals, directives) cannot change or hide audited
   instructions, because only the assembled bytes are read.
-- Object image: sections (with executable extents) and the complete symbol
-  table (binding, type, defining section, value, ELF size) are read from the
-  object itself. Function extents are the ELF symbol sizes, or for Mach-O the
-  next distinct defined address; extents lie in their section, never overlap,
-  and every non-padding instruction belongs to one.
+- Object image: sections (with executable extents), the complete symbol table
+  (raw linker name, binding, type, defining section, value, ELF size) and the
+  relocation tables of every executable section (type, raw target symbol,
+  addend; ELF RELA, or extern Mach-O entries - scattered, section-relative and
+  ADDEND forms fail) are read from the object itself. Function starts and
+  extents (ELF symbol size; Mach-O next distinct defined address) must be
+  instruction aligned, lie in their section and never overlap; every
+  non-padding instruction and every relocation belongs to one.
 - Inventory: the expected tile K-loop programs (row tile x integer family x
   policy x encoding/map/minimum) derive from the admitted ISA envelope; the
   inventory string embedded in the object and the object's function symbols
@@ -25,8 +28,10 @@ configured objdump and audit the instructions actually assembled.
   at every 4-byte address of its extent, in order, exactly once (no gaps,
   missing prefixes or tails, duplicates or reordering); every heading names a
   symbol defined at that address; function bodies are cut from the object's
-  extents, not from printed headings. Every line is a format, section, symbol,
-  instruction or relocation line; relocations attach to their instruction;
+  extents, not from printed headings. Every printed relocation must equal the
+  object's relocation at that instruction (type, target, addend) and every
+  object relocation must be printed; the object's record is the one analysed.
+  Every line is a format, section, symbol, instruction or relocation line;
   in-function branches become local labels, relocated branches name their
   symbol, page and low-12 data relocations become symbolic operands. Unknown
   relocations, branch addends, unrelocated address operands, data words and
@@ -37,11 +42,13 @@ configured objdump and audit the instructions actually assembled.
   objects plus the explicitly modelled merge definitions. This is an inventory
   of supported forms, not a complete AArch64 grammar; any other form fails.
 - Calls: the only admitted call is to the exact fatal-diagnostic symbol (a
-  defined function of the object), whose body must consist of admitted forms,
-  call only fwrite/fputs, be acyclic and end every path in a call to abort().
-  fwrite, fputs and abort are trusted only as the object's unique, undefined,
-  strongly bound imports; a local definition, alias, rebinding or weak import
-  disproves the diagnostic. Every other call boundary, including a direct
+  defined function of the object under its raw linker name), whose body must
+  consist of admitted forms, call only fwrite/fputs, be acyclic and end every
+  path in a call to abort(). fwrite, fputs and abort are trusted only as the
+  object's unique, undefined, strongly bound imports in the exact spelling of
+  the format's C ABI (_fputs/_abort on Mach-O, fputs/abort on ELF); a foreign
+  spelling, local definition, alias, rebinding or weak import disproves the
+  diagnostic. Every other call boundary, including a direct
   abort(), is a structural failure, so no interprocedural state is modelled.
 - Analysis: each program is analysed over its control-flow graph. Stack
   provenance of every general register is a forward data-flow fact; merge
@@ -72,9 +79,12 @@ configured objdump and audit the instructions actually assembled.
   bound with its logical path, its resolved path (component-wise, as the kernel
   resolves symlinks and "..") and the symlinks followed. The Ninja depfile names
   resolved paths; symlink retargeting is caught by verification. Those lists are
-  preprocessing dependencies only, so the preprocessed translation unit (same
-  flags) is retained and any inline-assembly directive making the assembler
-  read a file (.include/.incbin, in any literal spelling) is rejected.
+  preprocessing dependencies only, and the assembler can read further files or
+  construct directives through macros and substitution. Rather than model the
+  assembler, the preprocessed translation unit (same flags) is retained and
+  C++-tokenized, and every asm construct must have an empty template (a
+  compiler barrier) or a single plain symbol (an asm label); any other template
+  fails closed, as do assembler options in the compile command.
 
 Verify phase (Unit/preflight): no compiler is invoked, but every recorded input
 (including absolute system/SDK headers named by the compiler) must be present
@@ -255,9 +265,35 @@ class ObjectSymbol(NamedTuple):
 
 
 class ObjectImage(NamedTuple):
+    """Sections, the symbol table (raw linker names) and the relocations of every executable section
+    ({section: {address: (type name, raw target symbol, addend)}}), all read from the object."""
     macho: bool
     sections: dict[str, Section]
     symbols: list[ObjectSymbol]
+    relocations: dict[str, dict[int, tuple[str, str, int]]]
+
+    @property
+    def prefix(self) -> str:
+        """The C linker-name prefix of the object format (Mach-O prepends an underscore)."""
+        return "_" if self.macho else ""
+
+
+ELF_RELOCATIONS = {257: "R_AARCH64_ABS64", 275: "R_AARCH64_ADR_PREL_PG_HI21", 277: "R_AARCH64_ADD_ABS_LO12_NC",
+                   278: "R_AARCH64_LDST8_ABS_LO12_NC", 279: "R_AARCH64_TSTBR14", 280: "R_AARCH64_CONDBR19",
+                   282: "R_AARCH64_JUMP26", 283: "R_AARCH64_CALL26", 284: "R_AARCH64_LDST16_ABS_LO12_NC",
+                   285: "R_AARCH64_LDST32_ABS_LO12_NC", 286: "R_AARCH64_LDST64_ABS_LO12_NC",
+                   299: "R_AARCH64_LDST128_ABS_LO12_NC", 311: "R_AARCH64_ADR_GOT_PAGE",
+                   312: "R_AARCH64_LD64_GOT_LO12_NC"}
+MACHO_RELOCATIONS = {0: "ARM64_RELOC_UNSIGNED", 1: "ARM64_RELOC_SUBTRACTOR", 2: "ARM64_RELOC_BRANCH26",
+                     3: "ARM64_RELOC_PAGE21", 4: "ARM64_RELOC_PAGEOFF12", 5: "ARM64_RELOC_GOT_LOAD_PAGE21",
+                     6: "ARM64_RELOC_GOT_LOAD_PAGEOFF12", 7: "ARM64_RELOC_POINTER_TO_GOT",
+                     8: "ARM64_RELOC_TLVP_LOAD_PAGE21", 9: "ARM64_RELOC_TLVP_LOAD_PAGEOFF12", 10: "ARM64_RELOC_ADDEND"}
+
+
+def _add_relocation(table: dict, section: str, address: int, record: tuple[str, str, int]) -> None:
+    if address in table.setdefault(section, {}):
+        raise ValueError(f"two relocations at {section}+{address:#x}")
+    table[section][address] = record
 
 
 def _field(data: bytes, offset: int, size: int) -> int:
@@ -289,7 +325,8 @@ def _read_elf(data: bytes) -> ObjectImage:
         headers.append({"name": _field(data, base, 4), "type": _field(data, base + 4, 4),
                         "flags": _field(data, base + 8, 8), "address": _field(data, base + 16, 8),
                         "offset": _field(data, base + 24, 8), "size": _field(data, base + 32, 8),
-                        "link": _field(data, base + 40, 4), "entsize": _field(data, base + 56, 8)})
+                        "link": _field(data, base + 40, 4), "info": _field(data, base + 44, 4),
+                        "entsize": _field(data, base + 56, 8)})
     strings = headers[shstrndx]
     names = [_string(data, strings["offset"] + header["name"], strings["offset"] + strings["size"])
              for header in headers]
@@ -305,10 +342,14 @@ def _read_elf(data: bytes) -> ObjectImage:
     table, symbols = tables[0], []
     names_table = headers[table["link"]]
     kinds = {0: "notype", 1: "object", 2: "function", 3: "section", 4: "file"}
+    indexed: list[str] = [""]
     for entry in range(1, table["size"] // 24):
         base = table["offset"] + entry * 24
         name = _string(data, names_table["offset"] + _field(data, base, 4),
                        names_table["offset"] + names_table["size"])
+        if _field(data, base + 4, 1) & 0xF == 3 and 0 < _field(data, base + 6, 2) < len(headers):
+            name = names[_field(data, base + 6, 2)]  # A section symbol is named by its section.
+        indexed.append(name)
         info, index = _field(data, base + 4, 1), _field(data, base + 6, 2)
         binding = {0: "local", 1: "global", 2: "weak"}.get(info >> 4, "other")
         if index == 0:
@@ -322,13 +363,34 @@ def _read_elf(data: bytes) -> ObjectImage:
         else:
             raise ValueError(f"symbol {name} names a nonexistent section")
         symbols.append(ObjectSymbol(name, section, _field(data, base + 8, 8), _field(data, base + 16, 8), kind, binding))
-    return ObjectImage(False, sections, symbols)
+    relocations: dict[str, dict[int, tuple[str, str, int]]] = {}
+    for header in headers:
+        if header["type"] not in (4, 9) or not 0 < header["link"] < len(headers) or \
+                not 0 < header.get("info", 0) < len(headers):
+            continue
+        target = headers[header["info"]]
+        if not target["flags"] & 0x4:
+            continue  # Relocations of data sections are not analysed.
+        if header["type"] == 9 or header["entsize"] != 24 or headers[header["link"]] is not table:
+            raise ValueError("executable-section relocations must be RELA entries against the symbol table")
+        section = names[headers.index(target)]
+        for entry in range(header["size"] // 24):
+            base = header["offset"] + entry * 24
+            info = _field(data, base + 8, 8)
+            if not 0 < info >> 32 < len(indexed):
+                raise ValueError(f"relocation in {section} names no symbol")
+            kind = ELF_RELOCATIONS.get(info & 0xFFFFFFFF, f"R_AARCH64_UNSUPPORTED_{info & 0xFFFFFFFF}")
+            addend = int.from_bytes(data[base + 16:base + 24], "little", signed=True)
+            _add_relocation(relocations, section, target["address"] + _field(data, base, 8),
+                            (kind, indexed[info >> 32], addend))
+    return ObjectImage(False, sections, symbols, relocations)
 
 
 def _read_macho(data: bytes) -> ObjectImage:
     commands, offset = _field(data, 16, 4), 32
     sections: dict[str, Section] = {}
     ordered: list[str | None] = [None]
+    relocation_tables: dict[str, tuple[int, int]] = {}
     symtab = None
     for _ in range(commands):
         command, size = _field(data, offset, 4), _field(data, offset + 4, 4)
@@ -345,6 +407,7 @@ def _read_macho(data: bytes) -> ObjectImage:
                     raise ValueError(f"ambiguous Mach-O section name {name}")
                 sections[name] = Section(name, _field(data, base + 32, 8), _field(data, base + 40, 8),
                                          bool(flags & 0x80000400))
+                relocation_tables[name] = (_field(data, base + 56, 4), _field(data, base + 60, 4))
                 ordered.append(name)
         elif command == 0x2:  # LC_SYMTAB
             symtab = tuple(_field(data, offset + 8 + 4 * field, 4) for field in range(4))
@@ -354,10 +417,11 @@ def _read_macho(data: bytes) -> ObjectImage:
     if symtab is None:
         raise ValueError("the witness object has no Mach-O symbol table")
     symoff, count, stroff, strsize = symtab
-    symbols = []
+    symbols, indexed = [], []
     for index in range(count):
         base = symoff + index * 16
         name = _string(data, stroff + _field(data, base, 4), stroff + strsize)
+        indexed.append(name)
         kind_bits, number, description = _field(data, base + 4, 1), _field(data, base + 5, 1), _field(data, base + 6, 2)
         value = _field(data, base + 8, 8)
         if kind_bits & 0xE0:
@@ -373,8 +437,19 @@ def _read_macho(data: bytes) -> ObjectImage:
         else:
             kind = {0x2: "absolute", 0xA: "indirect"}.get(kind_bits & 0x0E, "other")
         binding = "weak" if description & 0xC0 else ("global" if kind_bits & 0x01 else "local")
-        symbols.append(ObjectSymbol(name[1:] if name.startswith("_") else name, section, value, None, kind, binding))
-    return ObjectImage(True, sections, symbols)
+        symbols.append(ObjectSymbol(name, section, value, None, kind, binding))
+    relocations: dict[str, dict[int, tuple[str, str, int]]] = {}
+    for name, (offset, count) in relocation_tables.items():
+        if not sections[name].executable:
+            continue
+        for entry in range(count):
+            address, info = _field(data, offset + entry * 8, 4), _field(data, offset + entry * 8 + 4, 4)
+            symbol, external, kind = info & 0xFFFFFF, (info >> 27) & 1, info >> 28
+            if address & 0x80000000 or not external or kind == 10 or not symbol < len(indexed):
+                raise ValueError(f"unsupported relocation form in {name} (scattered, section-relative or addend)")
+            _add_relocation(relocations, name, sections[name].address + address,
+                            (MACHO_RELOCATIONS.get(kind, f"ARM64_RELOC_UNSUPPORTED_{kind}"), indexed[symbol], 0))
+    return ObjectImage(True, sections, symbols, relocations)
 
 
 def function_extents(image: ObjectImage) -> dict[str, tuple[str, int, int]]:
@@ -398,6 +473,8 @@ def function_extents(image: ObjectImage) -> dict[str, tuple[str, int, int]]:
             if not symbol.size:
                 raise ValueError(f"function symbol {symbol.name} records no size")
             end = symbol.value + symbol.size
+        if symbol.value % 4 or end % 4:
+            raise ValueError(f"function symbol {symbol.name} has an unaligned start or extent")
         if not section.address <= symbol.value < end <= section.address + section.size:
             raise ValueError(f"function symbol {symbol.name} lies outside its section")
         if symbol.name in extents:
@@ -411,16 +488,19 @@ def function_extents(image: ObjectImage) -> dict[str, tuple[str, int, int]]:
 
 
 def trusted_imports(image: ObjectImage) -> set[str]:
-    """Names bound to exactly one symbol: an undefined, strongly bound import."""
+    """Raw linker names of the stdio/abort exceptions bound as the object's unique, undefined, strongly bound
+    imports, in the exact spelling of the object format's C ABI (abort on ELF, _abort on Mach-O)."""
     names = [symbol.name for symbol in image.symbols]
-    return {symbol.name for symbol in image.symbols if symbol.kind == "undefined" and symbol.binding == "global"
-            and names.count(symbol.name) == 1}
+    wanted = {image.prefix + name for name in DIAGNOSTIC_CALLS | NORETURN_LEAVES}
+    return {symbol.name for symbol in image.symbols if symbol.name in wanted and symbol.kind == "undefined"
+            and symbol.binding == "global" and names.count(symbol.name) == 1}
 
 
 def parse_disassembly(disassembly: str, macho: bool) -> tuple[dict[str, dict[int, list]], list[tuple[str, int, str]]]:
-    """Instruction map per section {address: [text, relocation]} and (section, address, name) headings."""
+    """Instruction map per section {address: [text, printed relocation]} and (section, address, raw name)
+    headings."""
     def symbol(name: str) -> str:
-        return name[1:] if macho and name.startswith("_") else name
+        return name
 
     lines = disassembly.splitlines()
     formats = [FORMAT_LINE.match(line).group(1) for line in lines if FORMAT_LINE.match(line)]
@@ -464,6 +544,11 @@ def parse_disassembly(disassembly: str, macho: bool) -> tuple[dict[str, dict[int
     return code, headings
 
 
+def relocation_target(symbol: str, addend: int) -> str:
+    """The relocation target as disassemblers print it: symbol, symbol+0xN or symbol-0xN."""
+    return symbol if not addend else f"{symbol}{'+' if addend > 0 else '-'}0x{abs(addend):x}"
+
+
 def normalize_disassembly(disassembly: str, image: ObjectImage) -> dict[str, list[str]]:
     """Translate disassembler output into one normalised body per function symbol of the object.
 
@@ -493,8 +578,24 @@ def normalize_disassembly(disassembly: str, image: ObjectImage) -> dict[str, lis
     for heading in headings:
         if heading not in defined:
             raise ValueError(f"disassembly heading is not a symbol defined at that address: {heading[2]}")
+    for name, table in image.relocations.items():
+        for address in table:
+            if address not in code.get(name, {}):
+                raise ValueError(f"object relocation at {name}+{address:#x} is not on a disassembled instruction")
+    for name, instructions in code.items():
+        table = image.relocations.get(name, {})
+        for address, (_, printed) in instructions.items():
+            actual = table.get(address)
+            if (printed is None) != (actual is None) or \
+                    (actual and printed != (actual[0], relocation_target(actual[1], actual[2]))):
+                raise ValueError(f"printed relocation at {name}+{address:#x} does not match the object: "
+                                 f"{printed} != {actual}")
     extents = function_extents(image)
     owned = {(section, address) for section, start, end in extents.values() for address in range(start, end, 4)}
+    for name, table in image.relocations.items():
+        orphans = [address for address in table if (name, address) not in owned]
+        if orphans:
+            raise ValueError(f"relocation outside every function extent in {name} at {orphans[0]:#x}")
     for name, instructions in code.items():
         orphans = [address for address, (text, _) in instructions.items()
                    if (name, address) not in owned and text != "nop"]
@@ -510,7 +611,8 @@ def normalize_disassembly(disassembly: str, image: ObjectImage) -> dict[str, lis
         function = {"section": section, "start": start}
         rewritten, targets = [], set()
         for address in range(start, end, 4):
-            text, relocation = code[section][address]
+            text = code[section][address][0]
+            relocation = image.relocations.get(section, {}).get(address)
             rewritten.append((address, rewrite(text, relocation, function, end, starts, targets)))
         body = [f'\t.section .text.{section.replace(",", ".")},"ax"']
         for address, text in rewritten:
@@ -523,18 +625,15 @@ def normalize_disassembly(disassembly: str, image: ObjectImage) -> dict[str, lis
     return bodies
 
 
-def rewrite(text: str, relocation: tuple[str, str] | None, function: dict, end: int,
+def rewrite(text: str, relocation: tuple[str, str, int] | None, function: dict, end: int,
             starts: dict[tuple[str, int], str], targets: set[int]) -> str:
     """One disassembled instruction in normalised form (symbolic branch targets and relocations)."""
     parts = text.split(None, 1)
     mnemonic, operands = parts[0], (split_operands(parts[1]) if len(parts) > 1 else [])
     branch = mnemonic in ("b", "bl", "cbz", "cbnz", "tbz", "tbnz") or CONDITIONAL_BRANCH.match(mnemonic)
-    kind = relocation[0] if relocation else None
-    name = relocation[1] if relocation else None
-    if relocation and re.search(r"[+-]0x[0-9a-f]+$", name):
-        if kind in BRANCH_RELOCATIONS:
-            raise ValueError(f"branch relocation with an addend is not supported: {text} {name}")
-        name = re.sub(r"[+-]0x[0-9a-f]+$", "", name)  # A data address offset; never a stack address.
+    kind, name, addend = relocation if relocation else (None, None, 0)
+    if relocation and addend and kind in BRANCH_RELOCATIONS:
+        raise ValueError(f"branch relocation with an addend is not supported: {text} {name}{addend:+#x}")
     if branch:
         target = ADDRESS_OPERAND.match(operands[-1]) if operands else None
         if not target:
@@ -1200,7 +1299,8 @@ class Analysis:
         return True
 
 
-def proven_noreturn(symbol: str, bodies: dict[str, list[str]], dialect: Dialect, imports: set[str]) -> bool:
+def proven_noreturn(symbol: str, bodies: dict[str, list[str]], dialect: Dialect, imports: set[str],
+                    prefix: str) -> bool:
     """The fatal diagnostic is exempt only if every reachable instruction is an admitted form, its only calls are
     the trusted diagnostic calls, and its body is acyclic with every path ending in a call to abort()."""
     body = bodies.get(symbol)
@@ -1225,10 +1325,10 @@ def proven_noreturn(symbol: str, bodies: dict[str, list[str]], dialect: Dialect,
                 if target not in imports:
                     valid = False  # Trusted only as an undefined, strongly bound import; never a local body.
                     break
-                if dialect.symbol(target) in NORETURN_LEAVES:
+                if target in {prefix + leaf for leaf in NORETURN_LEAVES}:
                     ends = True
                     break
-                if dialect.symbol(target) not in DIAGNOSTIC_CALLS:
+                if target not in {prefix + call for call in DIAGNOSTIC_CALLS}:
                     valid = False
                     break
                 continue
@@ -1278,10 +1378,11 @@ def analyse_function(name: str, bodies: dict[str, list[str]], dialect: Dialect,
     return analysis.spills, analysis.errors
 
 
-def noreturn_symbols(bodies: dict[str, list[str]], dialect: Dialect, imports: set[str]) -> set[str]:
-    """The only symbol a tile program may call: the exact fatal diagnostic, when proven never to return."""
-    return {name for name in bodies if dialect.symbol(name) == FATAL_DIAGNOSTIC and
-            proven_noreturn(name, bodies, dialect, imports)}
+def noreturn_symbols(bodies: dict[str, list[str]], dialect: Dialect, imports: set[str], prefix: str) -> set[str]:
+    """The only symbol a tile program may call: the exact fatal diagnostic (raw linker name of the object
+    format), when proven never to return."""
+    return {name for name in bodies if name == prefix + FATAL_DIAGNOSTIC and
+            proven_noreturn(name, bodies, dialect, imports, prefix)}
 
 
 def program_key(name: str) -> str:
@@ -1300,6 +1401,7 @@ ENVELOPE_PROGRAMS = {
                   "2:I8MM", "3:I8MM", "4:I8MM"),
 }
 TILE_RUN = re.compile(r"27CPUNativeNEONProjectionTileILm\d+EE3run")
+TILE_PROGRAM = re.compile(r"_ZNK9llaminar23cpu11native_quantised" + PROGRAM.pattern + r"EEvv")
 
 
 def audit(data: bytes, disassembly: str, mode: str) -> dict[str, int]:
@@ -1325,14 +1427,15 @@ def audit(data: bytes, disassembly: str, mode: str) -> dict[str, int]:
             for encoding, nibble_map, minimum in DISPATCH:
                 expected.add((int(rows), leaf, policy, encoding, nibble_map, minimum))
     bodies = normalize_disassembly(disassembly, image)
-    tile_symbols = sorted(symbol.name for symbol in image.symbols if TILE_RUN.search(symbol.name))
+    tile_symbols = sorted({symbol.name for symbol in image.symbols
+                           if symbol.kind != "section" and TILE_RUN.search(symbol.name)})
     for symbol in tile_symbols:
         if symbol not in bodies:
             raise ValueError(f"tile program symbol is not a function in an executable section: {symbol}")
-    noreturn = noreturn_symbols(bodies, GENERIC, trusted_imports(image))
+    noreturn = noreturn_symbols(bodies, GENERIC, trusted_imports(image), image.prefix)
     found: dict[tuple, str] = {}
     for name in tile_symbols:
-        match = PROGRAM.search(name)
+        match = TILE_PROGRAM.fullmatch(name[len(image.prefix):]) if name.startswith(image.prefix) else None
         if not match:
             raise ValueError(f"unrecognized tile program symbol: {name}")
         key = tuple(int(group) for group in match.groups())
@@ -1452,6 +1555,14 @@ def executed_command(command: list[str], source: str, obj: Path, dependencies: P
     return command + WITNESS_FLAGS + ["-c", source, "-o", str(obj), "-MD", "-MF", str(dependencies), "-MT", "probe"]
 
 
+def require_no_assembler_options(command: list[str]) -> None:
+    """Options handed to the assembler can add inputs no dependency list names: rejected."""
+    for argument in command:
+        if argument.startswith(("-Wa,", "--param=as")) or argument in ("-Xassembler", "-save-temps") or \
+                argument.startswith("-save-temps="):
+            raise ValueError(f"the witness compile command passes assembler options: {argument}")
+
+
 def require_absolute_source(source: str) -> None:
     """The probe path is passed to the compiler as given; relative spellings depend on the cwd and are rejected."""
     if not os.path.isabs(source):
@@ -1475,111 +1586,99 @@ def disassemble(tool: str, obj: Path) -> tuple[str, list[str], str]:
     return subprocess.check_output(command, text=True), command, version
 
 
-ASM_KEYWORD = re.compile(r"(?<![\w$])(?:asm|__asm|__asm__)(?![\w$])")
-ASM_QUALIFIERS = re.compile(r"\s*(?:volatile|__volatile__|__volatile|inline|__inline__|goto)\b")
-ASSEMBLER_FILE_INPUT = re.compile(r"\.(?:include|incbin)(?![\w$])", re.IGNORECASE)
-LITERAL_START = re.compile(r'(?:u8|u|U|L)?(R?)"')
+ASM_KEYWORDS = frozenset({"asm", "__asm", "__asm__"})
+ASM_QUALIFIERS = frozenset({"volatile", "__volatile__", "__volatile", "inline", "__inline__", "__inline", "goto"})
+# One C++ token of a preprocessed translation unit (comments are already removed by -E). Linemarkers and
+# pragmas are skipped; pp-numbers include digit separators; string and character literals carry their
+# encoding prefix; raw strings use their delimiter.
+CXX_TOKEN = re.compile(r"""
+    (?P<directive>^[ \t]*\#[^\n]*)
+  | (?P<space>[ \t\r\f\v]*\n|[ \t\r\f\v]+)
+  | (?P<raw>(?:u8|u|U|L)?R"(?P<delimiter>[^()\\\s"]{0,16})\((?P<body>.*?)\)(?P=delimiter)")
+  | (?P<string>(?:u8|u|U|L)?"(?:[^"\\\n]|\\.)*")
+  | (?P<character>(?:u8|u|U|L)?'(?:[^'\\\n]|\\.)+')
+  | (?P<number>\.?[0-9](?:[0-9A-Za-z_.]|'[0-9A-Za-z_]|[eEpP][+-])*)
+  | (?P<identifier>[A-Za-z_$][A-Za-z0-9_$]*)
+  | (?P<punctuator>.)
+""", re.MULTILINE | re.DOTALL | re.VERBOSE)
+ASM_LABEL = re.compile(r"[A-Za-z_$][\w$]*")
 ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v"}
 
 
-def _literal(text: str, index: int) -> tuple[str, int]:
-    """Decode the C/C++ string literal starting at index; return (contents, index after it)."""
-    start = LITERAL_START.match(text, index)
-    if not start:
-        raise ValueError("not a string literal")
-    position = start.end()
-    if start.group(1):  # Raw string: R"delimiter( ... )delimiter"
-        delimiter = text[position:text.index("(", position)]
-        close = text.index(f"){delimiter}\"", position)
-        return text[position + len(delimiter) + 1:close], close + len(delimiter) + 2
-    decoded = []
-    while True:
-        if position >= len(text) or text[position] == "\n":
-            raise ValueError("unterminated string literal")
-        character = text[position]
-        if character == '"':
-            return "".join(decoded), position + 1
+def decode_literal(token: re.Match) -> str:
+    """Contents of a string literal token, with escapes decoded."""
+    if token.lastgroup == "raw":
+        return token.group("body")
+    text = token.group()
+    body, decoded, position = text[text.index('"') + 1:-1], [], 0
+    while position < len(body):
+        character = body[position]
         if character != "\\":
             decoded.append(character)
             position += 1
             continue
-        escape = text[position + 1]
+        escape = body[position + 1]
         if escape == "x":
-            digits = re.match(r"[0-9a-fA-F]+", text[position + 2:]).group()
+            digits = re.match(r"[0-9a-fA-F]+", body[position + 2:]).group()
             decoded.append(chr(int(digits, 16) % 0x110000))
             position += 2 + len(digits)
         elif escape in "01234567":
-            digits = re.match(r"[0-7]{1,3}", text[position + 1:]).group()
+            digits = re.match(r"[0-7]{1,3}", body[position + 1:]).group()
             decoded.append(chr(int(digits, 8)))
             position += 1 + len(digits)
         elif escape in "uU":
             width = 4 if escape == "u" else 8
-            decoded.append(chr(int(text[position + 2:position + 2 + width], 16) % 0x110000))
+            decoded.append(chr(int(body[position + 2:position + 2 + width], 16) % 0x110000))
             position += 2 + width
         else:
             decoded.append(ESCAPES.get(escape, escape))
             position += 2
+    return "".join(decoded)
 
 
-def _inside_literal(text: str, start: int, end: int) -> bool:
-    """Whether end lies inside a string or character literal opened on the same line after start."""
-    quote, position = None, start
-    while position < end:
-        character = text[position]
-        if quote:
-            if character == "\\":
-                position += 2
-                continue
-            if character == quote:
-                quote = None
-        elif character in "\"'":
-            quote = character
-        position += 1
-    return quote is not None
-
-
-def assembler_file_inputs(preprocessed: str) -> list[str]:
-    """Inline-assembly directives that make the assembler read external files (.include/.incbin).
-
-    The compiler's dependency lists name preprocessing inputs only; a file consumed by the assembler through
-    inline assembly is not in them, so the witness rejects any such directive rather than leave it unbound.
-    Every asm construct of the preprocessed translation unit is parsed: its string literals are decoded and
-    concatenated (adjacent-literal joining and escapes cannot hide a directive). Unparseable asm fails.
-    """
-    findings = []
-    for match in ASM_KEYWORD.finditer(preprocessed):
-        line_start = preprocessed.rfind("\n", 0, match.start()) + 1
-        if preprocessed[line_start:match.start()].lstrip().startswith("#") or \
-                _inside_literal(preprocessed, line_start, match.start()):
+def cxx_tokens(preprocessed: str):
+    """Significant C++ tokens of a preprocessed translation unit; an unterminated literal fails."""
+    for token in CXX_TOKEN.finditer(preprocessed):
+        kind = token.lastgroup
+        if kind in ("space", "directive"):
             continue
-        position = match.end()
-        while True:
-            qualifier = ASM_QUALIFIERS.match(preprocessed, position)
-            if not qualifier:
-                break
-            position = qualifier.end()
-        while position < len(preprocessed) and preprocessed[position].isspace():
-            position += 1
-        if position >= len(preprocessed) or preprocessed[position] != "(":
-            raise ValueError(f"unclassifiable inline assembly near: {preprocessed[line_start:match.end() + 40]!r}")
-        depth, position, contents = 1, position + 1, []
+        if kind == "punctuator" and token.group() in "\"'":
+            raise ValueError(f"unterminated literal at offset {token.start()}")
+        yield token
+
+
+def inline_assembly_violations(preprocessed: str) -> list[str]:
+    """Inline-assembly templates the witness cannot prove free of assembler-side inputs.
+
+    The compiler's dependency lists name preprocessing inputs only; the assembler can read further files
+    (.include/.incbin) and can construct such directives through macros or substitution. Rather than model
+    assembler semantics, every asm construct of the tokenized translation unit must have an empty template
+    (a compiler barrier) or a single plain symbol (an asm label); any other template fails closed.
+    """
+    findings, tokens = [], cxx_tokens(preprocessed)
+    for token in tokens:
+        if token.lastgroup != "identifier" or token.group() not in ASM_KEYWORDS:
+            continue
+        following = next(tokens, None)
+        while following is not None and following.lastgroup == "identifier" and following.group() in ASM_QUALIFIERS:
+            following = next(tokens, None)
+        if following is None or following.group() != "(":
+            raise ValueError(f"unclassifiable inline assembly at offset {token.start()}")
+        template, following = [], next(tokens, None)
+        while following is not None and following.lastgroup in ("string", "raw"):
+            template.append(decode_literal(following))
+            following = next(tokens, None)
+        if not template or following is None or following.group() not in (")", ":"):
+            raise ValueError(f"inline assembly without a literal template at offset {token.start()}")
+        depth = 1 if following.group() == ":" else 0
         while depth:
-            if position >= len(preprocessed):
+            following = next(tokens, None)
+            if following is None:
                 raise ValueError("unterminated inline assembly")
-            literal = LITERAL_START.match(preprocessed, position)
-            if literal and (position == 0 or not (preprocessed[position - 1].isalnum() or
-                                                   preprocessed[position - 1] in "_$")):
-                content, position = _literal(preprocessed, position)
-                contents.append(content)
-                continue
-            character = preprocessed[position]
-            if character == "'":
-                position = preprocessed.index("'", position + 1 + (preprocessed[position + 1] == "\\")) + 1
-                continue
-            depth += {"(": 1, ")": -1}.get(character, 0)
-            position += 1
-        if ASSEMBLER_FILE_INPUT.search("".join(contents)):
-            findings.append(preprocessed[match.start():position][:120])
+            depth += {"(": 1, ")": -1}.get(following.group(), 0)
+        text = "".join(template)
+        if text.strip() and not ASM_LABEL.fullmatch(text):
+            findings.append(f"offset {token.start()}: {text[:80]!r}")
     return findings
 
 
@@ -1596,6 +1695,7 @@ def build(args: argparse.Namespace) -> None:
                   output.with_suffix(".s"), output.with_suffix(".sym")):
         stale.unlink(missing_ok=True)
     command, directory = envelope.target_command(args)
+    require_no_assembler_options(command)
     version = subprocess.check_output([command[0], "--version"], cwd=directory, text=True)
     identity = compiler_identity(version)
     if identity != args.identity:
@@ -1604,9 +1704,9 @@ def build(args: argparse.Namespace) -> None:
                    cwd=directory, check=True, stdout=subprocess.DEVNULL)
     before = bind_inputs(read_depfile(preprocessed, directory))
     subprocess.run(command + WITNESS_FLAGS + ["-E", args.source, "-o", str(translation_unit)], cwd=directory, check=True)
-    external = assembler_file_inputs(translation_unit.read_text(errors="replace"))
-    if external:
-        raise ValueError(f"inline assembly reads files the dependency closure cannot bind: {external[:2]}")
+    unproved = inline_assembly_violations(translation_unit.read_text(errors="replace"))
+    if unproved:
+        raise ValueError(f"inline assembly the dependency closure cannot bind (non-empty template): {unproved[:2]}")
     executed = executed_command(command, args.source, obj, dependencies)
     subprocess.run(executed, cwd=directory, check=True)
     closure = read_depfile(dependencies, directory)
@@ -1667,6 +1767,7 @@ def verify(args: argparse.Namespace) -> None:
         if not os.path.isfile(path) or input_identity(path) != expected:
             raise ValueError(f"stale tile register input (source, header or symlink changed): {path}")
     command, directory = envelope.target_command(args)
+    require_no_assembler_options(command)
     if proof.get("target_command_sha256") != envelope.command_digest(command, directory):
         raise ValueError("actual target compile command changed after the register witness")
     obj = proof_path.with_suffix(".o")
@@ -1687,8 +1788,8 @@ def verify(args: argparse.Namespace) -> None:
         raise ValueError(f"retained disassembly does not match the bound object: {retained.name}")
     unit = proof_path.with_suffix(".i")
     if not unit.is_file() or proof.get("translation_unit_sha256") != envelope.digest(unit) or \
-            assembler_file_inputs(unit.read_text(errors="replace")):
-        raise ValueError("retained translation unit is missing, changed or reads assembler files")
+            inline_assembly_violations(unit.read_text(errors="replace")):
+        raise ValueError("retained translation unit is missing, changed or has unproved inline assembly")
     counts = audit(obj.read_bytes(), disassembly, args.mode)
     if proof.get("program_violations") != counts:
         raise ValueError("tile register evidence changed")
@@ -1699,6 +1800,7 @@ def census(args: argparse.Namespace) -> None:
     """Maintainer tool: print the per-program spill census for qualifying a budget (no budget applied)."""
     require_absolute_source(args.source)
     command, directory = envelope.target_command(args)
+    require_no_assembler_options(command)
     version = subprocess.check_output([command[0], "--version"], cwd=directory, text=True)
     obj = Path(args.proof).with_suffix(".census.o")
     obj.parent.mkdir(parents=True, exist_ok=True)
