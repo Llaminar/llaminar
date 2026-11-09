@@ -270,3 +270,16 @@ the source policy). Dead persistent_state parameter removed.
   impact. Likely bounded P2 (exported primitive contract) + focused
   dirty-workspace negative-position regression. Ownership TBD after pass
   (lane's 7a/7a2 RoPE workspace vs base). No probe; tip stays stable.
+
+- Lane confirms OWNERSHIP: introduced by 7a (b5d9ebf9d), not base. Scope
+  confirmed (5 fills :531/:694/:826/:1438/:1980; unaffected: verifier :895,
+  Q8_1 :2709, typed paths, inline *_direct). FIX plan: 5 fills ->
+  RoPEPaddingRows::Compute (base semantics, base-identical bytes); enum
+  rename Skip->VerifierPadding (consumer must honour active) /
+  Compute->EveryPosition; consumer-policy asserts; no contract change, no
+  new fatal. Alternative (not preferred): fatal reject n_past<0.
+  Regression: V2_Integration_CPURoPENegativePositionDirtyWorkspace
+  (ProductionTestPreflight; poison+negatives, all formats/rotary/seq lengths,
+  team in/out; negative control fails at 407347f6c; rope_bytes_driver
+  n_past<0). Routing (a) into branch before handover preferred, (b) separate
+  follow-up — awaiting reviewer final.
