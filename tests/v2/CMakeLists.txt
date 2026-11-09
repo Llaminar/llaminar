@@ -19278,8 +19278,6 @@ add_v2_test(V2_Perf_CPUNativeQuantised_DispatchSweep
     MPI_PROCS 1
 )
 
-# Performance Test: CPU NativeQuantised GEMV Decode Sweep (native Q8_0 vs packed VNNI, all models)
-add_executable(v2_perf_cpu_native_quantised_gemv performance/kernels/cpu/native_quantised/Perf__CPUNativeQuantised_GEMV.cpp)
 add_executable(v2_perf_cpu_fused_verifier
     performance/kernels/cpu/native_quantised/Perf__CPUFusedVerifier.cpp)
 target_link_libraries(v2_perf_cpu_fused_verifier PRIVATE
@@ -19316,6 +19314,8 @@ add_v2_test(V2_Perf_CPUFusedVerifier
 # storage; target-only overrides must leave singleton peers on their own policy.
 # Register beside the owner so explicit Release selection reaches these aliases;
 # the canonical preflight list below retains their Integration membership.
+# The execution-exact collector drives AVX2/AVX512 leaves directly.
+if(V2_CPU_TARGET_X86)
 foreach(_execution_exact_isa IN ITEMS AVX2 AVX512)
     if(_execution_exact_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
         continue()
@@ -19340,7 +19340,15 @@ foreach(_execution_exact_isa IN ITEMS AVX2 AVX512)
             "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
             "LLAMINAR_SKIP_ROCM_STARTUP=1")
 endforeach()
+endif()
 
+# Performance Test: CPU NativeQuantised GEMV Decode Sweep (native Q8_0 vs packed VNNI,
+# all models) and the x86 generated-dispatch trainer/evidence collectors. Its
+# candidates are the AVX2/AVX512 schedule registry; ARM's native programs are
+# measured by the portable thread-scaling and fused-verifier owners and its
+# exact overlays, never by relabelled x86 schedule candidates.
+if(V2_CPU_TARGET_X86)
+add_executable(v2_perf_cpu_native_quantised_gemv performance/kernels/cpu/native_quantised/Perf__CPUNativeQuantised_GEMV.cpp)
 target_link_libraries(v2_perf_cpu_native_quantised_gemv
     llaminar2_core
     GTest::gtest
@@ -19372,6 +19380,8 @@ add_v2_test(V2_Integration_CPUNativeQuantisedDispatchEvidencePreparedLayout
     TIMEOUT 30
 )
 
+endif()
+
 # Performance Test: CPU NativeQuantised thread scaling across production regimes.
 add_executable(v2_perf_cpu_native_quantised_thread_scaling
     performance/kernels/cpu/native_quantised/Perf__CPUNativeQuantised_ThreadScaling.cpp)
@@ -19390,6 +19400,7 @@ add_v2_test(V2_Perf_CPUNativeQuantised_ThreadScaling
     TIMEOUT 120
 )
 
+if(V2_CPU_TARGET_X86)
 add_v2_test(V2_Perf_CPUNativeQuantised_VerifierRows
     COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_gemv>
             --gtest_filter=*MTP_VerifierRows_GroupedVsSerial_Synthetic
@@ -19415,6 +19426,7 @@ set_property(TEST V2_Perf_CPUNativeQuantised_MoEGateUpFusion
     "LLAMINAR_CPU_NATIVE_QUANTISED_MOE_GATEUP_WARMUP=2"
     "LLAMINAR_CPU_NATIVE_QUANTISED_MOE_GATEUP_ITERS=5"
 )
+endif()
 
 # Performance Test: CPU Flash Attention Sweep (all models, TP degrees, decode + prefill)
 add_executable(v2_perf_cpu_flash_attention_sweep performance/kernels/cpu/attention/Perf__CpuFlashAttentionSweep.cpp)
@@ -36328,6 +36340,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CPUSweepCompletedReceiptReuse)
 
 # The actual batch aliases are registered beside their original native owner.
+if(V2_CPU_TARGET_X86)
 foreach(_execution_exact_isa IN ITEMS AVX2 AVX512)
     if(_execution_exact_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
         continue()
@@ -36336,6 +36349,7 @@ foreach(_execution_exact_isa IN ITEMS AVX2 AVX512)
         V2_Integration_CPU_ExecutionExactBatch_${_execution_exact_isa}
         V2_Integration_CPU_ExecutionExactTimingCollection_${_execution_exact_isa})
 endforeach()
+endif()
 
 add_v2_test(V2_Integration_ROCmNativeQuantisedExactRetention
     COMMAND ${Python3_EXECUTABLE}
