@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace llaminar2::test
 {
@@ -86,10 +87,9 @@ CPUNativeQuantisedPackedWeights owner(const NativeQuantisedPreparedByteFixture &
 
 /**
  * @test The seal enforces exactly the reserved-bit rules execution used to test
- * per block, on every live column of every unit, and nothing more. Padding
- * columns of the final chunk (never moved, never published) are not admitted.
+ * per block, on every lane of every unit (padding columns included), and nothing more.
  */
-TEST(CPUNativeQuantisedMetadataSeal, CoversExactlyTheFormerInLoopRulesOnEveryLiveColumn)
+TEST(CPUNativeQuantisedMetadataSeal, CoversExactlyTheFormerInLoopRulesOnEveryLane)
 {
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
@@ -100,8 +100,8 @@ TEST(CPUNativeQuantisedMetadataSeal, CoversExactlyTheFormerInLoopRulesOnEveryLiv
         if (!hasSecondary(view))
             continue;
         const std::uint16_t mask = reservedMask(view);
-        // N=65: chunk 1 column 0 is the last live column; column 63 is padding.
-        for (const auto [chunk, block, column] : {std::array{0, 0, 0}, std::array{0, 2, 63}, std::array{1, 2, 0}})
+        // Column 63 of chunk 1 is padding (N=65): wider native loads read it.
+        for (const auto [chunk, block, column] : {std::array{0, 0, 0}, std::array{1, 2, 63}})
         {
             const auto offset = secondaryOffset(view, chunk, block, column);
             std::uint16_t original = 0;
@@ -114,10 +114,6 @@ TEST(CPUNativeQuantisedMetadataSeal, CoversExactlyTheFormerInLoopRulesOnEveryLiv
                 EXPECT_NO_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor, fixture.bytes));
             store(fixture.bytes, offset, original);
         }
-        // Padding words of the final chunk may hold anything.
-        for (int column = 1; column < 64; ++column)
-            store(fixture.bytes, secondaryOffset(view, 1, 1, column), 0xffffu);
-        EXPECT_NO_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor, fixture.bytes));
         if (mask)
         {
             // The largest permitted value is still admitted.
@@ -126,6 +122,64 @@ TEST(CPUNativeQuantisedMetadataSeal, CoversExactlyTheFormerInLoopRulesOnEveryLiv
             EXPECT_NO_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor, fixture.bytes));
         }
     }
+}
+
+/**
+ * @test Raw poisoned padding in a partial final chunk is rejected at
+ * publication; the same arrival after producer normalization (benign padding
+ * written in the owned generation) is accepted, with live words untouched.
+ */
+TEST(CPUNativeQuantisedMetadataSeal, PaddingNormalizationSeparatesRawFromNormalizedArrivals)
+{
+    for (const auto *source : {&native_quantised_formats::IQ3_S, &native_quantised_formats::IQ4_XS, &native_quantised_formats::IQ2_S,
+                               &native_quantised_formats::Q6_K, &native_quantised_formats::Q4_K})
+        for (const int n : {1, 33, 63, 65, 97, 127})
+        {
+            SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " n=" << n);
+            NativeQuantisedPreparedByteFixture fixture(*source, n, 96);
+            fixture.seedPayloadAndMetadata();
+            auto packed = owner(fixture);
+            const auto view = packed.readView();
+            const bool rules = reservedMask(view) != 0;
+            const int last = view.N_padded / 64 - 1, live = n % 64;
+            // An arrival writes live columns only; the slot's padding holds garbage.
+            const auto written = packed.native_interleaved.beginRewrite();
+            for (int block = 0; block < view.blocks_per_row; ++block)
+                for (int column = live; column < 64; ++column)
+                    store(written, secondaryOffset(view, last, block, column), 0xffffu);
+            const std::vector<std::uint8_t> raw(packed.native_interleaved.begin(), packed.native_interleaved.end());
+            if (rules)
+                EXPECT_THROW(packed.sealPublication(), std::invalid_argument);
+            packed.normalizePaddingMetadata();
+            EXPECT_NO_THROW(packed.sealPublication());
+            for (std::size_t byte = 0; byte < raw.size(); ++byte)
+            {
+                const std::size_t unit = byte / std::size_t(view.interleaved_block_stride);
+                const std::size_t offset = byte % std::size_t(view.interleaved_block_stride);
+                const std::size_t secondary = std::size_t(view.data_stride) + (view.usesInlineCompensation() ? 256 : 128);
+                const bool padding_word = int(unit / std::size_t(view.blocks_per_row)) == last &&
+                    offset >= secondary + std::size_t(live) * 2 && offset < secondary + 128;
+                ASSERT_EQ(packed.native_interleaved[byte], padding_word ? 0 : raw[byte]) << "byte " << byte;
+            }
+            EXPECT_DEATH(packed.normalizePaddingMetadata(), "sealed generation");
+        }
+}
+
+/** @test Normalization trusts only descriptor-owned geometry, never a raw byte size. */
+TEST(CPUNativeQuantisedMetadataSeal, PaddingNormalizationRejectsForeignGeometry)
+{
+    NativeQuantisedPreparedByteFixture fixture(native_quantised_formats::IQ3_S, 33, 64);
+    fixture.seedPayloadAndMetadata();
+    auto packed = owner(fixture);
+    (void)packed.native_interleaved.beginRewrite();
+    auto foreign = packed.blocks_per_row;
+    packed.blocks_per_row = foreign + 1;
+    EXPECT_THROW(packed.normalizePaddingMetadata(), std::logic_error);
+    packed.blocks_per_row = foreign;
+    packed.N_padded += 64;
+    EXPECT_THROW(packed.normalizePaddingMetadata(), std::logic_error);
+    packed.N_padded -= 64;
+    EXPECT_NO_THROW(packed.normalizePaddingMetadata());
 }
 
 /** @test A view needs a seal of exactly its bytes and interpretation; arithmetic policy is not part of it. */
