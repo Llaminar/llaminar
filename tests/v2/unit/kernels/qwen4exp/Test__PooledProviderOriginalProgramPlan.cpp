@@ -56,6 +56,9 @@ public:
 private:PreparedGPUWorkerThread thread_;
 };
 /** @test Serialized payload is shared while each actual graph/event program retains its own named commitment. */
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 TEST(PooledProviderOriginalProgramPlan, PayloadEnvelopeAndAdditiveNativeProgramsUseOneOriginalAuthority){
     using Source=NativeContextPreparationReplayAccess;using Fixture=PreparedNativeLookupFixtureReplayAccess;
     for(const auto device:{DeviceId::cuda(47),DeviceId::rocm(47)}){
@@ -96,4 +99,5 @@ TEST(PooledProviderOriginalProgramPlan, PayloadEnvelopeAndAdditiveNativePrograms
         Fixture::retire(*session);
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 }}
