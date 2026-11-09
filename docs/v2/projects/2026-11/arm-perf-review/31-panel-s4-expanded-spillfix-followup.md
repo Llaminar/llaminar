@@ -33,3 +33,18 @@ Status: OPEN (2026-11-09; queued via R2 C4 per-encoding width evidence).
   (column-strip) pressure. Idea-31 v2 (panel scope) incoming; draft v1's
   4-row reading is superseded. FP16 chain diff vs 39c at the real base =
   EMPTY (verified) → FP16 plan base gate PASSED.
+
+## Final-base forced-width census (2026-11-09, perf lane; NON-CERTIFYING)
+
+- 48 explicit Rows1/SDOT programs per envelope (NEON_DOTPROD + NEON_I8MM),
+  Strips1/2/4 inventory; identical across envelopes. S1/S2 all zero-spill.
+- S4 NibbleLUT centered/nonlinear 22/22 spills (both policies); unsigned+
+  minimum 6 (both); IQ4_XS source-scale 31 BackendNative / 20 GPUAligned.
+- **ExpandedInt8+minimum (Q5_K) = ZERO spills on GNU14** — no GNU epilogue
+  defect reproduced (Q5_K = AppleClang-secondary only).
+- Q6_K forced-S4 = UNCLASSIFIABLE with the unchanged canonical classifier
+  (`ldr x,mem,imm` post-index not understood) → no number claimed; TOOLING
+  GAP: extend CPUNativeTileRegisterEvidence.py instruction classifier for
+  the post-index form (owner = register-gate tooling/addon + reviewer; do
+  NOT change in the perf slice).
+- Classifier + installed witness untouched; .80 canonical gate separate.
