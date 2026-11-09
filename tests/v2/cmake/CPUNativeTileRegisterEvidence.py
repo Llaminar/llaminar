@@ -8,23 +8,33 @@ ordered compile command at -O3 and audit the assembly.
   policy x encoding/map/minimum) derive from the admitted ISA envelope; the
   probe's inventory string must agree. Every expected program must be emitted
   exactly once with real instructions; any other tile program symbol fails.
-- Grammar: function bodies keep every statement, including one on a global
-  label's line. Only admitted mnemonics, operand forms and addressing modes may
-  appear; executable sections admit only directives that emit no code bytes
-  (data directives belong to data sections, which control may not reach or fall
-  into); unknown section control fails.
+- Admitted forms: function bodies keep every statement, including one on a
+  global label's line, and start in the section actually in force at the label.
+  The dialect (ELF or Mach-O) is bound to the compiler identity and must match
+  the witness's own format declarations. Every instruction must be an admitted
+  (mnemonic, operand signature) form: the forms qualified on the GNU-14 and
+  AppleClang-21 witnesses plus the explicitly modelled merge definitions. This
+  is an inventory of supported forms, not a complete AArch64 grammar; any other
+  form fails. Executable sections admit only metadata directives and alignment
+  without a fill value (NOP padding); data directives belong to data sections,
+  which control may not reach or fall into; unknown section control fails.
 - Calls: the only admitted call is to the exact fatal-diagnostic symbol, whose
-  body must be acyclic with every path ending in a call to abort(). Every other
-  call boundary (local or external, direct or indirect, call or tail call) is a
-  structural failure, so no interprocedural state needs to be modelled.
+  body must consist of admitted forms, call only the trusted fwrite/fputs, be
+  acyclic and end every path in a call to abort(). Every other call boundary,
+  including a direct abort(), is a structural failure, so no interprocedural
+  state needs to be modelled.
 - Analysis: each program is analysed over its control-flow graph. Stack
   provenance of every general register is a forward data-flow fact; merge
-  definitions (bfi, movk, ...) keep their destination as an input; any other
-  computation on a stack address keeps it a stack address at an unknown offset;
-  a base that is a stack address on only some paths fails. 8-byte slots holding
-  stack addresses are tracked with their offsets; partial or reinterpreting
-  access to such a slot, a 32-bit view of a stack address and a stack address
-  leaving the tracked frame (to memory, an FP/SIMD register or an index) fail.
+  definitions (bfi, bfxil, movk) keep their destination as an input; csel joins
+  its alternatives; any other computation on a stack address keeps it a stack
+  address at an unknown offset; a base that is a stack address on only some
+  paths fails. 8-byte frame slots that may hold stack addresses are tracked
+  with may/must value sets (including the non-stack alternative); every memory
+  access uses its exact opcode/arrangement/lane footprint; partial or
+  reinterpreting access to such a slot, any stack access at an unknown offset
+  while such slots are live, a 32-bit view of a stack address and a stack
+  address leaving the tracked frame (to memory, an FP/SIMD register or an
+  index) fail.
 - Spills: each load/store moving FP/SIMD data (any width) through a stack
   address counts once, except proven ABI saves/restores of d8-d15: whole-register
   contiguous str/stp/ldr/ldp of the d or q view only, saved once before any
@@ -84,6 +94,32 @@ INDIRECT = re.compile(r"^(?:br|blr)(?:aa|ab|aaz|abz)?$")
 RETURN = re.compile(r"^ret(?:aa|ab)?$")
 BRANCHES = ("b", "bl", "b.cond", "cbz", "cbnz", "tbz", "tbnz")
 
+# Admitted instruction forms: (mnemonic, operand signature) pairs qualified on the GNU-14 and AppleClang-21
+# witnesses (all build types and envelopes) plus the forms the semantics below model explicitly. Operand kinds:
+# x/w general registers, b/h/s/d/q scalar FP views, v vector, v[] element, list / list[] register lists (lane),
+# mem addressing, imm, shift, cond, sym label, reloc relocated symbol. Any other form is a structural failure.
+FORMS = frozenset(line.strip() for line in """
+add v,v,v|add w,w,imm|add w,w,w|add x,x,imm|add x,x,imm,shift|add x,x,reloc|add x,x,x|add x,x,x,shift
+addp v,v,v|adrp x,reloc|adrp x,sym|and v,v,v|and w,w,imm|and x,x,imm|asr w,w,imm|b sym|b.cond sym|bic v,imm
+bic v,v,v|bics w,w,w|bif v,v,v|bit v,v,v|bfi w,w,imm,imm|bfi x,x,imm,imm|bfxil x,x,imm,imm|bl sym|bsl v,v,v
+cbnz w,sym|cbnz x,sym|cbz w,sym|cbz x,sym|ccmp w,w,imm,cond|cmeq v,v,imm|cmeq v,v,v|cmhi v,v,v|cmn w,imm
+cmp w,imm|cmp w,w|cmp w,w,shift|cmp x,imm|cmp x,x|csel w,w,w,cond|csel x,x,x,cond|cset x,cond|dup d,v[]
+dup v,v[]|dup v,w|dup v,x|eor x,x,x|ext v,v,v,imm|fadd v,v,v|fcvtl v,v|fmla v,v,v|fmov d,d|fmov d,x|fmov s,s
+fmov s,w|fmov w,s|fmov x,d|fmul s,s,s|fmul v,v,v|fmul v,v,v[]|fneg v,v|ins v[],v[]|ins v[],x|ld1 list,mem
+ld1 list,mem,imm|ld1 list[],mem|ld1 list[],mem,imm|ld1r list,mem|ld1r list,mem,imm|ld2 list,mem|ld2 list[],mem
+ld2r list,mem|ldp d,d,mem|ldp d,d,mem,imm|ldp q,q,mem|ldp q,q,mem,imm|ldp s,s,mem|ldp w,w,mem|ldp x,x,mem
+ldp x,x,mem,imm|ldpsw x,x,mem|ldr b,mem|ldr d,mem|ldr d,mem,imm|ldr h,mem|ldr q,mem|ldr q,mem,imm|ldr s,mem
+ldr w,mem|ldr x,mem|ldrb w,mem|ldrh w,mem|ldrsh w,mem|ldrsw x,mem|ldur d,mem|ldur q,mem|lsl w,w,imm|lsl x,x,imm
+lsr x,x,imm|lsr x,x,x|madd x,x,x,x|mov v,v|mov v[],v[]|mov w,imm|mov w,w|mov x,imm|mov x,x|movi d,imm|movi v,imm
+movi v,imm,shift|movk x,imm,shift|mul w,w,w|mul x,x,x|mvni v,imm|mvni v,imm,shift|orr v,imm|orr v,v,v|orr w,w,imm
+orr w,w,w|orr w,w,w,shift|orr x,x,imm|orr x,x,x,shift|ret|saddlp v,v|sbfiz x,x,imm,imm|scvtf s,w|scvtf v,v
+sdot v,v,v|shl v,v,imm|smaddl x,w,w,x|smmla v,v,v|smull v,v,v|smull x,w,w|smull2 v,v,v|sshll v,v,imm|sshr v,v,imm
+st1 list,mem|st1 list,mem,imm|st1 list[],mem|stp d,d,mem|stp q,q,mem|stp w,w,mem|stp x,x,mem|str b,mem|str d,mem|str d,mem,imm|str q,mem,imm
+str h,mem|str q,mem|str s,mem|str w,mem|str x,mem|stur d,mem|stur q,mem|sub v,v,v|sub w,w,imm|sub w,w,w
+sub x,x,imm|sub x,x,imm,shift|sub x,x,x|sxtw x,w|tbl v,list,v|tbnz w,imm,sym|tbnz x,imm,sym|tbz w,imm,sym
+uaddw v,v,v|ubfiz w,w,imm,imm|ubfx w,w,imm,imm|ucvtf v,v|umaddl x,w,w,x|umull x,w,w|ushll v,v,imm|ushr v,v,imm
+usra v,v,imm|uxtw x,w|zip1 v,v,v|zip2 v,v,v
+""".replace("\n", "|").split("|") if line.strip())
 # Admitted instruction grammar. Anything else is a structural failure.
 LOADS = frozenset("ldr ldur ldp ldpsw ldrb ldrh ldrsb ldrsh ldrsw ldurb ldurh ldursb ldursh ldursw "
                   "ld1 ld1r ld2 ld2r ld3 ld3r ld4 ld4r".split())
@@ -94,19 +130,21 @@ ABI_TRANSFERS = frozenset({"str", "stur", "stp", "ldr", "ldur", "ldp"})
 ABI_REGISTER = re.compile(r"^([dq])(8|9|1[0-5])$")
 NO_DESTINATION = frozenset({"cmp", "cmn", "ccmp", "ccmn", "tst", "fcmp", "fcmpe"})
 # The destination is also an input: only part of it is written.
-MERGE_DEFINITIONS = frozenset({"bfi", "bfxil", "bfm", "bfc", "movk"})
-CONDITIONAL_SELECTS = frozenset({"csel", "csinc", "csinv", "csneg"})
-DEFINITIONS = frozenset(
-    "add adds sub subs and ands orr eor bic bics orn eon mov mvn neg lsl lsr asr madd msub mul smaddl umaddl "
-    "smull umull sxtw sxth sxtb uxtw uxth uxtb sbfiz sbfx ubfiz ubfx cset csetm adrp adr fmov "
-    "addp dup ext fadd fsub fmul fmla fneg fcvtl scvtf ucvtf cmeq cmhi cmge cmgt bif bit bsl ins movi mvni "
-    "saddlp sdot smmla shl sshr ushr usra sshll ushll smull2 umull2 uaddw tbl zip1 zip2".split())
-ADMITTED = DEFINITIONS | MERGE_DEFINITIONS | CONDITIONAL_SELECTS | NO_DESTINATION | LOADS | STORES | PREFETCHES
+MERGE_DEFINITIONS = frozenset({"bfi", "bfxil", "movk"})
+CONDITIONAL_SELECTS = frozenset({"csel"})  # csinc/csinv/csneg transform one alternative: not admitted.
+STRUCTURE_ACCESSES = re.compile(r"^(ld|st)([1-4])(r?)$")
+# Trusted calls of the fatal diagnostic body (they return; the path must still reach abort()).
+DIAGNOSTIC_CALLS = frozenset({"fwrite", "fputs"})
 
-# Directives admitted inside executable sections: none of them emits instruction bytes.
-CODE_DIRECTIVES = re.compile(r"^\.(?:cfi_[a-z_]+|p2align|align|loc|file|type|size|globl|global|weak|hidden|"
-                             r"private_extern|weak_def_can_be_hidden|weak_definition|loh|ident|addrsig|addrsig_sym|"
-                             r"subsections_via_symbols|build_version)$")
+# Directives admitted inside executable sections, with validated operands: none emits instruction bytes.
+# Alignment is admitted only without an explicit fill value, so the assembler pads code with NOPs.
+CODE_DIRECTIVES = {
+    ".p2align": re.compile(r"^\d+(?:\s*,\s*,\s*\d+)?$"),
+    ".align": re.compile(r"^\d+$"),
+}
+METADATA_DIRECTIVES = re.compile(r"^\.(?:cfi_[a-z_]+|loc|file|type|size|globl|global|weak|hidden|private_extern|"
+                                 r"weak_def_can_be_hidden|weak_definition|loh|ident|addrsig|addrsig_sym|"
+                                 r"subsections_via_symbols|build_version)$")
 SECTION_CONTROL = frozenset({".section", ".text", ".data", ".bss"})
 UNSUPPORTED_SECTION_CONTROL = frozenset({".pushsection", ".popsection", ".previous", ".subsection"})
 ELF_DATA_SECTIONS = (".rodata", ".data", ".bss", ".gcc_except_table", ".note", ".comment", ".debug", ".eh_frame",
@@ -134,8 +172,24 @@ WIDEN_AFTER = 4
 class Dialect:
     """Assembler syntax of one witness: Mach-O (Apple) or ELF (GNU)."""
 
-    def __init__(self, assembly: str) -> None:
-        self.macho = ".subsections_via_symbols" in assembly or "__TEXT," in assembly
+    def __init__(self, macho: bool) -> None:
+        self.macho = macho
+
+    @staticmethod
+    def for_identity(identity: str) -> "Dialect":
+        """The object format is bound to the compiler identity, never guessed from the text."""
+        if identity.startswith("AppleClang-"):
+            return Dialect(True)
+        if identity.startswith(("GNU-", "Clang-")):
+            return Dialect(False)
+        raise ValueError(f"no assembly dialect for compiler identity {identity}")
+
+    def require_format(self, assembly: str) -> None:
+        """The witness must declare exactly the object format of its dialect (directive lines, not text)."""
+        declared = any(line.strip().startswith((".build_version", ".subsections_via_symbols", ".section\t__TEXT,",
+                                                ".section __TEXT,")) for line in assembly.splitlines())
+        if declared != self.macho:
+            raise ValueError("assembly object format does not match the compiler identity")
 
     def local(self, label: str) -> bool:
         """Assembler-local labels stay inside the enclosing function."""
@@ -174,21 +228,30 @@ class Dialect:
         return name, False if name.startswith(ELF_DATA_SECTIONS) else None
 
 
-def functions(assembly: str) -> dict[str, list[str]]:
-    """Split compiler -S output into global function bodies; local labels and same-line statements stay inside."""
-    dialect = Dialect(assembly)
+def functions(assembly: str, dialect: Dialect) -> dict[str, list[str]]:
+    """Split compiler -S output into global function bodies; local labels and same-line statements stay inside.
+
+    Each body starts with the section directive actually in force at its label (the assembler's default .text if
+    none), so the analysis knows the real section of the function entry.
+    """
     bodies: dict[str, list[str]] = {}
-    current = None
+    current, section = None, "\t.text"
     for line in assembly.splitlines():
         label = LABEL.match(line)
         if label and not dialect.local(label.group(1)):
             current = label.group(1)
             if current in bodies:
                 raise ValueError(f"symbol defined twice in the witness: {current}")
-            bodies[current] = [label.group(2)] if label.group(2).strip() else []
-            continue
-        if current is not None:
+            bodies[current] = [section] + ([label.group(2)] if label.group(2).strip() else [])
+            line = label.group(2)
+        elif current is not None:
             bodies[current].append(line)
+        for statement in dialect.statements(LABEL.match(line).group(2) if LABEL.match(line) else line):
+            directive = statement.strip().split(None, 1)[0] if statement.strip() else ""
+            if directive in SECTION_CONTROL:
+                section = "\t" + statement.strip()
+            elif directive in UNSUPPORTED_SECTION_CONTROL:
+                section = "\t" + statement.strip()  # Rejected by the analysis wherever it governs a function.
     return bodies
 
 
@@ -279,24 +342,33 @@ def memory_width(mnemonic: str, operand: str) -> int:
 def operand_kind(operand: str) -> str | None:
     """Kind of one operand in the admitted grammar; None if unclassifiable."""
     if gp(operand):
-        return "gp"
+        return "x"
     if GP32.match(operand):
-        return "gp32"
+        return "w"
     if operand.startswith("["):
-        return "memory"
-    try:
-        if fp_registers(operand) is not None:
-            return "fp"
-    except ValueError:
-        return None
+        return "mem"
+    if operand.startswith("{"):
+        try:
+            fp_registers(operand)
+        except ValueError:
+            return None
+        return "list[]" if operand.endswith("]") else "list"
+    if re.match(r"^[bhsdq](?:[12]?[0-9]|3[01])$", operand):
+        return operand[0]
+    if re.match(r"^v(?:[12]?[0-9]|3[01])(?:\.\d+[bhsd])?$", operand):
+        return "v"
+    if re.match(r"^v(?:[12]?[0-9]|3[01])(?:\.[bhsd])?\[\d+\]$", operand):
+        return "v[]"
     if IMMEDIATE.match(operand) or FLOAT.match(operand):
-        return "immediate"
+        return "imm"
     if SHIFT.match(operand):
         return "shift"
     if CONDITION.match(operand):
-        return "condition"
-    if RELOCATION.match(operand) or SYMBOL.match(operand):
-        return "symbol"
+        return "cond"
+    if RELOCATION.match(operand):
+        return "reloc"
+    if SYMBOL.match(operand):
+        return "sym"
     return None
 
 
@@ -308,11 +380,52 @@ class Instruction:
         parts = self.text.split(None, 1)
         mnemonic = parts[0].lower()
         self.operands = split_operands(parts[1]) if len(parts) > 1 else []
+        self.arrangement = None
         if CONDITIONAL_BRANCH.match(mnemonic):
             self.base = "b.cond"
+        elif dialect.macho and "." in mnemonic:
+            self.base, self.arrangement = mnemonic.split(".", 1)  # Apple: ld1.d, st1.s, ld1r.4s, add.16b ...
         else:
-            self.base = mnemonic.split(".", 1)[0] if dialect.macho else mnemonic
+            self.base = mnemonic
         self.memory = next((index for index, operand in enumerate(self.operands) if operand.startswith("[")), None)
+        kinds = [operand_kind(operand) for operand in self.operands]
+        self.form = None if None in kinds else f"{self.base} {','.join(kinds)}".strip()
+
+    def admitted(self) -> bool:
+        return self.form in FORMS
+
+
+def footprint(instruction: Instruction, operand: str) -> int | None:
+    """Bytes of memory one data operand of a load/store transfers; None if not exactly known."""
+    base = instruction.base
+    scalar = re.match(r"^([bhsdq])\d+$", operand)
+    if scalar and base in ("ldr", "ldur", "ldp", "str", "stur", "stp"):
+        return WIDTH[scalar.group(1)]
+    if gp(operand) or GP32.match(operand):
+        return memory_width(base, operand)
+    structure = STRUCTURE_ACCESSES.match(base)
+    if not structure or not operand.startswith("{"):
+        return None
+    count, replicate = int(structure.group(2)), bool(structure.group(3))
+    lane = re.search(r"\]\s*$", operand) is not None and not operand.rstrip().endswith("}")
+    registers = [element.strip() for element in operand[1:operand.rindex("}")].split(",")]
+    if any("-" in element for element in registers) or len(registers) != (count if count > 1 else len(registers)):
+        return None
+    shapes = {re.sub(r"^v\d+", "", element) for element in registers}
+    if len(shapes) != 1:
+        return None
+    shape = shapes.pop().lstrip(".") or (instruction.arrangement or "")
+    arrangement = re.match(r"^(\d*)([bhsd])$", shape)
+    if not arrangement:
+        return None
+    element = WIDTH[arrangement.group(2)]
+    if lane or replicate:
+        if arrangement.group(1) and not replicate:
+            return None
+        return len(registers) * element
+    if not arrangement.group(1):
+        return None
+    return len(registers) * int(arrangement.group(1)) * element
 
 
 class Block:
@@ -325,8 +438,8 @@ class Block:
 
 def build_cfg(body: list[str], dialect: Dialect) -> tuple[list[Block], list[str]]:
     """Basic blocks of one function body; only admitted directives may appear in executable sections."""
-    # The section the function label itself is in is declared before the label: an unknown identity.
-    section, executable = "<function entry section>", True
+    # A body without its entry section directive (functions() always supplies one) is not code.
+    section, executable = "<no section>", False
     blocks, errors = [Block(section, executable)], []
 
     def start(new_section: str, new_executable: bool | None) -> None:
@@ -357,7 +470,8 @@ def build_cfg(body: list[str], dialect: Dialect) -> tuple[list[Block], list[str]
                     if executable is None:
                         errors.append(f"unclassifiable section: {statement}")
                     start(section, executable)
-                elif executable and not CODE_DIRECTIVES.match(directive):
+                elif executable and not METADATA_DIRECTIVES.match(directive) and not (
+                        directive in CODE_DIRECTIVES and CODE_DIRECTIVES[directive].match(arguments)):
                     errors.append(f"directive may emit code bytes: {statement}")
                 continue
             if not executable:
@@ -371,22 +485,24 @@ def build_cfg(body: list[str], dialect: Dialect) -> tuple[list[Block], list[str]
 
 
 class State:
-    """Per-program-point facts: general register stack provenance, slots holding stack addresses, ABI saves.
+    """Per-program-point facts: general register stack provenance, pointer slots, ABI saves.
 
-    tainted holds (slot offset, stack offset or None) pairs: the 8-byte slots that hold a stack address.
+    pointers maps the offset of each 8-byte frame slot that may hold a stack address to the set of values it
+    may hold, including "N" when a non-stack value reaches the slot on some path (may/must information).
     """
 
-    def __init__(self, registers: dict[str, frozenset], tainted: frozenset, saved: dict[int, frozenset]) -> None:
-        self.registers, self.tainted, self.saved = registers, tainted, saved
+    def __init__(self, registers: dict[str, frozenset], pointers: dict[int, frozenset],
+                 saved: dict[int, frozenset]) -> None:
+        self.registers, self.pointers, self.saved = registers, pointers, saved
 
     @staticmethod
     def entry() -> "State":
         """Function entry: sp at offset 0 of the new frame, x29 the caller's frame pointer."""
         registers = {"sp": frozenset({("S", 0)}), "x29": UNKNOWN_STACK}
-        return State(registers, frozenset(), {n: frozenset({("U", None)}) for n in CALLEE_SAVED})
+        return State(registers, {}, {n: frozenset({("U", None)}) for n in CALLEE_SAVED})
 
     def copy(self) -> "State":
-        return State(dict(self.registers), self.tainted, dict(self.saved))
+        return State(dict(self.registers), dict(self.pointers), dict(self.saved))
 
     def value(self, register: str) -> frozenset:
         return self.registers.get(register, NOT_STACK) if register != "xzr" else NOT_STACK
@@ -399,16 +515,27 @@ class State:
         else:
             self.registers[register] = widen(values)
 
+    def slot(self, offset: int) -> frozenset:
+        return self.pointers.get(offset, NOT_STACK)
+
+    def store_slot(self, offset: int, values: frozenset) -> None:
+        if values == NOT_STACK:
+            self.pointers.pop(offset, None)
+        else:
+            self.pointers[offset] = widen(values)
+
     def join(self, other: "State") -> "State":
-        registers = {}
-        for register in set(self.registers) | set(other.registers):
-            registers[register] = widen(self.value(register) | other.value(register))
+        registers = {register: widen(self.value(register) | other.value(register))
+                     for register in set(self.registers) | set(other.registers)}
+        pointers = {offset: widen(self.slot(offset) | other.slot(offset))
+                    for offset in set(self.pointers) | set(other.pointers)}
         saved = {n: self.saved[n] | other.saved[n] for n in CALLEE_SAVED}
-        return State(registers, self.tainted | other.tainted, saved)
+        return State(registers, pointers, saved)
 
     def key(self) -> tuple:
         return (tuple(sorted((r, tuple(sorted(v, key=repr))) for r, v in self.registers.items())),
-                tuple(sorted(self.tainted, key=repr)), tuple(tuple(sorted(self.saved[n], key=repr)) for n in CALLEE_SAVED))
+                tuple(sorted((o, tuple(sorted(v, key=repr))) for o, v in self.pointers.items())),
+                tuple(tuple(sorted(self.saved[n], key=repr)) for n in CALLEE_SAVED))
 
 
 def widen(values: frozenset) -> frozenset:
@@ -525,6 +652,9 @@ class Analysis:
 
     def step(self, instruction: Instruction, state: State) -> bool:
         """Apply one instruction; False when control leaves the function or the path cannot be classified."""
+        if not instruction.admitted():
+            self.fail(instruction, f"instruction form outside the admitted grammar: {instruction.form or instruction.base}")
+            return False
         kind, target = self.classify_branch(instruction)
         if kind == "indirect":
             self.fail(instruction, "indirect or uninspectable branch")
@@ -540,20 +670,10 @@ class Analysis:
         if kind == "return":
             self.leave(instruction, state)
             return False
-        kinds = [operand_kind(operand) for operand in instruction.operands]
-        if None in kinds:
-            self.fail(instruction, "unclassifiable operand")
-            return False
         if kind in ("jump", "branch"):
             return self.reads(instruction, state, instruction.operands[:-1])
-        if instruction.base not in ADMITTED:
-            self.fail(instruction, f"instruction outside the admitted grammar: {instruction.base}")
-            return False
         if instruction.memory is not None:
             return self.access(instruction, state)
-        if "memory" in kinds or instruction.base in LOADS | STORES | PREFETCHES:
-            self.fail(instruction, "unclassifiable memory form")
-            return False
         return self.compute(instruction, state)
 
     def reads(self, instruction: Instruction, state: State, operands: list[str]) -> bool:
@@ -585,12 +705,11 @@ class Analysis:
         state.saved[number] = frozenset(result)
 
     def access(self, instruction: Instruction, state: State) -> bool:
-        """Loads/stores: FP/SIMD stack traffic, ABI saves/restores, slots holding stack addresses."""
+        """Loads/stores: FP/SIMD stack traffic, ABI saves/restores, pointer slots, with exact footprints."""
         name = instruction.base
         load, store = name in LOADS, name in STORES
-        if instruction.memory != len(instruction.operands) - 1 and not (
-                instruction.memory == len(instruction.operands) - 2 and immediate(instruction.operands[-1]) is not None):
-            self.fail(instruction, "unclassifiable post-index form")
+        if not (load or store):
+            self.fail(instruction, "unclassifiable memory instruction")
             return False
         memory = MEMORY.match(instruction.operands[instruction.memory])
         if not memory:
@@ -617,7 +736,7 @@ class Analysis:
             else:
                 self.fail(instruction, "unclassifiable addressing offset")
                 return False
-        if post and (writeback or offset_text):
+        if post and (writeback or offset_text or len(post) != 1 or immediate(post[0]) is None):
             self.fail(instruction, "unclassifiable post-index form")
             return False
         base_values = state.value(base)
@@ -628,26 +747,23 @@ class Analysis:
         stack = kind == "S"
         origin = single_offset(base_values)
         address = None if origin is None or displacement is None else origin + (0 if post else displacement)
-        data = [] if name in PREFETCHES else instruction.operands[:instruction.memory]
+        data = instruction.operands[:instruction.memory]
         if store and not self.reads(instruction, state, data):
             return False
         items, position = [], address
         for operand in data:
-            registers = fp_registers(operand)
-            if registers is not None:
-                width = sum(width for _, width in registers)
-                items.append(("fp", operand, registers, position, width))
-            elif gp(operand) or GP32.match(operand):
-                width = memory_width(name, operand)
-                items.append(("gp" if gp(operand) else "gp32", operand, None, position, width))
-            else:
-                self.fail(instruction, f"unclassifiable data operand {operand}")
+            width = footprint(instruction, operand)
+            registers = fp_registers(operand) if not (gp(operand) or GP32.match(operand)) else None
+            if width is None or (registers is None and not (gp(operand) or GP32.match(operand))):
+                self.fail(instruction, f"memory footprint of {operand} is not exactly known")
                 return False
+            items.append(("fp" if registers is not None else ("x" if gp(operand) else "w"),
+                          operand, registers, position, width))
             position = None if position is None else position + width
         if stack and not self.slots(instruction, state, load, store, address, items):
             return False
         if store and not stack and any(provenance(state.value(gp(operand))) != "N"
-                                       for category, operand, *_ in items if category == "gp"):
+                                       for category, operand, *_ in items if category == "x"):
             self.fail(instruction, "a stack address is stored where it cannot be tracked")
             return False
         spilled = False
@@ -655,12 +771,8 @@ class Analysis:
         for category, operand, registers, start, width in items:
             if category != "fp":
                 if load:
-                    stored = frozenset(("S", offset) for slot, offset in state.tainted if slot == start)
-                    exact = stack and start is not None and stored and category == "gp" and name in WHOLE_X
-                    target = gp(operand) or gp_view(operand)
-                    state.assign(target, stored if exact else
-                                 (frozenset({"N", ("S", None)}) if stack and start is None and state.tainted
-                                  and category == "gp" else NOT_STACK))
+                    exact = stack and start is not None and category == "x" and name in WHOLE_X
+                    state.assign(gp(operand) or gp_view(operand), state.slot(start) if exact else NOT_STACK)
                 continue
             for number, register_width in registers:
                 if stack and eligible and store and self.save(state, number, register_width, start):
@@ -673,7 +785,8 @@ class Analysis:
                         self.clobber(instruction, state, number)
                 elif load:
                     self.clobber(instruction, state, number)
-                start = None if start is None else start + register_width
+                if eligible and start is not None:
+                    start += register_width
         if spilled and self.report:
             self.spills += 1
         if writeback or post:
@@ -687,24 +800,24 @@ class Analysis:
 
     def slots(self, instruction: Instruction, state: State, load: bool, store: bool, address: int | None,
               items: list) -> bool:
-        """Track 8-byte slots holding stack addresses and protect live ABI save slots; partial access fails."""
+        """Pointer slots and live ABI save slots: any access that cannot be proven disjoint or exact fails."""
         live = [(n, slot) for n in CALLEE_SAVED for status, slot in state.saved[n]
                 if status in ("S", "D") and slot is not None]
         if address is None:
-            if store and (state.tainted or live):
-                self.fail(instruction, "stack store at an unknown offset while tracked slots are live")
+            if state.pointers or (store and live):
+                self.fail(instruction, "stack access at an unknown offset while pointer or save slots are live")
                 return False
             if store and any(provenance(state.value(gp(operand))) != "N"
-                             for category, operand, *_ in items if category == "gp"):
+                             for category, operand, *_ in items if category == "x"):
                 self.fail(instruction, "a stack address is stored where it cannot be tracked")
                 return False
             return True
         for category, operand, _, start, width in items:
             end = start + width
-            for slot in {slot for slot, _ in state.tainted}:
+            for slot in list(state.pointers):
                 if not (slot < end and start < slot + 8):
                     continue
-                exact = start == slot and width == 8 and category == "gp" and instruction.base in WHOLE_X
+                exact = start == slot and width == 8 and category == "x" and instruction.base in WHOLE_X
                 if load and not exact:
                     self.fail(instruction, "partial or reinterpreting reload of a stored stack address")
                     return False
@@ -712,20 +825,18 @@ class Analysis:
                     self.fail(instruction, "partial overwrite of a stored stack address")
                     return False
                 if store and not exact:
-                    state.tainted = frozenset(entry for entry in state.tainted if entry[0] != slot)
+                    state.store_slot(slot, NOT_STACK)
             if store:
                 for number, (slot, slot_width) in live:
                     if start < slot + slot_width and slot < end:
                         self.fail(instruction, f"overwrites the live save slot of d{number}")
                         return False
-                if category == "gp":
-                    value = provenance(state.value(gp(operand)))
-                    if value == "A":
+                if category == "x":
+                    values = state.value(gp(operand))
+                    if provenance(values) == "A":
                         self.fail(instruction, "stores a stack address on only some paths")
                         return False
-                    kept = frozenset(entry for entry in state.tainted if entry[0] != start)
-                    state.tainted = kept | ({(start, stack[1]) for stack in state.value(gp(operand))}
-                                            if value == "S" else set())
+                    state.store_slot(start, values)
         return True
 
     def save(self, state: State, number: int, width: int, slot: int | None) -> bool:
@@ -804,45 +915,58 @@ class Analysis:
 
 
 def proven_noreturn(symbol: str, bodies: dict[str, list[str]], dialect: Dialect) -> bool:
-    """The fatal diagnostic is exempt only if its body is acyclic and every path ends in a call to abort()."""
+    """The fatal diagnostic is exempt only if every reachable instruction is an admitted form, its only calls are
+    the trusted diagnostic calls, and its body is acyclic with every path ending in a call to abort()."""
     body = bodies.get(symbol)
     if body is None:
         return False
     blocks, errors = build_cfg(body, dialect)
-    if errors:
+    if errors or not blocks[0].executable:
         return False
     labels = {label: index for index, block in enumerate(blocks) for label in block.labels}
-    successors: dict[int, list[int]] = {}
+    successors: dict[int, list[int] | None] = {}
     for index, block in enumerate(blocks):
-        edges, ends = [], False
+        edges, ends, valid = [], False, True
         for instruction in block.instructions:
             target = instruction.operands[-1] if instruction.operands else ""
-            if instruction.base == "bl" and target not in labels and dialect.symbol(target) in NORETURN_LEAVES:
-                ends = True
+            if not instruction.admitted():
+                valid = False
                 break
-            if instruction.base == "bl" and target not in labels and not dialect.local(target):
-                continue  # An ordinary call returns here; the path must still reach abort().
+            if instruction.base == "bl":
+                if target in labels or dialect.local(target):
+                    valid = False
+                    break
+                if dialect.symbol(target) in NORETURN_LEAVES:
+                    ends = True
+                    break
+                if dialect.symbol(target) not in DIAGNOSTIC_CALLS:
+                    valid = False
+                    break
+                continue
             if instruction.base in ("b", "b.cond", "cbz", "cbnz", "tbz", "tbnz"):
                 if target not in labels or not blocks[labels[target]].executable:
-                    return False
+                    valid = False
+                    break
                 edges.append(labels[target])
                 if instruction.base == "b":
                     ends = True
                     break
-            elif RETURN.match(instruction.base) or INDIRECT.match(instruction.base) or instruction.base in BRANCHES:
-                return False
+            elif instruction.base == "ret":
+                valid = False
+                break
+        if not valid:
+            successors[index] = None
+            continue
         if not ends:
-            if index + 1 >= len(blocks):
-                successors[index] = [-1]
+            if index + 1 >= len(blocks) or blocks[index + 1].section != block.section:
+                successors[index] = None
                 continue
             edges.append(index + 1)
         successors[index] = edges
     colors: dict[int, str] = {}
 
     def visit(index: int) -> bool:
-        if index < 0:
-            return False
-        if colors.get(index) == "active":
+        if successors.get(index) is None or colors.get(index) == "active":
             return False
         if colors.get(index) == "done":
             return True
@@ -866,10 +990,9 @@ def analyse_function(name: str, bodies: dict[str, list[str]], dialect: Dialect,
 
 
 def noreturn_symbols(bodies: dict[str, list[str]], dialect: Dialect) -> set[str]:
-    """Exactly the fatal diagnostic, when proven never to return, and abort()."""
-    proven = {name for name in bodies if dialect.symbol(name) == FATAL_DIAGNOSTIC and
-              proven_noreturn(name, bodies, dialect)}
-    return proven | {("_" if dialect.macho else "") + leaf for leaf in NORETURN_LEAVES}
+    """The only symbol a tile program may call: the exact fatal diagnostic, when proven never to return."""
+    return {name for name in bodies if dialect.symbol(name) == FATAL_DIAGNOSTIC and
+            proven_noreturn(name, bodies, dialect)}
 
 
 def program_key(name: str) -> str:
@@ -890,7 +1013,7 @@ ENVELOPE_PROGRAMS = {
 TILE_RUN = re.compile(r"27CPUNativeNEONProjectionTileILm\d+EE3run")
 
 
-def audit(assembly: str, mode: str) -> dict[str, int]:
+def audit(assembly: str, mode: str, dialect: Dialect) -> dict[str, int]:
     """Per-program FP/SIMD spill counts over the probe's complete inventory and call closure.
 
     Structural failures (missing/duplicate/empty programs, unauditable callees, indirect branches, ambiguous or
@@ -910,8 +1033,8 @@ def audit(assembly: str, mode: str) -> dict[str, int]:
                 expected.add((int(rows), leaf, policy, encoding, nibble_map, minimum))
     if not expected:
         raise ValueError("register witness inventory names no tile instantiation")
-    dialect = Dialect(assembly)
-    bodies = functions(assembly)
+    dialect.require_format(assembly)
+    bodies = functions(assembly, dialect)
     noreturn = noreturn_symbols(bodies, dialect)
     found: dict[tuple, str] = {}
     for name in bodies:
@@ -1062,7 +1185,7 @@ def build(args: argparse.Namespace) -> None:
     if after != before:
         changed = sorted(path for path in closure if before[path] != after[path])
         raise ValueError(f"inputs changed while the witness compiled: {changed[:3]}")
-    counts = audit(assembly.read_text(), args.mode)
+    counts = audit(assembly.read_text(), args.mode, Dialect.for_identity(args.identity))
     require_registers(counts, args.identity, args.mode)
     result = {
         "schema": 4, "signature": args.signature, "identity": identity, "mode": args.mode,
@@ -1099,7 +1222,8 @@ def verify(args: argparse.Namespace) -> None:
         if proof.get(key) != envelope.digest(path):
             raise ValueError(f"stale tile register tool: {path}")
     inputs = proof.get("inputs")
-    source = resolve(os.path.abspath(args.source))[0]
+    # The probe path keeps its spelling: lexical normalisation would collapse a symlink followed by "..".
+    source = resolve(args.source if os.path.isabs(args.source) else os.path.join(os.getcwd(), args.source))[0]
     if not isinstance(inputs, dict) or not any(isinstance(identity, dict) and identity.get("resolved") == source
                                                for identity in inputs.values()):
         raise ValueError("tile register proof does not bind the probe's dependency closure")
@@ -1120,7 +1244,7 @@ def verify(args: argparse.Namespace) -> None:
         raise ValueError("recorded witness invocation is not the target command over the probe")
     if not assembly.is_file() or proof.get("assembly_sha256") != envelope.digest(assembly):
         raise ValueError("tile register assembly is missing or changed")
-    counts = audit(assembly.read_text(), args.mode)
+    counts = audit(assembly.read_text(), args.mode, Dialect.for_identity(args.identity))
     if proof.get("program_violations") != counts:
         raise ValueError("tile register evidence changed")
     require_registers(counts, args.identity, args.mode)
@@ -1133,7 +1257,7 @@ def census(args: argparse.Namespace) -> None:
     assembly = Path(args.proof).with_suffix(".census.s")
     assembly.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(command + WITNESS_FLAGS + ["-S", args.source, "-o", str(assembly)], cwd=directory, check=True)
-    counts = audit(assembly.read_text(), args.mode)
+    counts = audit(assembly.read_text(), args.mode, Dialect.for_identity(compiler_identity(version)))
     print(json.dumps({"identity": compiler_identity(version), "mode": args.mode,
                       "programs": {program_key(name): count for name, count in counts.items()}},
                      indent=1, sort_keys=True))
