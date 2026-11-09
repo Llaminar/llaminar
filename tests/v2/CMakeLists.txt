@@ -8143,6 +8143,16 @@ add_v2_test(V2_Unit_CPUFlashAttentionKernelT
     MPI_PROCS 1
 )
 
+# Flash-attention entry points admit banks, head mapping and output
+# disjointness before any team, returning false without writes otherwise.
+add_v2_test(V2_Integration_CPUFlashAttentionInvocationAdmission
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+            --gtest_filter=Test__CPUFlashAttention_TP_GQA.InvocationAdmissionRejectsBeforeAnyWrite
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Attention;FlashAttention;Geometry;Regression"
+    NO_MODELS
+    MPI_PROCS 1
+)
+
 # Device-free CPU attention launch/range policy registration is shared with
 # the native portability project in cmake/V2CPUArchitectureTests.cmake.
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_FP32
@@ -29870,7 +29880,8 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
 # list is (re)initialized above so they are not overwritten.
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_NativeNEONExactOverlayInstructionIdentity
-    V2_Integration_OpenMPCapacityOrderedCorePlaces)
+    V2_Integration_OpenMPCapacityOrderedCorePlaces
+    V2_Integration_CPUFlashAttentionInvocationAdmission)
 
 # Exact stage-level regression for external event prejoins and scoped capture retirement.
 add_v2_test(V2_Integration_CUDA_GDNTensorCaptureOwnership REQUIRES_BACKEND CUDA
