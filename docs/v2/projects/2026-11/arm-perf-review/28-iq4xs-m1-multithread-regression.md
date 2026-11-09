@@ -362,3 +362,17 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   9/9 cells single=0 grouped=budget (1029/1176/1274), 0 mismatches. Owner
   evidence complete for the object-bound gate (GNU + AppleClang). Reviewer
   SOURCE120 (source) pending.
+
+## SOURCE120 FINAL (2026-11-09) — successor scope (SOURCE121)
+
+- P1a object-bound RELOCATION tables (complete inventory/targets/addends +
+  forms before analysis; deletion/invention/wrong-target controls both
+  formats; relocation-bearing padding; REAL relocation tables in fixtures;
+  branch relocations bound to object targets).
+- P1b C++ tokenization (digit separators/raw literals) + FAIL CLOSED on
+  unproved assembler construction/substitution (macro-built .include);
+  composed input-mutation controls.
+- P1c RAW symbol identity: exact format-specific ABI import spellings
+  (Darwin `_fputs` vs bare) + foreign-import negatives.
+- P2 aligned extents (reject unaligned start/end/size; partial-final-
+  instruction negatives).
