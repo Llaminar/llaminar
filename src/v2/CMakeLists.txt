@@ -420,7 +420,15 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDASamplingKernels.cu        # Argmax + Top-K kernels for GPU-side sampling
         kernels/cuda/ops/CUDACastKernels.cu            # FP32↔FP16 cast kernels for mixed-precision allreduce
         kernels/cuda/ops/CUDATPKVStateKernels.cu       # TP-local K/V state deinterleave for phase-split decode caches
-        kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
+        # Flash Attention 2 and Flash Decoding are physically sharded by family
+        # and native KV type: seven complete, deterministic modules.
+        kernels/cuda/attention/CUDAFlashAttentionShard0.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard1.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard2.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard3.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard4.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard5.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard6.cu
         kernels/cuda/attention/CUDAQwenSparseAttention.cu # Flash Next selected-index attention
         kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
         kernels/cuda/kvcache/CUDAAttentionKeyQ8Kernels.cu # Quadratic-companded attention-key cache codec
@@ -451,16 +459,6 @@ if(HAVE_CUDA)
         utils/CUDAKernelProfiler.cu                   # CUDA event-based kernel profiling
     )
 
-    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.3")
-        # Attention owns one arithmetic body specialized across native formats,
-        # exact/partial widths, tile ownership and direct/context execution.
-        # Parallelize optimization of that complete family instead of making a
-        # single serial compiler worker dominate every local tuning rebuild.
-        set_source_files_properties(
-            kernels/cuda/attention/CUDAFlashAttentionKernels.cu
-            PROPERTIES COMPILE_OPTIONS "--split-compile=0"
-        )
-    endif()
     
     # NOTE: CUDA kernel ITensorGemm adapters (CUDAFloatingPointGemmKernel.cpp, CUDAQuantisedGemmKernel.cpp)
     # are added to llaminar2_core with target_sources() below, compiled with regular C++ compiler (NOT nvcc)
