@@ -432,3 +432,11 @@ the source policy). Dead persistent_state parameter removed.
   V2_Integration_{CUDA,ROCm}RoPEGraphCaptureNoH2D → x86 can't certify it;
   plan: GB10 full CUDA gate at merged tip (post spill-fix) exercises it
   (arm-sparks informed; handover note for the lane — not a seal blocker).
+
+- Reviewer interim 0b32f8edd: bindings/charges/provisioning consistent; ONE
+  test-contract item: Test__ComputeStages.cpp:1320–1338 catch-all
+  std::exception→GTEST_SKIP('requires device enumeration') + checks under
+  `if (success)` (false execute returns pass silently) = hidden-skip
+  MECHANISM intact. Required: ASSERT_TRUE(execute()), exceptions FAIL, norm
+  assertions unconditional. Lane pushing test-only follow-up; WSL (5'') held
+  for the final SHA. Not a production defect.
