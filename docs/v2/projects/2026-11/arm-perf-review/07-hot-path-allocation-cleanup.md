@@ -157,3 +157,21 @@ the source policy). Dead persistent_state parameter removed.
 - Expected-outcome framing: prefill gain did NOT materialize (+jitter);
   decode +0.66% on 35B-nomtp is the candidate → repeat or accept-as-noise
   before reviewer.
+
+## Lane read of the A/B (2026-11-09)
+
+- 3rd ABBA repeat accepted on 35B-nomtp (+0.66% ≈ 1.3–3σ, ambiguous; direction
+  = improvement — the gate targets a REGRESSION from memo deletion; 27B neutral
+  + 35B-mtp +0.31% → memo deletion cost nothing anywhere, Main condition met
+  regardless). Prediction if real: 0.3–0.7% (per-layer host time: before =
+  mutex + private cos/sin per team member; after = lock-free + one shared
+  omp-for trig fill; ~42.7ms/token 35B/10 layers; 27B ~217ms → ≤0.2% noise).
+  ≤0.2% → accept as noise. Prefill no-gain fits (GEMM-dominated; RoPE tiny).
+- CAPTURE POLICY: EXPECTED, no defect — allow_cached_graph_replay =
+  gpu_graphs && isGPU() && segmented (DeviceGraphOrchestrator.cpp:14762);
+  CPU executes ComputeGraph stage-by-stage for decode AND prefill (bucket
+  replay is GPU); collectives_graph_capturable=false for the same reason (no
+  NCCL/RCCL on CPU). Does NOT explain decode-vs-prefill.
+- LATENCY: p50/p95 not needed for the mean-tok/s gate; timer table in the
+  extra-B CSV; new prefill_chunk_host_wall/family timers populate only on GPU
+  bucketed prefill, not CPU runs.
