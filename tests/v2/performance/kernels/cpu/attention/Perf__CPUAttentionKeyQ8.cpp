@@ -28,7 +28,11 @@ using cpu::attention_key_q8::ISA;
 /** @brief Exactly one production operation per timing/profiler launch. */
 enum class Operation { Encode, Decode };
 
-/** @brief Validate a complete positive integer argument without partial parsing. */
+/** @brief Validate a complete positive integer argument without partial parsing.
+ * @param text Original complete option token.
+ * @return Positive representable integer.
+ * @throws std::invalid_argument For malformed, overflowing or nonpositive input.
+ */
 int positive(std::string_view text)
 {
     int value = 0;
@@ -40,6 +44,8 @@ int positive(std::string_view text)
 
 /**
  * @brief Repeated production kernel work with a stable, named profiling symbol.
+ * @tparam D Complete physical head width; @tparam Isa Authenticated native implementation.
+ * @tparam Op Exactly one encode or decode program for this process.
  * @param source Immutable original keys, one contiguous head per block.
  * @param anchors Immutable bases with matching geometry.
  * @param blocks Persistent compressed outputs/inputs.
@@ -79,10 +85,17 @@ __attribute__((noinline)) void kernelLoop(
     }
 }
 
-/** @brief Authenticate exact bytes, warm the selected kernel, then time only it. */
+/** @brief Authenticate exact bytes, warm the selected kernel, then time only it.
+ * @tparam D Physical head width; @tparam Isa Explicit admitted native implementation.
+ * @tparam Op One complete production program, unchanged across all samples.
+ * @param heads Retained independent original heads.
+ * @param iterations Complete passes per timed sample; @param workers Actual admitted team size.
+ * @throws std::runtime_error If production output disagrees with the independent oracle.
+ */
 template <int D, ISA Isa, Operation Op>
 void measure(int heads, int iterations, int workers)
 {
+    static_assert(Isa == ISA::NEON || Isa == ISA::AVX2 || Isa == ISA::AVX512);
     const auto source = test::makeAttentionKeyQ8DeviceInput<D>(heads);
     std::vector<float> anchors(source.size()), residual(source.size()), output(source.size());
     for (std::size_t index = 0; index < source.size(); ++index)
@@ -113,22 +126,37 @@ void measure(int heads, int iterations, int workers)
     std::sort(elapsed.begin(), elapsed.end());
     const double ns_per_head = elapsed[elapsed.size() / 2] * 1e9 / iterations / heads;
     const double logical_gib_s = (2.0 * D * sizeof(float) + sizeof(blocks[0])) / ns_per_head * 1e9 / (1024.0 * 1024.0 * 1024.0);
+    // Preserve the historical x86 CSV spellings while reporting the actual
+    // native compiler envelope. NEON_DOTPROD compilation and this ASIMD-only
+    // floating codec are distinct axes, not relabelled x86 observations.
+    const auto compiled = compiledCPUISALevel();
+    const char *codegen = compiled == ISALevel::AVX512 ? "AVX512" : compiled == ISALevel::AVX2 ? "AVX2" : isaLevelName(compiled);
+    const char *runtime = Isa == ISA::NEON ? "NEON" : Isa == ISA::AVX512 ? "AVX512" : "AVX2";
     std::cout << "codegen_isa,runtime_isa,operation,head_dim,heads,iterations,samples,workers,ns_per_head,logical_gib_s,byte_exact\n"
-#if LLAMINAR_COMPILED_WITH_AVX512
-              << "AVX512,"
-#else
-              << "AVX2,"
-#endif
-              << (Isa == ISA::AVX512 ? "AVX512" : "AVX2") << ','
+              << codegen << ',' << runtime << ','
               << (Op == Operation::Encode ? "encode" : "decode") << ','
               << D << ',' << heads << ',' << iterations << ',' << elapsed.size() << ',' << workers << ','
               << ns_per_head << ',' << logical_gib_s << ",true\n";
 }
 
-/** @brief Dispatch once outside timing, preserving a single-operation process. */
+/** @brief Dispatch once outside timing, preserving a single-operation process.
+ * @tparam D Complete supported physical head width.
+ * @param isa Authenticated explicit implementation; @param operation Sole program to time.
+ * @param heads Number of original heads; @param iterations Complete passes per sample.
+ * @param workers Admitted team size, not an inferred physical-core affinity.
+ * @throws std::invalid_argument If the selected native implementation was not compiled.
+ */
 template <int D>
 void dispatch(ISA isa, Operation operation, int heads, int iterations, int workers)
 {
+#if LLAMINAR_COMPILED_WITH_NEON
+    if (isa == ISA::NEON)
+    {
+        if (operation == Operation::Encode) measure<D, ISA::NEON, Operation::Encode>(heads, iterations, workers);
+        else measure<D, ISA::NEON, Operation::Decode>(heads, iterations, workers);
+        return;
+    }
+#endif
 #if defined(__AVX512F__)
     if (isa == ISA::AVX512)
     {
@@ -137,12 +165,22 @@ void dispatch(ISA isa, Operation operation, int heads, int iterations, int worke
         return;
     }
 #endif
-    if (operation == Operation::Encode) measure<D, ISA::AVX2, Operation::Encode>(heads, iterations, workers);
-    else measure<D, ISA::AVX2, Operation::Decode>(heads, iterations, workers);
+#if defined(__AVX2__)
+    if (isa == ISA::AVX2)
+    {
+        if (operation == Operation::Encode) measure<D, ISA::AVX2, Operation::Encode>(heads, iterations, workers);
+        else measure<D, ISA::AVX2, Operation::Decode>(heads, iterations, workers);
+        return;
+    }
+#endif
+    throw std::invalid_argument("AQ8 benchmark ISA has no compiled production implementation");
 }
 } // namespace
 
-/** @brief Fail closed on incomplete or unsupported benchmark configuration. */
+/** @brief Fail closed on incomplete or unsupported benchmark configuration.
+ * @param argc Complete argument count; @param argv Paired option/value tokens.
+ * @return Zero after authenticated timing, or one with a precise diagnostic.
+ */
 int main(int argc, char **argv)
 {
     try
@@ -163,6 +201,7 @@ int main(int argc, char **argv)
             {
                 if (value == "avx2") isa = ISA::AVX2;
                 else if (value == "avx512") isa = ISA::AVX512;
+                else if (value == "neon") isa = ISA::NEON;
                 else if (value != "auto") throw std::invalid_argument("unsupported ISA");
             }
             else if (option == "--operation")

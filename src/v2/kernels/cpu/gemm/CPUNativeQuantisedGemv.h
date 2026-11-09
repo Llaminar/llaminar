@@ -1,6 +1,10 @@
 /**
  * @file CPUNativeQuantisedGemv.h
- * @brief Optimized M=1 GEMV kernels for native-interleaved VNNI weights + AVX-512.
+ * @brief Architecture-dispatched CPU projections over canonical interleaved weights.
+ *
+ * AArch64 uses CPUNativeNEONGemv.h with the shared invocation contract and
+ * original-coordinate native row tiles. The remaining implementation below is
+ * the existing x86 AVX2/AVX512 backend; ISA selection never crosses architectures.
  *
  * ## Packed VNNI Path (all deferred formats: Q4_0, IQ4_NL, Q4_1, Q8_0, Q5_0, Q5_1)
  *
@@ -64,6 +68,10 @@
 
 #pragma once
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "CPUNativeNEONGemv.h"
+#else
+
 #include <immintrin.h>
 #include <algorithm>
 #include <array>
@@ -83,6 +91,9 @@
 
 #include "CPUNativeQuantisedDecode.h"
 #include "kernels/common/ProjectionRowWork.h"
+#include "CPUProjectionRowGrid.h"
+#include "CPUProjectionQ8Publication.h"
+#include "CPUNativeQuantisedExecutionContract.h"
 #include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedFP16.h"
 #include "CPUNativeQuantisedWeightPacker.h"
@@ -118,108 +129,6 @@ namespace llaminar2::cpu::native_quantised
     // parity comparison. AUTO selects the best available at runtime.
     // =========================================================================
 
-    enum class ISAPath
-    {
-        AUTO,   // Runtime detection: AVX512-VNNI if available, else AVX2
-        AVX512, // Force AVX512-VNNI path (only valid on AVX512 hardware)
-        AVX2,   // Force AVX2 emulated-VNNI path
-        SCALAR  // Force scalar decode path; used as the correctness floor
-    };
-
-    /**
-     * @brief Return the maximum CPU ISA compiled into this binary.
-     *
-     * An AVX512 build and an AVX2-only build may make different verifier-row
-     * policy choices even when both execute their AVX2 runtime path. In
-     * particular, an AVX512 translation unit can have different code
-     * generation, register allocation, and inlining decisions from the
-     * AVX2-only artifact. Keep the build envelope visible to telemetry and
-     * generated dispatch instead of treating the active runtime ISA as a
-     * complete binary identity.
-     */
-    inline constexpr const char *compiledNativeQuantisedBuildISAName()
-    {
-#if LLAMINAR_COMPILED_WITH_AVX512
-        return "AVX512";
-#else
-        return "AVX2";
-#endif
-    }
-
-    /**
-     * @brief Runtime policy for grouped verifier-row CPU NativeQuantised kernels.
-     *
-     * Pairwise tiles an arbitrary verifier batch into two-row chunk kernels,
-     * with one ordinary decode-equivalent tail row when M is odd. WideRows is
-     * the verifier-specialized three-row or four-row AVX512 policy that shares
-     * each decoded B chunk across more rows. The generated table is trained from strict
-     * decode-equivalent microbench CSVs independently for the compiled ISA,
-     * effective runtime ISA, and OpenMP thread count. OrderedThreeRows is a
-     * separately named explicit Prefill experiment using the existing ordered
-     * three-row body for regular tiles. It is not emitted by existing tables
-     * and never changes the meaning of WideRows or historical evidence.
-     * An untrained runtime key
-     * is an unsupported production configuration and fails explicitly; it is
-     * never converted into an unmeasured Pairwise policy.
-     */
-    enum class VerifierRowsPolicy
-    {
-        /**
-         * Use the generated production selector.  Perf harnesses may pass an
-         * explicit policy to compare candidates on the same k-tiled path, but
-         * normal inference should leave this as Auto.
-         */
-        Auto,
-        Pairwise,
-        WideRows,
-        FullKRowChunkGrid,
-        FullKTwoRowNbc1,
-        FullKTwoRowNbc2,
-        FullKTwoRowPairGridNbc1,
-        FullKTwoRowPairGridNbc2,
-        FullKTwoRowPairGridNbc4,
-        FullKTwoRowPairGridNbc8,
-        /** Explicit AVX512 GPU-aligned nibble Prefill candidate; never an Auto alias. */
-        OrderedThreeRows,
-    };
-
-    /**
-     * @brief Return the stable compiler and telemetry name for one grouped policy.
-     *
-     * These names are shared by the forceable trainer registry, route
-     * telemetry, generated C++ policy, and sealed evidence. Keep the spelling
-     * centralized so a new physical schedule cannot be timed under one name
-     * and executed under another.
-     */
-    inline const char *verifierRowsPolicyName(VerifierRowsPolicy policy)
-    {
-        switch (policy)
-        {
-        case VerifierRowsPolicy::Auto:
-            return "Auto";
-        case VerifierRowsPolicy::Pairwise:
-            return "Pairwise";
-        case VerifierRowsPolicy::WideRows:
-            return "WideRows";
-        case VerifierRowsPolicy::OrderedThreeRows:
-            return "OrderedThreeRows";
-        case VerifierRowsPolicy::FullKRowChunkGrid:
-            return "FullKRowChunkGrid";
-        case VerifierRowsPolicy::FullKTwoRowNbc1:
-            return "FullKTwoRowNbc1";
-        case VerifierRowsPolicy::FullKTwoRowNbc2:
-            return "FullKTwoRowNbc2";
-        case VerifierRowsPolicy::FullKTwoRowPairGridNbc1:
-            return "FullKTwoRowPairGridNbc1";
-        case VerifierRowsPolicy::FullKTwoRowPairGridNbc2:
-            return "FullKTwoRowPairGridNbc2";
-        case VerifierRowsPolicy::FullKTwoRowPairGridNbc4:
-            return "FullKTwoRowPairGridNbc4";
-        case VerifierRowsPolicy::FullKTwoRowPairGridNbc8:
-            return "FullKTwoRowPairGridNbc8";
-        }
-        return "Invalid";
-    }
 
     /**
      * @brief Test whether a grouped policy requires serial M=1 full-K arithmetic.
@@ -776,132 +685,6 @@ namespace llaminar2::cpu::native_quantised
         }
     }
 
-    /**
-     * @brief Forceable CPU M=1 N-chunk ownership policy.
-     *
-     * Every value preserves the frozen serial-M1 K partition and ascending
-     * FP32 reduction tree.  The policy changes only how many adjacent
-     * 64-column chunks one OpenMP task owns.  `FrozenSerialOracle` exists for
-     * correctness diagnostics and trainer references; production callers use
-     * `Auto`, which requires a sealed generated table.
-     */
-    enum class DecodeSchedulePolicy
-    {
-        Auto,
-        FrozenSerialOracle,
-        Nbc1,
-        Nbc2,
-        Nbc4,
-        Nbc8,
-        Nbc16,
-    };
-
-    /**
-     * @brief Return the caller-thread's serial output-partition width.
-     *
-     * A mirrored TP terminal head owns and writes the complete vocabulary on
-     * every rank. Its generated dispatch decision must nevertheless use the
-     * same logical N geometry as the serial column-parallel oracle so exact
-     * overlays, K partitioning, and task granularity cannot diverge merely
-     * because ownership became replicated. The value is thread-local because
-     * independent rank workers may lower different graph transactions in the
-     * same process.
-     *
-     * @return Zero outside an equivalence scope, otherwise the positive serial
-     *         output-partition width.
-     */
-    namespace detail
-    {
-        /** @brief Internal storage for the caller-thread output-partition scope. */
-        inline int &cpuNativeQuantisedSerialOutputPartitionNStorage()
-        {
-            static thread_local int serial_partition_n = 0;
-            return serial_partition_n;
-        }
-    }
-
-    namespace detail
-    {
-        /** @brief Authenticated leaf extent permitting policy N above physical N. */
-        struct OriginalOutputSlicePolicy { int physical_n = 0; int policy_n = 0; };
-        /** @return Caller-thread metadata used only inside an authenticated leaf scope. */
-        inline OriginalOutputSlicePolicy &originalOutputSlicePolicy()
-        {
-            static thread_local OriginalOutputSlicePolicy policy;
-            return policy;
-        }
-    }
-
-    /** @brief Read the immutable public view of the caller-thread scope. */
-    inline int cpuNativeQuantisedSerialOutputPartitionN()
-    {
-        return detail::cpuNativeQuantisedSerialOutputPartitionNStorage();
-    }
-
-    /**
-     * @brief Publish a serial output-partition width for the caller thread.
-     *
-     * This setter is the narrow implementation hook used by the RAII scope on
-     * `CPUNativeQuantisedGemmKernel`. Production stages must enter the typed
-     * `ITensorGemm::beginOutputPartitionEquivalenceScope()` API instead of
-     * mutating this state directly.
-     *
-     * @param serial_partition_n Zero to clear the scope, otherwise a positive
-     *        logical output width.
-     */
-    inline void setCPUNativeQuantisedSerialOutputPartitionN(int serial_partition_n)
-    {
-        if (serial_partition_n < 0)
-        {
-            throw std::invalid_argument(
-                "CPU NativeQuantised serial output partition cannot be negative");
-        }
-        detail::cpuNativeQuantisedSerialOutputPartitionNStorage() = serial_partition_n;
-    }
-
-    /**
-     * @brief Resolve the logical N used by generated policy and tile selection.
-     *
-     * Physical pointers, output strides, and launch extents continue to use
-     * `actual_n`. Only decisions that could differ from the serial TP shard use
-     * the returned width. A shorter remainder shard is legal, so the physical
-     * width need not be an exact multiple of the canonical partition width.
-     *
-     * @param actual_n Full physical output width for this projection.
-     * @return `actual_n` outside a scope, otherwise the serial partition width.
-     */
-    inline int cpuNativeQuantisedSerialEquivalentPolicyN(int actual_n)
-    {
-        if (actual_n <= 0)
-            throw std::invalid_argument(
-                "CPU NativeQuantised output width must be positive");
-        const int serial_partition_n =
-            cpuNativeQuantisedSerialOutputPartitionN();
-        if (serial_partition_n == 0)
-            return actual_n;
-        const auto original = detail::originalOutputSlicePolicy();
-        if (serial_partition_n > actual_n &&
-            (original.physical_n != actual_n || original.policy_n != serial_partition_n))
-        {
-            throw std::logic_error(
-                "CPU NativeQuantised serial output partition exceeds physical output width");
-        }
-        return serial_partition_n;
-    }
-
-    /**
-     * @brief Worker geometry shared by declaration, dispatch and diagnostics.
-     * @return Active workshare team size, or the budget for a new standalone team.
-     *
-     * OpenMP's max-thread query describes a future nested team, not necessarily
-     * the workers entering this invocation. Using it inside a retained team can
-     * change the ordered K tree and demand a different partial bank. Follow the
-     * same active-team decision as OMP_WORKSHARE_REGION, without a new barrier.
-     */
-    inline int nativeQuantisedInvocationWorkerCount() noexcept
-    {
-        return omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads();
-    }
 
     /**
      * @brief Exact ordered-partial bank for the current participant geometry.
@@ -931,50 +714,6 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /** Return the requested N-chunk count for one explicit decode policy. */
-    inline int decodeScheduleNBlockChunks(DecodeSchedulePolicy policy)
-    {
-        switch (policy)
-        {
-        case DecodeSchedulePolicy::Nbc1:
-            return 1;
-        case DecodeSchedulePolicy::Nbc2:
-            return 2;
-        case DecodeSchedulePolicy::Nbc4:
-            return 4;
-        case DecodeSchedulePolicy::Nbc8:
-            return 8;
-        case DecodeSchedulePolicy::Nbc16:
-            return 16;
-        case DecodeSchedulePolicy::Auto:
-        case DecodeSchedulePolicy::FrozenSerialOracle:
-            break;
-        }
-        throw std::invalid_argument(
-            "CPU NativeQuantised decode policy has no explicit N-block width");
-    }
-
-    /** Return the stable route name published by production telemetry. */
-    inline const char *decodeSchedulePolicyName(DecodeSchedulePolicy policy)
-    {
-        switch (policy)
-        {
-        case DecodeSchedulePolicy::Auto:
-            return "Auto";
-        case DecodeSchedulePolicy::FrozenSerialOracle:
-            return "FrozenSerialOracle";
-        case DecodeSchedulePolicy::Nbc1:
-            return "Nbc1";
-        case DecodeSchedulePolicy::Nbc2:
-            return "Nbc2";
-        case DecodeSchedulePolicy::Nbc4:
-            return "Nbc4";
-        case DecodeSchedulePolicy::Nbc8:
-            return "Nbc8";
-        case DecodeSchedulePolicy::Nbc16:
-            return "Nbc16";
-        }
-        return "Invalid";
-    }
 
     /**
      * @brief Complete runtime geometry needed to resolve one M=1 schedule.
@@ -3619,6 +3358,7 @@ namespace llaminar2::cpu::native_quantised
         ISAPath isa_path = ISAPath::AUTO,
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
+        requireNativeQuantisedISAPath(isa_path);
         const int N = packed.N;
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
@@ -3876,55 +3616,6 @@ namespace llaminar2::cpu::native_quantised
     // Full GEMV dispatcher (M=1) — unified eager-interleaved entrypoint
     // =========================================================================
 
-    /**
-     * @brief Publish one Q8 block under the matrix's arithmetic policy.
-     * @param source Source FP32 values.
-     * @param destination Destination Q8_1 block.
-     * @param valid_elements Number of valid source values.
-     * @param policy Backend-native or placement-invariant publication.
-     */
-    inline void quantizeActivationBlock(
-        const float *source,
-        Q8_1Block &destination,
-        int valid_elements,
-        CPUProjectionNumericalPolicy policy)
-    {
-        if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
-        {
-            gpu_aligned_expert_q8::quantizeBlock(
-                source, destination, valid_elements);
-            return;
-        }
-        simd::quantize_single_block(
-            source, destination, valid_elements);
-    }
-
-    /**
-     * @brief Publish two complete adjacent Q8 blocks under one policy.
-     * @param source Source pointer containing 64 FP32 values.
-     * @param first First destination block.
-     * @param second Second destination block.
-     * @param policy Backend-native or placement-invariant publication.
-     */
-    inline void quantizeTwoActivationBlocks(
-        const float *source,
-        Q8_1Block &first,
-        Q8_1Block &second,
-        CPUProjectionNumericalPolicy policy)
-    {
-        if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
-        {
-            gpu_aligned_expert_q8::quantizeTwoBlocks(source, first, second);
-            return;
-        }
-#if defined(__AVX512F__)
-        simd::quantize_two_blocks_avx512(source, first, second);
-#else
-        simd::quantize_single_block(source, first);
-        simd::quantize_single_block(
-            source + Q8_1Block::BLOCK_SIZE, second);
-#endif
-    }
 
     /**
      * @brief Quantize and execute one row using its prepared arithmetic policy.
@@ -5630,279 +5321,9 @@ namespace llaminar2::cpu::native_quantised
     // Shared activation quantization (for multiply_fused quantize-once)
     // =========================================================================
 
-    /**
-     * @brief Request-aligned CPU work grid over one borrowed original publication.
-     *
-     * Construct before entering OpenMP. Workers borrow this immutable value;
-     * they never fetch recorder TLS or compact row IDs. Fixed physical tiles
-     * share packed-weight decoding while every row retains serial K arithmetic.
-     */
-    class CPUProjectionRowGrid final
-    {
-    public:
-        /** @brief Validate all original request publications before any destination write.
-         * @param physical Original matrix/partial row capacity.
-         * @param work Optional invocation-owned immutable row admission.
-         * @throws std::invalid_argument For bad geometry or publication values.
-         */
-        CPUProjectionRowGrid(int physical,const ProjectionRowWork *work)
-            :physical_(physical),work_(work)
-        {
-            if(physical<=0||(work&&work->physicalRows()!=physical))
-                throw std::invalid_argument("CPU projection work requires exact physical matrix rows");
-            if(work_)for(int request=0;request<work_->requests();++request)(void)work_->resolveHost(request);
-        }
-        /** @return Whether any original request owns useful rows in this physical slice. */
-        [[nodiscard]] bool hasAny() const
-        {
-            if(!work_)return true;
-            for(int request=0;request<work_->requests();++request)
-                if(work_->resolveHost(request).size()>0)return true;
-            return false;
-        }
-        /** @brief Test an original physical row before any activation or partial read.
-         * @param row Original matrix-relative row, never a compacted useful index.
-         * @return Whether that exact row is authored.
-         */
-        [[nodiscard]] bool active(int row) const
-        {
-            if(row<0||row>=physical_)return false;
-            if(!work_)return true;
-            return work_->resolveHost(work_->requestForRow(row)).contains(row);
-        }
-        /** @brief Resolve immutable request-aligned task geometry.
-         * @param width Positive physical microkernel reuse width.
-         * @return Fixed tile count, independent of live word values.
-         * @throws std::invalid_argument For a nonpositive width.
-         */
-        [[nodiscard]] int tiles(int width) const
-        {
-            if(width<=0)throw std::invalid_argument("CPU projection row tile width must be positive");
-            return work_ ? work_->requests()*((work_->rowsPerRequest()-1)/width+1) : (physical_-1)/width+1;
-        }
-        /** @brief Resolve both endpoints of one original request-aligned work tile.
-         * @param tile Immutable task-grid row tile index.
-         * @param width Positive physical microkernel reuse width.
-         * @return Original matrix-relative useful span, including midtile suffixes.
-         * @throws std::out_of_range For an invalid immutable tile coordinate.
-         */
-        [[nodiscard]] ProjectionRowSpan tileSpan(int tile,int width) const
-        {
-            if(tile<0||tile>=tiles(width))throw std::out_of_range("CPU projection work tile exceeds geometry");
-            if(!work_) {
-                const int first=tile*width;
-                return {first,first+std::min(width,physical_-first)};
-            }
-            const int per=(work_->rowsPerRequest()-1)/width+1,request=tile/per;
-            const auto authored=work_->resolveHost(request);
-            const auto identity=work_->captureIdentity();
-            const auto base=static_cast<std::int64_t>(request)*work_->rowsPerRequest();
-            const auto originalFirst=base+static_cast<std::int64_t>(tile%per)*width;
-            const auto originalEnd=std::min(originalFirst+width,base+work_->rowsPerRequest());
-            const int first=static_cast<int>(std::clamp<std::int64_t>(originalFirst-identity.first_physical_row,0,physical_));
-            const int end=static_cast<int>(std::clamp<std::int64_t>(originalEnd-identity.first_physical_row,0,physical_));
-            const int selectedEnd=std::min(end,authored.end);
-            return {std::min(selectedEnd,std::max(first,authored.first)),selectedEnd};
-        }
-    private:
-        int physical_; ///< Original tensor/partial capacity; never useful row count.
-        const ProjectionRowWork *work_; ///< Invocation-owned immutable metadata, live through the workshare.
-    };
 
-    /**
-     * @brief Quantize only authored original activation rows into admitted Q8 storage.
-     * @param A_fp32 Original immutable matrix with physical M-by-K coordinates.
-     * @param A_q8 Invocation-owned physical-M Q8 bank; unused rows stay dirty.
-     * @param M Original physical row capacity, never useful row count.
-     * @param K Original logical input width.
-     * @param K_blocks Original ceil(K/32) blocks per physical row.
-     * @param policy Existing per-block quantization arithmetic, unchanged.
-     * @param work Optional explicit original-row selection borrowed before OpenMP.
-     * @throws std::invalid_argument For inconsistent work/publication geometry.
-     */
-    inline void quantize_activations_to_q8_1(
-        const float *A_fp32,
-        Q8_1Block *A_q8,
-        int M,
-        int K,
-        int K_blocks,
-        CPUProjectionNumericalPolicy policy =
-            CPUProjectionNumericalPolicy::BackendNative,
-        const ProjectionRowWork *work = nullptr)
-    {
-        const CPUProjectionRowGrid row_grid(M,work);
-        if(!row_grid.hasAny())return;
-        const bool k_aligned = (K % 32 == 0);
 
-        auto do_quantize = [&]()
-        {
-#pragma omp for schedule(static)
-            for (int m = 0; m < M; ++m)
-            {
-                if(!row_grid.active(m))continue;
-                const float *row_a = A_fp32 + m * K;
-                Q8_1Block *row_q8 = A_q8 + static_cast<size_t>(m) * K_blocks;
-                int kb = 0;
-#if defined(__AVX512F__)
-                if (k_aligned)
-                {
-                    for (; kb + 1 < K_blocks; kb += 2)
-                    {
-                        quantizeTwoActivationBlocks(
-                            row_a + kb * 32,
-                            row_q8[kb],
-                            row_q8[kb + 1],
-                            policy);
-                    }
-                }
-#endif
-                for (; kb < K_blocks; ++kb)
-                {
-                    int block_start = kb * 32;
-                    int block_len = std::min(32, K - block_start);
-                    quantizeActivationBlock(
-                        row_a + block_start,
-                        row_q8[kb],
-                        block_len,
-                        policy);
-                }
-            }
-        };
 
-        OMP_WORKSHARE_REGION(do_quantize);
-    }
-
-    /**
-     * @brief Apply SwiGLU and publish its exact Q8_1 rows in one workshare.
-     *
-     * Routed CPU MoE execution needs the FP32 gate/up projections only long
-     * enough to form the activation consumed by the expert down projection.
-     * Materializing that activation in a third FP32 matrix and then opening a
-     * second OpenMP region to quantize it adds avoidable memory traffic and a
-     * team boundary to every MoE layer. This helper instead owns independent
-     * 64-element tasks: each task computes two canonical 32-element Q8_1 blocks
-     * and publishes them directly to the down-projection input.
-     *
-     * The arithmetic is intentionally identical to the unfused production
-     * sequence. `compute_swiglu_serial()` uses the same ISA-dispatched FP32
-     * vectors as `compute_swiglu()`, and the temporary is stored as FP32 before
-     * the unchanged Q8_1 quantizer observes it. A 64-element task is an exact
-     * multiple of AVX2 and AVX-512 vector widths, so task boundaries cannot
-     * change scalar-tail selection. K must be Q8_1-block aligned; NativeQuantised
-     * expert matrices already require that invariant.
-     *
-     * @param gate Row-major FP32 gate projection, shape `[M, K]`.
-     * @param up Row-major FP32 up projection, shape `[M, K]`.
-     * @param output_q8 Row-major Q8_1 destination, shape `[M, K_blocks]`.
-     * @param M Number of independently routed expert rows.
-     * @param K Logical FP32 elements in each row; must be divisible by 32.
-     * @param K_blocks Number of Q8_1 blocks per row; must equal `K / 32`.
-     */
-    inline void swiglu_quantize_activations_to_q8_1(
-        const float *gate,
-        const float *up,
-        Q8_1Block *output_q8,
-        int M,
-        int K,
-        int K_blocks,
-        CPUProjectionNumericalPolicy policy =
-            CPUProjectionNumericalPolicy::BackendNative)
-    {
-        constexpr int kQ8BlockSize =
-            static_cast<int>(Q8_1Block::BLOCK_SIZE);
-        if (!gate || !up || !output_q8 || M <= 0 || K <= 0 ||
-            K % kQ8BlockSize != 0 ||
-            K_blocks != K / kQ8BlockSize)
-        {
-            throw std::invalid_argument(
-                "CPU NativeQuantised fused SwiGLU/Q8_1 publication requires "
-                "positive block-aligned geometry and non-null buffers");
-        }
-
-        constexpr int kBlocksPerTask = 2;
-        constexpr int kElementsPerTask =
-            kBlocksPerTask * kQ8BlockSize;
-        const int tasks_per_row =
-            (K + kElementsPerTask - 1) / kElementsPerTask;
-        const int task_count = M * tasks_per_row;
-
-        auto do_swiglu_quantize = [&]()
-        {
-#pragma omp for schedule(static)
-            for (int task = 0; task < task_count; ++task)
-            {
-                const int row = task / tasks_per_row;
-                const int row_task = task % tasks_per_row;
-                const int element_begin = row_task * kElementsPerTask;
-                const int element_count =
-                    std::min(kElementsPerTask, K - element_begin);
-                const size_t fp32_offset =
-                    static_cast<size_t>(row) * static_cast<size_t>(K) +
-                    static_cast<size_t>(element_begin);
-                const int first_block =
-                    element_begin / kQ8BlockSize;
-                Q8_1Block *destination =
-                    output_q8 +
-                    static_cast<size_t>(row) *
-                        static_cast<size_t>(K_blocks) +
-                    static_cast<size_t>(first_block);
-
-                /*
-                 * The explicit FP32 temporary is part of the equivalence
-                 * contract: the former path stored SwiGLU to FP32 memory before
-                 * quantization, so keeping the same rounding point prevents a
-                 * compiler from forwarding wider intermediate precision.
-                 */
-                alignas(64) float activated[kElementsPerTask] = {};
-                if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
-                {
-                    primitives::compute_swiglu_gpu_aligned_expert_serial(
-                        gate + fp32_offset,
-                        up + fp32_offset,
-                        activated,
-                        element_count);
-                }
-                else
-                {
-                    primitives::compute_swiglu_serial(
-                        gate + fp32_offset,
-                        up + fp32_offset,
-                        activated,
-                        element_count);
-                }
-
-#if defined(__AVX512F__)
-                if (element_count == kElementsPerTask)
-                {
-                    quantizeTwoActivationBlocks(
-                        activated,
-                        destination[0],
-                        destination[1],
-                        policy);
-                    continue;
-                }
-#endif
-                const int block_count =
-                    (element_count + kQ8BlockSize - 1) /
-                    kQ8BlockSize;
-                for (int block = 0; block < block_count; ++block)
-                {
-                    const int block_begin =
-                        block * kQ8BlockSize;
-                    const int block_length = std::min(
-                        kQ8BlockSize,
-                        element_count - block_begin);
-                    quantizeActivationBlock(
-                        activated + block_begin,
-                        destination[block],
-                        block_length,
-                        policy);
-                }
-            }
-        };
-
-        OMP_WORKSHARE_REGION(do_swiglu_quantize);
-    }
 
     // =========================================================================
     // Pre-quantized GEMM (M>1) — compute only, skips quantization
@@ -5957,8 +5378,9 @@ namespace llaminar2::cpu::native_quantised
         int n_block_chunks_override = 0,
         const ProjectionRowWork *work = nullptr)
     {
+        requireNativeQuantisedISAPath(isa_path);
         const CPUProjectionRowGrid row_grid(M,work);
-        if(!row_grid.hasAny())return;
+        if(!row_grid.beginWorkshare())return;
         const int N = packed.N;
         const int K_blocks = packed.blocks_per_row;
         const int N_chunks = (N + 63) / 64;
@@ -6470,8 +5892,9 @@ namespace llaminar2::cpu::native_quantised
         int full_k_n_block_chunks_override,
         const ProjectionRowWork *work)
     {
+        requireNativeQuantisedISAPath(isa_path);
         const CPUProjectionRowGrid row_grid(M,work);
-        if(!row_grid.hasAny())return;
+        if(!row_grid.beginWorkshare())return;
         const int N = packed.N;
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
@@ -7105,81 +6528,7 @@ namespace llaminar2::cpu::native_quantised
         OMP_WORKSHARE_REGION(do_rows);
     }
 
-    /**
-     * @brief Ownership of unchanged fused output jobs, independent of row arithmetic.
-     * Current preserves the original static mapping; Contiguous is its retained
-     * large-chunk control. PanelBlocks is the measured explicit small-block path.
-     * Auto selects bounded panel blocks only for qualified AVX512 GPU-aligned
-     * ordinary Prefill in the original local-output route. Other supported
-     * execution domains retain Current; scratch and arithmetic are never changed.
-     */
-    enum class FusedOutputJobOwnership { Current=0, Contiguous=1, PanelBlocks=4, Auto=5 };
 
-    /**
-     * @brief Name an invocation-local diagnostic without selecting arithmetic.
-     * @param ownership Complete typed choice; unknown enum values are rejected.
-     * @return Stable observation token.
-     * @throws std::invalid_argument For an unknown ownership value.
-     */
-    [[nodiscard]] constexpr const char *fusedOutputJobOwnershipName(FusedOutputJobOwnership ownership)
-    {
-        switch (ownership) {
-        case FusedOutputJobOwnership::Current: return "Current";
-        case FusedOutputJobOwnership::Contiguous: return "Contiguous";
-        case FusedOutputJobOwnership::PanelBlocks: return "PanelBlocks";
-        case FusedOutputJobOwnership::Auto: return "Auto";
-        }
-        throw std::invalid_argument("CPU fused output ownership has an unknown value");
-    }
-
-    /**
-     * @brief Descriptor for one projection in a grouped verifier-row bundle.
-     *
-     * All descriptors share the same pre-quantized activation rows.  Each
-     * projection keeps its own packed weight matrix, output stride, and optional
-     * bias. The helper below schedules arbitrary runtime-M verifier rows for
-     * several projections in one OpenMP region while preserving the exact M=1
-     * GEMV chunk kernels used by serial decode.
-     */
-    struct FusedVerifierRowsDesc
-    {
-        const CPUNativeQuantisedPackedWeights *packed = nullptr;
-        float *output = nullptr;
-        const float *bias = nullptr;
-        int N = 0;
-        int ldc = 0;
-        /**
-         * Projection-local row count. Zero inherits the function-level M.
-         *
-         * MoE layers route a different number of rows to each expert. Keeping
-         * that geometry in the descriptor lets one persistent OpenMP team own
-         * every expert projection in the layer instead of repeatedly opening
-         * a whole-socket team for each small matrix.
-         */
-        int rows = 0;
-        /**
-         * Optional projection-local activation base. A null value means that
-         * every projection shares the function-level activation base. This
-         * keeps gate/up bundles and multi-expert down bundles on one audited
-         * scheduler without copying or repacking Q8_1 activations.
-         */
-        const Q8_1Block *input = nullptr;
-        /**
-         * Forceable M=1 schedule used by the decode trainer. Grouped M>1
-         * verifier launches must leave this as Auto because their row policy
-         * is selected independently by the verifier policy table.
-         */
-        DecodeSchedulePolicy decode_schedule = DecodeSchedulePolicy::Auto;
-        /**
-         * Forceable grouped schedule for M>1 trainer and regression launches.
-         * Production descriptors leave this as Auto and resolve the sealed
-         * grouped policy independently for each projection geometry/codebook.
-         */
-        VerifierRowsPolicy verifier_schedule = VerifierRowsPolicy::Auto;
-        /** Scheduling intent; changing it never changes the numerical K tree. */
-        ProjectionRowsPurpose purpose = ProjectionRowsPurpose::Decode;
-        int policy_n = 0; ///< Explicit authenticated leaf width; zero retains existing ambient policy.
-    };
 
     /** @brief One projection's unchanged serial arithmetic and fused task geometry. */
     struct FusedVerifierRowsPlan
@@ -7502,6 +6851,7 @@ namespace llaminar2::cpu::native_quantised
         std::span<const FusedVerifierRowsDesc> descriptors,
         int M, int num_threads, ISAPath isa_path = ISAPath::AUTO)
     {
+        requireNativeQuantisedISAPath(isa_path);
         requireNativeQuantisedFusedRowsPlanInput(descriptors,M,num_threads);
         if(plans.size() != descriptors.size())
             throw std::invalid_argument("CPU fused planner fill requires exactly its live projection prefix");
@@ -8101,6 +7451,7 @@ namespace llaminar2::cpu::native_quantised
         ISAPath isa_path = ISAPath::AUTO,
         FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Auto)
     {
+        requireNativeQuantisedISAPath(isa_path);
         constexpr int kMaxFusedVerifierProjections = NativeQuantisedFusedRowsPlan::capacity;
         if (!descs || num_descs <= 0 ||
             num_descs > kMaxFusedVerifierProjections ||
@@ -10612,7 +9963,7 @@ namespace llaminar2::cpu::native_quantised
     {
         if(work&&M!=1)throw std::invalid_argument("CPU ordinary work-selected projection requires its original M1 route");
         const CPUProjectionRowGrid row_grid(M,work);
-        if(!row_grid.hasAny())return;
+        if(!row_grid.beginWorkshare())return;
         auto multiply_into = [&](float *destination)
         {
             if (M == 1)
@@ -10705,22 +10056,7 @@ namespace llaminar2::cpu::native_quantised
     // Fused multi-projection GEMV (single OMP region, all formats)
     // =========================================================================
 
-    /**
-     * @brief Descriptor for one projection in a fused GEMV call.
-     *
-     * Every projection owns the eager interleaved representation used by the
-     * ordinary GEMV entry point. Keeping one prepared representation prevents
-     * fused inference from silently selecting a different Q8_0 arithmetic and
-     * scheduling path than the path certified by the all-format trainer.
-     */
-    struct FusedGemvDesc
-    {
-        const CPUNativeQuantisedPackedWeights *packed; // eager interleaved weights
-        float *output;                            // output vector [N]
-        const float *bias;                        // optional bias [N], nullptr if none
-        int N;                                    // number of output rows
-        int policy_n = 0; ///< Projection-local original width; never an output stride.
-    };
+
 
     /**
      * @brief Fused multi-projection GEMV in a single OMP region.
@@ -10749,6 +10085,7 @@ namespace llaminar2::cpu::native_quantised
         ISAPath isa_path = ISAPath::AUTO,
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
+        requireNativeQuantisedISAPath(isa_path);
         constexpr int kMaxFusedDecodeProjections = NativeQuantisedFusedRowsPlan::capacity;
         if (!A_q8 || !descs || num_descs <= 0 ||
             num_descs > kMaxFusedDecodeProjections)
@@ -10804,21 +10141,7 @@ namespace llaminar2::cpu::native_quantised
     // Fused multi-input GEMV (single OMP region, different Q8_1 input per desc)
     // =========================================================================
 
-    /**
-     * @brief Descriptor for one projection with its own pre-quantized input.
-     *
-     * Unlike FusedGemvDesc (which shares a single Q8_1 input across all
-     * projections), each descriptor here carries its own A_q8 pointer.
-     * Used for MoE expert down projections where each expert has a different
-     * SwiGLU activation as input.
-     */
-    struct FusedGemvMultiInputDesc
-    {
-        const Q8_1Block *A_q8;                    // per-projection Q8_1 input
-        const CPUNativeQuantisedPackedWeights *packed;  // packed weights
-        float *output;                            // output vector [N]
-        int N;                                    // number of output rows
-    };
+
 
     /**
      * @brief Fused multi-input GEMV: multiple projections with different inputs.
@@ -10841,6 +10164,7 @@ namespace llaminar2::cpu::native_quantised
         ISAPath isa_path = ISAPath::AUTO,
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
+        requireNativeQuantisedISAPath(isa_path);
         constexpr int kMaxFusedMultiInputProjections = NativeQuantisedFusedRowsPlan::capacity;
         if (!descs || num_descs <= 0 ||
             num_descs > kMaxFusedMultiInputProjections)
@@ -10893,3 +10217,4 @@ namespace llaminar2::cpu::native_quantised
     }
 
 } // namespace llaminar2::cpu::native_quantised
+#endif // Native architecture implementation

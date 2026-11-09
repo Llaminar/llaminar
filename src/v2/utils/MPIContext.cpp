@@ -6,6 +6,9 @@
  * Local preparation is authenticated before MPI_Comm_split; excluded ranks
  * leave with a typed inactive result. Active contexts retain projected hardware
  * and the parent owner, so later planning cannot rediscover or substitute WORLD.
+ * Public borrowed-context construction also lives here, after MPITopology is
+ * complete: exception cleanup must not instantiate a unique_ptr deleter while
+ * the topology is only forward-declared in the public header.
  */
 #include "utils/MPIContext.h"
 #include "planning/ExecutionRankMembership.h"
@@ -13,6 +16,16 @@
 
 namespace llaminar2
 {
+    MPIContext::MPIContext(int rank, int world_size, MPI_Comm comm)
+        : rank_(rank), world_size_(world_size), comm_(comm), local_rank_(rank)
+    {
+    }
+
+    MPIContext::MPIContext(int rank, int world_size, int local_rank, MPI_Comm comm)
+        : rank_(rank), world_size_(world_size), comm_(comm), local_rank_(local_rank)
+    {
+    }
+
     MPIContext::MPIContext(std::shared_ptr<IMPIContext> discovery,
         std::shared_ptr<const ExecutionRankMembership> membership, int rank)
         : discovery_owner_(std::move(discovery)), membership_(std::move(membership)),
