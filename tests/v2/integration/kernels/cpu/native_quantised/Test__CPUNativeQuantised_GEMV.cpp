@@ -159,7 +159,7 @@ namespace
                 fixture.seedPayloadAndMetadata();
                 const auto layout = fixture.view();
                 const int last = layout.N_padded / 64 - 1, live = n % 64;
-                const auto make = [&](bool normalized) {
+                const auto make = [&](bool normalized, int poisoned_block = -1) {
                     CPUNativeQuantisedPackedWeights packed;
                     packed.N = layout.N; packed.K = layout.K; packed.N_padded = layout.N_padded;
                     packed.blocks_per_row = layout.blocks_per_row; packed.payload_bytes = layout.source_payload_bytes;
@@ -174,6 +174,8 @@ namespace
                     for (int block = 0; block < layout.blocks_per_row; ++block)
                         for (int column = live; column < 64; ++column)
                         {
+                            if (poisoned_block >= 0 && block != poisoned_block)
+                                continue;
                             const std::uint16_t poison = 0xffff;
                             std::memcpy(owned.data() + (std::size_t(last) * layout.blocks_per_row + block) *
                                 layout.interleaved_block_stride + secondary + std::size_t(column) * 2, &poison, sizeof(poison));
@@ -193,10 +195,19 @@ namespace
                 const std::array<float *, 1> output{result.data()};
                 if (source == &native_quantised_formats::IQ2_S)
                 {
-                    EXPECT_THROW((multi_scale::dispatch<8, 1>(raw, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
+                    // Dispatch walks blocks in order, so each block is poisoned
+                    // alone: rejection is proved at every K block, not the first.
+                    for (int block = 0; block < layout.blocks_per_row; ++block)
+                    {
+                        SCOPED_TRACE(block);
+                        const auto single = make(false, block);
+                        EXPECT_THROW((multi_scale::dispatch<8, 1>(single, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+                        EXPECT_THROW((multi_scale::dispatch<16, 1>(single, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
+#endif
+                    }
                     EXPECT_NO_THROW((multi_scale::dispatch<8, 1>(normalized, input, output, last, 0, layout.blocks_per_row, false)));
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-                    EXPECT_THROW((multi_scale::dispatch<16, 1>(raw, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
                     EXPECT_NO_THROW((multi_scale::dispatch<16, 1>(normalized, input, output, last, 0, layout.blocks_per_row, false)));
 #endif
                     continue;
