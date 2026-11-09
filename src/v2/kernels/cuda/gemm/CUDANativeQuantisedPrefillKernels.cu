@@ -370,7 +370,14 @@ namespace
             __syncthreads(); // sync 1: B decoded + A half 0 ready
 
             // Phase 2: two K=128 halves, each with pre-loaded A fragments
+            // hi feeds only scalar offsets and the smem_A reload, never a
+            // register-array index, so rolling it is safe and halves the MMA
+            // window that must fit the 128-register CTA budget on sm_120/121.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#pragma unroll 1
+#else
 #pragma unroll
+#endif
             for (int hi = 0; hi < 2; ++hi)
             {
                 if constexpr (!ORDERED_M1)
@@ -511,7 +518,16 @@ namespace
                         (num_q40_blocks +
                          serial_m1_k_partitions - 1) /
                         serial_m1_k_partitions;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+                    // The ordered reducer keeps partition and running totals
+                    // live. Its A fragment and scale arrays are declared inside
+                    // this loop, so rolling is safe (no register array is
+                    // indexed by k) and bounds the in-flight MMA/fragment
+                    // window that the 128-register budget must hold.
+#pragma unroll 1
+#else
 #pragma unroll
+#endif
                     for (int k = 0; k < 4; ++k)
                     {
                         const int completed_block =
