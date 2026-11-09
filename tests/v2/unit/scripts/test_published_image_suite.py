@@ -1325,8 +1325,6 @@ class PublishedImageSuiteTests(unittest.TestCase):
                       if rule["type"] == "required_status_checks")["parameters"]
         self.assertTrue(checks["strict_required_status_checks_policy"])
         self.assertEqual(checks["required_status_checks"], [
-            {"context": "Develop PR / Unit + host (AVX512)",
-             "integration_id": 15368},
             {"context": "Develop PR / Unit + host (AVX2)",
              "integration_id": 15368}])
         self.assertEqual(master_ruleset.proposed_develop_ruleset(proposed), proposed)

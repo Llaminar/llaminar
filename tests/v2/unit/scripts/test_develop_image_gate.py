@@ -299,14 +299,19 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", workflow)
         policy = yaml.load(workflow, Loader=yaml.BaseLoader)
         self.assertEqual(policy["jobs"]["develop-images"]["runs-on"],
-                         {"group": "Develop CI", "labels": "llaminar-cloud-16"})
+                         {"group": "Develop CI", "labels": "llaminar-develop-avx2"})
         self.assertEqual(policy["concurrency"], {
-            "group": "llaminar-cloud-develop-images", "cancel-in-progress": "true"})
+            "group": "llaminar-develop-images", "cancel-in-progress": "true"})
         self.assertIn("--build-only", workflow)
         self.assertNotIn("prerequisites/", workflow)
         self.assertNotIn("prune_docker_build_cache", workflow)
+        buildx = next(step for step in policy["jobs"]["develop-images"]["steps"]
+                      if step.get("uses") == "docker/setup-buildx-action@v4")
+        self.assertEqual(buildx["with"]["name"], "llaminar-develop")
+        self.assertEqual(buildx["with"]["keep-state"], "true")
+        self.assertNotIn("sudo", workflow)
 
-    def test_develop_pr_matrix_runs_both_isas_on_separate_unit_and_host_jobs(self):
+    def test_develop_pr_runs_avx2_unit_and_host_on_the_dedicated_runner(self):
         """Exercise the real PR command, not a separately invented argument set."""
         workflow = yaml.load((ROOT / ".github/workflows/develop-pr.yml").read_text(),
                              Loader=yaml.BaseLoader)
@@ -316,7 +321,7 @@ class DevelopImageGateTests(unittest.TestCase):
                          {"opened", "synchronize", "reopened", "ready_for_review"})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(workflow["concurrency"], {
-            "group": "llaminar-cloud-develop-pr-${{ github.event.pull_request.number }}",
+            "group": "llaminar-develop-pr-${{ github.event.pull_request.number }}",
             "cancel-in-progress": "true"})
         self.assertEqual(set(workflow["jobs"]), {"unit"})
         job = workflow["jobs"]["unit"]
@@ -331,9 +336,9 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(reusable["permissions"], {"contents": "read"})
         caller = job
         job = reusable["jobs"]["unit"]
-        self.assertEqual(job["runs-on"], {"group": "Develop CI", "labels": "llaminar-cloud-16"})
-        self.assertEqual(job["strategy"], {"fail-fast": "false", "max-parallel": "2",
-                                           "matrix": {"cpu_isa": ["AVX512", "AVX2"]}})
+        self.assertEqual(job["runs-on"], {"group": "Develop CI", "labels": "llaminar-develop-avx2"})
+        self.assertEqual(job["strategy"], {"fail-fast": "false", "max-parallel": "1",
+                                           "matrix": {"cpu_isa": ["AVX2"]}})
         self.assertEqual(f"{caller['name']} / {job['name']}",
                          "Develop PR / Unit + host (${{ matrix.cpu_isa }})")
         self.assertIn("github.event_name == 'pull_request'", job["if"])
@@ -351,9 +356,11 @@ class DevelopImageGateTests(unittest.TestCase):
         for key, value in {"driver": "docker-container", "cache-binary": "false"}.items():
             self.assertEqual(buildx["with"][key], value)
         commands = [step["run"] for step in steps if "run" in step]
-        self.assertEqual(len(commands), 3)
-        self.assertNotIn("keep-state", buildx["with"])
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(buildx["with"]["keep-state"], "true")
+        self.assertEqual(buildx["with"]["name"], "llaminar-develop")
         self.assertNotIn("cleanup", buildx["with"])
+        self.assertNotIn("sudo", "\n".join(commands))
         build_step = next(step for step in steps if "exec python3" in step.get("run", ""))
         self.assertEqual(build_step["env"], {"CPU_ISA": "${{ matrix.cpu_isa }}",
                                             "LLAMINAR_DOCKER_BUILD_CACHE_ACCESS": "import-only"})
