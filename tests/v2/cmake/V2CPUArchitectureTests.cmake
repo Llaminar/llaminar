@@ -148,6 +148,21 @@ v2_add_core_free_test(V2_Unit_Q16_1RMSNorm
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16LegacyCoverage
     COMMAND $<TARGET_FILE:v2_test_q16_1_rmsnorm>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16_1 Regression)
+# Pure-integer Q8_1 gamma is cached by owner control block, never by raw address.
+add_executable(v2_test_cpu_rmsnorm_gamma_q11_identity
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/ops/Test__RMSNormGammaQ11Identity.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RMSNormPrimitives.cpp")
+target_compile_features(v2_test_cpu_rmsnorm_gamma_q11_identity PRIVATE cxx_std_23)
+target_include_directories(v2_test_cpu_rmsnorm_gamma_q11_identity PRIVATE
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
+target_link_libraries(v2_test_cpu_rmsnorm_gamma_q11_identity PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+v2_add_core_free_test(V2_Unit_CPURMSNormGammaQ11Identity
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_gamma_q11_identity>
+    LABELS V2 Unit CPU DeviceFree RMSNorm Q8_1 Ownership)
+v2_add_core_free_test(V2_Integration_CPURMSNormGammaQ11OwnerIdentity
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_gamma_q11_identity>
+        --gtest_filter=RMSNormGammaQ11Identity.NewOwnerAtReusedAddressNeverStaleHits:RMSNormGammaQ11Identity.ExpiredOwnerRequantizes:RMSNormGammaQ11Identity.UnownedGammaIsNeverCached
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q8_1 Ownership Regression)
 # Compile the actual legacy precision caller TU, not a hand-copied surrogate.
 # Its remaining precision/ISA cases retain their canonical full-core Unit gate;
 # this core-free selection certifies only the admitted original-INT32 publisher.

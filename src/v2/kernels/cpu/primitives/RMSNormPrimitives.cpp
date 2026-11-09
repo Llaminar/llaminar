@@ -20,6 +20,8 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <memory>
+#include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -3084,114 +3086,116 @@ namespace llaminar2::primitives
 #endif
     }
 
+    void quantize_rmsnorm_gamma_q11(const float *gamma, int16_t *gamma_q11, std::size_t cols)
+    {
+        if (cols == 0)
+            return;
+        if (!gamma || !gamma_q11)
+            throw std::invalid_argument("Q11 gamma quantization requires complete gamma and output rows");
+        const uintptr_t gamma_begin = reinterpret_cast<uintptr_t>(gamma);
+        const uintptr_t output_begin = reinterpret_cast<uintptr_t>(gamma_q11);
+        if (gamma_begin + cols * sizeof(float) > output_begin &&
+            output_begin + cols * sizeof(int16_t) > gamma_begin)
+            throw std::invalid_argument("Q11 gamma quantization requires disjoint gamma and output rows");
+        // Q11 with a [-16, 16] range keeps Qwen2.5 gamma values above 13.0
+        // representable; the former Q12 [-8, 8] range clipped them.
+#ifdef __AVX512F__
+        {
+            size_t i = 0;
+            const __m512 scale = _mm512_set1_ps(2047.0f); // Q11 scale for [-16, 16] range
+            const __m512 clamp_lo = _mm512_set1_ps(-16.0f);
+            const __m512 clamp_hi = _mm512_set1_ps(16.0f);
+            const __m512 int16_lo = _mm512_set1_ps(-32767.0f);
+            const __m512 int16_hi = _mm512_set1_ps(32767.0f);
+
+            for (; i + 32 <= cols; i += 32)
+            {
+                __m512 v0 = _mm512_loadu_ps(gamma + i);
+                __m512 v1 = _mm512_loadu_ps(gamma + i + 16);
+                v0 = _mm512_max_ps(v0, clamp_lo);
+                v0 = _mm512_min_ps(v0, clamp_hi);
+                v1 = _mm512_max_ps(v1, clamp_lo);
+                v1 = _mm512_min_ps(v1, clamp_hi);
+                v0 = _mm512_mul_ps(v0, scale);
+                v1 = _mm512_mul_ps(v1, scale);
+                v0 = _mm512_max_ps(v0, int16_lo);
+                v0 = _mm512_min_ps(v0, int16_hi);
+                v1 = _mm512_max_ps(v1, int16_lo);
+                v1 = _mm512_min_ps(v1, int16_hi);
+                __m512i i0 = _mm512_cvtps_epi32(v0);
+                __m512i i1 = _mm512_cvtps_epi32(v1);
+                __m512i packed = _mm512_packs_epi32(i0, i1);
+                packed = _mm512_permutexvar_epi64(
+                    _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7), packed);
+                _mm512_storeu_si512(reinterpret_cast<__m512i *>(gamma_q11 + i), packed);
+            }
+            for (; i < cols; ++i)
+            {
+                float clamped = std::max(-16.0f, std::min(16.0f, gamma[i]));
+                float scaled = clamped * 2047.0f;
+                scaled = std::max(-32767.0f, std::min(32767.0f, scaled));
+                gamma_q11[i] = static_cast<int16_t>(scaled);
+            }
+        }
+#else
+        for (size_t i = 0; i < cols; ++i)
+        {
+            float clamped = std::max(-16.0f, std::min(16.0f, gamma[i]));
+            float scaled = clamped * 2047.0f;
+            scaled = std::max(-32767.0f, std::min(32767.0f, scaled));
+            gamma_q11[i] = static_cast<int16_t>(scaled);
+        }
+#endif
+    }
+
+    const int16_t *rmsnorm_gamma_q11_for_owner(
+        const float *gamma, std::size_t cols, const std::weak_ptr<const void> &owner)
+    {
+        struct Entry
+        {
+            std::weak_ptr<const void> owner;
+            const float *gamma = nullptr;
+            std::size_t cols = 0;
+            std::vector<int16_t> words;
+        };
+        // Single writer: every thread owns its entry. The weak reference pins
+        // the owner's control block, so owner equivalence cannot be satisfied
+        // by a different, later allocation that reuses the gamma address.
+        thread_local Entry entry;
+        const std::weak_ptr<const void> unowned;
+        const bool has_owner = owner.owner_before(unowned) || unowned.owner_before(owner);
+        const bool same_owner = !entry.owner.owner_before(owner) && !owner.owner_before(entry.owner);
+        if (has_owner && !owner.expired() && same_owner && entry.gamma == gamma && entry.cols == cols)
+            return entry.words.data();
+
+        if (entry.words.size() < cols)
+            entry.words.resize(cols);
+        quantize_rmsnorm_gamma_q11(gamma, entry.words.data(), cols);
+        // Unowned or expired weights have no authentic identity and stay uncached.
+        const bool cacheable = has_owner && !owner.expired();
+        entry.owner = cacheable ? owner : std::weak_ptr<const void>{};
+        entry.gamma = cacheable ? gamma : nullptr;
+        entry.cols = cacheable ? cols : 0;
+        return entry.words.data();
+    }
+
     void rmsnorm_q8_1_pure_integer(
         const Q8_1Block *input,
-        const float *gamma,
+        const int16_t *gamma_q11,
         Q8_1Block *output,
         std::size_t rows,
         std::size_t blocks_per_row,
         float epsilon,
         const RMSNormExecOptions &opts)
     {
-        if (!input || !gamma || !output || rows == 0 || blocks_per_row == 0)
+        if (!input || !gamma_q11 || !output || rows == 0 || blocks_per_row == 0)
             return;
-
-        const size_t cols = blocks_per_row * 32;
 
         // Scale epsilon to integer domain
         // Typical epsilon is 1e-5 to 1e-6. We scale to ~1-100 range.
         int32_t epsilon_scaled = static_cast<int32_t>(epsilon * 1e10f);
         if (epsilon_scaled < 1)
             epsilon_scaled = 1;
-
-        // ================================================================
-        // UNIFIED ROW-PARALLEL APPROACH
-        // 1. Quantize gamma once (sequential, ~1% of work)
-        // 2. Process rows in parallel (each row: sumsq -> inv_rms -> apply)
-        //
-        // This is simpler than 3-phase and avoids intermediate allocations
-        // for row_sumsq/row_inv_rms vectors. Each thread does complete
-        // per-row processing, which has better cache locality.
-        // ================================================================
-
-        // Phase 0: Quantize gamma ONCE (sequential, shared across all rows)
-        // Use thread-local cache to avoid repeated allocations across calls
-        // Cache key: gamma pointer + cols (assumes same gamma pointer = same weights)
-        thread_local std::vector<int16_t> gamma_q12_cache;
-        thread_local const float *cached_gamma_ptr = nullptr;
-        thread_local size_t cached_cols = 0;
-
-        int16_t *gamma_q12 = nullptr;
-
-        if (cached_gamma_ptr == gamma && cached_cols == cols)
-        {
-            // Cache hit - reuse previous quantization
-            gamma_q12 = gamma_q12_cache.data();
-        }
-        else
-        {
-            // Cache miss - quantize gamma and update cache
-            if (gamma_q12_cache.size() < cols)
-            {
-                gamma_q12_cache.resize(cols);
-            }
-            gamma_q12 = gamma_q12_cache.data();
-
-            // NOTE: Using Q11 format with [-16, 16] range to support larger gamma values
-            // found in Qwen2.5 models (some gamma weights exceed 13.0).
-            // Previous Q12 format with [-8, 8] range caused ~38% error on these elements.
-            // Scale factor: 2047 (11 fractional bits) instead of 4095 (12 fractional bits)
-#ifdef __AVX512F__
-            {
-                size_t i = 0;
-                const __m512 scale = _mm512_set1_ps(2047.0f); // Q11 scale for [-16, 16] range
-                const __m512 clamp_lo = _mm512_set1_ps(-16.0f);
-                const __m512 clamp_hi = _mm512_set1_ps(16.0f);
-                const __m512 int16_lo = _mm512_set1_ps(-32767.0f);
-                const __m512 int16_hi = _mm512_set1_ps(32767.0f);
-
-                for (; i + 32 <= cols; i += 32)
-                {
-                    __m512 v0 = _mm512_loadu_ps(gamma + i);
-                    __m512 v1 = _mm512_loadu_ps(gamma + i + 16);
-                    v0 = _mm512_max_ps(v0, clamp_lo);
-                    v0 = _mm512_min_ps(v0, clamp_hi);
-                    v1 = _mm512_max_ps(v1, clamp_lo);
-                    v1 = _mm512_min_ps(v1, clamp_hi);
-                    v0 = _mm512_mul_ps(v0, scale);
-                    v1 = _mm512_mul_ps(v1, scale);
-                    v0 = _mm512_max_ps(v0, int16_lo);
-                    v0 = _mm512_min_ps(v0, int16_hi);
-                    v1 = _mm512_max_ps(v1, int16_lo);
-                    v1 = _mm512_min_ps(v1, int16_hi);
-                    __m512i i0 = _mm512_cvtps_epi32(v0);
-                    __m512i i1 = _mm512_cvtps_epi32(v1);
-                    __m512i packed = _mm512_packs_epi32(i0, i1);
-                    packed = _mm512_permutexvar_epi64(
-                        _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7), packed);
-                    _mm512_storeu_si512(reinterpret_cast<__m512i *>(gamma_q12 + i), packed);
-                }
-                for (; i < cols; ++i)
-                {
-                    float clamped = std::max(-16.0f, std::min(16.0f, gamma[i]));
-                    float scaled = clamped * 2047.0f;
-                    scaled = std::max(-32767.0f, std::min(32767.0f, scaled));
-                    gamma_q12[i] = static_cast<int16_t>(scaled);
-                }
-            }
-#else
-            for (size_t i = 0; i < cols; ++i)
-            {
-                float clamped = std::max(-16.0f, std::min(16.0f, gamma[i]));
-                float scaled = clamped * 2047.0f;
-                scaled = std::max(-32767.0f, std::min(32767.0f, scaled));
-                gamma_q12[i] = static_cast<int16_t>(scaled);
-            }
-#endif
-            // Update cache metadata
-            cached_gamma_ptr = gamma;
-            cached_cols = cols;
-        }
 
         // Process rows - parallelize if we have enough work
         // Each row does: sumsq -> inv_rms -> apply (all in rmsnorm_q8_1_pure_integer_row)
@@ -3214,7 +3218,7 @@ namespace llaminar2::primitives
                 {
                     rmsnorm_q8_1_pure_integer_row_unrolled(
                         input + r * blocks_per_row,
-                        gamma_q12,
+                        gamma_q11,
                         output + r * blocks_per_row,
                         blocks_per_row,
                         epsilon_scaled);
@@ -3229,7 +3233,7 @@ namespace llaminar2::primitives
         {
             rmsnorm_q8_1_pure_integer_row_unrolled(
                 input + r * blocks_per_row,
-                gamma_q12,
+                gamma_q11,
                 output + r * blocks_per_row,
                 blocks_per_row,
                 epsilon_scaled);

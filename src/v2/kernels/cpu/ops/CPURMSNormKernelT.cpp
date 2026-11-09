@@ -601,7 +601,8 @@ namespace llaminar2
         int rows,
         int cols,
         float epsilon,
-        int device_idx)
+        int device_idx,
+        const std::weak_ptr<const void> &gamma_owner)
     {
         (void)device_idx;
 
@@ -625,13 +626,14 @@ namespace llaminar2
         opts.allow_parallel = want_parallel(rows, ucols);
 
         primitives::rmsnorm_q8_1_pure_integer(
-            input, gamma, output,
+            input, primitives::rmsnorm_gamma_q11_for_owner(gamma, ucols, gamma_owner), output,
             static_cast<size_t>(rows), blocks_per_row,
             epsilon, opts);
 
         record_grouped_rmsnorm_call("q8_1", "q8_1", rows, cols);
         return true;
 #else
+        (void)gamma_owner; // FP32 gamma is consumed directly; nothing is cached.
         const bool use_parallel = want_parallel(rows, ucols);
 
         auto process_row = [&](int row, float *fp32_in, float *fp32_out)

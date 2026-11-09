@@ -28,6 +28,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include "../../../tensors/BlockStructures.h"
 
 namespace llaminar2::primitives
@@ -543,13 +544,38 @@ namespace llaminar2::primitives
         int32_t epsilon_scaled);
 
     /**
+     * @brief Quantize FP32 gamma to the Q11 words consumed by pure-integer Q8_1 rows.
+     * @param gamma Original FP32 weights [cols].
+     * @param gamma_q11 Receives clamp(gamma, -16, 16) * 2047, saturated to int16 [cols].
+     * @param cols Complete column count.
+     *
+     * AVX512 builds round each complete 32-column group to nearest and truncate a
+     * scalar tail; other builds truncate every column. Q8_1 rows always contain
+     * whole 32-value blocks, so the AVX512 kernel never executes the tail.
+     */
+    void quantize_rmsnorm_gamma_q11(const float *gamma, int16_t *gamma_q11, std::size_t cols);
+
+    /**
+     * @brief Return Q11 gamma for one immutable weight, cached per thread by owner identity.
+     * @param gamma Original FP32 weights [cols], immutable for the owner's lifetime.
+     * @param cols Complete column count.
+     * @param owner Control-block identity of the object owning gamma; empty when unowned.
+     * @return Calling-thread storage valid until this thread's next call.
+     *
+     * A raw address is not an identity: freed weights can be reallocated at the
+     * same address with different values. The cache therefore hits only for the
+     * same live owner control block, address and width. The retained weak
+     * reference keeps that control block allocated, so no later owner can
+     * alias it. Empty or expired owners always requantize and never stale-hit.
+     */
+    const int16_t *rmsnorm_gamma_q11_for_owner(
+        const float *gamma, std::size_t cols, const std::weak_ptr<const void> &owner);
+
+    /**
      * @brief Pure-integer Q8_1 RMSNorm for multiple rows (parallelized)
      *
-     * Wrapper that handles gamma quantization and row dispatch.
-     * Converts FP32 gamma to Q10 format internally (10-bit fractional precision).
-     *
      * @param input Input Q8_1 blocks [rows * blocks_per_row]
-     * @param gamma Gamma weights [cols] (FP32, will be quantized to Q10)
+     * @param gamma_q11 Quantized gamma [cols] from quantize_rmsnorm_gamma_q11, shared by all rows
      * @param output Output Q8_1 blocks [rows * blocks_per_row]
      * @param rows Number of rows
      * @param blocks_per_row Number of Q8_1 blocks per row (cols / 32)
@@ -558,7 +584,7 @@ namespace llaminar2::primitives
      */
     void rmsnorm_q8_1_pure_integer(
         const Q8_1Block *input,
-        const float *gamma,
+        const int16_t *gamma_q11,
         Q8_1Block *output,
         std::size_t rows,
         std::size_t blocks_per_row,
