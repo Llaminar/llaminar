@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <algorithm> // For std::min, std::max in AttentionCacheConfig
 #include <stdexcept>
+#include "CPUCacheObservation.h"
 #if defined(__aarch64__)
 #include "ARMCPUFeatures.h"
 #endif
@@ -1012,7 +1013,33 @@ namespace llaminar2
 #endif
 
     /**
-     * @brief Cache hierarchy information for tiling/batching decisions
+     * @brief Return the process's immutable genuine x86 cache observation.
+     * @return Checked CPUID/topology fields, or unknown zeros on other targets.
+     * @details Admission and measured cache-derived policies use this record,
+     * not the legacy convenience capacities exposed by CacheInfo.
+     */
+    inline const cpu::CPUCacheObservation &cpu_cache_observation()
+    {
+        static const cpu::CPUCacheObservation observation = [] {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+            return cpu::observeX86CacheGeometry([](std::uint32_t leaf, std::uint32_t sub) {
+                std::array<std::uint32_t, 4> registers{};
+                cpuid(leaf, sub, registers.data());
+                return registers;
+            });
+#else
+            return cpu::CPUCacheObservation{};
+#endif
+        }();
+        return observation;
+    }
+
+    /**
+     * @brief Legacy cache convenience values for existing non-admission tiling callers.
+     * @warning Missing observations can produce historical convenience defaults.
+     * Use cpu_cache_observation() for admission or measured-policy evidence.
+     *
+     * Cache hierarchy information for tiling/batching decisions
      *
      * Provides detected cache sizes and computes optimal batch sizes
      * for operations like Wo projection that benefit from batching

@@ -111,10 +111,11 @@ namespace llaminar2
         /**
          * @brief Select one authenticated K/V tile from exact storage geometry.
          *
-         * The cache detector reports capacities per physical core. The caller
-         * supplies one stored K head row and one stored V head row so FP32,
-         * FP16, Q16, Q8, and TurboQuant all use the same normalized policy
-         * without lying about memory traffic. Debug tournament controls are
+         * The caller supplies original K/V storage widths. X86 consumes its
+         * private-cache observations; the native ARM canonical-span policy
+         * deliberately reads no x86 cache detector or guessed private capacity.
+         * FP32, FP16, Q16, Q8 and TurboQuant therefore retain their exact storage
+         * identities without changing arithmetic. Debug tournament controls are
          * exact: an uncompiled positive override is a fatal configuration error
          * rather than being rounded to a different experiment.
          *
@@ -134,36 +135,19 @@ namespace llaminar2
             std::size_t value_head_row_bytes,
             int explicit_tile)
         {
-            const CacheInfo &cache = cache_info();
-            const auto vector_isa = []
-            {
-                switch (activeISALevel())
-                {
-                case ISALevel::Scalar:
-                    return cpu::fa2_policy::CPUFA2VectorISA::Scalar;
-                case ISALevel::AVX2:
-                    return cpu::fa2_policy::CPUFA2VectorISA::AVX2;
-                case ISALevel::AVX512:
-                    return cpu::fa2_policy::CPUFA2VectorISA::AVX512;
-                }
-                return cpu::fa2_policy::CPUFA2VectorISA::Invalid;
-            }();
+            const auto codegen_isa = cpu::fa2_policy::compiledCPUFA2CodegenISA();
+            const auto vector_isa = cpu::fa2_policy::cpuFA2VectorISAFor(activeISALevel());
+            const auto observed_cache = cpu::fa2_policy::observedCPUFA2PolicyCache();
             const int tile = cpu::fa2_policy::selectCPUFA2KVTile(
                 {
                     .storage_pair = storage_pair,
                     .vector_isa = vector_isa,
-                    .codegen_isa =
-                        cpu::fa2_policy::compiledCPUFA2CodegenISA(),
+                    .codegen_isa = codegen_isa,
                     .head_dim = head_dim,
                     .kv_rows = kv_len,
                     .key_head_row_bytes = key_head_row_bytes,
                     .value_head_row_bytes = value_head_row_bytes,
-                    .cache = {
-                        .private_l1d_bytes = cache.l1_size,
-                        .private_l2_bytes = cache.l2_size,
-                        .shared_l3_bytes = cache.l3_size,
-                        .cache_line_bytes = cache.cache_line,
-                    },
+                    .cache = observed_cache,
                 },
                 explicit_tile);
             if (tile == 0)

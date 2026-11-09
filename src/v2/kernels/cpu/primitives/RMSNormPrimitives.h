@@ -3,11 +3,13 @@
  * @brief Vectorized RMSNorm primitives for V2 (ported from V1)
  * @author David Sanftenberg
  *
- * High-performance RMSNorm implementation with:
- * - AVX512/AVX2 vectorization (4-8× speedup)
- * - Double precision accumulation for accuracy
- * - Thread-local scratch buffers
- * - T5 compatibility mode
+ * FP32 matrix normalization retains complete original rows within one worker
+ * transaction: summary, inverse and publication have the same lexical owner.
+ * Native ARM tiles share gamma across1..4 rows and need no row scratch bank;
+ * their fixed arithmetic is independent of M or worker count. Explicit T5
+ * accumulation remains a distinct program. Original tensors/gamma retain their
+ * caller-owned storage authority. Other typed publication APIs keep their own
+ * numerical programs:
  * - INT32→INT8 pipeline support for full INT8 inference
  * - Q8_1 integer-space RMSNorm (avoids FP32 dequant overhead)
  */
@@ -55,21 +57,7 @@ namespace llaminar2::primitives
         }
     };
 
-    /**
-     * @brief Compute per-row sum of squares (vectorized)
-     *
-     * @param src Input tensor [rows, cols]
-     * @param rows Number of rows
-     * @param cols Number of columns
-     * @param row_sumsq Output per-row sum of squares (length = rows)
-     * @param opts Execution options
-     */
-    void rmsnorm_compute_row_sumsq_vectorized(
-        const float *src,
-        std::size_t rows,
-        std::size_t cols,
-        double *row_sumsq,
-        const RMSNormExecOptions &opts = {});
+
 
     /**
      * @brief Convert row sum of squares to inverse RMS scaling factors
@@ -87,25 +75,7 @@ namespace llaminar2::primitives
         float epsilon,
         float *inv_out);
 
-    /**
-     * @brief Apply RMSNorm scaling and gamma weights (vectorized)
-     *
-     * @param src Input tensor [rows, cols]
-     * @param gamma Gamma weights [cols]
-     * @param inv Per-row inverse RMS values
-     * @param rows Number of rows
-     * @param cols Number of columns
-     * @param dst Output tensor [rows, cols]
-     * @param opts Execution options
-     */
-    void rmsnorm_apply_vectorized(
-        const float *src,
-        const float *gamma,
-        const float *inv,
-        std::size_t rows,
-        std::size_t cols,
-        float *dst,
-        const RMSNormExecOptions &opts = {});
+
 
     /**
      * @brief Fused RMSNorm computation (all stages)
@@ -127,22 +97,22 @@ namespace llaminar2::primitives
         float epsilon,
         const RMSNormExecOptions &opts = {});
 
-    /**
-     * @brief Fused RMSNorm with provided scratch buffer
-     */
-    void rmsnorm_fused_vectorized(
-        const float *src,
-        const float *gamma,
-        float *dst,
-        std::size_t rows,
-        std::size_t cols,
-        float epsilon,
-        RMSNormScratch &scratch,
-        const RMSNormExecOptions &opts = {});
+
 
     // ========================================================================
     // Per-Row Primitives (Testable SIMD variants)
     // ========================================================================
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    /**
+     * @brief Native noncollective FP32 row leaf with the per-row FP32-mean inverse.
+     * @param src Original input row; @param gamma Original immutable weights or identity.
+     * @param dst Original output row; @param cols Logical elements; @param epsilon Original policy.
+     * @details The caller owns row worksharing. This leaf creates no team or decoded row bank.
+     */
+    void rmsnorm_fused_row_neon(const float *src,const float *gamma,float *dst,
+                               std::size_t cols,float epsilon);
+#endif
 
     /**
      * @brief RMSNorm per-row FP32 scalar implementation
@@ -155,6 +125,8 @@ namespace llaminar2::primitives
      * @param cols Number of columns
      * @param epsilon Epsilon for numerical stability
      */
+
+
     void rmsnorm_fused_row_scalar(
         const float *src,
         const float *gamma,

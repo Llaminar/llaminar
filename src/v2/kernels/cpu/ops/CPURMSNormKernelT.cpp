@@ -3,7 +3,10 @@
  * @brief Typed RMSNorm kernel implementation with fused precision conversion
  *
  * Key optimization: Process data in row-sized chunks that fit in L1/L2 cache.
- * Never allocate full-sized FP32 scratch buffers - stream through the data.
+ * Native ARM floating normalization consumes original encoded rows directly,
+ * sharing gamma in bounded tiles. Residual/quantized conversion paths retain
+ * their separately declared arithmetic/workspace contracts; none is certified
+ * by an isolated floating-leaf result.
  *
  * @author David Sanftenberg
  * @date 2025-12-04
@@ -114,21 +117,25 @@ namespace llaminar2
         size_t cols,
         float epsilon)
     {
-#if defined(__AVX512F__)
-        if (cpu_supports_avx512())
+        switch(activeISALevel())
         {
-            primitives::rmsnorm_fused_row_avx512(input, gamma, output, cols, epsilon);
-            return;
-        }
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        case ISALevel::NEON:
+        case ISALevel::NEONDotProd:
+            primitives::rmsnorm_fused_row_neon(input,gamma,output,cols,epsilon);return;
+#endif
+#if defined(__AVX512F__)
+        case ISALevel::AVX512:
+            primitives::rmsnorm_fused_row_avx512(input,gamma,output,cols,epsilon);return;
 #endif
 #if defined(__AVX2__)
-        if (cpu_supports_avx2())
-        {
-            primitives::rmsnorm_fused_row_avx2(input, gamma, output, cols, epsilon);
-            return;
-        }
+        case ISALevel::AVX2:
+            primitives::rmsnorm_fused_row_avx2(input,gamma,output,cols,epsilon);return;
 #endif
-        primitives::rmsnorm_fused_row_scalar(input, gamma, output, cols, epsilon);
+        case ISALevel::Scalar:
+            primitives::rmsnorm_fused_row_scalar(input,gamma,output,cols,epsilon);return;
+        default:throw std::logic_error("RMSNorm row received an incompatible ISA");
+        }
     }
 
     // =========================================================================
@@ -257,6 +264,12 @@ namespace llaminar2
             return false;
         }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        // Native encoded rows stay in their original storage: no invocation-time
+        // decoded bank, heap allocation or host shadow is admitted.
+        primitives::rmsnorm_fused_bf16_vectorized(input,gamma,output,
+            std::size_t(rows),std::size_t(cols),epsilon);
+#else
         const size_t ucols = static_cast<size_t>(cols);
         const bool use_parallel = want_parallel(rows, ucols);
 
@@ -316,6 +329,8 @@ namespace llaminar2
                 process_row(row, fp32_in, fp32_out);
             }
         }
+
+#endif
 
         record_grouped_rmsnorm_call("bf16", "bf16", rows, cols);
         return true;
@@ -422,6 +437,12 @@ namespace llaminar2
             return false;
         }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        // Native encoded rows stay in their original storage: no invocation-time
+        // decoded bank, heap allocation or host shadow is admitted.
+        primitives::rmsnorm_fused_fp16_vectorized(input,gamma,output,
+            std::size_t(rows),std::size_t(cols),epsilon);
+#else
         const size_t ucols = static_cast<size_t>(cols);
         const bool use_parallel = want_parallel(rows, ucols);
 
@@ -481,6 +502,8 @@ namespace llaminar2
                 process_row(row, fp32_in, fp32_out);
             }
         }
+
+#endif
 
         record_grouped_rmsnorm_call("fp16", "fp16", rows, cols);
         return true;

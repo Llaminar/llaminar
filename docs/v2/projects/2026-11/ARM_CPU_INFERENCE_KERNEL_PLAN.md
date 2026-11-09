@@ -148,29 +148,49 @@ arbitrary hard CPU-ID pinning; record advisory placement and actual evidence.
   Borrowed constructors moved out of line; no MPI protocol changed. The real
   attention class now parses as actual FP32 C++23 after converting four orphan
   timing reductions, retaining small active teams, using native prefetch and
-  shared Q16 scaling. The unhandled native FA2 launch-policy warning and full
-  helper/KV/factory/runtime admission remain unfinished. Later class edits are
+  shared Q16 scaling. Native FA2 compiler/runtime identities now map explicitly;
+  the actual class parses warning-free under C++23 and `-Werror=switch`.
+  Its initial canonical256-row span consumes neither x86 timings nor invented
+  private-cache capacity; checked byte/integer geometry has focused preflights.
+  Helper/KV/factory/runtime admission remains unfinished. Later class edits are
   outside the frozen Spark certificate; syntax/leaf/scope checks do not qualify
   their runtime. All four softmax and both rotation entries resolve.
-- 125 focused core-free registrations now pass in baseline/DotProd Release,
-  DotProd ASan/UBSan, strict-warning Debug and LLVM Release, plus both native
-  Linux/arm64 GCC13.3 profiles in a local M1 VM. All93 configured
-  `ProductionTestPreflight` entries passed twenty repetitions in Mac DotProd
-  and Linux GCC baseline. This supersedes the117/87 Mac checkpoint, not the
-  failed first Spark campaign. Immutable projection fixtures/serial oracles now
+- The latest completed five-Mac focused matrix passes151/151 in baseline/DotProd
+  Release, DotProd ASan/UBSan, strict-warning Debug and LLVM Release; all115
+  configured preflights pass20 repetitions (2300 raw passes), including the new
+  native reduction/production-TU RMSNorm ownership, byte and portable-half cases. The intervening136-test sanitizer
+  projection-batch timeout remains RED. Its unchanged hashed binary passes20
+  isolated-window repetitions, then the complete current matrix passes; no
+  timeout/worker budget was changed and contention remains only a hypothesis.
+  All17 dependency lifecycle/serialization cases and six genuine-cache decoder
+  cases are covered. Historical native Linux/arm64 GNU13.3 and GNU14.2 baseline/DotProd
+  matrices pass126/126 each; the prior93-entry inventory passed20 repetitions
+  in Linux GNU13 baseline. The immutable Spark successor separately passes125/125×4.
+  These are distinct source scopes,
+  not certification of newer changes from historical evidence. Immutable projection fixtures/serial oracles now
   reuse storage across every worker budget, avoiding sanitizer timeouts without
   raising the ordinary timeout or reducing coverage. See the evidence record
   for exact scope, empty-team/geometry defects and negative regression proof.
-- Shared AVX2/AVX512 compact templates pass syntax instantiation. Earlier focused
-  x86 projects cross-compiled/linked, but no x86 execution is proven (no Rosetta).
+- Shared AVX2/AVX512 compact templates pass syntax instantiation. Separate real
+  WSL hardware now passes the repaired snapshot's complete focused AVX2/AVX512
+  projects80/80 and82/82, with55preflights each and all four typed cases20/20.
+  This is native hardware evidence, not Rosetta or a full Intel engine gate.
 - The complete refresh Python suite currently has 63/118 failures at Linux-only
   shell-driver `lscpu` discovery; native tooling support is required, not skips.
-- Full `src/v2` configuration still fails at Linux libnuma. Core-free projection
-  entrypoints and the GemmKernel header compile natively, but the remaining
-  factory/runtime closure contains x86/Linux dependencies and an unsupported
-  libc++ atomic-shared-pointer specialization. A recursive stage-type Clang
-  defect found in that closure is fixed with an explicit preflight. No model
-  or final `Perf__` gate has run.
+- Full Darwin `src/v2` configuration still rejects the unimplemented Linux-only
+  memory/placement backend; libc++ atomic-shared-pointer closure also remains.
+  A genuine separate Linux ARM GNU14/OpenMPI4.1.6/NUMA/OpenSSL SDK closes C++23
+  prerequisites and now actually builds/installs canonical oneDNN. A genuine
+  GMock package closes the next SDK gap; full engine configuration/generation
+  passes. Actual compilation then exposed OpenMPI ARM C-only internal atomics
+  in its C++ component: a real C11 adapter now owns ORTE structures, while C++17
+  retains the single typed environment/readiness authority. Component/helper/probe
+  build and four actual native Linux preflights pass on explicit native POSIX
+  session storage, without SDK macros, atomic emulation or weaker ownership.
+  No dependency was disabled or replaced. Resumable installation/manifest,
+  exact consumer library, compiler ARG1 and diagnostics have focused regressions;
+  actual whole core/factory/runtime and complete gates remain open.
+  No model or final `Perf__` gate has run.
 
 The initial evidence and full-build command are retained in
 [the first-slice handoff](2026-11-04-native-arm-port.md). Subsequent native
@@ -208,8 +228,79 @@ and AVX512, but its native test fails73/166 assertions and scalar passes, each
 reproduced3/3. The new all-ISA oracle incorrectly assumed ties-away for the
 existing AVX512 fixed32 Q16 nearest-even program. Preserve those explicit
 per-ISA programs and independently diagnose any unretained decode-product
-edges; do not converge arithmetic blindly or relax the byte gate. Full x86,
+edges; do not converge arithmetic blindly or relax the byte gate. A native
+read-only witness now shows73 remaining mismatches on each ISA against its own
+publication program, all matching FusedA with production-wrapper FMA attribution.
+`X86FP32.h` and the three fixed32 add routines now retain separate products;
+manual per-ISA references and operand-order/exact-reuse regressions preserve
+rounding policies. Immutable `eb3120f8…69a37` now passes native AVX2/AVX512
+focused projects80/80 and82/82 plus all four typed cases20/20. New tests against
+unchanged old headers fail73 native and3 alias assertions on each ISA; scalar
+and signed-rounding controls pass. The unchanged independent probe reports
+zero declared-program mismatches on both ISAs. AVX512's95 generic-away
+mismatches correctly preserve its different nearest-even program. Named wrapper
+inspection finds zero accidental FMA sites with no new stack/frame growth in
+that bounded witness; no throughput certificate is inferred. Broader x86,
 production attention integration and final economy remain open.
+
+Official Ubuntu ARM GNU14.2 packages now provide a genuine locally compiled/
+linked/executed C++23 print and atomic-shared-pointer closure, without a fake
+header or changing the old SDK. The full engine must still actually build and
+pass its complete applicable gates before a small real GGUF launch; focused
+kernels are not a runnable server.
+
+The actual full Linux dependency attempt exposed compiler-memory exhaustion:
+individual oneDNN reorder TUs consume about2.1GiB, while the VM has8GiB.
+Canonical optimization/ISA flags and unrestricted Ninja parallelism remain.
+Isolated exact-TU resource diagnoses are not full-build passes. The old CMake
+also erased partial work without an install stamp and discarded Ninja stdout;
+`cmake/OneDNNBuild.cmake` now separates configured and installed ownership,
+retains failed-build work, binds toolchain identity and reports both streams.
+An empty origin observation previously triggered destructive source re-cloning
+without retaining Git status/stderr. Existing-source authentication now rejects
+without deletion; the underlying old probe error is not retrospectively known.
+Seventeen real CMake/Ninja/Git device-free cases exercise these states, missing
+libraries/other headers, modified artifacts and mandatory compiler arguments,
+without a compiler substitute or an SDK implementation. Review also exposed
+legacy fabricated x86 cache defaults: the new genuine CPUID/topology record now
+keeps unknown/shared caches unknown, and both FA2 and inventory consume it.
+Retirement intent is durable across missing receipts and partial failure. New
+two-call and interrupted-retirement tests expose actual outside writes/bad
+same-mtime bytes in the unchanged staged662 owner; its build authorization was
+withheld and it remains immutable. The current full matrix passes after repair.
+Full engine compilation next exhausted the8GiB VM on two real core TUs. The
+fresh immutable `3bf350a5…a80ba` packet received a one-Spark CPU-only build window
+and exact SDK authentication. Its validator reports successful genuine oneDNN
+installation, then a first configuration failure from repeated heterogeneous
+`lscpu` topology fields at `V2TestGateFinalization.cmake`; application/gate
+compilation never began. Raw evidence has been returned and is being audited.
+Repair truthful sysfs/cpuset-backed admission rather than trimming a first line
+or deduplicating misleading `lscpu` core IDs. No retry, worker cap, source patch
+or SDK substitution is authorized; export a new immutable successor first.
+Whole engine gates remain open.
+
+The RMSNorm frontier now has a bounded native production-TU slice. Actual
+retained1×12288 all-ones execution reproduced per-caller partial ownership
+(output1.7320248 instead of0.999995), plus repeated small in-place normalization
+and empty early return. All three focused regressions are repaired and explicitly
+registered in preflight. Complete row/tile transactions replace FP32 TLS banks
+and atomic column partitions; unused detached FP32 stages/scratch overload were
+retired. Native FP32/FP16/BF16 tiles share gamma over1..4 original rows, preserve
+staged versus per-row inverse programs, and publish portable half tails without
+a decoded row bank. Independent formulas and actual M=1 bytes cover M1..16/31/33
+and workers1..10 in the new production-TU tests. Native BF16/FP16 factory source
+now selects original-storage primitives and its actual C++23 TU parses cleanly.
+The complete fresh five-profile checkpoint matrix passes151/151 each and115
+configured preflights×20; see the evidence log. These checks do not qualify
+factory runtime or full inference.
+
+RMSNorm remains unfinished: residual and quantized factory/workspace routes,
+Q8 epsilon/stale gamma/no-op/narrowing defects, Q16 distinct square/geometry/
+expansion rules, INT32 AVX2 low-bit loss and row-quantizer alias/scale programs
+need independent executed regressions, repairs and complete gates. Preserve the
+source audit's distinct numerical programs instead of copying legacy outputs
+or accepting cosine-only tests as metadata/code correctness. Final resource,
+latency, scaling and complete model/MTP campaigns still apply.
 
 ### 2.4 Audit coverage and limits
 

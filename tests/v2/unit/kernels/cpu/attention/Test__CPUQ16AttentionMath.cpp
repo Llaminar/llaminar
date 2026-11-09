@@ -33,8 +33,8 @@ TEST(CPUQ16AttentionMath, PhysicalBlocksAndInvalidGeometry)
     static_assert(q16AttentionQueryLimit(32) == 2047);
     static_assert(q16AttentionQueryLimit(64) == 1023);
     static_assert(q16AttentionQueryLimit(128) == 511);
-    EXPECT_THROW(q16AttentionQueryLimit(0), std::invalid_argument);
-    EXPECT_THROW(q16AttentionQueryLimit(-1), std::invalid_argument);
-    EXPECT_THROW(q16AttentionQueryLimit(65536), std::invalid_argument);
-    EXPECT_THROW(q16AttentionQueryLimit(std::numeric_limits<int>::max()), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(q16AttentionQueryLimit(0)), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(q16AttentionQueryLimit(-1)), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(q16AttentionQueryLimit(65536)), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(q16AttentionQueryLimit(std::numeric_limits<int>::max())), std::invalid_argument);
 }

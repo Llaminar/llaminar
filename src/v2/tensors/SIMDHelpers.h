@@ -29,10 +29,8 @@
 #include <algorithm>
 #include <stdexcept>
 
-#if defined(__AVX512F__)
-#include <immintrin.h>
-#elif defined(__AVX2__)
-#include <immintrin.h>
+#if defined(__AVX512F__) || defined(__AVX2__)
+#include "X86FP32.h"
 #endif
 
 namespace llaminar2
@@ -2444,8 +2442,8 @@ namespace llaminar2
                     __m128i qb16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_b.qs + i * 8));
                     __m256i ia32 = _mm256_cvtepi16_epi32(qa16);
                     __m256i ib32 = _mm256_cvtepi16_epi32(qb16);
-                    __m256 fa = _mm256_mul_ps(_mm256_cvtepi32_ps(ia32), scale_a_vec);
-                    __m256 fb = _mm256_mul_ps(_mm256_cvtepi32_ps(ib32), scale_b_vec);
+                    __m256 fa = x86_fp32::persistRounded(_mm256_mul_ps(_mm256_cvtepi32_ps(ia32), scale_a_vec));
+                    __m256 fb = x86_fp32::persistRounded(_mm256_mul_ps(_mm256_cvtepi32_ps(ib32), scale_b_vec));
                     __m256 sum = _mm256_add_ps(fa, fb);
                     _mm256_store_ps(temp + i * 8, sum);
                 }
@@ -2513,14 +2511,14 @@ namespace llaminar2
                 // Load and dequant A (16 int16 values → 16 floats, 2 iterations for 32 elements)
                 __m256i qa_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_a.qs));
                 __m256i qa_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_a.qs + 16));
-                __m512 fa0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qa_lo)), _mm512_set1_ps(scale_a));
-                __m512 fa1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qa_hi)), _mm512_set1_ps(scale_a));
+                __m512 fa0 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qa_lo)), _mm512_set1_ps(scale_a)));
+                __m512 fa1 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qa_hi)), _mm512_set1_ps(scale_a)));
 
                 // Load and dequant B
                 __m256i qb_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_b.qs));
                 __m256i qb_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_b.qs + 16));
-                __m512 fb0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qb_lo)), _mm512_set1_ps(scale_b));
-                __m512 fb1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qb_hi)), _mm512_set1_ps(scale_b));
+                __m512 fb0 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qb_lo)), _mm512_set1_ps(scale_b)));
+                __m512 fb1 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qb_hi)), _mm512_set1_ps(scale_b)));
 
                 // Add
                 __m512 sum0 = _mm512_add_ps(fa0, fb0);
@@ -2664,7 +2662,7 @@ namespace llaminar2
                 {
                     __m128i qr16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + i * 8));
                     __m256i qr32 = _mm256_cvtepi16_epi32(qr16);
-                    __m256 fr = _mm256_mul_ps(_mm256_cvtepi32_ps(qr32), scale_vec);
+                    __m256 fr = x86_fp32::persistRounded(_mm256_mul_ps(_mm256_cvtepi32_ps(qr32), scale_vec));
                     __m256 fd = _mm256_loadu_ps(delta_ptr + i * 8);
                     __m256 sum = _mm256_add_ps(fr, fd);
                     _mm256_store_ps(temp + i * 8, sum);
@@ -2729,8 +2727,8 @@ namespace llaminar2
                 // Load and dequant residual
                 __m256i qr_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
                 __m256i qr_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs + 16));
-                __m512 fr0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_lo)), _mm512_set1_ps(scale));
-                __m512 fr1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_hi)), _mm512_set1_ps(scale));
+                __m512 fr0 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_lo)), _mm512_set1_ps(scale)));
+                __m512 fr1 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_hi)), _mm512_set1_ps(scale)));
 
                 // Load delta (already FP32)
                 __m512 fd0 = _mm512_loadu_ps(delta_ptr);
@@ -3156,12 +3154,12 @@ namespace llaminar2
                     // Dequant Q16_1 residual
                     __m128i qr16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_r.qs + i * 8));
                     __m256i qr32 = _mm256_cvtepi16_epi32(qr16);
-                    __m256 fr = _mm256_mul_ps(_mm256_cvtepi32_ps(qr32), scale_r_vec);
+                    __m256 fr = x86_fp32::persistRounded(_mm256_mul_ps(_mm256_cvtepi32_ps(qr32), scale_r_vec));
 
                     // Dequant Q8_1 delta (load 8 int8 → extend to int32 → FP32)
                     __m128i qd8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block_d.qs + i * 8));
                     __m256i qd32 = _mm256_cvtepi8_epi32(qd8);
-                    __m256 fd = _mm256_mul_ps(_mm256_cvtepi32_ps(qd32), scale_d_vec);
+                    __m256 fd = x86_fp32::persistRounded(_mm256_mul_ps(_mm256_cvtepi32_ps(qd32), scale_d_vec));
 
                     __m256 sum = _mm256_add_ps(fr, fd);
                     _mm256_store_ps(temp + i * 8, sum);
@@ -3229,16 +3227,16 @@ namespace llaminar2
                 // Load and dequant residual (Q16_1: int16 → FP32)
                 __m256i qr_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_r.qs));
                 __m256i qr_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_r.qs + 16));
-                __m512 fr0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_lo)), _mm512_set1_ps(scale_r));
-                __m512 fr1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_hi)), _mm512_set1_ps(scale_r));
+                __m512 fr0 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_lo)), _mm512_set1_ps(scale_r)));
+                __m512 fr1 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_hi)), _mm512_set1_ps(scale_r)));
 
                 // Load and dequant delta (Q8_1: int8 → FP32)
                 __m128i qd_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_d.qs));
                 __m128i qd_bytes_hi = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_d.qs + 16));
                 __m512i qd_lo = _mm512_cvtepi8_epi32(qd_bytes);
                 __m512i qd_hi = _mm512_cvtepi8_epi32(qd_bytes_hi);
-                __m512 fd0 = _mm512_mul_ps(_mm512_cvtepi32_ps(qd_lo), _mm512_set1_ps(scale_d));
-                __m512 fd1 = _mm512_mul_ps(_mm512_cvtepi32_ps(qd_hi), _mm512_set1_ps(scale_d));
+                __m512 fd0 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(qd_lo), _mm512_set1_ps(scale_d)));
+                __m512 fd1 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(qd_hi), _mm512_set1_ps(scale_d)));
 
                 // Add
                 __m512 sum0 = _mm512_add_ps(fr0, fd0);
