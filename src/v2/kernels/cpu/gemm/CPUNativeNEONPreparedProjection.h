@@ -31,6 +31,8 @@ namespace llaminar2::cpu::native_quantised
 #define LLAMINAR_NEON_PROJECTION_EXACT
 #endif
 
+    class CPUNativeNEONProjectionBatch;
+
     /** @brief Closed synchronous binding for up to four independently accumulated rows.
      * @tparam Rows Physical row tile in [1,4], independent of logical request depth.
      */
@@ -157,17 +159,6 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /**
-         * @brief Execute an admitted family inside a worker team.
-         * @tparam Instruction Family whose CPU features the caller has already admitted.
-         * @details No check can fail here: publication, policy, encoding and
-         * geometry were admitted before the team, and metadata by the seal.
-         */
-        template <Dot Instruction> void executeAdmitted() const noexcept
-        {
-            executeWithAdmitted<multi_scale::NEONMultiScaleOps<leafInstruction<Instruction>()>>();
-        }
-
-        /**
          * @brief Resolve the exact leaf instruction family one tile executes.
          * @tparam Instruction Admitted family requested for the whole projection.
          * @return The requested family, except that a lone I8MM row is the SDOT leaf.
@@ -177,6 +168,23 @@ namespace llaminar2::cpu::native_quantised
          */
         template <Dot Instruction> static constexpr Dot leafInstruction() noexcept
         { return Instruction == Dot::I8MM && Rows == 1 ? Dot::DotProd : Instruction; }
+
+    private:
+        // Only the batch binding, which admits CPU features, publication,
+        // policy, K tree and every task's spans before forming a team, may build
+        // and run tiles without per-task checks.
+        friend class CPUNativeNEONProjectionBatch;
+
+        /**
+         * @brief Execute an admitted family inside a worker team.
+         * @tparam Instruction Family whose CPU features the caller has already admitted.
+         * @details No check can fail here: publication, policy, encoding and
+         * geometry were admitted before the team, and metadata by the seal.
+         */
+        template <Dot Instruction> void executeAdmitted() const noexcept
+        {
+            executeWithAdmitted<multi_scale::NEONMultiScaleOps<leafInstruction<Instruction>()>>();
+        }
 
         /**
          * @brief Construct a tile whose publication and geometry an enclosing binding admitted.
@@ -194,7 +202,6 @@ namespace llaminar2::cpu::native_quantised
                 std::min(64, weights.N - chunk * 64), partitionsFor(weights));
         }
 
-    private:
         /** @return Canonical arithmetic partition count; zero for an invalid expert K tree. */
         static constexpr int partitionsFor(const CPUNativeQuantisedWeightView &weights) noexcept
         {
