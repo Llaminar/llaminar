@@ -208,3 +208,16 @@ After i8mm merge (same tile / post-merge):
   OR deprioritize; (b) idea 31 S=4 spillfixes (GNU/Spark side: NibbleLUT
   spills + Q5_K minimum epilogue); (c) FP16 fmlalq emission check; (d) future
   perf ideas route here (13/16/22 etc. as the operator directs).
+| 32 | NEON serial/grouped NaN-precedence witness | `32-neon-nan-precedence-witness.md` | Open (Main follow-up; not a blocker) |
+
+## Tip f69446e3c (2026-11-09, Main) — base fixes in
+
+- (a) qwen4exp_device_primitives CUDA branch guarded on TARGET (CUDA Release
+  + tests ON configure OK @sm_121); (b) UnsignedWeightDotLifecycle AVX2/AVX512
+  witness __AVX2__-only + the x86 planner assertions (plan.projections /
+  nativeQuantisedUsesKPartitions) x86-only. Full aarch64 Integration tree
+  builds on Mac (exit 0); fused-completion + unsigned-dot NEON cells pass.
+  LESSON (recorded): routine base rebase with NEW test code in shared files
+  needs a FULL ARM COMPILE; configure+policy tests insufficient (matches the
+  no-regate nuance entry). research/gdn_leaf_elimination __m256 = not
+  CMake-built; left (Main). Arm tip = f69446e3c (151 commits @ 07d4f2085).
