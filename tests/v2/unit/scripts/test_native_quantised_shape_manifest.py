@@ -987,6 +987,7 @@ class NativeQuantisedShapeManifestTest(unittest.TestCase):
         }
         expected_shared_targets = {
             "v2_perf_cpu_native_quantised_gemv",
+            "v2_perf_cpu_native_neon_exact_overlay",
             "v2_test_native_quantised_shape_manifest_projection",
             "v2_perf_cuda_native_quantised_decode_trainer",
             "v2_perf_cuda_native_quantised_gemm",
