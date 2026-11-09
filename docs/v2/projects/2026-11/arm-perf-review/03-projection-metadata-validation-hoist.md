@@ -145,3 +145,9 @@ separate (shared) path with the same pattern but different owners.
 - 4 'outside-diff' BUILD failures = classes fixed by Main's 302318f1e (branch
   predates it) → LANE REBASES onto 302318f1e before final R1 close.
 - Reviewer SOURCE111 recheck requested on e0d2a0fd3.
+
+- R1 REBASED onto 302318f1e (no conflicts), tip **b645ca7d1** (force-pushed).
+  SOURCE111 recheck = b645ca7d1. .80 close run restarted at b645ca7d1
+  (incremental; Unit/preflight/focused incl. full MoEOverlay/MoEPipeline).
+  Perf window (b): base = 302318f1e (confirmed) — IQ3_S/IQ4_XS gemv threads
+  1/10/20, M=1+4/15, 3 shapes ABBA; 35B decode MTP off/dyn ABBA saved plan.
