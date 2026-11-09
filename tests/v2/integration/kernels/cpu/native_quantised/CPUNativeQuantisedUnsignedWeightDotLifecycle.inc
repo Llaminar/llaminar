@@ -308,7 +308,18 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                 const size_t extent = size_t(max_rows) * stride + 17;
                 std::vector<Q8_1Block> input(size_t(max_rows) * packed.blocks_per_row);
                 std::array<std::vector<float>, 2> output, expected;
-                for (int bank = 0; bank < 2; ++bank)
+#if defined(__aarch64__)
+                // ARM kernels borrow only the resident publication; a deferred
+                // workspace pointer carries no bounded lease and is rejected.
+                {
+                    UnsignedDotBankScope binding(packed, workspace.data());
+                    EXPECT_THROW((void)packed.readView(), std::logic_error);
+                }
+                constexpr int bank_count = 1;
+#else
+                constexpr int bank_count = 2;
+#endif
+                for (int bank = 0; bank < bank_count; ++bank)
                 {
                     SCOPED_TRACE(bank);
                     UnsignedDotBankScope binding(packed, bank == 0 ? nullptr : workspace.data());
