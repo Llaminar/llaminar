@@ -173,3 +173,18 @@ another schedule heuristic.
   idea 06 NOT triggered by this cell; I8MM stays for Q6_K (better tail).
 - libgomp capacity spelling = colon form `{5:5},…` (range-inside-braces
   rejected).
+
+## DGX station CPU test (2026-11-09, operator-authorized)
+
+- Hardware: NVIDIA GB300 (sm_103) + Grace aarch64, driver 595.99.02, CUDA
+  13.2.51, no ROCm; temporary eval unit, GPU in use (GLM-5.3-Flash staging)
+  → CPU-ONLY test only. Latest pushed = 39c24d8b4 (ideas FF landed).
+- OWNER SAFETY RULES for station runs (from the dgx-station brain):
+  LLAMINAR_SHARED_CORE=ON MANDATORY (avoids ~850MB/test-binary, 400G-tree
+  failure mode), exclude FetchModelsFixture from ctest (never fetch models),
+  BOUNDED parallelism while GLM inference runs (no unrestricted -j), no
+  service installs/networking changes, tooling provisioning = operator's.
+- Status: task dispatched to the DGX worker (bi-directional intercom now
+  qualified); worker blocked on ninja/ccache provisioning (operator-side).
+  GW: build (Integration, CPU-only) + Unit + model-free Preflight +
+  cpuinfo (I8MM/SMMLA? SVE2?) + optional local-GGUF smoke.
