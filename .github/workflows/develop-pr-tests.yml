@@ -33,6 +33,12 @@ jobs:
           submodules: false
           lfs: false
           persist-credentials: false
+      - name: Disable crash collection for expected-fatal test cases
+        # This kernel belongs to the disposable Actions VM. Piped collectors
+        # ignore RLIMIT_CORE=0 and can stall hundreds of intentional traps.
+        # A non-piped, unwritable core target preserves signals and watchdogs.
+        shell: bash
+        run: sudo sysctl -w kernel.core_pattern=/dev/null
       - name: Admit the requested CPU ISA before toolchain preparation
         shell: bash
         env:

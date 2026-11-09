@@ -65,6 +65,12 @@ workflow reference while the default checkout still tests the caller's PR
 merge ref. Both workflows grant only Contents read access and pass no secrets.
 The called job admits only same-repository pull requests targeting `develop`.
 
+Both cloud workflows disable core collection on their disposable Ubuntu VMs
+with `kernel.core_pattern=/dev/null`. Native proof death tests retain their fatal
+signals and ordinary watchdogs. Piped crash collectors ignore `RLIMIT_CORE=0`
+and otherwise add unrelated host work to every expected trap. This setup also
+applies to dependency proofs during cold toolchain preparation.
+
 The PR test job uses the same 16-core GitHub-hosted runner pool as develop publication.
 Each PR has its own `llaminar-cloud-develop-pr-<number>` concurrency group with
 `cancel-in-progress: true`: separate PRs can run concurrently, while new commits

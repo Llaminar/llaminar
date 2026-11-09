@@ -351,7 +351,7 @@ class DevelopImageGateTests(unittest.TestCase):
         for key, value in {"driver": "docker-container", "cache-binary": "false"}.items():
             self.assertEqual(buildx["with"][key], value)
         commands = [step["run"] for step in steps if "run" in step]
-        self.assertEqual(len(commands), 2)
+        self.assertEqual(len(commands), 3)
         self.assertNotIn("keep-state", buildx["with"])
         self.assertNotIn("cleanup", buildx["with"])
         build_step = next(step for step in steps if "exec python3" in step.get("run", ""))
