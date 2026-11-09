@@ -18,6 +18,7 @@
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include <map>
 #include <tuple>
+#include <sstream>
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/Q8ResidualAllFormatOracle.h"
 #include "../../utils/Qwen4ExpFAOutputStageFixture.h"
@@ -33,6 +34,11 @@
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
+#ifdef HAVE_ROCM
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"
+#include "utils/DebugEnv.h"
+#endif
 #include "tensors/Tensors.h"
 #include "transfer/TransferEngine.h"
 #include "../../utils/PreparedWeightTestHarness.h"
@@ -1117,6 +1123,8 @@ void proveHC103CapturedStorageOwnership(DeviceId device) {
  }).get();
 }
 
+#include "NativeQ8SmallNTileProbe.inc"
+
 /** @brief Calibrate grouped rows, real HC shape and exact alias before extraction. */
 void proveHC103Backend(DeviceId device) {
  for(int m:{1,3,9,17,33,513})for(bool alias:{false,true})proveHC103Control(device,m,8,32,alias);
@@ -1217,5 +1225,59 @@ TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHC103CandidateM1PairedChainEvents) 
 /** @test Opt-in one-shape actual builder/frozen-original complete-chain native events. */
 TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHC103CandidateM512PairedChainEvents) {
  proveHC103Chain(DeviceId::rocm(0),512,2560,320,false,HC103Path::Typed,HC103Observation::Paired);
+}
+#endif
+
+#ifdef HAVE_ROCM
+/** @test Original prepared shared-gate geometry retains bytes across both tiles and448/64 reset histories. */
+TEST(Q8ResidualCorrectionDevice,ROCmNativeQ8N320TileByteResetK2560) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),2560);
+}
+/** @test Original prepared HC-down geometry retains bytes across both tiles and448/64 reset histories. */
+TEST(Q8ResidualCorrectionDevice,ROCmNativeQ8N320TileByteResetK10240) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),10240);
+}
+/** @test Opt-in paired events for one exact prepared source/M; no production policy selection. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M64K2560TileEvents) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),2560,64);
+}
+/** @test Opt-in paired events for one exact prepared source/M; no production policy selection. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M64K10240TileEvents) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),10240,64);
+}
+/** @test Opt-in paired events for one exact prepared source/M; no production policy selection. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M448K2560TileEvents) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),2560,448);
+}
+/** @test Opt-in paired events for one exact prepared source/M; no production policy selection. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M448K10240TileEvents) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),10240,448);
+}
+#endif
+
+#ifdef HAVE_ROCM
+/** @test The single NT64/MT16 candidate matches original Auto through dirty448/64 storage reuse. */
+TEST(Q8ResidualCorrectionDevice,ROCmNativeQ8N320RowTileByteResetK2560) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),2560,0,NativeQ8TileComparison::Rows);
+}
+/** @test HC-down retains original source/workspace bytes with the single new row tile. */
+TEST(Q8ResidualCorrectionDevice,ROCmNativeQ8N320RowTileByteResetK10240) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),10240,0,NativeQ8TileComparison::Rows);
+}
+/** @test One original source/M with balanced isolated MT32/MT16 graph event pairs. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M64K2560RowTileEvents) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),2560,64,NativeQ8TileComparison::Rows);
+}
+/** @test One original source/M with balanced isolated MT32/MT16 graph event pairs. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M64K10240RowTileEvents) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),10240,64,NativeQ8TileComparison::Rows);
+}
+/** @test One original source/M with balanced isolated MT32/MT16 graph event pairs. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M448K2560RowTileEvents) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),2560,448,NativeQ8TileComparison::Rows);
+}
+/** @test One original source/M with balanced isolated MT32/MT16 graph event pairs. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M448K10240RowTileEvents) {
+ proveNativeQ8SmallNTiles(DeviceId::rocm(0),10240,448,NativeQ8TileComparison::Rows);
 }
 #endif

@@ -933,12 +933,29 @@ if(HAVE_CUDA OR HAVE_ROCM)
         integration/kernels/qwen4exp/Test__Qwen4ExpAuxiliaryAdmission.cpp
         integration/kernels/qwen4exp/Test__DiagnosticSnapshotCopy.cpp
         integration/kernels/qwen4exp/Test__QwenSparseDeviceStages.cpp)
+    # This owner includes shared utils/ and fixtures/ by their test-root paths.
+    # Keep that source contract private to the original C++/HIP target.
+    target_include_directories(v2_test_qwen4exp_device_primitives PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(v2_test_qwen4exp_device_primitives PRIVATE llaminar2_core GTest::gtest_main)
+    # These helpers implement declarations used by the original always-built
+    # owner. Source closure must not depend on optional test registration mode.
+    if(HAVE_CUDA)
+        target_sources(v2_test_qwen4exp_device_primitives PRIVATE
+            integration/kernels/qwen4exp/CUDAHC103Original.cu
+            integration/kernels/qwen4exp/PooledACKReadyCancellationCUDA.cu)
+        set_target_properties(v2_test_qwen4exp_device_primitives PROPERTIES
+            CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    endif()
     if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
-        set_source_files_properties(integration/kernels/qwen4exp/ROCmOriginalBranchRMSNormOracle.hip
+        set_source_files_properties(
+            integration/kernels/qwen4exp/ROCmOriginalBranchRMSNormOracle.hip
+            integration/kernels/qwen4exp/ROCmHC103Original.hip
+            integration/kernels/qwen4exp/PooledACKReadyCancellationROCm.hip
             PROPERTIES LANGUAGE HIP)
         target_sources(v2_test_qwen4exp_device_primitives PRIVATE
-            integration/kernels/qwen4exp/ROCmOriginalBranchRMSNormOracle.hip)
+            integration/kernels/qwen4exp/ROCmOriginalBranchRMSNormOracle.hip
+            integration/kernels/qwen4exp/ROCmHC103Original.hip
+            integration/kernels/qwen4exp/PooledACKReadyCancellationROCm.hip)
         target_link_libraries(v2_test_qwen4exp_device_primitives PRIVATE hip::host ${CMAKE_DL_LIBS})
         set_target_properties(v2_test_qwen4exp_device_primitives PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
@@ -10096,6 +10113,19 @@ if(HAVE_CUDA OR HAVE_ROCM)
         MPI_PROCS 1
         TIMEOUT 60
         NO_MODELS)
+
+    # Exact QFN ingress samples keep ready payload timing separate from CPU wait.
+    foreach(_ticket_vendor CUDA ROCm)
+        if((_ticket_vendor STREQUAL "CUDA" AND NOT HAVE_CUDA) OR
+           (_ticket_vendor STREQUAL "ROCm" AND NOT HAVE_ROCM))
+            continue()
+        endif()
+        add_v2_test(V2_Perf_CanonicalRouteTicketQFN_${_ticket_vendor}
+            COMMAND $<TARGET_FILE:v2_perf_background_mapped_copy>
+                --gtest_filter=ReadyPayload/CanonicalRouteTicketEconomy.${_ticket_vendor}/QFN*
+            LABELS "V2;Performance;${_ticket_vendor};TransferEngine;MappedHost;ExpertOverlay;QFN"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+    endforeach()
 
     # Explicit scheduling experiment, not an installed route policy or preflight gate.
     add_executable(v2_perf_canonical_route_row_partition
@@ -23034,7 +23064,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
                 --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.CPUCanonicalRouteTicketReusesSafelyOnCUDA
                 --gtest_brief=1
-        LABELS "V2;Integration;ExpertOverlay;CUDA;MappedHost;GraphCapture;TicketProtocol;TypedLifecycle;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ExpertOverlay;CUDA;MappedHost;GraphCapture;TicketProtocol;TypedLifecycle;Regression"
         MPI_PROCS 1
         TIMEOUT 30
         NO_MODELS
@@ -23051,7 +23081,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
                 --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.CPUCanonicalRouteTicketReusesSafelyOnROCm
                 --gtest_brief=1
-        LABELS "V2;Integration;ExpertOverlay;ROCm;MappedHost;GraphCapture;TicketProtocol;TypedLifecycle;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ExpertOverlay;ROCm;MappedHost;GraphCapture;TicketProtocol;TypedLifecycle;Regression"
         MPI_PROCS 1
         TIMEOUT 30
         NO_MODELS
@@ -32396,17 +32426,6 @@ set_tests_properties(V2_Integration_Qwen4ExpGPUAdaptiveArtifactNames PROPERTIES
     TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpGPUAdaptiveArtifactNames)
 
-# Native cancellation fixture edits the actual pooled authorization frontier before instantiation.
-if(HAVE_CUDA)
-    target_sources(v2_test_qwen4exp_device_primitives PRIVATE
-        integration/kernels/qwen4exp/PooledACKReadyCancellationCUDA.cu)
-endif()
-if(HAVE_ROCM)
-    set_source_files_properties(integration/kernels/qwen4exp/PooledACKReadyCancellationROCm.hip PROPERTIES LANGUAGE HIP)
-    target_sources(v2_test_qwen4exp_device_primitives PRIVATE
-        integration/kernels/qwen4exp/PooledACKReadyCancellationROCm.hip)
-endif()
-
 # Linux POSIX interposition is deliberately confined to this one executable.
 # Do not append its TU to any existing shared/multi-suite target or preload it.
 add_executable(v2_test_retained_ticket_worker_construction
@@ -35602,19 +35621,9 @@ foreach(V2_HC103_BACKEND CUDA ROCm)
     if((V2_HC103_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR
        (V2_HC103_BACKEND STREQUAL "ROCm" AND HAVE_ROCM))
         if(V2_HC103_BACKEND STREQUAL "CUDA")
-            set(V2_HC103_ORACLE integration/kernels/qwen4exp/CUDAHC103Original.cu)
-            set(V2_HC103_LANGUAGE CUDA)
             set(V2_HC103_ENV "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
         else()
-            set(V2_HC103_ORACLE integration/kernels/qwen4exp/ROCmHC103Original.hip)
-            set(V2_HC103_LANGUAGE HIP)
             set(V2_HC103_ENV "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
-        endif()
-        set_source_files_properties(${V2_HC103_ORACLE} PROPERTIES LANGUAGE ${V2_HC103_LANGUAGE})
-        if(TARGET v2_test_qwen4exp_device_primitives)
-            target_sources(v2_test_qwen4exp_device_primitives PRIVATE ${V2_HC103_ORACLE})
-            set_target_properties(v2_test_qwen4exp_device_primitives PROPERTIES
-                ${V2_HC103_LANGUAGE}_STANDARD 20 ${V2_HC103_LANGUAGE}_STANDARD_REQUIRED ON)
         endif()
         foreach(V2_HC103_CASE OriginalControlChain OriginalAllFormats CapturedStorageOwnership TypedBuilderChain TypedAllFormats)
             add_v2_test(V2_Integration_${V2_HC103_BACKEND}_HC103${V2_HC103_CASE}
@@ -36705,6 +36714,17 @@ if(NOT V2_PERF_TESTS_ONLY)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayPublicationWaitPhase)
+endif()
+
+# Native canonical ingress owns exact-width reuse/progress on both backends.
+# This append follows the main set(), so explicit suite membership survives.
+if(TARGET v2_integration_mapped_activation_packet_cuda_rocm)
+    foreach(_canonical_ticket_vendor CUDA ROCm)
+        if(TEST V2_Integration_CanonicalRouteTicketAckRace_${_canonical_ticket_vendor})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_CanonicalRouteTicketAckRace_${_canonical_ticket_vendor})
+        endif()
+    endforeach()
 endif()
 
 # These CPU aliases are declared above the main preflight inventory. Append
@@ -39146,4 +39166,55 @@ if(Python3_Interpreter_FOUND)
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Resources;ProcessOwnership;Replay;Regression"
         TIMEOUT 15)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OwnedProcessExitMMReplay)
+endif()
+
+# One existing prepared Q8 producer, two existing physical column tiles.
+# Native correctness is explicit preflight; paired events are opt-in only.
+if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
+    foreach(V2_NATIVE_Q8_TILE_K 2560 10240)
+        set(V2_NATIVE_Q8_TILE_ALIAS V2_Integration_ROCmNativeQ8N320TileByteResetK${V2_NATIVE_Q8_TILE_K})
+        add_v2_test(${V2_NATIVE_Q8_TILE_ALIAS}
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=Q8ResidualCorrectionDevice.ROCmNativeQ8N320TileByteResetK${V2_NATIVE_Q8_TILE_K}
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;Capture;ByteExact;Lifecycle;Regression"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        if(TEST ${V2_NATIVE_Q8_TILE_ALIAS})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_NATIVE_Q8_TILE_ALIAS})
+        endif()
+        foreach(V2_NATIVE_Q8_TILE_M 64 448)
+            add_v2_test(V2_Perf_ROCmNativeQ8N320M${V2_NATIVE_Q8_TILE_M}K${V2_NATIVE_Q8_TILE_K}TileEvents
+                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_also_run_disabled_tests
+                    --gtest_filter=Q8ResidualCorrectionDevice.DISABLED_ROCmNativeQ8N320M${V2_NATIVE_Q8_TILE_M}K${V2_NATIVE_Q8_TILE_K}TileEvents
+                LABELS "V2;Performance;ROCm;NativeQuantised;ComponentTiming"
+                ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        endforeach()
+    endforeach()
+endif()
+
+# Single existing NT64/MT16 candidate against NT64/MT32; original tile aliases stay intact.
+if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
+    foreach(V2_NATIVE_Q8_ROW_TILE_K 2560 10240)
+        set(V2_NATIVE_Q8_ROW_TILE_ALIAS V2_Integration_ROCmNativeQ8N320RowTileByteResetK${V2_NATIVE_Q8_ROW_TILE_K})
+        add_v2_test(${V2_NATIVE_Q8_ROW_TILE_ALIAS}
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=Q8ResidualCorrectionDevice.ROCmNativeQ8N320RowTileByteResetK${V2_NATIVE_Q8_ROW_TILE_K}
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;Capture;ByteExact;Lifecycle;Regression"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        if(TEST ${V2_NATIVE_Q8_ROW_TILE_ALIAS})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_NATIVE_Q8_ROW_TILE_ALIAS})
+        endif()
+        foreach(V2_NATIVE_Q8_ROW_TILE_M 64 448)
+            add_v2_test(V2_Perf_ROCmNativeQ8N320M${V2_NATIVE_Q8_ROW_TILE_M}K${V2_NATIVE_Q8_ROW_TILE_K}RowTileEvents
+                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_also_run_disabled_tests
+                    --gtest_filter=Q8ResidualCorrectionDevice.DISABLED_ROCmNativeQ8N320M${V2_NATIVE_Q8_ROW_TILE_M}K${V2_NATIVE_Q8_ROW_TILE_K}RowTileEvents
+                LABELS "V2;Performance;ROCm;NativeQuantised;ComponentTiming"
+                ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        endforeach()
+    endforeach()
 endif()

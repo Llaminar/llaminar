@@ -1,5 +1,7 @@
 /**
  * @file Perf__BackgroundMappedCopy.cpp
+ * Canonical-ticket cases carry exact width and native endpoint identity;
+ * ready-payload event timing stays separate from held-publication lifecycle proof.
  * @brief Production background-copy, retained ticket and sparse return economy.
  *
  * Persistent storage, function preparation and warmup precede event timing.
@@ -7,7 +9,14 @@
  * progress path is the public background-transfer API, not a benchmark kernel.
  * This performance suite deliberately does not belong to parity preflight.
  */
+#include <cstdint>
 #include <gtest/gtest.h>
+#ifdef HAVE_CUDA
+#include "backends/cuda/CUDAHardwareMetadata.h"
+#endif
+#ifdef HAVE_ROCM
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#endif
 
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -461,6 +470,7 @@ namespace
         std::size_t capacity; ///< Route bank embedded in the retained graph.
         std::size_t live_routes; ///< Actual routes published by the CPU.
         const char *name; ///< Exact geometry for isolated profiler launches.
+        int d_model = 3072; ///< Exact row width; existing geometries retain their original3072.
     };
 
     /**
@@ -480,6 +490,22 @@ namespace
         if (backend->deviceCount() <= device.gpu_ordinal()) GTEST_SKIP();
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         context.submitAndWait([&] {
+#ifdef HAVE_CUDA
+            if (device.is_cuda())
+            {
+                const auto &hardware = cudaHardwareMetadata().at(device.ordinal);
+                std::printf("TICKET_DEVICE,%s,pci=%s,isa=sm%d%d,scope=cached_native_metadata\n",
+                    device.toString().c_str(), hardware.pci_address.c_str(), hardware.sm_major, hardware.sm_minor);
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (device.is_rocm())
+            {
+                const auto &hardware = rocmHardwareMetadata().at(device.ordinal);
+                std::printf("TICKET_DEVICE,%s,pci=%s,isa=%s,scope=cached_native_metadata\n",
+                    device.toString().c_str(), hardware.pci_address.c_str(), hardware.isa_target.c_str());
+            }
+#endif
             void *stream = context.getOrCreateAuxiliaryStream("canonical_ticket_economy");
             void *start = context.createEvent(GPUEventPurpose::Timing);
             void *end = context.createEvent(GPUEventPurpose::Timing);
@@ -493,7 +519,8 @@ namespace
             std::unique_ptr<void, decltype(retire_events)> events(&context, retire_events);
             TransferEngine engine;
             const std::array devices{device};
-            constexpr int width = 3072;
+            const int width = geometry.d_model;
+            ASSERT_GT(width, 0);
             // A production MTP graph retains its maximum-depth capacity even
             // when the controller publishes only a few active verifier rows.
             const std::size_t routes = geometry.capacity;
@@ -564,11 +591,20 @@ namespace
                     if (sample >= 5u)
                         timings[sample - 5u] = context.eventElapsedTime(start, end);
                 }
+                // Preserve original event samples before median sorting. Raw
+                // output is outside timing and keeps native FP32 milliseconds
+                // losslessly in hex; readable microseconds are a presentation.
+                const auto raw_timings = timings;
+                for (std::size_t sample = 0; sample < raw_timings.size(); ++sample)
+                    std::printf("TICKET_SAMPLE,%s,%zu,%zu,%d,%zu,us=%.9g,event_ms_hex=%a\n",
+                        device.toString().c_str(), routes, live_routes, width, sample,
+                        static_cast<double>(raw_timings[sample]) * 1000.0,
+                        static_cast<double>(raw_timings[sample]));
                 std::sort(timings.begin(), timings.end());
                 const float median_ms = timings[timings.size() / 2u];
-                std::printf("TICKET_ECONOMY,%s,%zu,%zu,%.3f,%.3f\n",
+                std::printf("TICKET_ECONOMY,%s,%zu,%zu,%.3f,%.3f,width=%d,samples=%zu,scope=ready_captured_consumer\n",
                     device.toString().c_str(), routes, live_routes, median_ms * 1000.0,
-                    (live_routes * width * sizeof(float)) / (median_ms * 1e6));
+                    (live_routes * width * sizeof(float)) / (median_ms * 1e6), width, timings.size());
                 std::vector<float> actual(routes * width);
                 std::vector<float> expected(routes * width, 0.0f);
                 std::fill_n(expected.data(), live_routes * width, 0.125f);
@@ -1171,7 +1207,19 @@ namespace
             CanonicalTicketGeometry{128u, 32u, "SparseVerifier"},
             CanonicalTicketGeometry{512u, 512u, "Prefill"},
             CanonicalTicketGeometry{4096u, 512u, "SparsePrefill"},
-            CanonicalTicketGeometry{4800u, 4800u, "LargePrefill"}),
+            CanonicalTicketGeometry{4800u, 4800u, "LargePrefill"},
+            // Ticket capacity is capturedM*top10, not maximum arena storage.
+            // Generic visible ordinal0 remains unchanged. An explicit diagnostic
+            // visibility selection must be authenticated by cached PCI/ISA below.
+            CanonicalTicketGeometry{640u, 0u, "QFN64Empty", 2560},
+            CanonicalTicketGeometry{640u, 3u, "QFN64Live3", 2560},
+            CanonicalTicketGeometry{640u, 448u, "QFN64Live448", 2560},
+            CanonicalTicketGeometry{640u, 640u, "QFN64Full", 2560},
+            CanonicalTicketGeometry{4480u, 0u, "QFN448Empty", 2560},
+            CanonicalTicketGeometry{4480u, 3u, "QFN448Live3", 2560},
+            CanonicalTicketGeometry{4480u, 448u, "QFN448Live448", 2560},
+            CanonicalTicketGeometry{4480u, 3200u, "QFN448Live3200", 2560},
+            CanonicalTicketGeometry{4480u, 4480u, "QFN448Full", 2560}),
         [](const ::testing::TestParamInfo<CanonicalTicketGeometry> &info) {
             return info.param.name;
         });

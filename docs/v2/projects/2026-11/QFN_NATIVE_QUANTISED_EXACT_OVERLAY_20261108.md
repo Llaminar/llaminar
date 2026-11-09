@@ -987,9 +987,132 @@ measures one 512-token prefill after preparation and warmup. Root pure wait is
 the same critical interval and must not be added. Native Q8 GEMM contributes
 197.290 ms root interval union, and live CPU-ticket materialization 134.484 ms.
 The latter reads only live rows; no capacity-sized transfer defect is established.
-The next bounded GPU candidate is the existing N64 tile for N320 prepared-Q8
-projections at M448, qualified separately for HC K10240 and shared-FFN K2560.
-It reduces padded columns and increases independent blocks; neither performance
-nor byte equivalence of that selection has yet been measured. The general Q8
-variant sweep does not currently exercise this observed NativeCooperative
-producer, so an unrelated variant result cannot qualify it.
+The existing N64 tile for N320 prepared-Q8 projections is now measured separately
+for HC K10240 and shared-FFN K2560. The original prepared-weight factory and
+retained GEMMStage graphs exercise NativeCooperative, MT32/MB1/UG2 on the actual
+gfx906 at PCI 8c:00.0. Two native regressions pass twenty dirty large/small/reset
+histories, original weight bytes, output bytes and inactive guards. Four separate
+event cases each repeat byte checks, then collect 31 alternating candidate pairs.
+
+| Actual M / K | N64 median µs | N128 median µs | N128/N64 |
+|---|---:|---:|---:|
+| 448 / 2560 | 150.719 | 158.240 | 1.050 |
+| 448 / 10240 | 438.560 | 461.439 | 1.052 |
+| 64 / 2560 | 116.959 | 147.360 | 1.260 |
+| 64 / 10240 | 333.120 | 434.400 | 1.304 |
+
+Every pair favors N64, but M64 already uses it. These intervals include the
+original activation quantizer and projection; inputs are authored deterministic
+fixtures. The roughly 5% large-chunk component improvement does not establish a
+model gain, and no production dispatch is changed. Native function receipts
+report N64/N128 at 86/114 VGPRs, 12,800/21,504 LDS bytes and zero local storage.
+These are static resources, not measured occupancy. Evidence and raw pairs are
+at `/tmp/qfn-rocm-native-q8-small-n-r1122/`.
+
+Building this original owner in selected Release mode exposed missing test-root
+includes and four native helper translation units hidden under perf-only
+registration conditions. They now belong to the original target independently
+of registration mode; duplicate late attachments are removed. Compilation covers
+CUDA 80/86/89/90 and HIP gfx906/gfx1100 with spill guards. Native byte/reset gates also pass on gfx1100 at PCI 49:00.0;
+projection timing here qualifies only the selected MI50. The fixture also matches the captured function
+identity directly: HIP does not promise demangled display names. Both lifecycle
+regressions are explicitly registered in production preflight; the four timing
+cases remain opt-in. The general Q8 variant sweep still does not exercise this
+NativeCooperative producer, so unrelated variant records cannot qualify it.
+
+Closed prefill records also narrow the next CPU question without recollecting
+already-paid data. The r1118 follower's large chunk carries median 3206.5 routed
+rows, versus 519 in the authored FFN control. The retained r1115 JSON contains
+prefill histograms even though its text report omitted them: dominant gate/up
+row-weighted median M is 72, with 71.57% of row-events at M >= 32. These are
+marginal descriptor counts, not recoverable mixed route vectors or per-M time.
+The larger-row policy is unchanged by the later M3-only overlay. Full analysis
+is at `/tmp/qfn-cpu-current-prefill-shapes-next/`; it prevents extrapolating the
+small balanced fixture's speedup to the dominant model workload.
+
+### Prepared-Q8 row tile follow-up
+
+One further existing candidate, N64/MT16/MB1/UG2, improves both physical row
+counts without changing arithmetic or the original prepared Q8_0 planes. The
+same owner captures the true Auto oracle and both candidates, proves twenty
+dirty large/small/reset histories, then measures 31 alternating pairs:
+
+| Actual M / K | N64/MT32 median µs | N64/MT16 median µs | MT32/MT16 |
+|---|---:|---:|---:|
+| 448 / 2560 | 150.720 | 138.560 | 1.088 |
+| 448 / 10240 | 438.720 | 399.680 | 1.098 |
+| 64 / 2560 | 116.960 | 97.441 | 1.200 |
+| 64 / 10240 | 333.600 | 267.680 | 1.246 |
+
+Both row-tile byte/reset registrations pass on MI50 and 7900 XTX, and belong
+explicitly to production preflight. Timing cases remain opt-in. Evidence:
+`/tmp/qfn-rocm-native-q8-row-tile-r1123/`. These component results are not an
+installed policy or a model speedup. Native-family collection, isolated
+winner/baseline profiling, architecture-scoped exact emission and post-install
+Auto/model qualification are still required; expanded INT8 variant records
+cannot be relabeled as this native producer's measurements. No broader shape
+resweep is needed to finish those four selected cells.
+
+### Canonical CPU-ticket ingress: two independent HIP reads
+
+Original gfx906 materializer ISA serialized each scalar mapped load, wait and
+store before the next load. The local HIP loop now issues two independent
+scalar fresh reads before storing. It retains the original immutable ticket
+lease, exact live source/destination indices, acquire, per-route barrier and
+separate whole-grid acknowledgement. CUDA and the common copy helper remain
+unchanged. This is scheduling only: no arithmetic, precision, transport,
+allocation, launch-count or communication-extent change.
+
+The original native lifecycle fixture covers twenty generations with empty,
+sparse and full payloads, aborts, held publication, dirty destinations and
+retained capture. QFN H2560 capacities640/4480 are added alongside existing
+H67/3072; partial second-read/next-iteration widths257/513 have focused cases.
+The original ready-payload performance owner adds nine H2560 live-count cases
+with five warmups and fifty raw event samples each, emitted outside timing.
+The authored counts are not recorded model route vectors or MTP distribution.
+
+On MI50, baseline/candidate/baseline medians in microseconds are:
+
+| Capacity / live rows | Baseline A1 | Two reads | Baseline A2 |
+|---|---:|---:|---:|
+| 640 / 3 | 61.600 | 54.960 | 61.520 |
+| 4480 / 3 | 64.720 | 57.440 | 59.440 |
+| 640 / 640 | 527.040 | 527.520 | 528.240 |
+| 4480 / 4480 | 3467.517 | 3456.398 | 3456.157 |
+
+Small ready cases improve about8–12%; bulk transfer remains approximately
+13.2 GB/s. The same nine-case gfx1100 comparison improves the two live3 medians
+by about8–12% against the mean controls, while large transfers remain within
+about2% and show baseline lifetime variation. Empty cases do no payload work
+and do not establish a copy win.
+
+Both gfx906/gfx1100 ISA show two independent scalar reads before the first
+wait/store, zero spills and zero private memory. Candidate compiler resources
+are respectively17/18 VGPR and36/34 SGPR with wave64. Separate isolated gfx906
+profiling for exactly H2560/capacity640/live3 confirms unchanged median wave,
+VMEM-read/write and external-read-request counts. Native allocated VGPRs rise
+16→20; compiler and allocated counts are different measurements. Achieved
+occupancy is not available from the selected gfx906 counter inventory. Profiler
+durations are not used as canonical clocks. The complete CUDA80/86/89/90 and
+HIP gfx906/gfx1100 build retains mandatory spill guards.
+
+The matched Release model finishes at **280.307100 prefill /38.534730 decode**
+tok/s, versus279.867598 /38.707213: **+0.16% /−0.45%, effectively flat**. All768
+generated IDs, MTP work, normalized configuration and initial placement match.
+This remains the original 512-input/256-output, one-warmup/three-measurement
+workload on two MI50 continuation cards and two physical CPU socket ranks,
+context262144, dynamic MTP/balancing, RAM ngrams, local GPU caches and16/32GiB
+RAM/disk prefix budgets. No profiler/build competes with canonical timing.
+
+Driver observation reports205 snapshots and zero findings;219 passive resource
+samples show no increased maximum individual RSS or per-client VRAM. RSS peaks
+82.830 GB versus82.862 GB; client maxima are32.455/32.279 GB. Aliases are never
+summed, and these short observations are not a long-lived leak certificate.
+All processes retire. Metadata-only cleanup removes18 run-owned prefix files,
+727,912,507 bytes, without reading/hashing cache payloads.
+
+Evidence: `/tmp/qfn-canonical-ingress-two-scalar-r1123/` (frozen original core,
+raw A/C/A samples, ISA and isolated counters),
+`/tmp/qfn-canonical-ingress-model-r1124/` (matched model, resource and retirement
+receipts). The 500/40 target remains open. Full preflight remains explicitly
+outside this focused iteration.

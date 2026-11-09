@@ -5,6 +5,8 @@
  * This implementation is included by one CUDA and one HIP bridge translation
  * unit.  It contains no backend-role assumptions: every launch receives the
  * exact continuation/follower lane and logical participant chosen by planning.
+ * Canonical CPU-ticket ingress separately overlaps two scalar HIP mapped reads
+ * while retaining its exact publication lifetime and bit-preserving permutation.
  * Packet metadata uses a deterministic block scan that preserves original
  * row/router-slot order without serializing a whole prefill packet onto one GPU
  * thread. Bulk FP32 movement is parallel and remains ordered by the caller's
@@ -2634,10 +2636,34 @@ namespace llaminar2::moe_activation_packet_device
             {
                 const std::size_t source = static_cast<std::size_t>(compact_slot) * launch.d_model;
                 const std::size_t destination = static_cast<std::size_t>(original_slot) * launch.d_model;
+#if defined(__HIP_DEVICE_COMPILE__)
+                // This acquired ticket keeps both source columns immutable until
+                // the unchanged whole-grid acknowledgement. Issue two independent
+                // SCALAR fresh reads before their stores: the original gfx906
+                // loop waited/stored every scalar before issuing the next read.
+                // Keep this scheduling local; the shared helper's other packet
+                // consumers retain their qualified implementation/cache policy.
+                for (std::size_t column = threadIdx.x;
+                     column < static_cast<std::size_t>(launch.d_model);
+                     column += 2u * blockDim.x)
+                {
+                    const float first = loadPeerPublished(
+                        launch.compact_preweighted_contributions_fp32 + source + column);
+                    const std::size_t next = column + blockDim.x;
+                    float second{};
+                    if (next < static_cast<std::size_t>(launch.d_model))
+                        second = loadPeerPublished(
+                            launch.compact_preweighted_contributions_fp32 + source + next);
+                    launch.canonical_route_contributions_fp32[destination + column] = first;
+                    if (next < static_cast<std::size_t>(launch.d_model))
+                        launch.canonical_route_contributions_fp32[destination + next] = second;
+                }
+#else
                 copyPeerPublishedRow(
                     launch.compact_preweighted_contributions_fp32 + source,
                     launch.canonical_route_contributions_fp32 + destination,
                     launch.d_model);
+#endif
             }
             // Do not overwrite shared indices while another warp is still
             // using them; this also covers rejected rows and odd hidden widths.

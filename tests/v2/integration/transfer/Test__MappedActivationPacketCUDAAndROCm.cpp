@@ -1,5 +1,7 @@
 /**
  * @file Test__MappedActivationPacketCUDAAndROCm.cpp
+ * Canonical ticket lifecycle also covers actual QFN H2560 chunk capacities,
+ * preserving original twenty-generation dirty-tail and held-publication checks.
  * @brief Real-device sparse-payload proof for node-local ExpertOverlay epochs.
  *
  * The production node-local transport resolves one mapped packet lane for each
@@ -3809,6 +3811,8 @@ namespace
         std::int32_t d_model = 3072,
         TicketRoutePattern pattern = TicketRoutePattern::Full)
     {
+        SCOPED_TRACE(continuation_device.toString());
+        SCOPED_TRACE("capacity=" + std::to_string(route_capacity) + " width=" + std::to_string(d_model));
         /* Exercise both decode and prefill-sized grids at the real hidden
          * width. A publication-first eager launch cannot prove that a retained
          * waiting consumer leaves resources available to maintenance. */
@@ -4988,6 +4992,12 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
     runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 19u, 67);
     runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 128u, 3072, TicketRoutePattern::Varying);
     runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 19u, 67, TicketRoutePattern::Varying);
+    // Straddle both the second-read boundary and the next loop iteration.
+    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 19u, 257, TicketRoutePattern::Varying);
+    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 19u, 513, TicketRoutePattern::Varying);
+    // Actual QFN chunk contracts: H2560 and top10, retained M64/M448.
+    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 640u, 2560, TicketRoutePattern::Varying);
+    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 4480u, 2560, TicketRoutePattern::Varying);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
@@ -5005,6 +5015,13 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
     runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 19u, 67);
     runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 128u, 3072, TicketRoutePattern::Varying);
     runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 19u, 67, TicketRoutePattern::Varying);
+    // Straddle both the second-read boundary and the next loop iteration.
+    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 19u, 257, TicketRoutePattern::Varying);
+    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 19u, 513, TicketRoutePattern::Varying);
+    // Keep the original representative endpoint; diagnostic visibility binding
+    // is external and must retain the actual native hardware identity.
+    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 640u, 2560, TicketRoutePattern::Varying);
+    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 4480u, 2560, TicketRoutePattern::Varying);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
