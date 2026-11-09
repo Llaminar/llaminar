@@ -619,3 +619,19 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   NEONTileRegisters correctly absent on x86. Items:
   PartialChunkPaddingIsNormalizedForX86Readers + full Unit/preflight + 10
   Evidence shards; expected base set only.
+
+## 2026-11-09 — addon R1 rebased onto 425002104 (5d4e3716a)
+
+- Method = #43's: replay 302318f1e..ae090ec81 via /tmp/remap/vnni_map.py onto
+  f0100c898, then `rebase --onto 425002104 f0100c898`. Range-diff:
+  26/27 commits =; commit 1 (seal) one conflict (upstream secondary_word in
+  Perf__CPUNativeQuantised_GEMV.cpp — upstream kept + one-line delta);
+  NEW commit (visible): Itanium length prefixes not renamed by the token map
+  → witness failed CLOSED on the new base; 3 spellings fixed from real nm
+  (cpu16native_quantised, 26CPUNativeQuantisedEncoding,
+  28CPUNativeQuantisedWeightView) — 5 lines checker+test.
+- Owner evidence (Mac): AppleClang census 9/9 (0 single; grouped
+  1415/2003/2171; 0 mismatches, unchanged budget); E2E PASS176 + 12/12;
+  writer policy + negative pass; clang syntax = pre-existing failures only.
+- Pending: reviewer mechanical pass; .80 full gate (near-full rebuild, booked
+  with arm-sparks); WSL (4') at 5d4e3716a.
