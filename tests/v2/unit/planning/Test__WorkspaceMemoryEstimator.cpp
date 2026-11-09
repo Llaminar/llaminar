@@ -2602,3 +2602,42 @@ TEST(Test__WorkspaceMemoryEstimator, QFNWorkspaceAdmissionPreservesConventionalD
             WorkspaceMemoryEstimator::estimate(withoutQFNMainQueryMarker(profile), geometry));
     }
 }
+
+/**
+ * @test CPU participants price one shared set of RoPE angle planes; GPU keeps its publication ABI.
+ *
+ * The CPU extent is the largest graph invocation (batch x bucket rows, or the
+ * grouped verifier rows) at the physical head width, priced through the same
+ * contract the CPU RoPE kernel declares; estimate() adds this contribution.
+ */
+TEST(Test__WorkspaceMemoryEstimator, RoPEWorkspacePricesCPUAngleRowsAndGPUPublication)
+{
+    ModelMemoryProfile profile;
+    profile.n_layers = 1;
+    profile.head_dim = 128;
+    TensorSizeInfo query;
+    query.name = "blk.0.attn_q.weight";
+    query.layer_index = 0;
+    profile.tensors.push_back(query);
+
+    WorkspaceMemoryGeometry cpu;
+    cpu.device = DeviceId::cpu();
+    cpu.batch_size = 2;
+    cpu.resident_graph_rows = 64;
+    cpu.mtp_target_query_rows = 8;
+    cpu.first_layer = 0;
+    cpu.last_layer = 0;
+    EXPECT_EQ(WorkspaceMemoryEstimator::ropeWorkspaceBytes(profile, cpu),
+              cpu_rope_workspace::requirements({.graph_rows = 128, .head_dim = 128}).total_bytes_with_alignment());
+    cpu.mtp_target_query_rows = 200;
+    EXPECT_EQ(WorkspaceMemoryEstimator::ropeWorkspaceBytes(profile, cpu),
+              cpu_rope_workspace::requirements({.graph_rows = 200, .head_dim = 128}).total_bytes_with_alignment());
+
+    WorkspaceMemoryGeometry gpu = cpu;
+    gpu.device = DeviceId::cuda(0);
+    EXPECT_EQ(WorkspaceMemoryEstimator::ropeWorkspaceBytes(profile, gpu),
+              rope_workspace::requirements({.graph_rows = 64}).total_bytes_with_alignment());
+
+    profile.tensors.front().name = "blk.0.ssm_out.weight";
+    EXPECT_EQ(WorkspaceMemoryEstimator::ropeWorkspaceBytes(profile, cpu), 0u);
+}

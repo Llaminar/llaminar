@@ -5,8 +5,8 @@
  * This executable links the real RoPE translation unit. A memory-rounded pair
  * oracle checks native floating storage and bounded tails; actual production M1
  * calls certify grouped position/head scheduling without serial replay in the
- * optimized path. Memoized state is participant-thread-local, as in the CPU
- * kernel. No model graph, full factory or performance certificate is implied.
+ * optimized path. Angle planes are borrowed and shared by the calling team, as
+ * in the CPU kernel. No model graph, full factory or performance certificate is implied.
  */
 #include "kernels/cpu/primitives/NEONRoPEPrimitives.h"
 #include "kernels/cpu/primitives/NEONQuantizedRoPE.h"
@@ -14,6 +14,7 @@
 #include "tensors/SIMDHelpers.h"
 #include "utils/CPUFeatures.h"
 #include "utils/CPUExplicitRoundingOracle.h"
+#include "utils/RoPEAngleTestStorage.h"
 #include <gtest/gtest.h>
 #include <omp.h>
 #include <array>
@@ -103,34 +104,34 @@ template <typename T> void bytes(const std::vector<T> &actual, const std::vector
  * @param dim Complete original head width.
  * @param q_heads Query heads; @param k_heads Key heads.
  * @param position Absolute first position.
- * @param state Caller-thread-owned memoized angles.
+ * @param angles Angle planes for rows x dim/2 pairs, shared by the calling team.
  */
 template <nr::Storage Format> void full(nr::Word<Format> *q, nr::Word<Format> *k,
-    int rows, int dim, int q_heads, int k_heads, int position, primitives::RoPEPersistentState &state)
+    int rows, int dim, int q_heads, int k_heads, int position, const primitives::RoPEAngleRows &angles)
 {
     if constexpr (Format == nr::Storage::FP32)
-        primitives::apply_rope_vectorized(q, k, rows, dim, q_heads, k_heads, position, 10000.0f, &state);
+        primitives::apply_rope_vectorized(q, k, rows, dim, q_heads, k_heads, position, 10000.0f, angles);
     else if constexpr (Format == nr::Storage::Half)
-        primitives::apply_rope_fp16(q, k, rows, dim, q_heads, k_heads, position, 10000.0f, &state);
+        primitives::apply_rope_fp16(q, k, rows, dim, q_heads, k_heads, position, 10000.0f, angles);
     else
-        primitives::apply_rope_bf16(q, k, rows, dim, q_heads, k_heads, position, 10000.0f, &state);
+        primitives::apply_rope_bf16(q, k, rows, dim, q_heads, k_heads, position, 10000.0f, angles);
 }
 /** @brief Execute the actual grouped verifier API without compacting positions or heads.
  * @tparam Format Original retained storage.
  * @param q Query physical bank; @param k Key physical bank.
  * @param positions Original position words, including inactive rows.
  * @param rows Original physical M; @param dim Original head width.
- * @param state Caller-thread-owned memoized angle authority.
+ * @param angles Angle planes for rows x dim/2 pairs, shared by the calling team.
  */
 template <nr::Storage Format> void grouped(nr::Word<Format> *q, nr::Word<Format> *k,
-    const int *positions, int rows, int dim, primitives::RoPEPersistentState &state)
+    const int *positions, int rows, int dim, const primitives::RoPEAngleRows &angles)
 {
     if constexpr (Format == nr::Storage::FP32)
-        primitives::apply_rope_decode_equivalent_rows(q, k, positions, rows, dim, 0, 3, 1, 0, 10000.0f, &state);
+        primitives::apply_rope_decode_equivalent_rows(q, k, positions, rows, dim, 0, 3, 1, 0, 10000.0f, angles);
     else if constexpr (Format == nr::Storage::Half)
-        primitives::apply_rope_fp16_decode_equivalent_rows(q, k, positions, rows, dim, 3, 1, 0, 10000.0f, &state);
+        primitives::apply_rope_fp16_decode_equivalent_rows(q, k, positions, rows, dim, 3, 1, 0, 10000.0f, angles);
     else
-        primitives::apply_rope_bf16_decode_equivalent_rows(q, k, positions, rows, dim, 3, 1, 0, 10000.0f, &state);
+        primitives::apply_rope_bf16_decode_equivalent_rows(q, k, positions, rows, dim, 3, 1, 0, 10000.0f, angles);
 }
 
 /** @brief Exercise memory-rounded pairs across every native vector/storage fringe.
@@ -178,26 +179,24 @@ template <nr::Storage Format> void originalRows()
             auto query = data<Format>(std::size_t(rows) * 3 * dim, 13), key = data<Format>(std::size_t(rows) * dim, 71);
             auto expected_q = query, expected_k = key;
             std::vector<int> positions(rows);
-            primitives::RoPEPersistentState reference;
+            RoPEAngleTestStorage reference(1, dim / 2);
             for (int row = 0; row < rows; ++row)
             {
                 positions[row] = row % 7 == 2 ? -1 : (row % 3 == 0 ? 17231 : row % 3 == 1 ? 11 : 17231);
                 if (positions[row] >= 0)
                     full<Format>(expected_q.data() + std::size_t(row) * 3 * dim, expected_k.data() + std::size_t(row) * dim,
-                        1, dim, 3, 1, positions[row], reference);
+                        1, dim, 3, 1, positions[row], reference.view(1, dim / 2));
             }
             auto actual_q = query, actual_k = key;
-            primitives::RoPEPersistentState state;
+            RoPEAngleTestStorage storage(rows, dim / 2);
+            const auto angles = storage.view(rows, dim / 2);
             omp_set_num_threads(3);
-            grouped<Format>(actual_q.data(), actual_k.data(), positions.data(), rows, dim, state);
+            grouped<Format>(actual_q.data(), actual_k.data(), positions.data(), rows, dim, angles);
             bytes(actual_q, expected_q); bytes(actual_k, expected_k);
-            EXPECT_EQ(state.last_pos, reference.last_pos);
-            bytes(state.cos_curr, reference.cos_curr); bytes(state.sin_curr, reference.sin_curr);
             actual_q = query; actual_k = key;
 #pragma omp parallel num_threads(3)
             {
-                primitives::RoPEPersistentState participant_state;
-                grouped<Format>(actual_q.data(), actual_k.data(), positions.data(), rows, dim, participant_state);
+                grouped<Format>(actual_q.data(), actual_k.data(), positions.data(), rows, dim, angles);
             }
             bytes(actual_q, expected_q); bytes(actual_k, expected_k);
         }

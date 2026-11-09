@@ -5,7 +5,7 @@
  *
  * High-performance RoPE implementation with:
  * - AVX512/AVX2 vectorization (8-16× speedup)
- * - Persistent thread-local state for decode
+ * - Caller-borrowed angle planes; no thread-local or per-call angle storage
  * - Absolute-position angles independent of prefill and restore boundaries
  * - Inverse frequency caching
  * - One angle calculation shared by all heads at that position
@@ -16,30 +16,24 @@
 #include <vector>
 #include <cstddef>
 #include <cstdint>
+#include "RoPEAngleRows.h"
 #include "../../../tensors/BlockStructures.h" // For Q8_1Block
 
 namespace llaminar2::primitives
 {
 
     /**
-     * @brief Memoized absolute-position angles, never numerical execution history.
+     * @brief Compute one absolute position's angle row: the single CPU angle authority.
+     * @param inv_freq Immutable inverse frequencies; their count is the row width.
+     * @param position Absolute position, never a recurrence seed.
+     * @param cosine Receives inv_freq.size() cosines.
+     * @param sine Receives inv_freq.size() sines.
+     *
+     * angle = float(position) * inv_freq[i], then separate std::cos and std::sin.
+     * Serial, decode, verifier-row and prefill paths all fill rows through this
+     * function, so their angles are byte-identical by construction.
      */
-    struct RoPEPersistentState
-    {
-        int cached_head_dim = -1;
-        float cached_freq_base = -1.0f;
-        int last_pos = -1;
-        std::vector<float> cos_curr;
-        std::vector<float> sin_curr;
-
-        /** @brief Invalidate the cached position while preserving geometry identity. */
-        void reset()
-        {
-            last_pos = -1;
-            cos_curr.clear();
-            sin_curr.clear();
-        }
-    };
+    void fill_rope_angle_row(const std::vector<float> &inv_freq, int position, float *cosine, float *sine);
 
     /**
      * @brief Apply RoPE to Q and K tensors (vectorized implementation)
@@ -54,14 +48,14 @@ namespace llaminar2::primitives
      * @param k_heads Number of key heads (may differ for GQA)
      * @param n_past Number of tokens already processed
      * @param freq_base Base frequency for RoPE (model-specific)
-     * @param persistent_state Optional persistent state for decode optimization
+     * @param angles Borrowed planes for seq_len x head_dim/2 pairs.
      */
     void apply_rope_vectorized(
         float *q, float *k,
         int seq_len, int head_dim,
         int q_heads, int k_heads,
         int n_past, float freq_base,
-        RoPEPersistentState *persistent_state = nullptr);
+        const RoPEAngleRows &angles);
 
     /**
      * @brief Apply partial RoPE to Q and K tensors
@@ -82,12 +76,14 @@ namespace llaminar2::primitives
      * @param k_heads Number of key heads
      * @param n_past Number of tokens already processed
      * @param freq_base Base frequency for RoPE
+     * @param angles Borrowed planes for seq_len x rotary_dim/2 pairs.
      */
     void apply_rope_partial(
         float *q, float *k,
         int seq_len, int head_dim, int rotary_dim,
         int q_heads, int k_heads,
-        int n_past, float freq_base);
+        int n_past, float freq_base,
+        const RoPEAngleRows &angles);
 
     /**
      * @brief Apply the MTP verifier RoPE contract for every supported row count.
@@ -108,8 +104,7 @@ namespace llaminar2::primitives
      * @param k_heads Number of key heads.
      * @param pos_offset Contiguous-position fallback when position_ids is null.
      * @param freq_base RoPE frequency base.
-     * @param persistent_state Required angle memoization owned by the kernel;
-     *                         its previous position never changes arithmetic.
+     * @param angles Borrowed planes for verifier_rows x rotary pairs.
      */
     void apply_rope_decode_equivalent_rows(
         float *q, float *k,
@@ -118,22 +113,7 @@ namespace llaminar2::primitives
         int head_dim, int rotary_dim,
         int q_heads, int k_heads,
         int pos_offset, float freq_base,
-        RoPEPersistentState *persistent_state);
-
-    /**
-     * @brief Update persistent state cache for a specific position
-     *
-     * Ensures that the sin/cos cache in the persistent state is valid for the target position.
-     * This is useful for kernels that need to access the cache directly (e.g. fused kernels).
-     *
-     * @param head_dim Dimension per head
-     * @param freq_base Base frequency for RoPE
-     * @param target_pos Target position index
-     * @param state Persistent state to update
-     */
-    void update_rope_cache(
-        int head_dim, float freq_base, int target_pos,
-        RoPEPersistentState &state);
+        const RoPEAngleRows &angles);
 
     /**
      * @brief Get cached inverse frequencies for (head_dim, freq_base)
@@ -155,14 +135,14 @@ namespace llaminar2::primitives
      * @param k_heads Number of key heads (may differ for GQA)
      * @param n_past Number of tokens already processed
      * @param freq_base Base frequency for RoPE (model-specific)
-     * @param persistent_state Optional persistent state for decode optimization
+     * @param angles Borrowed planes for seq_len x head_dim/2 pairs.
      */
     void apply_rope_bf16(
         uint16_t *q_bf16, uint16_t *k_bf16,
         int seq_len, int head_dim,
         int q_heads, int k_heads,
         int n_past, float freq_base,
-        RoPEPersistentState *persistent_state = nullptr);
+        const RoPEAngleRows &angles);
 
     /**
      * @brief Apply grouped BF16 verifier rows with serial-decode angle state.
@@ -181,7 +161,7 @@ namespace llaminar2::primitives
      * @param k_heads Number of key heads in each row.
      * @param pos_offset First contiguous position when position_ids is null.
      * @param freq_base Model RoPE frequency base.
-     * @param persistent_state Absolute-position angle memoization owned by the kernel.
+     * @param angles Borrowed planes for verifier_rows x head_dim/2 pairs.
      */
     void apply_rope_bf16_decode_equivalent_rows(
         uint16_t *q_bf16, uint16_t *k_bf16,
@@ -190,7 +170,7 @@ namespace llaminar2::primitives
         int head_dim,
         int q_heads, int k_heads,
         int pos_offset, float freq_base,
-        RoPEPersistentState *persistent_state);
+        const RoPEAngleRows &angles);
 
     /**
      * @brief Apply RoPE to Q and K tensors (native FP16 implementation)
@@ -206,14 +186,14 @@ namespace llaminar2::primitives
      * @param k_heads Number of key heads (may differ for GQA)
      * @param n_past Number of tokens already processed
      * @param freq_base Base frequency for RoPE (model-specific)
-     * @param persistent_state Optional persistent state for decode optimization
+     * @param angles Borrowed planes for seq_len x head_dim/2 pairs.
      */
     void apply_rope_fp16(
         uint16_t *q_fp16, uint16_t *k_fp16,
         int seq_len, int head_dim,
         int q_heads, int k_heads,
         int n_past, float freq_base,
-        RoPEPersistentState *persistent_state = nullptr);
+        const RoPEAngleRows &angles);
 
     /**
      * @brief Apply grouped FP16 verifier rows with serial-decode angle state.
@@ -232,7 +212,7 @@ namespace llaminar2::primitives
      * @param k_heads Number of key heads in each row.
      * @param pos_offset First contiguous position when position_ids is null.
      * @param freq_base Model RoPE frequency base.
-     * @param persistent_state Absolute-position angle memoization owned by the kernel.
+     * @param angles Borrowed planes for verifier_rows x head_dim/2 pairs.
      */
     void apply_rope_fp16_decode_equivalent_rows(
         uint16_t *q_fp16, uint16_t *k_fp16,
@@ -241,7 +221,7 @@ namespace llaminar2::primitives
         int head_dim,
         int q_heads, int k_heads,
         int pos_offset, float freq_base,
-        RoPEPersistentState *persistent_state);
+        const RoPEAngleRows &angles);
 
     /**
      * @brief Apply RoPE to Q and K tensors (INT32 not supported)
@@ -500,7 +480,7 @@ namespace llaminar2::primitives
      * @param n_kv_heads Number of key/value heads
      * @param head_dim Head dimension (must be divisible by 32)
      * @param rope_theta RoPE base frequency (e.g., 10000.0f)
-     * @param persistent_state Optional current-row angle memoization.
+     * @param angles Borrowed planes for seq_len x head_dim/2 pairs, including Q15 rows.
      * @param pos_offset Absolute first position when IDs are implicit.
      */
     void apply_rope_q8_1_integer(
@@ -512,7 +492,7 @@ namespace llaminar2::primitives
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        RoPEPersistentState *persistent_state = nullptr,
+        const RoPEAngleRows &angles,
         int pos_offset = 0);
 
     /**
@@ -532,7 +512,7 @@ namespace llaminar2::primitives
      * @param head_dim Logical values per head; must be Q8-block aligned.
      * @param pos_offset First contiguous position when position_ids is null.
      * @param rope_theta Model RoPE frequency base.
-     * @param persistent_state Absolute-position angle memoization owned by the kernel.
+     * @param angles Borrowed planes for verifier_rows x head_dim/2 pairs, including Q15 rows.
      */
     void apply_rope_q8_1_decode_equivalent_rows(
         Q8_1Block *Q,
@@ -544,7 +524,7 @@ namespace llaminar2::primitives
         int head_dim,
         int pos_offset,
         float rope_theta,
-        RoPEPersistentState *persistent_state);
+        const RoPEAngleRows &angles);
 
     /**
      * @brief Apply RoPE to Q8_1 input, output to FP32 (Hybrid mode)
@@ -654,7 +634,6 @@ namespace llaminar2::primitives
      * @param n_kv_heads Number of key/value heads
      * @param head_dim Head dimension (must be divisible by 32)
      * @param rope_theta RoPE base frequency (e.g., 10000.0f)
-     * @param persistent_state Optional persistent state for decode optimization
      */
     void apply_rope_q16_1_integer(
         Q16_1Block *Q,
@@ -664,8 +643,7 @@ namespace llaminar2::primitives
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        float rope_theta,
-        RoPEPersistentState *persistent_state = nullptr);
+        float rope_theta);
 
     // ============================================================================
     // Templated Q16 RoPE Primitives (Variable Block Size Support)
@@ -774,7 +752,6 @@ namespace llaminar2::primitives
      * @param n_kv_heads Number of key/value heads
      * @param head_dim Head dimension (must be divisible by BlockType::BLOCK_SIZE)
      * @param rope_theta RoPE base frequency (e.g., 10000.0f)
-     * @param persistent_state Optional persistent state for decode optimization
      * @param pos_offset Absolute first position when IDs are implicit.
      */
     template <typename BlockType>
@@ -787,7 +764,6 @@ namespace llaminar2::primitives
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        RoPEPersistentState *persistent_state = nullptr,
         int pos_offset = 0);
 
     /**
@@ -804,7 +780,6 @@ namespace llaminar2::primitives
      * @param n_kv_heads Number of key/value heads
      * @param head_dim Head dimension
      * @param rope_theta RoPE base frequency
-     * @param persistent_state Optional persistent state
      */
     void apply_rope_q16_integer_dispatch(
         void *Q,
@@ -815,8 +790,7 @@ namespace llaminar2::primitives
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        float rope_theta,
-        RoPEPersistentState *persistent_state = nullptr);
+        float rope_theta);
 
     // ============================================================================
     // Q8_1 → Q16_1 RoPE Primitives (HybridQ16 Mode)
