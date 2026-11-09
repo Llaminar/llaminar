@@ -463,3 +463,18 @@ the source policy). Dead persistent_state parameter removed.
   unrelated RMSNorm/GEMM catch-skip wrappers remain (not in scope).
   SOURCE COMPLETE. Remaining: WSL (5'') + handover (lane preparing doc) +
   N2/N3 (arm tip, independent).
+
+## (5') signal FINAL (2026-11-09) — 2 open preflight items
+
+- Build clean; Unit 948/966 (14 base + 4 flagged); Preflight 2341/2361
+  (16 base + 4 new); ThreadSweep PASS 86s; NEGCTL rc=1 ×4; focused 7/8.
+- COVERED by 0b32f8edd: QFNSelectedAttentionWorkspaceAdmission +
+  CUDABuilderProvisioning (same causes).
+- ❗ CPURoPEAngleWorkspaceLifecycle.SerialFamilyReusesOneBindingAcross
+  ResetAndReplay: 12 memcmp EXPECT fails (q/k vs serial ref; −192/−202/−223),
+  5/5; other 3 cases pass; includes grouped verifier −1 row + beffdbe13
+  negative-position change in area → lane owning production-vs-reference
+  analysis. ❗ ParityFixtureShardOwnership.EvidenceRequiresExactRetained
+  RunnerIdentity: SIGABRT double-free 9/9 at b199ccfa0, PASSES at
+  5d4e3716a/ae090ec81 → (5'') 912d0107 = direct control (attribution
+  verdict). No seal until both resolved.
