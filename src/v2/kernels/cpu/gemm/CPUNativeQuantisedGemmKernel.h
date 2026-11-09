@@ -508,7 +508,8 @@ namespace llaminar2::cpu::native_quantised
 
         /**
          * @brief Admit completely written slot bytes before their engine becomes reachable.
-         * @throws std::invalid_argument For reserved metadata bits; the engine stays unadmitted.
+         * @throws std::invalid_argument For reserved metadata bits in live columns; the engine stays unadmitted.
+         * @throws std::logic_error For a retired engine or storage that disagrees with its geometry.
          * @throws std::logic_error For a retired engine.
          * @details A current seal is left untouched, so republishing an unchanged
          * engine never writes state that concurrent readers observe.
@@ -518,7 +519,12 @@ namespace llaminar2::cpu::native_quantised
             if (!valid_)
                 throw std::logic_error("Retired CPU NativeQuantised engine cannot publish weights");
             if (!packed_.publicationSealed())
+            {
+                // The arrival wrote live columns only; the publisher defines the
+                // final chunk's padding in the same generation, then seals.
+                packed_.normalizePaddingMetadata();
                 packed_.sealPublication();
+            }
         }
 
         // -------------------------------------------------------------------
