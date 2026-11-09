@@ -48,6 +48,8 @@ namespace llaminar2::primitives
 
     namespace
     {
+        /// Process-lifetime table; entries are never erased, and unordered_map
+        /// nodes keep their addresses across rehashing.
         static std::unordered_map<uint64_t, std::vector<float>> g_inv_freq_cache;
         static std::mutex g_inv_freq_mutex;
 
@@ -57,35 +59,66 @@ namespace llaminar2::primitives
             std::memcpy(&freq_bits, &freq_base, sizeof(float));
             return ((uint64_t)head_dim << 32) | freq_bits;
         }
+
+        /**
+         * @brief Find or publish one geometry's inverse frequencies under the table lock.
+         * @param key Exact (head_dim, freq_base bits) identity.
+         * @param head_dim Rotary width.
+         * @param freq_base RoPE base.
+         * @return Immutable values with process lifetime.
+         */
+        const std::vector<float> &publish_inv_freq(uint64_t key, int head_dim, float freq_base)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_inv_freq_mutex);
+                auto it = g_inv_freq_cache.find(key);
+                if (it != g_inv_freq_cache.end())
+                {
+                    return it->second;
+                }
+            }
+
+            // Compute inverse frequencies
+            const int half_dim = head_dim / 2;
+            std::vector<float> inv_freq(half_dim);
+            const float log_base = std::log(freq_base);
+
+            for (int i = 0; i < half_dim; ++i)
+            {
+                float exponent = (2.0f * i) / head_dim;
+                inv_freq[i] = std::exp(-log_base * exponent);
+            }
+
+            std::lock_guard<std::mutex> lock(g_inv_freq_mutex);
+            auto res = g_inv_freq_cache.emplace(key, std::move(inv_freq));
+            return res.first->second;
+        }
     } // anonymous namespace
 
     const std::vector<float> &get_inv_freq_cached(int head_dim, float freq_base)
     {
-        uint64_t key = make_cache_key(head_dim, freq_base);
+        const uint64_t key = make_cache_key(head_dim, freq_base);
 
+        // Every RoPE call, and every worker of a retained team, asks for the same
+        // few model-constant geometries. A per-thread memo of published node
+        // addresses answers those hits without contending on the table lock.
+        struct Memo
         {
-            std::lock_guard<std::mutex> lock(g_inv_freq_mutex);
-            auto it = g_inv_freq_cache.find(key);
-            if (it != g_inv_freq_cache.end())
-            {
-                return it->second;
-            }
+            uint64_t key = 0;
+            const std::vector<float> *values = nullptr;
+        };
+        thread_local std::array<Memo, 8> memo{};
+        thread_local std::size_t next_slot = 0;
+        for (const Memo &entry : memo)
+        {
+            if (entry.values && entry.key == key)
+                return *entry.values;
         }
 
-        // Compute inverse frequencies
-        const int half_dim = head_dim / 2;
-        std::vector<float> inv_freq(half_dim);
-        const float log_base = std::log(freq_base);
-
-        for (int i = 0; i < half_dim; ++i)
-        {
-            float exponent = (2.0f * i) / head_dim;
-            inv_freq[i] = std::exp(-log_base * exponent);
-        }
-
-        std::lock_guard<std::mutex> lock(g_inv_freq_mutex);
-        auto res = g_inv_freq_cache.emplace(key, std::move(inv_freq));
-        return res.first->second;
+        const std::vector<float> &values = publish_inv_freq(key, head_dim, freq_base);
+        memo[next_slot] = Memo{key, &values};
+        next_slot = (next_slot + 1) % memo.size();
+        return values;
     }
 
     // ============================================================================
