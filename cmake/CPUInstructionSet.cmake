@@ -23,7 +23,7 @@ endfunction()
 
 # @brief Resolve an explicit ISA and reject incompatible target/ISA pairs.
 # @param processor Target processor, independent of the machine running CMake.
-# @param requested Case-insensitive ISA name (AVX512, AVX2, NEON or NEON_DOTPROD).
+# @param requested Case-insensitive ISA name (AVX512, AVX2, NEON, NEON_DOTPROD or NEON_I8MM).
 # @param flags_output Caller variable receiving space-separated compiler flags.
 # @param definitions_output Caller variable receiving compiled-ISA definitions.
 function(llaminar_cpu_instruction_set processor requested flags_output definitions_output)
@@ -34,17 +34,27 @@ function(llaminar_cpu_instruction_set processor requested flags_output definitio
         # AppleClang can otherwise auto-vectorize with apple-m1-only SDOT even
         # while its preprocessor advertises an ARMv8.0 envelope. Reset the CPU
         # model explicitly; optional instructions then come only from -march.
+        # NEON_I8MM adds exactly the Int8 matrix-multiply extension to the
+        # DotProd envelope. Keep the ARMv8.0 base: an ARMv8.2+ base would also
+        # enable LSE, RDMA and CRC, which no startup admission authenticates.
         if(isa STREQUAL "NEON")
             set(flags "-mcpu=generic -march=armv8-a+simd")
             set(dotprod 0)
+            set(i8mm 0)
         elseif(isa STREQUAL "NEON_DOTPROD")
             set(flags "-mcpu=generic -march=armv8-a+simd+dotprod")
             set(dotprod 1)
+            set(i8mm 0)
+        elseif(isa STREQUAL "NEON_I8MM")
+            set(flags "-mcpu=generic -march=armv8-a+simd+dotprod+i8mm")
+            set(dotprod 1)
+            set(i8mm 1)
         else()
-            message(FATAL_ERROR "CPU ISA '${requested}' is incompatible with AArch64 target '${processor}'; use NEON or NEON_DOTPROD")
+            message(FATAL_ERROR "CPU ISA '${requested}' is incompatible with AArch64 target '${processor}'; use NEON, NEON_DOTPROD or NEON_I8MM")
         endif()
         set(definitions LLAMINAR_COMPILED_WITH_AVX2=0 LLAMINAR_COMPILED_WITH_AVX512=0
-            LLAMINAR_COMPILED_WITH_NEON=1 LLAMINAR_COMPILED_WITH_NEON_DOTPROD=${dotprod})
+            LLAMINAR_COMPILED_WITH_NEON=1 LLAMINAR_COMPILED_WITH_NEON_DOTPROD=${dotprod}
+            LLAMINAR_COMPILED_WITH_NEON_I8MM=${i8mm})
     else()
         set(flags "-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt")
         if(isa STREQUAL "AVX512")
@@ -57,7 +67,7 @@ function(llaminar_cpu_instruction_set processor requested flags_output definitio
         endif()
         set(definitions LLAMINAR_COMPILED_WITH_AVX2=1
             LLAMINAR_COMPILED_WITH_AVX512=${avx512} LLAMINAR_COMPILED_WITH_NEON=0
-            LLAMINAR_COMPILED_WITH_NEON_DOTPROD=0)
+            LLAMINAR_COMPILED_WITH_NEON_DOTPROD=0 LLAMINAR_COMPILED_WITH_NEON_I8MM=0)
     endif()
     set(${flags_output} "${flags}" PARENT_SCOPE)
     set(${definitions_output} "${definitions}" PARENT_SCOPE)
@@ -78,8 +88,8 @@ macro(llaminar_configure_cpu_instruction_set)
     endif()
     llaminar_default_cpu_isa("${LLAMINAR_CPU_TARGET_PROCESSOR}" LLAMINAR_CPU_DEFAULT_ISA)
     set(LLAMINAR_CPU_ISA "${LLAMINAR_CPU_DEFAULT_ISA}" CACHE STRING
-        "CPU code-generation envelope: AVX512/AVX2 on x86-64, NEON/NEON_DOTPROD on AArch64")
-    set_property(CACHE LLAMINAR_CPU_ISA PROPERTY STRINGS AVX512 AVX2 NEON NEON_DOTPROD)
+        "CPU code-generation envelope: AVX512/AVX2 on x86-64, NEON/NEON_DOTPROD/NEON_I8MM on AArch64")
+    set_property(CACHE LLAMINAR_CPU_ISA PROPERTY STRINGS AVX512 AVX2 NEON NEON_DOTPROD NEON_I8MM)
     string(TOUPPER "${LLAMINAR_CPU_ISA}" LLAMINAR_CPU_ISA_UPPER)
     llaminar_cpu_instruction_set("${LLAMINAR_CPU_TARGET_PROCESSOR}" "${LLAMINAR_CPU_ISA}"
         LLAMINAR_CPU_COMPILE_FLAGS LLAMINAR_CPU_COMPILE_DEFINITIONS)
