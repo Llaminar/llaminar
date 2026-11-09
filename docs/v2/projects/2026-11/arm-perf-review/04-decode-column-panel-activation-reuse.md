@@ -85,3 +85,13 @@ in the plan. Any NibbleMap touch points must remain seam-based.
   spills, budgets only down); GB10 tournament + engine E2E (A1; windows via
   arm-perf — coordinate with CUDA lane on .79); self-gate → fresh reviewer
   checkpoint → WSL at R2 tip. R1 merged (5d4e3716a) — R1 DONE.
+
+## R2 gate stop (2026-11-09) — registration finding
+
+- C2c test V2_Integration_CPUFlashAttentionInvocationAdmission registered
+  with FIXTURES_REQUIRED=V2_Models + ProductionTestPreflight → base guard at
+  tests/v2/CMakeLists.txt:37501 rejects ('Preflight is deliberately
+  model-free... NO_MODELS'). FIX: NO_MODELS registration (model-free by
+  design), keep label. arm-sparks held (b)/(c); resume at fixed SHA; no
+  local patch (tree exact). R1 configured clean at 5d4e3716a (same dir) —
+  .80 fine.
