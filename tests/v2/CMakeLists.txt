@@ -1013,7 +1013,8 @@ if(HAVE_CUDA OR HAVE_ROCM)
     target_link_libraries(v2_test_qwen4exp_device_primitives PRIVATE llaminar2_core GTest::gtest_main)
     # These helpers implement declarations used by the original always-built
     # owner. Source closure must not depend on optional test registration mode.
-    if(HAVE_CUDA)
+    # Release perf-only selection does not create this owner.
+    if(HAVE_CUDA AND TARGET v2_test_qwen4exp_device_primitives)
         target_sources(v2_test_qwen4exp_device_primitives PRIVATE
             integration/kernels/qwen4exp/CUDAHC103Original.cu
             integration/kernels/qwen4exp/PooledACKReadyCancellationCUDA.cu)
