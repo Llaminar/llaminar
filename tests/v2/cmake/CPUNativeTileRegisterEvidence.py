@@ -1945,9 +1945,44 @@ def validate_plan(jobs: list[list[str]], identity: str, paths: JobPaths) -> None
             len(compiler.get("assembly", [])) != 1 or \
             len(compiler.get("dumpdir", [])) > 1:
         raise ValueError("the GNU compiler job does not write the witness dependencies and one assembly")
+    if gnu_temporary(jobs) != compiler["assembly"][0]:
+        raise ValueError("the GNU compiler output is not its temporary assembly file")
     assembler = admit_job(jobs[1], GNU_AS, paths, compiler["assembly"][0])
     if assembler.get("object") != [paths.obj]:
         raise ValueError("the GNU assembler job does not write the witness object")
+
+
+GNU_TEMPORARY = re.compile(r"^cc[A-Za-z0-9]{6}\.s$")
+
+
+def gnu_temporary(jobs: list[list[str]]) -> str:
+    """GCC's per-expansion temporary assembly file: the cc1plus -o value, which must be an absolute path named
+    cc + six alphanumerics + .s, occur exactly once in the compiler job (as its output) and exactly once in the
+    assembler job (as its sole, final input)."""
+    compiler, assembler = jobs
+    outputs = [index for index, argument in enumerate(compiler[:-1]) if argument == "-o"]
+    if len(outputs) != 1:
+        raise ValueError("the GNU compiler job must name exactly one output")
+    temporary = compiler[outputs[0] + 1]
+    if not os.path.isabs(temporary) or not GNU_TEMPORARY.match(os.path.basename(temporary)):
+        raise ValueError(f"the GNU compiler output is not a driver temporary assembly file: {temporary}")
+    if compiler.count(temporary) != 1 or assembler.count(temporary) != 1 or assembler[-1] != temporary:
+        raise ValueError("the GNU assembler job must read exactly the compiler's temporary output, once, last")
+    return temporary
+
+
+def plan_shape(plan: dict) -> dict:
+    """The plan with only GCC's ephemeral temporary name masked (the driver picks a fresh one per expansion).
+
+    The directory stays; only the basename of the one shared cc*.s temporary, at its two validated positions,
+    becomes a placeholder. Any other difference - program, option, value, search list - remains visible.
+    """
+    jobs = [list(job) for job in plan["jobs"]]
+    if len(jobs) == 2 and Path(jobs[0][0]).name == "cc1plus":
+        temporary = gnu_temporary(jobs)
+        masked = os.path.join(os.path.dirname(temporary), "cc<temporary>.s")
+        jobs = [[masked if argument == temporary else argument for argument in job] for job in jobs]
+    return dict(plan, jobs=jobs)
 
 
 def observe(command: list[str], directory: str) -> str:
@@ -2096,7 +2131,7 @@ def build(args: argparse.Namespace) -> None:
         changed = sorted(path for path in closure if before[path] != after[path])
         raise ValueError(f"inputs changed while the witness compiled: {changed[:3]}")
     if program_identities(plan, command) != programs or \
-            driver_plan(executed, directory, identity, paths) != plan:
+            plan_shape(driver_plan(executed, directory, identity, paths)) != plan_shape(plan):
         raise ValueError("a compiler or assembler program, or the driver plan, changed while the witness compiled")
     disassembly, disassembly_command, tool_version = disassemble(args.disassembler, obj)
     disassembly_path.write_text(disassembly)
