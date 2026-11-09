@@ -8,6 +8,7 @@
  * original coordinates across standalone and retained OpenMP workshares.
  */
 #include "kernels/cpu/gemm/CPUNativeNEONProjectionBatch.h"
+#include "kernels/cpu/gemm/CPUNativeNEONExactOverlay.h"
 #include "kernels/cpu/gemm/CPUProjectionQ8Publication.h"
 #include "utils/NativeQuantisedPreparedByteFixture.h"
 #include "utils/CPUExplicitRoundingOracle.h"
@@ -18,6 +19,7 @@
 #include <atomic>
 #include <thread>
 #include <span>
+#include <tuple>
 #include <vector>
 
 namespace llaminar2::test
@@ -398,5 +400,66 @@ TEST_F(CPUNativeNEONProjectionBatchTest, RejectsWholeBankAliasesAndInvalidGeomet
     EXPECT_THROW((void)CPUNativeNEONProjectionBatch::bind(weights, input,
         {reinterpret_cast<float *>(original_words.data()), output.size()}, 5, 68, tile, &aliased), std::invalid_argument);
     for (auto value : output) EXPECT_EQ(value, 123456.0f);
+}
+
+/** @test Exact overlays replace the total policy only for their complete measured key. */
+TEST(CPUNativeNEONExactOverlay, ExactKeysOverrideTotalPolicyAndNeverInterpolate)
+{
+    // The installed table is compile-time validated; every unmeasured key is total.
+    const auto installed = installedNativeNEONExactOverlay();
+    const auto total = resolveNativeNEONSchedule(5, true, 4096, 2048, 7, 20, {});
+    EXPECT_EQ(total.tile, NEONProjectionRowTile::Four);
+    EXPECT_EQ(total.n_block_chunks, 1);
+    EXPECT_FALSE(total.exact);
+    (void)installed;
+
+    const std::array<NativeNEONExactOverlayEntry, 3> table{{
+        {.codebook_id = 5, .is_superblock = true, .n = 4096, .k = 2048, .m = 4, .workers = 20,
+         .tile = NEONProjectionRowTile::Pair, .n_block_chunks = 2},
+        {.codebook_id = 5, .is_superblock = true, .n = 4096, .k = 2048, .m = 15, .workers = 20,
+         .tile = NEONProjectionRowTile::Four, .n_block_chunks = 4},
+        {.codebook_id = 19, .is_superblock = false, .n = 512, .k = 2048, .m = 1, .workers = 10,
+         .tile = NEONProjectionRowTile::Four, .n_block_chunks = 8},
+    }};
+    const auto hit = resolveNativeNEONSchedule(5, true, 4096, 2048, 4, 20, table);
+    EXPECT_TRUE(hit.exact);
+    EXPECT_EQ(hit.tile, NEONProjectionRowTile::Pair);
+    EXPECT_EQ(hit.n_block_chunks, 2);
+    const auto decode = resolveNativeNEONSchedule(19, false, 512, 2048, 1, 10, table);
+    EXPECT_TRUE(decode.exact);
+    EXPECT_EQ(decode.n_block_chunks, 8);
+    // Every neighbour of a measured key keeps the total policy.
+    using Key = std::tuple<std::uint8_t, bool, int, int, int, int>;
+    for (const auto &[codebook, superblock, n, k, m, workers] : std::array<Key, 7>{{
+             {5, true, 4096, 2048, 5, 20}, {5, true, 4096, 2048, 4, 19}, {5, false, 4096, 2048, 4, 20},
+             {6, true, 4096, 2048, 4, 20}, {5, true, 4160, 2048, 4, 20},
+             {5, true, 4096, 2304, 4, 20}, {19, false, 512, 2048, 2, 10}}})
+    {
+        const auto miss = resolveNativeNEONSchedule(codebook, superblock, n, k, m, workers, table);
+        EXPECT_FALSE(miss.exact);
+        EXPECT_EQ(miss.tile, NEONProjectionRowTile::Four);
+        EXPECT_EQ(miss.n_block_chunks, 1);
+    }
+}
+
+/** @test Invalid overlay tables and geometry fail instead of selecting a schedule. */
+TEST(CPUNativeNEONExactOverlay, InvalidTablesAndGeometryFail)
+{
+    const NativeNEONExactOverlayEntry a{.codebook_id = 5, .is_superblock = true, .n = 64, .k = 256,
+        .m = 2, .workers = 4, .tile = NEONProjectionRowTile::Pair, .n_block_chunks = 1};
+    auto b = a;
+    b.m = 3;
+    const std::array<NativeNEONExactOverlayEntry, 2> unsorted{b, a};
+    const std::array<NativeNEONExactOverlayEntry, 2> duplicate{a, a};
+    auto bad = a;
+    bad.n_block_chunks = 3;
+    const std::array<NativeNEONExactOverlayEntry, 1> chunks{bad};
+    for (const auto table : {std::span<const NativeNEONExactOverlayEntry>(unsorted),
+             std::span<const NativeNEONExactOverlayEntry>(duplicate),
+             std::span<const NativeNEONExactOverlayEntry>(chunks)})
+        EXPECT_THROW((void)resolveNativeNEONSchedule(5, true, 64, 256, 2, 4, table), std::invalid_argument);
+    EXPECT_THROW((void)resolveNativeNEONSchedule(5, true, 0, 256, 2, 4, {}), std::invalid_argument);
+    EXPECT_THROW((void)resolveNativeNEONSchedule(5, true, 64, 256, 0, 4, {}), std::invalid_argument);
+    EXPECT_THROW((void)resolveNativeNEONSchedule(5, true, 64, 256, 2, 0, {}), std::invalid_argument);
 }
 } // namespace llaminar2::test
