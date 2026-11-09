@@ -523,3 +523,22 @@ the source policy). Dead persistent_state parameter removed.
   the SAME production kernel (NOT independent arithmetic — handover wording).
   execute-after-reset default-position/fail-fast = Main follow-up. SOURCE
   COMPLETE at 39c24d8b4; only WSL (5'') remains → handover.
+
+## (C) VERDICT — STALE CCACHE ARTIFACT (2026-11-09) — (5'') GREEN
+
+- WSL retracted the ideas-lane attribution. gdb frame: free() ←
+  default_delete<IOrchestrationRunner> ← cache.runner.reset() (:110); failing
+  binary alloc 0x35e8 (13800) vs core sizeof 13808 (ModelMemoryProfile 344 +
+  rope_dimension_count) → 8-byte write past allocation; CCACHE_DISABLE=1 +
+  PCH-family rebuild → 0x35f0, E alone + S alone PASS. ccache 4.9.1 served
+  pre-change PCH/object across worktrees (/src mount, CCACHE_BASEDIR=,
+  NOHASHDIR, pch_defines/time_macros sloppiness). Blast radius = 1 PCH
+  family, 9 preflight tests; re-cert 39c24d8b4 9/9 + 5d4e3716a 9/9.
+- (5'') FINAL GREEN: Unit 960/974 (14 base), Preflight 2357/2373 (16
+  base/WSL; ParityFixture passes post-PCH-clean); per-case all OK
+  (ComputeStage ×7, ComputeStages, estimator 53/53, MemoryPlanner,
+  provisioning 4, lifecycle, thread sweep 89.6 s, NEGCTL rc=1 ×4, 0 skips).
+  TRIGGER MET → lane handover to Main (FF 5d4e3716a → 39c24d8b4).
+- Systemic: gate2.sh PCH-family clean rebuild before testing (PCHCLEAN);
+  recommended for .80 r2gate.sh (addon lane). N2 relaunched PCH-clean
+  20:14Z; N3 next.
