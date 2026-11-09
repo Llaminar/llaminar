@@ -192,3 +192,4 @@ After i8mm merge (same tile / post-merge):
   ninja -k 0 (affected = BUILD-BREAK, not env); ETA ~1h.
 
 | 30 | ARMv9 ISA bundle (SVE2 + FP16/fp16fml) | `30-armv9-sve2-fp16fml-bundle.md` | Open (proposal; operator decision) |
+| 31 | S=4 for remaining expanded encodings (Q5_K+nibble spillfix) | `31-panel-s4-expanded-spillfix-followup.md` | Open (via R2 C4 census; 5–40% Q5_K, 2–11% nibble) |
