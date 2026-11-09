@@ -442,6 +442,29 @@ TEST(CPUNativeNEONExactOverlay, ExactKeysOverrideTotalPolicyAndNeverInterpolate)
     }
 }
 
+/** @test The installed GB10 table resolves its own keys exactly through the hot-path API. */
+TEST(CPUNativeNEONExactOverlay, InstalledTableResolvesEveryEntryExactly)
+{
+    const auto installed = installedNativeNEONExactOverlay();
+    ASSERT_FALSE(installed.empty());
+    for (const auto &entry : installed)
+    {
+        const auto schedule = resolveNativeNEONSchedule(entry.codebook_id, entry.is_superblock,
+            entry.n, entry.k, entry.m, entry.workers);
+        ASSERT_TRUE(schedule.exact);
+        EXPECT_EQ(schedule.tile, entry.tile);
+        EXPECT_EQ(schedule.n_block_chunks, entry.n_block_chunks);
+    }
+    // Overlays are keyed by the measured worker budget; another budget is total.
+    const auto &first = installed.front();
+    const auto other = resolveNativeNEONSchedule(first.codebook_id, first.is_superblock,
+        first.n, first.k, first.m, first.workers + 1);
+    if (std::none_of(installed.begin(), installed.end(), [&](const auto &e) {
+            return e.key() == std::tuple{first.codebook_id, first.is_superblock, first.n, first.k,
+                first.m, first.workers + 1}; }))
+        EXPECT_FALSE(other.exact);
+}
+
 /** @test Invalid overlay tables and geometry fail instead of selecting a schedule. */
 TEST(CPUNativeNEONExactOverlay, InvalidTablesAndGeometryFail)
 {
