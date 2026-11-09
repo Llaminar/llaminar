@@ -31,3 +31,16 @@ with tile choices far from the tournament-optimal ones.
 - Re-run the tournament per codec pair and per core class (X925-only /
   A725-only / mixed) on GB10; target p95 regret ≤ 5% per codec; byte-exact
   outputs preserved; final `Perf__` round after any policy change.
+
+## r2fa evidence (2026-11-09, R2 lane, .80 Release solo ABBA) — base fails its own policy
+
+- V2_Perf_CPUFlashAttentionTileTournament: base r1 507s exit1 p95 8.955%
+  max 20.1%; R2 r1 496s 7.998%/22.4%; R2 r2 493s 8.487%/14.1%; base r2 508s
+  5.129%/17.7%. Policy check requires p95 <= 5% -> FAILS ON BASE both runs
+  (drift 5.1-9.0% = GB10 tile-policy calibration, not R2). R2 mean -2.6%
+  wall vs base (C2c per-row check removal). Solo = 83-85% of the 600 s limit
+  -> parallel-ctest timeout = load, not R2. CLASSIFICATION: base/env.
+- Worst tails: grouped_verifier M=15 hd256 tq8_tq8 / q8_1. Options: GB10
+  tile-policy recalibration or cell timeout/ISA policy review; owner = FA2
+  tile policy (idea 22), not a lane. Gated-cell rerun (ctest solo) = wall
+  time only; cannot flip the classification.
