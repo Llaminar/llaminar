@@ -108,3 +108,10 @@ After i8mm merge (same tile / post-merge):
   04 (wider panel + activation reuse, MXFP4-coordinated), 11 (attention
   validation hoist + integer-dot proof). Plan-first; independent until fully
   merge-ready, then handover to Main.
+
+- **ideas 25+7** (arm-qualification session 01a1bd53, branch
+  codex/hotpath-cleanup-prefill on ea5402a54): idea 07 implementation (RoPE
+  allocations, inv-freq lock, RMSNorm heap fallback, gamma TLS stale fix) +
+  idea 25 startable parts (PerfStats bucket counters, nsys-in-uma3 image
+  proposal, single-bucket/async design). Plan-first; handover to Main when
+  fully merge-ready.
