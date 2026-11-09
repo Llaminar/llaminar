@@ -122,3 +122,19 @@ decision; plan-first doc.
   Idea 30 = CLOSED/deprioritized (evidence complete). ISA queue = idea 31
   (S=4 spillfixes; census: NibbleLUT 22/22+6, IQ4_XS 31/20, Q5_K GNU clean
   = AppleClang-only, Q6_K classifier gap) + FP16/FMLAL verification.
+
+## External evidence (online research 2026-11-09) — 128-bit is by design
+
+- NVIDIA Grace spec: "Neoverse V2 Cores: Armv9 with **4x128b SVE2**" (NVIDIA
+  Grace CPU Superchip Architecture In Depth / whitepaper) -> 128-bit SVE2
+  implementation by NVIDIA (matches both platforms' firmware max VL=16).
+- NVIDIA DGX Spark Porting Guide: SIMD = NEON + SVE only (no width claim);
+  recommends SVE for gather/scatter/predicated/SM4 - instruction-set, not
+  width. DGX Spark UEFI guide: boot/network/secure-boot settings only - NO
+  CPU-feature/SVE-VL toggle exists. DGX OS kernel = Canonical kernel.
+- Linux semantics: PR_SVE_SET_VL value = UPPER BOUND; kernel picks the best
+  supported VL from the firmware-advertised bitmap (kernel sve docs; man
+  PR_SVE_SET_VL); sve_default_vector_length sysctl = default only (RO here).
+  -> clamp observed = implementation max; no boot/kernel/cgroup/sysctl path
+  raises it. Verdict CONFIRMED: SVE2 = 128-bit by silicon design on NVIDIA
+  ARM (GB10 + Grace); no missed setting; SVE2 remains closed.
