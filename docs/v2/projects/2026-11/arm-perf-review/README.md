@@ -176,3 +176,17 @@ After i8mm merge (same tile / post-merge):
   tracker, 01 code = codex/bundle1-perf-harness @ a27c7ed4f → reviewer →
   FF to Main; 01 scope = 01-1 + 01-3; isolation = own container/private
   ccache (the (C) lesson).
+
+## No-regate rule nuance (2026-11-09, Bundle-1 lane → Main)
+
+- Routine base REBAsES (no content change) → no regate, correct. It does NOT
+  cover a base commit that ADDS new x86-only test code to shared files:
+  cc502b95a (base 07d4f2085) added the unguarded __m256 AddWitness to
+  CPUNativeQuantisedUnsignedWeightDotLifecycle.inc; #43's aarch64 rebase
+  adapted the .inc but missed that block → ARM preflight gate (and R2
+  r2gate2) cannot build at a27c7ed4f. LESSON: a cheap COMPILE-ONLY aarch64
+  check of the gate targets (or the R1/develop gates) on the merged tip
+  would catch new-x86-code-in-shared-files instantly; recommended as a
+  routine step on any base pickup (candidates: compile-only ARM target
+  build in preflight or CI image gate). Mac record (lane) continues with
+  ninja -k 0 (affected = BUILD-BREAK, not env); ETA ~1h.
