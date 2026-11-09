@@ -577,6 +577,7 @@ TEST_F(ComputeStageTest, RoPEPartialRotaryKeepsFullHeadStride)
         .position_ids = position_ids.data()};
 
     RoPEStage stage(params);
+    const test::StageWorkspaceTestBinding workspace(stage, seq_len);
     ASSERT_TRUE(stage.execute(ctx_.get()));
 
     const float *q_out = Q->data();
@@ -746,6 +747,7 @@ TEST_F(ComputeStageTest, KeyOnlyRoPEIsByteIdenticalToTheSameQueryRotation)
         .theta_base = 1000000.0f,
         .seq_len = seq_len,
     });
+    const test::StageWorkspaceTestBinding reference_workspace(reference_stage, seq_len);
     ASSERT_TRUE(reference_stage.execute(ctx_.get()));
 
     auto key = makeTensor(seq_len, width, input);
@@ -760,6 +762,9 @@ TEST_F(ComputeStageTest, KeyOnlyRoPEIsByteIdenticalToTheSameQueryRotation)
         .k_buffer_id = BufferId::K_PROJ,
     });
     ASSERT_NE(key_stage, nullptr);
+    auto *key_rope = dynamic_cast<RoPEStage *>(key_stage.get());
+    ASSERT_NE(key_rope, nullptr);
+    const test::StageWorkspaceTestBinding key_workspace(*key_rope, seq_len);
     ASSERT_TRUE(key_stage->execute(ctx_.get()));
 
     EXPECT_EQ(
@@ -824,6 +829,7 @@ TEST_F(ComputeStageTest, RoPEVerifierPrefillMatchesSerialDecodeRows)
         .force_decode_equivalent_verifier_prefill = true};
 
     RoPEStage grouped_stage(grouped_params);
+    const test::StageWorkspaceTestBinding grouped_workspace(grouped_stage, seq_len);
     ASSERT_TRUE(grouped_stage.execute(ctx_.get()));
 
     std::vector<float> serial_q(q_input.size(), 0.0f);
@@ -850,6 +856,7 @@ TEST_F(ComputeStageTest, RoPEVerifierPrefillMatchesSerialDecodeRows)
             .theta_base = 1000000.0f,
             .seq_len = 1};
         RoPEStage row_stage(row_params);
+        const test::StageWorkspaceTestBinding row_workspace(row_stage, 1);
         ASSERT_TRUE(row_stage.execute(ctx_.get())) << "row=" << row;
 
         std::copy_n(row_q->data(), q_cols,

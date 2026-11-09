@@ -35,6 +35,7 @@
 #include "../../utils/PlanningHostServiceFixture.h"
 #include "../models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "kernels/rope/RoPEWorkspaceContract.h"
 #include "memory/CPUGroupedMoEStorageLayout.h"
 #include "memory/CPURouterQ8StorageLayout.h"
 #include "utils/DebugEnv.h"
@@ -2909,6 +2910,12 @@ TEST(Test__MemoryPlanner, CPUOnly_AttentionWorkspaceUsesPhysicalWorkerBOM)
         cfg.batch_size * cfg.max_seq_len, profile.d_ff));
     expected.merge(cpuProjectionQ8WorkspaceRequirements(
         cfg.batch_size * cfg.max_seq_len, profile.d_ff));
+    // RoPE borrows one shared set of angle planes for the largest invocation
+    // at the effective rotated width; it coexists with the other buffers.
+    expected.merge(cpu_rope_workspace::requirements({
+        .graph_rows = cfg.batch_size * cfg.max_seq_len,
+        .rotary_dim = profile.effectiveRotaryDimension(),
+    }));
     // All ordinary projections contribute their common name maximum. Terminal
     // projection has one live sampling row, not the prefill family's row count.
     for (const auto &tensor : profile.tensors)
