@@ -12,7 +12,9 @@
 #include "tensors/FP16Utils.h"
 #include <gtest/gtest.h>
 #include <omp.h>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <atomic>
 #include <limits>
 #include <cstdint>
@@ -269,6 +271,54 @@ TEST(CPURoPEWorkshare, HybridStorageAdmissionAndEmptyCompletion)
         }
         ASSERT_EQ(observed, 3);
     }
+}
+
+/**
+ * @test Lock-free inverse-frequency hits return the one published table.
+ *
+ * More geometries than the per-thread memo holds force evictions; concurrent
+ * workers must still observe the single process-lifetime address and the exact
+ * values of an independent computation for every (head_dim, base) identity.
+ */
+TEST(CPURoPEWorkshare, InverseFrequencyLookupIsStableAcrossThreadsAndEvictions)
+{
+    struct Geometry { int head_dim; float base; };
+    std::vector<Geometry> geometries;
+    for (int dim : {32, 64, 96, 128, 256, 512})
+        for (float base : {10000.0f, 1000000.0f})
+            geometries.push_back({dim, base});
+
+    std::vector<const std::vector<float> *> published;
+    for (const auto &geometry : geometries)
+    {
+        const auto &values = primitives::get_inv_freq_cached(geometry.head_dim, geometry.base);
+        ASSERT_EQ(values.size(), static_cast<std::size_t>(geometry.head_dim / 2));
+        const float log_base = std::log(geometry.base);
+        for (int i = 0; i < geometry.head_dim / 2; ++i)
+        {
+            const float expected = std::exp(-log_base * ((2.0f * i) / geometry.head_dim));
+            ASSERT_EQ(std::bit_cast<std::uint32_t>(values[i]), std::bit_cast<std::uint32_t>(expected));
+        }
+        published.push_back(&values);
+    }
+
+    std::atomic<int> mismatches{0};
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 6; ++worker)
+        workers.emplace_back([&, worker] {
+            for (int round = 0; round < 64; ++round)
+                for (std::size_t index = 0; index < geometries.size(); ++index)
+                {
+                    const std::size_t pick = (index * 5 + static_cast<std::size_t>(worker + round)) % geometries.size();
+                    const auto &values = primitives::get_inv_freq_cached(
+                        geometries[pick].head_dim, geometries[pick].base);
+                    if (&values != published[pick])
+                        mismatches.fetch_add(1, std::memory_order_relaxed);
+                }
+        });
+    for (auto &worker : workers)
+        worker.join();
+    EXPECT_EQ(mismatches.load(), 0);
 }
 } // namespace
 } // namespace llaminar2::test
