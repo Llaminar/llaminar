@@ -339,3 +339,21 @@ the source policy). Dead persistent_state parameter removed.
   partial APIs still give valid one-row −1 → don't claim unavailable.
 - Recommended small follow-up commit before handover (raw byte check, actual
   width assert, comment fix, accurate evidence description). Lane deciding.
+
+## b199ccfa0 (2026-11-09) — test-only; all four qualifications folded
+
+- (1) RAW byte check (cells = clean-workspace bytes, no zero folding; 4
+  workspace contents); canonical documented 'modulo signed zero'; :716
+  comment corrected (calls current one-row path, not independent arithmetic;
+  base equality = cross-TU harness). (2) team width measured (member 0
+  omp_get_num_threads(), no barrier; assert == request; OMP_THREAD_LIMIT=1
+  FAILS as designed). (3) harness rows 1..64 contiguous; Q8 exclusion =
+  rows==1 negative-start ONLY; MIN_ROWS removed.
+  (4) base −1 = fresh persistent-state route only; BASE_NO_STATE=1 gives
+  valid no-state one-row −1 → IDENTICAL.
+- Harness: no-state −1/−3/−40/−100 IDENTICAL; state −3/−40/−100 IDENTICAL
+  (−1 base abort); 0/17231 incl Q8 IDENTICAL; unfixed TU differs at byte 1.
+- Negative control: canonical 160/160 fail; raw 112 (clean cells can't fail;
+  some BF16 coincide); width 0. Gates: Mac 271/271 both ISAs; preflight
+  215/215 ×20; gcc/clang x86 syntax OK. Reviewer test-delta pass in flight;
+  WSL (5') final = b199ccfa0.
