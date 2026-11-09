@@ -40,3 +40,30 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 ## Evidence
 
 `.80:build/results/w-r1-20261109T031823Z` + `build/wr1-summary.py`.
+
+## ROOT-CAUSED + FIXED (2026-11-09) — b01d285dc (parent d1f1e8e34)
+
+- CAUSE: R1 tile programs spill vector registers — with UNCHECKED
+  admittedScales/admittedMins accessors, gcc hoists later metadata/payload
+  loads into the dot program and spills accumulators/scale vectors
+  (str q31,[sp]…ldr q25,[sp] once per block in Rows=1 IQ4_XS hot loop).
+- Attribution (production gcc-14 -O3; gcc-16 same): base 0 spilling fns/0
+  spill insns/43442 insns; R1 45/1154/38392; R1 w/ THROWING accessors 0/0/
+  42866; address-dependency-only 40; memory-barrier-after-dots 31; hoisted
+  strides 43; FIX (admitted accessor + FATAL NORETURN COLD bound check)
+  0/0/38548. I8MM envelope: base 0, R1 48, fix 0. Compact kernels never
+  spilled. MECHANISM: the old throwing check was the scheduling boundary
+  stopping speculative hoisting; fatal noreturn provides it without
+  exceptions — run path stays noexcept, instruction savings retained,
+  in-loop reserved-bit test stays removed, arithmetic unchanged, M1 bytes
+  pass.
+- REGRESSION (maxim 22/24): CPUNativeTileRegisterEvidence.py — build-time
+  probe of every tile (Rows1..4 × ASIMD/SDOT/SMMLA × policy × encoding) at
+  -O3; ANY q/v stack traffic in run/pairBlock fails the build.
+  V2_{Unit,Integration}_CPUNativeNEONTileRegisters re-verify the retained
+  proof; adversarial tests V2_*_CPUNativeTileRegisterEvidence. Checker
+  rejects d1f1e8e34 (120/176 spill), accepts base + fix (0/176).
+- Reviewer informed (fatal accessor = small semantic delta; optional look).
+- Pending: .80 build+gate at b01d285dc + 3-arm confirmation runs (base /
+  R1-spilling / fix, ≥5×31, IQ4_XS+IQ3_S, 17408×5120+2048×4096, M=1/4,
+  10/20t, ~45 min).
