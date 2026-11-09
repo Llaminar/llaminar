@@ -646,3 +646,22 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   fullmatch; budget byte-identical; no stale spellings. BOUNDED MECHANICAL
   ACK (not transfer of prior semantic/runtime approvals; Mac evidence =
   owner reports). REMAINING: .80 full gate (GNU) + WSL (4'); then handover.
+
+## R1 .80 gate — classification (2026-11-09, 5d4e3716a)
+
+- Clean: CFG=0 BUILD=0 (near-full rebuild); census ALL GREEN 12/12, proof
+  242/1274, lifecycle 1, 9/9 cells 1029/1176/1274, 0 mismatches.
+- PROVEN base (same container, 425002104): grouped_sealed_plan,
+  common_dispatch_policy, model_kld_canary, production_parity_campaigns,
+  optional_gpu_preflight_registration, rocm_architecture_policy.
+- SAME base cause ('Unknown CMake command v2_test_registration_selected'):
+  ROCmArchitectureIdentityReplay, NativeGTestRequiredExecution,
+  PreflightDeviceInventoryIsolation, NativeMPITestLaunchDefaults,
+  ROCmMoEAutomaticOwnerConfiguration (U+I), DevelopPRGateContract.
+- Base fixture drop: ROCm trainer generators + csv validator
+  (rocm_native_quantised_*.csv) + MoEForbiddenDependencyScan.
+- UNATTRIBUTED (spot-check at 425002104 in flight): CPUShardRouteCollective.
+  FusedFinalAddPreservesRawAndWeightedBytes (4 names),
+  Perf__CPURootedPublicationTransport.OriginalNUMAVariableRecordGatherReplay.
+- Base-issue flag sent to Main (CMake-harness family + ROCm CSVs + new-base
+  set) — separate from the addon handover.
