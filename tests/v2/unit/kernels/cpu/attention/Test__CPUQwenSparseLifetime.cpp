@@ -191,7 +191,7 @@ TEST(CPUQwenSparseLifetime,FullSameHeadQueryAliasMatchesOriginalNativeProgram)
         cpuQwenSparseAttention(p);authenticate(actual,expected);EXPECT_EQ(f.keys,keys);EXPECT_EQ(f.values,values);
     }
 }
-/** @test Empty/nonempty attention and no-write accepted-tail calls retire a delayed retained participant. */
+/** @test Attention, indexer, selector and accepted-tail calls retire a delayed retained participant. */
 TEST(CPUQwenSparseLifetime,EmptyAndNonemptyCallsCompleteBeforeOuterJoin)
 {
     requireNative();TeamPolicy policy;Fixture f(1);f.p.observations=nullptr;
@@ -199,6 +199,19 @@ TEST(CPUQwenSparseLifetime,EmptyAndNonemptyCallsCompleteBeforeOuterJoin)
     {
         f.replay.live_rows=live;EXPECT_EQ(immediatelyRetired([&](){cpuQwenSparseAttention(f.p);}),3);
     }
+    for(auto representation:{QwenSparseScalar::FP32,QwenSparseScalar::FP16,QwenSparseScalar::BF16})
+        for(int prefix:{3,2051})
+        {
+            IndexerFixture indexer(prefix);indexer.p.representation=representation;
+            for(int live:{1,0})
+            {
+                indexer.replay.live_rows=live;
+                // The existing delayed-entry witness observes participant arrival
+                // before the outer join, including empty native work frontiers.
+                EXPECT_EQ(immediatelyRetired([&](){cpuQwenSparseIndexer(indexer.p);}),3);
+                EXPECT_EQ(immediatelyRetired([&](){cpuQwenSparseSelectPools(indexer.p);}),3);
+            }
+        }
     std::array<float,4*128>prior{},destination{};std::array<float,128>raw{};const int accepted=0;
     for(int live:{1,0})
     {

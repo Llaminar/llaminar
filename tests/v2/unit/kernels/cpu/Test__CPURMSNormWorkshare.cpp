@@ -7,8 +7,12 @@
  * reduction drift. Delayed small/empty participants prove completion, including
  * exact input/output aliases that must be normalized only once. This device-free
  * target does not certify factories, model inference or performance/scaling.
+ * The existing scalar summary seam is checked against independently rounded
+ * FP64 products/sums, including witnesses that separate serial and lane folds.
  */
 #include "kernels/cpu/primitives/RMSNormPrimitives.h"
+#include "kernels/cpu/primitives/RMSNormPrimitives_detail.h"
+#include "utils/CPUFeatures.h"
 #include "tensors/FP16Utils.h"
 #include <gtest/gtest.h>
 #include <omp.h>
@@ -21,12 +25,132 @@
 #include <limits>
 #include <type_traits>
 #include <cstdint>
+#include <cstring>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
 namespace llaminar2::test
 {
 using namespace primitives;
+
+/** @test Explicit scalar FP32 summaries retain increasing-column FP64 bytes, not a SIMD lane fold. */
+TEST(CPURMSNormWorkshare,ScalarFP32SummaryRetainsIncreasingColumnFMA)
+{
+    EXPECT_EQ(std::bit_cast<std::uint64_t>(primitives::detail::compute_sumsq_scalar(nullptr,0)),0u);
+    std::vector<std::size_t>widths;
+    for(std::size_t columns=1;columns<=130;++columns)widths.push_back(columns);
+    for(std::size_t columns:{255u,256u,257u,511u,512u,513u,896u,1024u,1025u,2047u,4096u})widths.push_back(columns);
+    constexpr std::array<std::uint32_t,8>boundaryWords{
+        0x00000001u,0x007fffffu,0x00800000u,0x3f800001u,0x7f7fffffu,0xff7fffffu,0x00000000u,0x80000000u};
+    constexpr std::size_t guard=7,suffix=9;
+    for(const auto columns:widths)for(const auto anchor:std::array<std::size_t,3>{0,columns/2,columns-1})
+        for(const bool boundaries:{false,true})
+        {
+            SCOPED_TRACE(::testing::Message()<<"K="<<columns<<" anchor="<<anchor<<" boundaries="<<boundaries);
+            std::vector<float>input(guard+columns+suffix,919.25f);
+            for(std::size_t c=0;c<columns;++c)
+                input[guard+c]=boundaries?std::bit_cast<float>(boundaryWords[c%boundaryWords.size()]):1.0f;
+            input[guard+anchor]=0x1p27f;const auto original=input;
+            double expected=0;
+            for(std::size_t c=0;c<columns;++c)
+            {
+                const double value=double(input[guard+c]);
+                // Each original FP32 square fits exactly in FP64; volatile
+                // addition independently retains every increasing-column edge.
+                volatile double square=value*value;
+                volatile double rounded=expected+square;expected=rounded;
+            }
+            if(columns==17&&anchor==0&&!boundaries)
+            {
+                // At2^54, ULP=4: sixteen serial +1 terms are individually lost.
+                // A lane-partitioned reduction retains some before its fold.
+                EXPECT_EQ(std::bit_cast<std::uint64_t>(expected),std::bit_cast<std::uint64_t>(0x1p54));
+            }
+            const auto actual=primitives::detail::compute_sumsq_scalar(input.data()+guard,columns);
+            EXPECT_EQ(std::bit_cast<std::uint64_t>(actual),std::bit_cast<std::uint64_t>(expected));
+            EXPECT_EQ(std::memcmp(input.data(),original.data(),input.size()*sizeof(float)),0);
+        }
+}
+
+namespace
+{
+/** @brief Keep requested retained teams exact without leaking caller OpenMP policy. */
+class RMSApplicationTeamPolicy final
+{
+public:
+    /** @brief Retain caller policy and disable dynamic shrinking for this fixture. */
+    RMSApplicationTeamPolicy():threads_(omp_get_max_threads()),dynamic_(omp_get_dynamic()){omp_set_dynamic(0);}
+    /** @brief Restore the original caller ICVs even on an assertion failure. */
+    ~RMSApplicationTeamPolicy(){omp_set_num_threads(threads_);omp_set_dynamic(dynamic_);}
+private:
+    int threads_,dynamic_;
+};
+} // namespace
+
+/** @test Admitted native FP32 application preserves rounded edges, tails, exact aliases and guards. */
+TEST(CPURMSNormWorkshare,FP32ApplicationRetainsOriginalRoundedEdges)
+{
+    const auto isa=activeISALevel();
+    if(isa==ISALevel::Scalar||!isNativeCPUExecutionISAPair(compiledCPUISALevel(),isa))
+        throw std::runtime_error("CPU FP32 RMS application requires an admitted native profile");
+    const RMSApplicationTeamPolicy policy;
+    std::vector<std::size_t>widths;
+    for(std::size_t c=1;c<=65;++c)widths.push_back(c);
+    for(std::size_t c:{127u,128u,129u,255u,256u,257u,511u,512u,513u})widths.push_back(c);
+    constexpr std::array<std::uint32_t,8>weights{
+        0x00000001u,0x80000001u,0x007fffffu,0x807fffffu,0x3f800001u,0xbf400003u,0x00000000u,0x80000000u};
+    constexpr std::size_t guard=7,suffix=9;
+    const float inverse=float(1.0/std::sqrt(12.0));
+    for(const std::size_t rows:{1u,2u,3u,4u,5u,6u,7u,8u,9u,10u,11u,12u,13u,14u,15u,16u,31u,33u})
+        for(const auto columns:widths)for(const bool weighted:{false,true})for(const bool scalar:{false,true})
+            for(const bool alias:{false,true})for(const bool retained:{false,true})
+            {
+                if(retained&&columns!=1&&columns!=17&&columns!=129&&columns!=513)continue;
+                SCOPED_TRACE(::testing::Message()<<"M="<<rows<<" K="<<columns<<" gamma="<<weighted<<" scalar="<<scalar<<" alias="<<alias<<" retained="<<retained);
+                std::vector<float>source(guard+(rows+2)*columns+suffix,919.25f),gamma(guard+columns+suffix,719.5f);
+                for(std::size_t i=0;i<rows*columns;++i)source[guard+i]=(i%2)?-3.0f:3.0f;
+                for(std::size_t c=0;c<columns;++c)gamma[guard+c]=std::bit_cast<float>(weights[c%weights.size()]);
+                const auto original=source,originalGamma=gamma;
+                auto actual=alias?source:std::vector<float>(source.size(),-19.5f);auto expected=actual;
+                std::size_t reorderedDifferences=0;
+                for(std::size_t r=0;r<rows;++r)for(std::size_t c=0;c<columns;++c)
+                {
+                    const auto i=guard+r*columns+c;
+                    // Every square is9, so all admitted summary trees yield the
+                    // same exact mean9 and staged FP64 inverse1/sqrt(9+3).
+                    volatile float scaled=source[i]*inverse;
+                    volatile float value=weighted?scaled*gamma[guard+c]:float(scaled);expected[i]=value;
+                    if(weighted)
+                    {
+                        volatile float premature=inverse*gamma[guard+c];
+                        volatile float reordered=source[i]*premature;
+                        reorderedDifferences+=std::bit_cast<std::uint32_t>(float(reordered))!=std::bit_cast<std::uint32_t>(float(value));
+                    }
+                }
+                if(weighted)ASSERT_GT(reorderedDifferences,0u);
+                const RMSNormExecOptions options{.allow_parallel=false,.force_scalar=scalar};
+                const auto verify=[&]()
+                {
+                    EXPECT_EQ(std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(float)),0);
+                    EXPECT_EQ(std::memcmp(source.data(),original.data(),source.size()*sizeof(float)),0);
+                    EXPECT_EQ(std::memcmp(gamma.data(),originalGamma.data(),gamma.size()*sizeof(float)),0);
+                };
+                const auto call=[&](){rmsnorm_fused_vectorized(alias?actual.data()+guard:source.data()+guard,
+                    weighted?gamma.data()+guard:nullptr,actual.data()+guard,rows,columns,3.0f,options);};
+                if(retained)
+                {
+                    int actualTeam=0;
+#pragma omp parallel num_threads(3)
+                    {
+                        if(omp_get_thread_num()==0)actualTeam=omp_get_num_threads();
+                        call();if(omp_get_thread_num()==0)verify();
+                    }
+                    ASSERT_EQ(actualTeam,3);
+                }
+                else{call();verify();}
+            }
+}
 
 /** @test A retained wide M=1 invocation uses the complete row, not each worker's private partial. */
 TEST(CPURMSNormWorkshare, WideRetainedRowUsesCompleteOriginalSummary)

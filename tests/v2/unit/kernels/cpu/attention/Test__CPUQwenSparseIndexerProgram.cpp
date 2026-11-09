@@ -13,6 +13,8 @@
  * regression separately treats produced queries/pools as score-phase inputs,
  * checks independent per-ISA FMA/head programs, and authenticates every original
  * score/selection/count guard; it does not replace the preparation oracle.
+ * The integration totality cells derive all stages from original inputs, with
+ * position/pair-varying supplied rotary planes and bitwise source-bank checks.
  */
 #include "kernels/qwen4exp/QwenSparseAttention.h"
 #include "kernels/qwen4exp/QwenSparseMath.h"
@@ -26,6 +28,9 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <span>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 namespace llaminar2::qwen4exp::test
@@ -482,4 +487,239 @@ TEST(CPUQwenSparseIndexerProgram,NativeRankingScoresRetainOriginalHeadProgram)
     }
     EXPECT_GT(authoredScores,0u);EXPECT_EQ(cutoffWitnesses,3u);EXPECT_EQ(headOrderWitnesses,3u);
 }
+namespace
+{
+/** @brief Closed original representation and accepted-tail geometry for totality cells. */
+struct IndexerTotalityCase
+{
+    QwenSparseScalar representation; ///< Original FP32-container cast program.
+    int tail; ///< Original prefix remainder0..3, never a worker-dependent partition.
+};
+constexpr std::size_t totalityGuard=7,totalitySuffix=9;
+constexpr float totalityCanary=std::bit_cast<float>(0x4a613257u);
+constexpr float totalityScorePoison=std::bit_cast<float>(0x7fc54321u);
+/** @brief Authenticate every float/guard word, including intentional unconsumed NaN poison.
+ * @param actual Complete original result storage; @param expected Independent complete gold.
+ * @param role Original result role for a bounded diagnostic.
+ */
+void expectIndexerWords(std::span<const float>actual,std::span<const float>expected,const char*role)
+{
+    ASSERT_EQ(actual.size(),expected.size());std::size_t mismatches=0,first=0;
+    for(std::size_t i=0;i<actual.size();++i)
+        if(std::bit_cast<std::uint32_t>(actual[i])!=std::bit_cast<std::uint32_t>(expected[i]))
+        {if(mismatches==0)first=i;++mismatches;}
+    EXPECT_EQ(mismatches,0u)<<role<<" first word="<<first;
+}
+/** @brief Persistent diagnostic output banks; reset changes bytes, never pointer topology. */
+struct IndexerTotalityBanks
+{
+    std::vector<float>prepared,pools,scores;
+    std::vector<std::int32_t>selected,count;
+    /** @brief Allocate one fixed fixture before invoking any kernel or retained team.
+     * @param capacity Original row envelope; @param blocks Original pool stride.
+     * @param initialPools Original old pools, unused capacity and all guard words.
+     */
+    IndexerTotalityBanks(int capacity,int blocks,const std::vector<float>&initialPools)
+        :prepared(totalityGuard+std::size_t(capacity)*512+totalitySuffix,totalityCanary),pools(initialPools),
+         scores(totalityGuard+std::size_t(capacity)*blocks+totalitySuffix,totalityScorePoison),
+         selected(totalityGuard+std::size_t(capacity)*QwenSparseSelected+totalitySuffix,-91),
+         count(totalityGuard+std::size_t(capacity)+totalitySuffix,-71){}
+    /** @brief Re-poison all writers and restore original pools without reallocating.
+     * @param initialPools Same-sized original source/guard words retained by the fixture.
+     */
+    void reset(const std::vector<float>&initialPools)
+    {
+        ASSERT_EQ(pools.size(),initialPools.size());std::copy(initialPools.begin(),initialPools.end(),pools.begin());
+        std::fill(prepared.begin(),prepared.end(),totalityCanary);std::fill(scores.begin(),scores.end(),totalityScorePoison);
+        std::fill(selected.begin(),selected.end(),-91);std::fill(count.begin(),count.end(),-71);
+    }
+    /** @brief Check complete produced stages/selection and every inactive/unused guard.
+     * @param expected Independently produced original-source result banks.
+     */
+    void expect(const IndexerTotalityBanks&expected)const
+    {
+        expectIndexerWords(prepared,expected.prepared,"prepared");expectIndexerWords(pools,expected.pools,"pools");
+        expectIndexerWords(scores,expected.scores,"scores");EXPECT_EQ(selected,expected.selected);EXPECT_EQ(count,expected.count);
+    }
+};
+/** @brief Original host-owned replay/projections and independent whole-indexer oracle. */
+struct IndexerTotalityFixture
+{
+    static constexpr int origin=17,rotary=16,half=rotary/2;
+    QwenSparseScalar representation;ISALevel isa;
+    int rows,capacity,prefix,tokens,blocks,positions;
+    QwenSparseReplay replay;
+    std::vector<float>query,raw,partial,queryNorm,keyNorm,cosine,sine,initialPools;
+    /** @brief Bind finite original sources at every tail and with inactive row capacity.
+     * @param rep Original cast program; @param tail Original accepted-prefix remainder0..3.
+     * @param liveRows Original live rows; @param program Already-admitted native dot program.
+     */
+    IndexerTotalityFixture(QwenSparseScalar rep,int tail,int liveRows,ISALevel program)
+        :representation(rep),isa(program),rows(liveRows),capacity(rows+2),prefix(QwenSparseBlocks*4+tail),
+         tokens(prefix+capacity),blocks((tokens+3)/4),positions(origin+tokens+1),
+         replay{.prefix_tokens=prefix,.live_rows=rows,.position_origin=origin},
+         query(totalityGuard+std::size_t(capacity)*512+totalitySuffix,totalityCanary),
+         raw(totalityGuard+std::size_t(capacity)*128+totalitySuffix,totalityCanary),
+         partial(totalityGuard+512+totalitySuffix,totalityCanary),
+         queryNorm(totalityGuard+128+totalitySuffix,totalityCanary),keyNorm(queryNorm),
+         cosine(totalityGuard+std::size_t(positions)*half+totalitySuffix,totalityCanary),sine(cosine),
+         initialPools(totalityGuard+std::size_t(blocks)*128+totalitySuffix,totalityCanary)
+    {
+        for(std::size_t i=totalityGuard;i<query.size()-totalitySuffix;++i)query[i]=float(int((i*13)%97)-48)*0.015625f;
+        for(std::size_t i=totalityGuard;i<raw.size()-totalitySuffix;++i)raw[i]=float(int((i*7)%59)-29)*0.03125f;
+        for(std::size_t i=totalityGuard;i<partial.size()-totalitySuffix;++i)partial[i]=float(int((i*11)%61)-30)*0.03125f;
+        for(int c=0;c<128;++c)
+        {queryNorm[totalityGuard+c]=1.0f+float(c%17-8)*0.03125f;keyNorm[totalityGuard+c]=1.0f+float(c%13-6)*0.015625f;}
+        // Supplied finite dyadic planes distinguish original positions and pairs;
+        // identity coefficients would hide an ignored origin or wrong address.
+        for(int position=0;position<positions;++position)for(int pair=0;pair<half;++pair)
+        {
+            cosine[totalityGuard+std::size_t(position)*half+pair]=float((position*17+pair*7)%251+1)*0.00390625f;
+            sine[totalityGuard+std::size_t(position)*half+pair]=float((position*11+pair*13)%127-63)*0.0078125f;
+        }
+        for(int block=0;block<prefix/4;++block)for(int c=0;c<128;++c)
+            initialPools[totalityGuard+std::size_t(block)*128+c]=float((block*17+c*13)%127-63)*0.015625f;
+    }
+    /** @brief Produce independent cast/RMS/RoPE/scores/frontiers from original sources once.
+     * @param demand Original all-live or ranking-only authorship policy.
+     * @param gold Same-envelope poisoned banks receiving independent expected words.
+     * @details No production kernel, produced stage, native dot/fold or converter
+     * supplies gold. Original old pools remain authored inputs; every new pool
+     * uses prior-tail/current rows0..3 and the original block-start position.
+     */
+    void reference(QwenSparseQueryDemand demand,IndexerTotalityBanks&gold)const
+    {
+        const auto store=[&](const float*input,const float*weight,int position,float*output)
+        {
+            const auto normalized=normalize(input,weight,representation,1.0e-4f);
+            const auto result=rotate(normalized,cosine.data()+totalityGuard+std::size_t(position)*half,
+                sine.data()+totalityGuard+std::size_t(position)*half,rotary,representation);
+            std::copy(result.begin(),result.end(),output);
+        };
+        for(int block=prefix/4;block<(prefix+rows)/4;++block)
+        {
+            std::array<float,128>pooled{};
+            for(int c=0;c<128;++c)
+            {
+                float sum=0;
+                for(int member=0;member<4;++member)
+                {
+                    const int logical=block*4+member;
+                    const auto*source=logical<prefix?partial.data()+totalityGuard+std::size_t(logical-(prefix/4)*4)*128:
+                        raw.data()+totalityGuard+std::size_t(logical-prefix)*128;
+                    const auto value=test::representation(source[c],representation);
+                    sum=member==0?value:add(sum,value);
+                }
+                pooled[c]=test::representation(multiply(sum,0.25f),representation);
+            }
+            store(pooled.data(),keyNorm.data()+totalityGuard,origin+block*4,gold.pools.data()+totalityGuard+std::size_t(block)*128);
+        }
+        for(int row=0;row<rows;++row)
+        {
+            const int visible=prefix+row+1,complete=visible/4,keep=std::min(complete,QwenSparseBlocks);
+            if(demand==QwenSparseQueryDemand::AllLive||complete>QwenSparseBlocks)
+                for(int head=0;head<4;++head)
+                    store(query.data()+totalityGuard+std::size_t(row)*512+head*128,queryNorm.data()+totalityGuard,
+                        origin+prefix+row,gold.prepared.data()+totalityGuard+std::size_t(row)*512+head*128);
+            if(complete>QwenSparseBlocks)
+                for(int block=0;block<complete;++block)
+                {
+                    float score=0;
+                    for(int head=0;head<4;++head)
+                    {
+                        const auto value=rankingDot(gold.prepared.data()+totalityGuard+std::size_t(row)*512+head*128,
+                            gold.pools.data()+totalityGuard+std::size_t(block)*128,isa);
+                        ASSERT_TRUE(std::isfinite(value));score=add(score,std::max(0.0f,value));
+                    }
+                    gold.scores[totalityGuard+std::size_t(row)*blocks+block]=multiply(score,0.08838834764831844055f);
+                }
+            std::vector<int>chosen(complete);for(int block=0;block<complete;++block)chosen[block]=block;
+            if(complete>QwenSparseBlocks)
+            {
+                const auto*score=gold.scores.data()+totalityGuard+std::size_t(row)*blocks;
+                std::sort(chosen.begin(),chosen.end(),[&](int a,int b){return score[a]>score[b]||(score[a]==score[b]&&a<b);});
+                chosen.resize(keep);std::sort(chosen.begin(),chosen.end());
+            }
+            for(int block=0;block<keep;++block)for(int member=0;member<4;++member)
+                gold.selected[totalityGuard+std::size_t(row)*QwenSparseSelected+block*4+member]=chosen[block]*4+member;
+            for(int tail=0;tail<visible%4;++tail)
+                gold.selected[totalityGuard+std::size_t(row)*QwenSparseSelected+keep*4+tail]=complete*4+tail;
+            gold.count[totalityGuard+row]=keep*4+visible%4;
+        }
+        for(int row=rows;row<capacity;++row)gold.count[totalityGuard+row]=0;
+    }
+    /** @brief Bind unchanged original pointers and one persistent output-bank topology.
+     * @param output Persistent fixture banks, reset only between completed invocations.
+     * @param demand Original authored query-work mode.
+     * @return Original-input descriptor validated by the called public entrypoint.
+     */
+    QwenSparseIndexer bind(IndexerTotalityBanks&output,QwenSparseQueryDemand demand)const
+    {
+        return{.replay=&replay,.query=query.data()+totalityGuard,.raw_keys=raw.data()+totalityGuard,
+            .partial_keys=partial.data()+totalityGuard,.pooled_keys=output.pools.data()+totalityGuard,
+            .query_norm=queryNorm.data()+totalityGuard,.key_norm=keyNorm.data()+totalityGuard,
+            .cosine=cosine.data()+totalityGuard,.sine=sine.data()+totalityGuard,
+            .prepared_query=output.prepared.data()+totalityGuard,.scores=output.scores.data()+totalityGuard,
+            .selected=output.selected.data()+totalityGuard,.selected_count=output.count.data()+totalityGuard,
+            .row_capacity=capacity,.token_capacity=tokens,.block_capacity=blocks,.position_capacity=positions,
+            .rotary_dim=rotary,.norm_epsilon=1.0e-4f,.representation=representation,.query_demand=demand};
+    }
+};
+/** @brief Give each real format/tail integration cell its own unchanged timeout budget. */
+class CPUQwenSparseIndexerTotality:public ::testing::TestWithParam<IndexerTotalityCase>{};
+constexpr std::array<IndexerTotalityCase,12>indexerTotalityCases{{
+    {QwenSparseScalar::FP32,0},{QwenSparseScalar::FP32,1},{QwenSparseScalar::FP32,2},{QwenSparseScalar::FP32,3},
+    {QwenSparseScalar::FP16,0},{QwenSparseScalar::FP16,1},{QwenSparseScalar::FP16,2},{QwenSparseScalar::FP16,3},
+    {QwenSparseScalar::BF16,0},{QwenSparseScalar::BF16,1},{QwenSparseScalar::BF16,2},{QwenSparseScalar::BF16,3}}};
+/** @brief Give one closed format/tail tuple a stable independently filterable test name.
+ * @param info Original parameter; @return Exact source-owned CTest filter suffix.
+ */
+std::string indexerTotalityName(const ::testing::TestParamInfo<IndexerTotalityCase>&info)
+{
+    const char*name=nullptr;
+    switch(info.param.representation){case QwenSparseScalar::FP32:name="FP32";break;case QwenSparseScalar::FP16:name="FP16";break;case QwenSparseScalar::BF16:name="BF16";break;}
+    if(!name)throw std::invalid_argument("Indexer totality case has no declared representation");
+    return std::string(name)+"_Tail"+std::to_string(info.param.tail);
+}
+} // namespace
+/** @test Every native row/team envelope matches original-source gold before outer-team completion. */
+TEST_P(CPUQwenSparseIndexerTotality,NativeRowsAndWorkers)
+{
+    const auto isa=activeISALevel();::llaminar2::cpu::qsa_native::requireNativeProgram(isa);
+    const TeamPolicy policy;const int maximum=policy.threads;ASSERT_GT(maximum,0);
+    for(int rows:{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,31,33})
+    {
+        const auto parameter=GetParam();IndexerTotalityFixture f(parameter.representation,parameter.tail,rows,isa);
+        const auto query=f.query,raw=f.raw,partial=f.partial,queryNorm=f.queryNorm,keyNorm=f.keyNorm,cosine=f.cosine,sine=f.sine;
+        for(auto demand:{QwenSparseQueryDemand::AllLive,QwenSparseQueryDemand::RankingOnly})
+        {
+            IndexerTotalityBanks expected(f.capacity,f.blocks,f.initialPools),actual(f.capacity,f.blocks,f.initialPools);
+            ASSERT_NO_FATAL_FAILURE(f.reference(demand,expected));const auto p=f.bind(actual,demand);
+            const auto verify=[&]()
+            {
+                actual.expect(expected);expectIndexerWords(f.query,query,"original query");expectIndexerWords(f.raw,raw,"original raw keys");
+                expectIndexerWords(f.partial,partial,"original partial keys");expectIndexerWords(f.queryNorm,queryNorm,"original query norm");
+                expectIndexerWords(f.keyNorm,keyNorm,"original key norm");expectIndexerWords(f.cosine,cosine,"original cosine");
+                expectIndexerWords(f.sine,sine,"original sine");
+                EXPECT_EQ(f.replay.prefix_tokens,f.prefix);EXPECT_EQ(f.replay.live_rows,rows);EXPECT_EQ(f.replay.position_origin,f.origin);
+            };
+            for(int workers=1;workers<=maximum;++workers)
+            {
+                SCOPED_TRACE(::testing::Message()<<"rep="<<int(parameter.representation)<<" tail="<<parameter.tail<<" M="<<rows<<" demand="<<int(demand)<<" workers="<<workers);
+                omp_set_num_threads(workers);actual.reset(f.initialPools);cpuQwenSparseIndexer(p);verify();
+                actual.reset(f.initialPools);int actualTeam=0;bool checkedInside=false;
+#pragma omp parallel num_threads(workers)
+                {
+                    if(omp_get_thread_num()==0)actualTeam=omp_get_num_threads();
+                    cpuQwenSparseIndexer(p);
+                    // No test barrier may repair a missing kernel completion edge.
+                    if(omp_get_thread_num()==0){verify();checkedInside=true;}
+                }
+                EXPECT_EQ(actualTeam,workers);EXPECT_TRUE(checkedInside);
+            }
+        }
+    }
+}
+INSTANTIATE_TEST_SUITE_P(OriginalInputs,CPUQwenSparseIndexerTotality,
+    ::testing::ValuesIn(indexerTotalityCases),indexerTotalityName);
 } // namespace llaminar2::qwen4exp::test
