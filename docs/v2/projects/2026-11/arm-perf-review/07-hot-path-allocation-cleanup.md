@@ -107,3 +107,14 @@ idea 10).
   lifecycle reset/replay test, no thread_local cos/sin left in RoPE TU.
 - Process: local --no-verify OK (macOS can't configure full engine); WSL x86
   gate = real prerequisite; branch stays local until gate + handover.
+
+## Follow-up A (from the ideas 7+25 lane, allowlisted '07 follow-up A')
+
+Convert the TEST-ONLY Q16/hybrid RoPE family (apply_rope_q8_1_to_fp32,
+q16_1_integer, q16_integer, q8_1→q16 incl. fixed-scale/head variants,
+q16→q16 fixed/dynamic, compute_rope_sincos_q15) to the admitted angle
+workspace. Proven unreachable in production (QwenGraphBase addRoPE /
+addKeyCachePublicationTransforms = FP32 Q/K, no Q_out; key-only factory
+rejects Q_out/K_out at ComputeStageFactory.cpp:111; ActivationPrecisionPolicy
+rejects non-FP32; GraphResolver sets no outputs — allowlisted by function in
+the source policy). Dead persistent_state parameter removed.
