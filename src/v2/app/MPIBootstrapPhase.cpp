@@ -31,7 +31,6 @@
 #include <map>
 #include <filesystem>
 #include <stdexcept>
-#include <cstdlib>
 #include <string_view>
 
 namespace llaminar2
@@ -48,9 +47,9 @@ namespace llaminar2
          */
         bool selfBootstrappedCorePlaces()
         {
-            const char *self = std::getenv("LLAMINAR_SELF_BOOTSTRAPPED");
-            const char *places = std::getenv("OMP_PLACES");
-            const char *bind = std::getenv("OMP_PROC_BIND");
+            const char *self = DebugEnv::envValue("LLAMINAR_SELF_BOOTSTRAPPED");
+            const char *places = DebugEnv::envValue("OMP_PLACES");
+            const char *bind = DebugEnv::envValue("OMP_PROC_BIND");
             return self && std::string_view(self) == "1" && places && std::string_view(places) == "cores" &&
                 bind && std::string_view(bind) == "close";
         }
