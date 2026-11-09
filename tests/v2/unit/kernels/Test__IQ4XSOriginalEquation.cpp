@@ -13,6 +13,7 @@
 #include <bit>
 #include "../../utils/IQ4XSOriginalEquationSource.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 namespace llaminar2::test
 {
 /** @brief Retain the caller's worker policy across bounded source preparation. */
