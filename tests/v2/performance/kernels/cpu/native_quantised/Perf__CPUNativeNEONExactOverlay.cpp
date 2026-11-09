@@ -178,7 +178,7 @@ TEST(Perf__CPUNativeNEONExactOverlay, CollectAuthenticatedCandidates)
     ASSERT_TRUE(output) << output_path;
     output.seekp(0, std::ios::end);
     if (output.tellp() == 0)
-        output << "schema,isa,codebook,superblock,source_format,shape,n,k,m,workers,tile,nbc,"
+        output << "schema,build_isa,instruction,codebook,superblock,source_format,shape,n,k,m,workers,tile,nbc,"
                   "samples,median_us,p10_us,p90_us,byte_exact\n";
 
     for (const auto *format : formats)
@@ -242,10 +242,11 @@ TEST(Perf__CPUNativeNEONExactOverlay, CollectAuthenticatedCandidates)
                 {
                     auto sorted = samples[index];
                     std::sort(sorted.begin(), sorted.end());
-                    // The build envelope, not the shared arithmetic level, identifies
-                    // the measured leaves: NEON_DOTPROD (SDOT) and NEON_I8MM (SMMLA
-                    // row pairs) share NEONDotProd yet time different instructions.
-                    output << "neon-exact-overlay-v1," << compiledNativeQuantisedBuildISAName() << ','
+                    // Record the build envelope and the leaf instruction the AUTO
+                    // launches resolved (LLAMINAR_ISA_LEVEL may force SDOT/ASIMD in a
+                    // NEON_I8MM binary); the generator never pools across them.
+                    output << "neon-exact-overlay-v2," << compiledNativeQuantisedBuildISAName() << ','
+                           << multi_scale::neonByteDotName(neon_execution::instruction(ISAPath::AUTO)) << ','
                            << static_cast<int>(packed.codebook_id) << ',' << (packed.is_superblock ? 1 : 0) << ','
                            << format->label << ',' << shape.name << ',' << shape.N << ',' << shape.K << ','
                            << m << ',' << workers << ',' << tileName(candidates[index].tile) << ','
