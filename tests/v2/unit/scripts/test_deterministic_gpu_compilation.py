@@ -21,8 +21,10 @@ compiler-internal partitioning. This script proves that contract twice:
   flag on any device compilation. Device compilation is identified by the
   compiler (nvcc/hipcc/clang with CUDA or HIP language) or the source suffix,
   never by the suffix alone, and option sources are expanded first: nvcc
-  ``--options-file``/``-optf`` and ``@response`` files are read relative to
-  the command's directory. An option source that cannot be read is itself a
+  ``--options-file``/``-optf`` and ``@response`` files (including nested
+  ones) are read relative to the command's directory, environment
+  assignments in launcher chains are inspected, and the checker's own
+  NVCC_APPEND_FLAGS/NVCC_PREPEND_FLAGS are rejected. An option source that cannot be read is itself a
   violation, because its contents cannot be certified.
 
 Every invocation runs the negative controls first, so the preflight cell
@@ -33,13 +35,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import shlex
 import sys
 import tempfile
 
-SPLIT_COMPILE = re.compile(r"^-{1,2}split-compile(?:-extended)?(?:=.*)?$")
+SPLIT_COMPILE = re.compile(r"(?<![\w-])-{1,2}split-compile(?:-extended)?(?![\w-])")
+NVCC_ENVIRONMENT_FLAGS = ("NVCC_APPEND_FLAGS", "NVCC_PREPEND_FLAGS")
 CMAKE_GLOBS = ("**/CMakeLists.txt", "**/*.cmake")
 EXCLUDED_ROOTS = ("external", "corpora", ".git")
 DEVICE_SUFFIXES = (".cu", ".hip", ".cu.inc")
@@ -100,15 +104,6 @@ def cmake_code(text: str) -> str:
     return "".join(out)
 
 
-def _cmake_tokens(line: str) -> list[str]:
-    """Split one comment-free CMake line into unquoted argument words."""
-    words = re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s()"]+)', line)
-    tokens: list[str] = []
-    for quoted, bare in words:
-        tokens.extend((quoted or bare).replace(";", " ").split())
-    return tokens
-
-
 def cmake_violations(repo_root: pathlib.Path) -> list[str]:
     """Return every CMake declaration of nvcc split-compile under the repository."""
     violations: list[str] = []
@@ -118,7 +113,7 @@ def cmake_violations(repo_root: pathlib.Path) -> list[str]:
                 continue
             code = cmake_code(path.read_text(encoding="utf-8", errors="replace"))
             for number, line in enumerate(code.splitlines(), 1):
-                if any(SPLIT_COMPILE.match(token) for token in _cmake_tokens(line)):
+                if SPLIT_COMPILE.search(line):
                     violations.append(
                         f"{path.relative_to(repo_root)}:{number}: nvcc split-compile "
                         "is nondeterministic; shard the translation unit instead"
@@ -167,7 +162,9 @@ def _expand_option_sources(
         except (OSError, ValueError) as error:
             unreadable.append(f"{path}: {error}")
         else:
-            expanded.extend(_expand_option_sources(inner, path.parent, unreadable, depth + 1))
+            # Drivers resolve every option source against their working
+            # directory, including sources named inside another source.
+            expanded.extend(_expand_option_sources(inner, directory, unreadable, depth + 1))
         i += 1
     return expanded
 
@@ -176,8 +173,7 @@ def _is_device_compilation(tokens: list[str], source: str) -> bool:
     """Identify device compilation from the compiler and language, not the suffix alone."""
     if source.endswith(DEVICE_SUFFIXES):
         return True
-    executables = [pathlib.Path(token).name for token in tokens[:2]]
-    if any(name.startswith(DEVICE_COMPILERS) for name in executables):
+    if any(pathlib.Path(token).name.startswith(DEVICE_COMPILERS) for token in tokens):
         return True
     for i, token in enumerate(tokens):
         language = None
@@ -185,6 +181,8 @@ def _is_device_compilation(tokens: list[str], source: str) -> bool:
             language = tokens[i + 1]
         elif token.startswith("-x") and len(token) > 2:
             language = token[2:]
+        elif token == "--language" and i + 1 < len(tokens):
+            language = tokens[i + 1]
         elif token.startswith("--language="):
             language = token.split("=", 1)[1]
         if language in DEVICE_LANGUAGES:
@@ -205,14 +203,22 @@ def command_violations(entries: list[dict[str, object]]) -> list[str]:
         for problem in unreadable:
             violations.append(f"{source}: unreadable option source {problem}")
         for token in tokens:
-            if SPLIT_COMPILE.match(token):
+            # Unanchored: also catches NVCC_APPEND_FLAGS=... env assignments
+            # in launcher chains and option values embedded in other words.
+            if SPLIT_COMPILE.search(token):
                 violations.append(f"{source}: generated command uses {token}")
     return violations
 
 
+def environment_violations(environment: dict[str, str]) -> list[str]:
+    """nvcc silently appends/prepends these variables to every invocation."""
+    return [f"environment {name} requests {value}" for name in NVCC_ENVIRONMENT_FLAGS
+            if SPLIT_COMPILE.search(value := environment.get(name, ""))]
+
+
 def verify(repo_root: pathlib.Path, build_dir: pathlib.Path | None) -> list[str]:
-    """Run the source and (when supplied) generated-command contracts."""
-    violations = cmake_violations(repo_root)
+    """Run the source, environment and (when supplied) generated-command contracts."""
+    violations = cmake_violations(repo_root) + environment_violations(dict(os.environ))
     if build_dir is not None:
         database = build_dir / "compile_commands.json"
         if not database.is_file():
@@ -234,7 +240,10 @@ def run_self_test() -> int:
             "target_compile_options(t PRIVATE \"-DNOTE=#\" \"--split-compile=8\")\n"
             "#[[ --split-compile=2 inside a bracket comment ]]\n"
             "set(OPTS \"-O3;--split-compile=0\")\n"
-            "set(SAFE \"-DTEXT=--split-compile-is-only-a-word\")\n",
+            "set(SAFE \"-DTEXT=--split-compile-is-only-a-word\")\n"
+            "target_compile_options(t PRIVATE \"$<$<COMPILE_LANGUAGE:CUDA>:--split-compile=8>\")\n"
+            "target_compile_options(t PRIVATE \"SHELL:--split-compile=8\")\n"
+            "set(CMAKE_CUDA_FLAGS [[--split-compile=8]])\n",
             encoding="utf-8",
         )
         (root / "cmake").mkdir()
@@ -253,6 +262,9 @@ def run_self_test() -> int:
             "src/CMakeLists.txt:2",
             "src/CMakeLists.txt:3",
             "src/CMakeLists.txt:5",
+            "src/CMakeLists.txt:7",
+            "src/CMakeLists.txt:8",
+            "src/CMakeLists.txt:9",
         ], found
 
         build = root / "build"
@@ -260,6 +272,12 @@ def run_self_test() -> int:
         (build / "gpu.opts").write_text("-O3 --split-compile=8\n", encoding="utf-8")
         (build / "clean.opts").write_text("-O3\n", encoding="utf-8")
         (build / "nested.rsp").write_text("--options-file gpu.opts\n", encoding="utf-8")
+        # Same-name inner sources in two directories: only the executed
+        # directory's copy is the authority.
+        (build / "cfg").mkdir()
+        (build / "cfg" / "outer.opts").write_text("--options-file inner.opts\n", encoding="utf-8")
+        (build / "cfg" / "inner.opts").write_text("-O3\n", encoding="utf-8")
+        (build / "inner.opts").write_text("--split-compile=4\n", encoding="utf-8")
         d = str(build)
         entries = [
             {"directory": d, "file": "/s/a.cu", "command": "nvcc -O3 --split-compile=0 -c a.cu"},
@@ -274,14 +292,21 @@ def run_self_test() -> int:
             {"directory": d, "file": "/s/j.cu", "command": "nvcc @nested.rsp -c j.cu"},
             {"directory": d, "file": "/s/k.cu", "command": "nvcc --options-file missing.opts -c k.cu"},
             {"directory": d, "file": "/s/l.cu.inc", "command": "/usr/bin/ccache nvcc --split-compile=1 -c l.cu.inc"},
+            {"directory": d, "file": "/s/m.cu", "command": "env NVCC_APPEND_FLAGS=--split-compile=8 nvcc -c m.cu"},
+            {"directory": d, "file": "/s/n.cu", "command": "env NVCC_PREPEND_FLAGS='-O3 --split-compile=2' nvcc -c n.cu"},
+            {"directory": d, "file": "/s/o.cu", "command": "nvcc --options-file cfg/outer.opts -c o.cu"},
+            {"directory": d, "file": "/s/p.cpp", "command": "cmake -E env A=1 /opt/cuda/bin/nvcc --language cu --split-compile=8 -c p.cpp"},
         ]
         found = command_violations(entries)
         offenders = sorted({item.split(":")[0] for item in found})
         assert offenders == [
             "/s/a.cu", "/s/b.cu", "/s/e.hip", "/s/f.cu", "/s/h.cpp",
             "/s/i.cpp", "/s/j.cu", "/s/k.cu", "/s/l.cu.inc",
+            "/s/m.cu", "/s/n.cu", "/s/o.cu", "/s/p.cpp",
         ], found
         assert not command_violations([entries[2], entries[3], entries[6]])
+        assert environment_violations({"NVCC_APPEND_FLAGS": "--split-compile=8"})
+        assert not environment_violations({"NVCC_APPEND_FLAGS": "-O3", "OTHER": "--split-compile=8"})
     print("deterministic GPU compilation policy self-test: PASS")
     return 0
 
