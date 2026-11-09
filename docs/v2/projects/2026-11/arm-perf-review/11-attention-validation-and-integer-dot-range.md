@@ -78,3 +78,20 @@ Proposed options (only with proof):
   tail-bearing adversarial regression (current n64 fixture only exercises
   vector lanes with key=1). Amended R1 SHA → reviewer re-check (reviewer
   pins to exact SHAs; in-flight R2 kept out of the reviewed tree).
+
+## P1 FIXED at amended R1 0501d506b (2026-11-09)
+
+- Reproduced with UBSan on 09cba9963 ('signed integer overflow:
+  2113929216 + 1073741824' at tail add).
+- Fix: combined vector peak + tail-code scan checked BEFORE the horizontal
+  fold and any scalar tail arithmetic (before that: modular SIMD adds only —
+  no UB). Valid input runs the IDENTICAL INT32 program (same vector
+  accumulation, fold, tail order).
+- Regression: Q16BoundRejectsInvalidTailCodesBeforeTailArithmetic
+  (V2_Integration_NEONAttentionQ16Int32Bound) — n=65, limit 1008, keys
+  −32768; valid worst case 2,146,959,360 exact for Rows 1/2/4; tail codes
+  −32768/±1009/32767 fatal per Rows 1/2/4; same codes in the vector part
+  fatal. UBSan clean; 7/7 NEONAttentionMath on M1.
+- Reviewed tree = 09cba9963 + fix only (no R2). R2 (C2c) uncommitted; will
+  rebase onto 0501d506b and carry the same tail ordering into the admitted
+  integerDotRows kernel.
