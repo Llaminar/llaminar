@@ -67,9 +67,15 @@ Installed and verified:
   members' tasks in one dynamic workshare (byte-identical). On GB10 35B it cut
   the bundle from 668 to 176 us per call (routed experts 803 to 274 us, which
   also includes the bounded spin policy).
-- **GB10 integrated GPU (validation build: head + `codex/cuda-sm121-spills`).**
-  CUDA+CPU builds at sm_121 with zero spills once the separate CUDA spill branch
-  is merged. Logical plan lines now keep the integrated GPU's pool observation
+- **GB10 integrated GPU (sm_121).** The branch builds spill-free at sm_121, at
+  120;121 and at the complete 80;86;89;90;120;121 set, with the fatal spill guard
+  active. The remaining 12.x spills were fixed without register-array demotion:
+  - NativeQuantised prefill and flash attention are persistent TU shards. nvcc
+    `--split-compile` gave nondeterministic register allocation and is now
+    forbidden by `V2_Integration_DeterministicGPUCompilation`.
+  - Tensor prefill, BK256 and the HD256 one-warp context oracle have 12.x-only
+    scheduling fixes.
+  GB10 runtime gates for that slice are tracked as idea 21. Logical plan lines now keep the integrated GPU's pool observation
   (`98e427c7c`, `V2_Integration_IntegratedGPUPoolObservationMerge`); before,
   every GB10 CUDA start failed `validateMemoryPlan`. 35B CUDA+CPU runs at 132
   tok/s prefill and 97 tok/s decode, and an over-subscribed authored tier is
