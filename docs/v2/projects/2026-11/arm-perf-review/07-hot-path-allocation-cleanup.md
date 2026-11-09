@@ -185,6 +185,15 @@ the source policy). Dead persistent_state parameter removed.
   35B-mtp +0.31%); prefill no-gain (+0.20% jitter). +0.8% decode = branch
   BONUS (recorded in the handover).
 
+## RENAME REBASE onto 425002104 (2026-11-09)
+
+- #43 rebased + force-pushed: tip **425002104** @ base `46c35f15b`; base
+  renamed `NativeVNNI`->`NativeQuantised` (`a0fd16d04`); old tip `5922cd1f5`
+  is pre-rename. 989b7bada must be replayed with the map
+  (`/tmp/remap/vnni_map.py`) onto 425002104; new tip TBD; WSL x86 gate + Mac
+  portability + reviewer on the new tip. A/B economy stands (rename =
+  identifiers only; Main's deletions already rebased).
+
 ## Rebase onto arm tip 5922cd1f5 (2026-11-09)
 
 - Main retired getOrCreateRoPE + two dead test sources (lane's flagged
