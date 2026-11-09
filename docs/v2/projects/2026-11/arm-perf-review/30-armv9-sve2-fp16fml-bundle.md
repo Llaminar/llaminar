@@ -81,3 +81,30 @@ decision; plan-first doc.
   rejection (half-operand policies) is scoped; 'native' runs quantized GDN.
   Full log retained by the DGX addon (scratch-sve2/*).
 - PMU inaccessible (perf_event_paranoid=4) -> estimated cycles only.
+
+## DGX addon FINAL (2026-11-09) — full census + sweep + X925 plan
+
+- COMPILERS: GCC13 + GCC14.2 identical census; every spelling compiles
+  (table incl. minimal `armv8-a+simd+dotprod+sve2` + optional +i8mm/bf16/
+  fp16fml). `armv9-a+...` expands the WHOLE baseline (LSE etc.) — NOT a safe
+  cosmetic rename; prefer minimal leaf flags. GCC14: -mcpu=generic conflicts
+  with richer -march (do not change envelope to mask).
+- SWEEP (Grace, VL=128, estimated cycles, cache-hot synthetic): SVE128 vs
+  NEON = LOSES at small K (0.85-0.99x), near-parity at K512 (sdot 1.02x,
+  smmla 1.075x); fixed128 codegen SMMLA 1.017/1.060/1.080 @K128/256/512.
+  NO honest SVE256 numbers (VL capped on Grace; X925 pending). Conclusion:
+  at 128-bit SVE2 = no significant win (instruction-pool only).
+- X925 PLAN (if 256-bit admitted): capability gate (HWCAP bits + VALID VL
+  selections; never infer 256 from name/bit/rejected prctl); minimal leaf
+  envelope; leaf-first vs runtime-default; VL ownership per-worker (seal
+  identity; fresh probe process); kernel priority (Q8/int8 decode
+  panels/GEMV -> grouped-GEMV/MTP -> attention -> FP16/BF16 only under
+  explicit contracts); evidence gates (census x envelope x route x VL x
+  compiler; byte oracle; register witness to Z/P; ProductionTestPreflight);
+  effort ~1-2d census / 3-5d one family / 1-3+w full. Risks: no gain@128,
+  arithmetic changes, VL/layout mismatch, untracked armv9 baseline.
+- GDN native ADMIT (Grace, exact cmd + diagnostics retained; 'Candidates: 1
+  admitted'; NOT an executed-Sparks admission).
+- Decision: if X925-256 -> resume SVE2 candidate (DGX lane); if 128 ->
+  prioritize NEONDotProd/I8MM + emitted-FP16 verification (idea 31 +
+  vfmlalq check).
