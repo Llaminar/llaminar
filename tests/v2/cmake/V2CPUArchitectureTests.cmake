@@ -367,14 +367,25 @@ v2_add_core_free_test(V2_Unit_CPUCodegenEvidenceLifecycle
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_envelope.py"
     LABELS V2 Unit CPU DeviceFree ISA Build Regression)
-v2_add_core_free_test(V2_Unit_CPUNativeTileRegisterEvidence
-    COMMAND "${Python3_EXECUTABLE}" -B
-        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_native_tile_register_evidence.py"
-    LABELS V2 Unit CPU DeviceFree ISA Build Regression)
-v2_add_core_free_test(V2_Integration_CPUNativeTileRegisterEvidence
-    COMMAND "${Python3_EXECUTABLE}" -B
-        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_native_tile_register_evidence.py"
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
+# The witness checker tests run in shards: the compiler-free analysis classes, and the proof-binding tests
+# (which spawn stand-in compiler/disassembler processes) split four ways, each well inside the timeout.
+foreach(v2_tile_register_shard IN ITEMS analysis binding-0 binding-1 binding-2 binding-3)
+    string(REPLACE "-" "" v2_tile_register_shard_suffix "${v2_tile_register_shard}")
+    string(SUBSTRING "${v2_tile_register_shard_suffix}" 0 1 v2_tile_register_first)
+    string(TOUPPER "${v2_tile_register_first}" v2_tile_register_first)
+    string(SUBSTRING "${v2_tile_register_shard_suffix}" 1 -1 v2_tile_register_rest)
+    set(v2_tile_register_name "${v2_tile_register_first}${v2_tile_register_rest}")
+    v2_add_core_free_test(V2_Unit_CPUNativeTileRegisterEvidence${v2_tile_register_name}
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_native_tile_register_evidence.py"
+            --shard "${v2_tile_register_shard}"
+        LABELS V2 Unit CPU DeviceFree ISA Build Regression)
+    v2_add_core_free_test(V2_Integration_CPUNativeTileRegisterEvidence${v2_tile_register_name}
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_native_tile_register_evidence.py"
+            --shard "${v2_tile_register_shard}"
+        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
+endforeach()
 v2_add_core_free_test(V2_Integration_CPUCodegenFailedRebuildInvalidation
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_envelope.py"
