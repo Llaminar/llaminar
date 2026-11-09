@@ -7820,3 +7820,19 @@ TEST(CPUGDNKernels, ShortConvNeonPrefillAndDecodeExactReference)
 }
 #endif
 }
+
+/** @test A causal window wider than the SIMD prefill programs hold is rejected before any write. */
+TEST(Test__GDNKernels, ShortConvPrefillRejectsWindowWiderThanSIMDRegisters)
+{
+    const int seq_len = 3, channels = 5, kernel_size = 9;
+    std::vector<float> input(static_cast<std::size_t>(seq_len * channels), 1.0f);
+    std::vector<float> weight(static_cast<std::size_t>(channels * kernel_size), 0.5f);
+    std::vector<float> output(input.size(), -7.0f);
+    std::vector<float> state(static_cast<std::size_t>(channels * (kernel_size - 1)), 2.0f);
+    const auto state_before = state;
+    CPUShortConvolution conv;
+    EXPECT_FALSE(conv.forward(input.data(), weight.data(), nullptr, output.data(), state.data(),
+                              seq_len, channels, kernel_size, false));
+    EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](float v) { return v == -7.0f; }));
+    EXPECT_EQ(state, state_before);
+}
