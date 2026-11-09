@@ -155,12 +155,14 @@ arbitrary hard CPU-ID pinning; record advisory placement and actual evidence.
   Helper/KV/factory/runtime admission remains unfinished. Later class edits are
   outside the frozen Spark certificate; syntax/leaf/scope checks do not qualify
   their runtime. All four softmax and both rotation entries resolve.
-- The latest completed five-Mac focused matrix passes159/159 in baseline/DotProd
-  Release, DotProd ASan/UBSan, strict-warning Debug and LLVM Release; all121
-  configured preflights pass20 repetitions (2420 raw passes), including native
-  reduction/production-TU RMSNorm ownership/bytes/portable half, configure-host
-  topology/receipt, real CTest retirement metadata and image-fixture contracts.
-  The earlier151/115 and157/119 checkpoints retain their narrower scopes.
+- The latest completed five-Mac focused matrix passes170/170 in baseline/DotProd
+  Release, DotProd ASan/UBSan, strict-warning Debug and LLVM Release; all130
+  configured preflights pass20 repetitions (2600 raw passes), including native
+  reduction/production-TU RMSNorm ownership/bytes/portable half, original-Q16
+  geometry/expansion/ISA-specific reductions and actual legacy callers,
+  configure-host topology/receipt, real CTest retirement metadata and image-fixture
+  contracts. Actual XML/raw records were independently parsed without fail/skip.
+  The earlier151/115,157/119,159/121 and167/128 checkpoints retain narrower scopes.
   The intervening136-test sanitizer
   projection-batch timeout remains RED. Its unchanged hashed binary passes20
   isolated-window repetitions, then the complete current matrix passes; no
@@ -304,6 +306,15 @@ silent SDK substitution is authorized. Export a new source successor, bind this
 new SDK explicitly and obtain fresh lab/capacity admission for one BUILD-ONLY
 attempt. Whole engine gates remain open.
 
+That new immutablec76/e981 attempt now has independently SHA-checked returned
+raw evidence: actual20-core/1-package/1-thread configure/generate passes97.265s,
+and the complete ordinary app/gate target command reaches real compilation.
+It stops90.352s later at an unused x86-only header in KVCacheAppendStage.cpp,
+without OOM. Main removes the unused include and adds explicit architecture
+preflight; actual current GNU14 stage syntax passes with the exact captured
+production command. No old packet was patched/retried and no complete target,
+Unit or serving pass is inferred. A new full-build successor is still required.
+
 The RMSNorm frontier now has a bounded native production-TU slice. Actual
 retained1×12288 all-ones execution reproduced per-caller partial ownership
 (output1.7320248 instead of0.999995), plus repeated small in-place normalization
@@ -320,13 +331,38 @@ RMSNorm8+3 XML passes. The implementation evidence retains each newer focused
 matrix's exact source/count scope. None of these checks qualifies factory
 runtime or full inference.
 
+Original-Q16 now has a separate current-worktree native tile program: FP32
+products/squares precede fixed FP64 chains and original FP32-mean inverse;
+complete-block/expansion/gamma/options checks and retained empty completion have
+three failing frozen-source regressions. Native GNU14 ARM15 production+9 actual
+legacy+3 reduction cases and all170 Mac focused registrations/five profiles pass;
+130 preflights pass20 repetitions. Actual production M1 bytes and independent
+rounded-square programs cover original geometry/workers without a decoded bank.
+Reference trees follow declared ISA/force-scalar, preserving eight-chain native
+and sixteen-chain AVX512 arithmetic; a K128 RN fixture proves their different
+means/inverses. Six legacy unconditional AVX512 callers were independently
+reproduced failing before repair. Public native calls now preserve their original
+accuracy obligations; the named entry separately proves implementation or exact
+rejection, and rejects nonfinite output as evidence. The canonical Unit name and
+explicit legacy/tree preflights use the actual core-free production TU.
+
+A genuine AVX2 body and both x86 syntax envelopes exist, but new native x86
+runtime still needs qualification. The old native SDK now directly proves both
+CMake/CTest3.28.3, not the required4.x serializer. An initial SDK producer stopped
+before install at BuildKit registry resolution; its failure remains immutable.
+The authorized exact-local offline SDK successor requires actual tool/native
+proof before source tests, without host changes or alternate-base substitution.
+Four-row AppleClang/GNU14 static resources have no hot stack accesses/calls
+(28/23 SIMD identities); this is not PMU, latency/scaling or final performance
+qualification.
+
 RMSNorm remains unfinished: residual and quantized factory/workspace routes,
-Q8 epsilon/stale gamma/no-op/narrowing defects, Q16 distinct square/geometry/
-expansion rules, INT32 AVX2 low-bit loss and row-quantizer alias/scale programs
-need independent executed regressions, repairs and complete gates. Preserve the
-source audit's distinct numerical programs instead of copying legacy outputs
-or accepting cosine-only tests as metadata/code correctness. Final resource,
-latency, scaling and complete model/MTP campaigns still apply.
+Q8 epsilon/stale gamma/no-op/narrowing defects, INT32 AVX2 low-bit loss and
+row-quantizer alias/scale programs require independent executed repairs and
+complete gates. Q16 full factory/runtime/snapshot and actual capacity/lifetime
+qualification remain open. Preserve distinct audited programs instead of
+copying legacy outputs or accepting cosine-only metadata/code tests. Final
+resource, latency, scaling and complete model/MTP campaigns still apply.
 
 ### 2.4 Audit coverage and limits
 

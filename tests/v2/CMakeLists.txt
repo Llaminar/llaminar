@@ -6737,18 +6737,8 @@ add_v2_test(V2_Unit_Q8_1PureIntegerRMSNorm
     MPI_PROCS 1
 )
 
-# Test: Q16_1 RMSNorm (Q16_1 input → FP32 output)
-add_executable(v2_test_q16_1_rmsnorm unit/kernels/cpu/ops/Test__Q16_1RMSNorm.cpp)
-target_link_libraries(v2_test_q16_1_rmsnorm 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16_1RMSNorm 
-    COMMAND $<TARGET_FILE:v2_test_q16_1_rmsnorm>
-    LABELS "V2;Unit;Kernels;RMSNorm;Q16_1;TypedResiduals;CPU"
-    MPI_PROCS 1
-)
+# Q16 RMSNorm's actual primitive-TU accuracy/ISA tests are core-free and
+# registered once in V2CPUArchitectureTests.cmake for both full and focused gates.
 
 # Test: Q4_1 SIMD Unpack
 add_executable(v2_test_q4_1_simd_unpack unit/tensors/Test__Q4_1_SIMD_Unpack.cpp)
