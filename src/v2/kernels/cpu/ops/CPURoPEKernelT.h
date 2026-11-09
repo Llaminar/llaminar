@@ -15,7 +15,7 @@
  * KernelFactory can simply return the typed kernel as ITensorRoPE* - no adapters needed.
  *
  * Angle ownership: the FP32/BF16/FP16/Q8_1 kernels own no angle storage. Each
- * declares the `cpu_rope_angles` workspace (graph rows x head_dim/2 pairs) and
+ * declares the `cpu_rope_angles` workspace (graph rows x rotated pairs) and
  * borrows it from the RoPEStage binding on every call; a missing or undersized
  * binding is fatal. There is no thread-local memo: every call fills its rows
  * through the single absolute-position row function.
@@ -153,16 +153,16 @@ namespace llaminar2
      * @brief Workspace declaration and borrow shared by the angle-table CPU RoPE kernels.
      *
      * The stage-owned kernel receives its stage's DeviceWorkspaceManager through
-     * the PreparedEngine binding. RoPE consumers receive the physical head width
-     * as `n`; the requirement then depends only on graph rows and head geometry.
+     * the PreparedEngine binding. RoPE consumers receive the effective rotated
+     * width as `n`; the requirement then depends only on graph rows and that width.
      */
     class CPURoPEAngleWorkspaceConsumer : public CPUKernelBase
     {
     public:
         /**
-         * @brief Declare the angle planes for m rows of an n-wide head.
+         * @brief Declare the angle planes for m rows of an n-wide rotated prefix.
          * @param m Maximum rows one invocation of this graph rotates.
-         * @param n Physical head width; zero leaves the geometry undeclared.
+         * @param n Effective rotated width; zero leaves the geometry undeclared.
          * @param k Unused.
          * @return The single `cpu_rope_angles` buffer, or nothing without a head width.
          */
