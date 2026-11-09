@@ -229,6 +229,16 @@ TEST_F(NEONAttentionMath, OriginalStorageAndDomainAdmission)
     values.fill(std::span(value).first(4));std::array<float,4> aliased_weights{1,2,3,4};
     EXPECT_THROW((native::accumulate<Storage::FP32,4>(aliased_weights,values,aliased_weights)),std::invalid_argument);
     EXPECT_EQ(output,original);EXPECT_EQ(aliased_weights,weights);
+    // A nonfinite weight is fatal before any numerator write: a throw here
+    // would strand the rest of the worker team at its barrier.
+    values.fill(value);
+    for(const float bad:{std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity(),-std::numeric_limits<float>::infinity()})
+        for(int row=0;row<4;++row)
+        {
+            auto invalid=weights;invalid[row]=bad;
+            EXPECT_DEATH((native::accumulate<Storage::FP32,4>(output,values,invalid)),"nonfinite attention weight");
+        }
+    EXPECT_EQ(output,original);
     std::array<std::int16_t,8> destination;destination.fill(0x5151);const auto initial=destination;
     EXPECT_THROW(native::quantizeQuery(query,destination,0),std::invalid_argument);
     EXPECT_THROW(native::quantizeQuery(query,std::span(destination).first(7),127),std::invalid_argument);
