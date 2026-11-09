@@ -960,6 +960,10 @@ v2_add_core_free_test(V2_Integration_CPURoPECachedRetained
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE ByteExact Regression)
 
+v2_add_core_free_test(V2_Integration_CPURoPEInverseFrequencyLookup
+    COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
+        --gtest_filter=CPURoPEWorkshare.InverseFrequencyLookupIsStableAcrossThreadsAndEvictions
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Ownership Regression)
 v2_add_core_free_test(V2_Integration_CPURoPEInlineBoundedCoefficients
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
         --gtest_filter=CPURoPEWorkshare.InlineWideHeadsAndPartialPrefixesRetainProductionBytes
