@@ -4534,6 +4534,14 @@ foreach(V2_MPI_INVALID_KIND IN ITEMS layout version)
         target_compile_definitions(${V2_MPI_INVALID_TARGET} PRIVATE LLAMINAR_MPI_INVALID_VERSION)
     endif()
 endforeach()
+add_v2_test(V2_Integration_MPISessionNativeCABI
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_mpi_native_module_abi.py
+        --module $<TARGET_FILE:llaminar_mpi_schizo> --mpi-library "${MPI_mpi_LIBRARY}"
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;ABI;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPISessionNativeCABI)
+
 foreach(V2_MPI_DAEMON_CASE IN ITEMS success wait missing incompatible incompatible-version
         unselected-inclusion unselected-exclusion)
     add_v2_test(V2_Integration_MPISessionNativeDaemon_${V2_MPI_DAEMON_CASE}
@@ -7613,21 +7621,8 @@ add_v2_test(V2_Unit_CPUFlashAttentionKernelT
     MPI_PROCS 1
 )
 
-# Test: typed CPU FlashAttention2 cache and physical-axis launch policy.
-add_executable(v2_test_cpu_flash_attention_launch_policy
-    unit/kernels/cpu/attention/Test__CPUFlashAttentionLaunchPolicy.cpp
-    unit/kernels/cpu/attention/Test__CPUQ16AttentionMath.cpp
-)
-target_link_libraries(v2_test_cpu_flash_attention_launch_policy
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_CPUFlashAttentionLaunchPolicy
-    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
-    LABELS "V2;Unit;Kernels;Attention;FlashAttention;CPU;Dispatch;CachePolicy;Totality"
-    MPI_PROCS 1
-)
+# Device-free CPU attention launch/range policy registration is shared with
+# the native portability project in cmake/V2CPUArchitectureTests.cmake.
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_FP32
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
             --gtest_filter=Test__CPUFlashAttentionKernelT.GroupedVerifierRowsMatchSerialDecode_Qwen36FP32_RuntimeM

@@ -28,10 +28,9 @@ namespace llaminar2
                 result.projection_abi = CPUProjectionScheduleABI::ARMRegisterK;
             }
 #else
-            std::uint32_t l2 = 0, l3 = 0, l2_ways = 0, l3_ways = 0;
-            if (detail::detect_cache_by_level(2, false, l2, nullptr, &l2_ways) &&
-                detail::detect_cache_by_level(3, false, l3, nullptr, &l3_ways))
-                result.cache = {l2, l3, l2_ways, l3_ways};
+            const auto &cache = cpu_cache_observation();
+            result.cache = {cache.private_l2_bytes, cache.shared_l3_bytes,
+                cache.private_l2_ways, cache.shared_l3_ways};
             result.maximum_native_row_tile = isa == ISALevel::AVX512 ? 4 :
                 (isa == ISALevel::AVX2 ? 2 : 0);
             if (result.maximum_native_row_tile)

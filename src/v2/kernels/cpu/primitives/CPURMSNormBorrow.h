@@ -1,0 +1,132 @@
+/**
+ * @file CPURMSNormBorrow.h
+ * @brief Complete original floating RMSNorm bank/policy borrows before worksharing.
+ *
+ * Geometry, address arithmetic, exact-alias policy and immutable gamma/metadata
+ * protection are established before workers can write. These synchronous views
+ * neither invent capacity nor extend arena leases; PhysicalMemoryAuthority and
+ * the caller's tensors remain the storage authorities. No decoded bank, live
+ * allocation ledger, persistent execution shadow or numerical state is owned.
+ */
+#pragma once
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <span>
+#include <stdexcept>
+#include <type_traits>
+
+namespace llaminar2::primitives::rmsnorm_operands
+{
+/** @brief Compare nonempty byte spans without forming overflowing end pointers.
+ * @param a First bank; @param a_bytes Its physical bytes.
+ * @param b Second bank; @param b_bytes Its physical bytes.
+ * @return Whether the declared byte envelopes intersect.
+ */
+inline bool overlaps(const void *a,std::size_t a_bytes,const void *b,std::size_t b_bytes) noexcept
+{
+    if(!a_bytes||!b_bytes)return false;
+    const auto x=reinterpret_cast<std::uintptr_t>(a),y=reinterpret_cast<std::uintptr_t>(b);
+    return x<=y?y-x<a_bytes:x-y<b_bytes;
+}
+/** @brief Validate declared original bank arithmetic, without asserting allocated capacity.
+ * @param bank Original synchronous borrow; @param units Original physical words.
+ * @param unit_bytes Exact physical word width.
+ * @throws std::invalid_argument For missing data or unrepresentable/wrapping extents.
+ */
+inline void requireBank(const void *bank,std::size_t units,std::size_t unit_bytes)
+{
+    if(!unit_bytes||units>std::size_t(std::numeric_limits<std::ptrdiff_t>::max())/unit_bytes)
+        throw std::invalid_argument("CPU RMS original bank extent exceeds the pointer domain");
+    const auto bytes=units*unit_bytes;
+    if(bytes&&(!bank||reinterpret_cast<std::uintptr_t>(bank)>std::numeric_limits<std::uintptr_t>::max()-bytes))
+        throw std::invalid_argument("CPU RMS requires a complete nonwrapping original bank");
+}
+
+/** @brief Checked complete original floating bank and immutable normalization policy.
+ * @tparam Word Exact original/result floating physical word (FP32 or encoded16-bit).
+ */
+template<class Word>
+class FloatingBorrow final
+{
+    static_assert(std::is_same_v<Word,float>||std::is_same_v<Word,std::uint16_t>);
+public:
+    /** @brief Bind the complete invocation before any worker can mutate data.
+     * @param source Original complete row-major bank; @param gamma Immutable FP32 weights or identity.
+     * @param output Original writable bank, permitting only exact source aliases.
+     * @param rows Original row count; @param columns Original logical width.
+     * @param epsilon Finite nonnegative original normalization policy.
+     * @return A synchronous immutable addressing/policy borrow.
+     * @throws std::invalid_argument For invalid geometry, policy or aliases.
+     */
+    static FloatingBorrow bind(const Word *source,const float *gamma,Word *output,
+        std::size_t rows,std::size_t columns,float epsilon)
+    {
+        if(!std::isfinite(epsilon)||epsilon<0.0f||rows>std::size_t(std::numeric_limits<std::ptrdiff_t>::max())||
+           columns>std::size_t(std::numeric_limits<std::ptrdiff_t>::max())/sizeof(Word)||
+           (columns&&rows>std::size_t(std::numeric_limits<std::ptrdiff_t>::max())/sizeof(Word)/columns))
+            throw std::invalid_argument("CPU RMS requires representable original geometry and a finite nonnegative epsilon");
+        const auto words=rows*columns;
+        requireBank(source,words,sizeof(Word));requireBank(output,words,sizeof(Word));
+        if(gamma)requireBank(gamma,columns,sizeof(float));
+        const auto bytes=words*sizeof(Word);
+        if(source!=output&&overlaps(source,bytes,output,bytes))
+            throw std::invalid_argument("CPU RMS supports exact source aliases, not partial original-bank overlap");
+        if(gamma&&overlaps(output,bytes,gamma,columns*sizeof(float)))
+            throw std::invalid_argument("CPU RMS output aliases immutable original gamma");
+        return FloatingBorrow(source,gamma,output,rows,columns,epsilon);
+    }
+    /** @return Whether the complete original invocation has no arithmetic work. */
+    [[nodiscard]] bool empty()const noexcept{return rows_==0||columns_==0;}
+    /** @return Original row count, independent of worker assignment. */
+    [[nodiscard]] std::size_t rows()const noexcept{return rows_;}
+    /** @return Original logical width, independent of physical padding. */
+    [[nodiscard]] std::size_t columns()const noexcept{return columns_;}
+    /** @return Original finite epsilon, unchanged by dtype or worker count. */
+    [[nodiscard]] float epsilon()const noexcept{return epsilon_;}
+    /** @return Original immutable weights, or an explicitly empty identity span. */
+    [[nodiscard]] std::span<const float> gamma()const noexcept
+    {return gamma_?std::span<const float>(gamma_,columns_):std::span<const float>{};}
+    /** @brief Borrow one original logical input row.
+     * @param row Original row coordinate; @return Complete original row.
+     * @throws std::out_of_range For an invalid original row coordinate.
+     */
+    [[nodiscard]] std::span<const Word> sourceRow(std::size_t row)const
+    {
+        if(row>=rows_)throw std::out_of_range("CPU RMS input row outside original bank");
+        return {columns_?source_+row*columns_:source_,columns_};
+    }
+    /** @brief Borrow one original logical output row.
+     * @param row Original row coordinate; @return Complete original output row.
+     * @throws std::out_of_range For an invalid original row coordinate.
+     */
+    [[nodiscard]] std::span<Word> outputRow(std::size_t row)const
+    {
+        if(row>=rows_)throw std::out_of_range("CPU RMS output row outside original bank");
+        return {columns_?output_+row*columns_:output_,columns_};
+    }
+    /** @brief Retain immutable invocation metadata throughout publication.
+     * @param metadata Original live policy/descriptor; @param bytes Its complete physical extent.
+     * @throws std::invalid_argument For any metadata/output alias.
+     */
+    void requireMetadataReadOnly(const void *metadata,std::size_t bytes)const
+    {
+        if(overlaps(output_,rows_*columns_*sizeof(Word),metadata,bytes))
+            throw std::invalid_argument("CPU RMS output aliases retained invocation metadata");
+    }
+private:
+    /** @brief Retain only already-checked original addressing and policy.
+     * @param source Original input; @param gamma Original immutable weights.
+     * @param output Original output; @param rows Original rows; @param columns Original width.
+     * @param epsilon Original finite policy.
+     */
+    FloatingBorrow(const Word *source,const float *gamma,Word *output,std::size_t rows,std::size_t columns,float epsilon)
+        :source_(source),gamma_(gamma),output_(output),rows_(rows),columns_(columns),epsilon_(epsilon){}
+    const Word *source_;
+    const float *gamma_;
+    Word *output_;
+    std::size_t rows_,columns_;
+    float epsilon_;
+};
+} // namespace llaminar2::primitives::rmsnorm_operands
