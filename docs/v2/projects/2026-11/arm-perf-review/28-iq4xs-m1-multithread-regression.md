@@ -590,3 +590,10 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   the Linux ABI). FIX: single option cluster `-SE`; keep sharding/timeouts.
 - Census heads-up sent (stand-in/shebang failure would be this finding, not a
   rejection). Reviewer continues (no probe; no census inference).
+
+- CONFIRMED on the c1b3fbd35 census: the 8 Binding0-3 stand-in failures =
+  the known shebang-ABI finding exactly (every failing test emits
+  'Unknown option: -' from python3.12; stand-ins never start). NOT a product
+  rejection — EvidenceAnalysis 2 + NEONTileRegisters 2 + witness + lifecycle +
+  9/9 census all green; proof/2714 intact. Awaiting the `-SE` successor;
+  no re-run of the old SHA.
