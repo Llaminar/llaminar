@@ -32,6 +32,10 @@ struct Common {
  std::shared_ptr<const void> definition_scope_=std::make_shared<const std::byte>();
  detail::NativeCapturedFragmentFrontiers<void*,void*> fragment_frontiers_;
  bool native_capture_active_=false;int device_ordinal_=0;
+ // Recording-definition scope and fragment frontiers are retired first by the
+ // production bodies, before any native handle is released.
+ std::shared_ptr<const void> definition_scope_=std::make_shared<const int>(1);
+ struct FragmentFrontiers{std::vector<int>nodes{1,2};void clear(){nodes.clear();}} fragment_frontiers_;
  void*exec_=reinterpret_cast<void*>(0x100);void*graph_=reinterpret_cast<void*>(0x200);
  std::size_t resident_memory_bytes_=1024,node_count_=5;int cleanup=0;
  bool activateOwner(const char*){++SDK::activate;return SDK::fail!=1;}
@@ -71,6 +75,7 @@ template<class Capture>void success(){
  for(bool executable:{false,true})for(bool graph:{false,true}){
   SDK::reset(0);Capture capture;if(!executable)capture.exec_=nullptr;if(!graph)capture.graph_=nullptr;
   capture.reset();EXPECT_EQ(capture.exec_,nullptr);EXPECT_EQ(capture.graph_,nullptr);
+  EXPECT_EQ(capture.definition_scope_,nullptr);EXPECT_TRUE(capture.fragment_frontiers_.nodes.empty());
   EXPECT_EQ(SDK::exec,executable?1:0);EXPECT_EQ(SDK::graph,graph?1:0);EXPECT_EQ(capture.cleanup,1);
   capture.reset();EXPECT_EQ(SDK::exec,executable?1:0);EXPECT_EQ(SDK::graph,graph?1:0);
  }
