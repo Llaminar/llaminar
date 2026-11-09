@@ -503,3 +503,17 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - 80 tests; Mac E2E 3 configs. UNREPRODUCED 1-of-4 tile failure post-rebuild
   (not captured; 20 subsequent runs green) — watch on GB10; fix-back if
   recurs. GB10 census pending (first absolute-PATH-enforcement real run).
+
+## SOURCE124 census — REAL REJECTION (fix-back; sealed K14-SOURCE124-REJECTION-20261109)
+
+- Epoch check fired on real GNU-14 at :2100 (final plan re-observation): the
+  ONLY diff = GCC's random temp name (cc1plus `-o /tmp/cc??????.s` + as input
+  mirrors it); everything else byte-identical (programs/options/dirs/PATH all-
+  absolute accepted; no PCH/-H; no depfile issue). Toolchain-intrinsic — fires
+  on ANY GNU host (per-`-###` fresh temp name).
+- FIX-BACK (strong normalization): cc1plus -o == as sole input ==
+  `/tmp/cc\w{6}\.s` pattern enforced; ONLY the shared ephemeral base masked;
+  any real plan difference still fires (reviewer will scrutinize).
+- Downstream: 2/4 ctest + lifecycle 0 = expected no-receipt consequences
+  (proof.json absent); census 9/9 still green. NOT a skip: 100% reproduction.
+- Successor (SOURCE125) pending publication + census re-run.
