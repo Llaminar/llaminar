@@ -635,3 +635,14 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   writer policy + negative pass; clang syntax = pre-existing failures only.
 - Pending: reviewer mechanical pass; .80 full gate (near-full rebuild, booked
   with arm-sparks); WSL (4') at 5d4e3716a.
+
+## Reviewer ACK — R1 mechanical pass at 5d4e3716a (2026-11-09)
+
+- Source-only, NO new P1. Map comparison (27 diffs) independent + matches;
+  range-diff reproduced (26 '=', seal context = upstream + one-line delta,
+  symbol-fix commit separate); c31366aec conflict verified (secondary_word
+  kept, beginRewrite before parallel writes, sealPublication after, no lost
+  edge); Itanium lengths 16/26/28 correct; 6 changed lines; TILE_PROGRAM
+  fullmatch; budget byte-identical; no stale spellings. BOUNDED MECHANICAL
+  ACK (not transfer of prior semantic/runtime approvals; Mac evidence =
+  owner reports). REMAINING: .80 full gate (GNU) + WSL (4'); then handover.
