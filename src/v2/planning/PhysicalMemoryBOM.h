@@ -207,6 +207,15 @@ namespace llaminar2
                    ";device=" + device.toString();
         }
 
+        /** @return Identity plus every observed capacity field, for diagnostics. */
+        [[nodiscard]] std::string observation() const
+        {
+            return id() + ";total=" + std::to_string(total_bytes) +
+                   ";available=" + std::to_string(admission_available_bytes) +
+                   ";backing=" + std::string(toString(backing)) +
+                   ";pool_available=" + std::to_string(pool_available_bytes);
+        }
+
         /** @return Whether two BOMs charge the same physical allocator. */
         [[nodiscard]] bool sameAllocator(
             const PhysicalMemoryResource &other) const noexcept

@@ -4205,6 +4205,51 @@ TEST(Test__MemoryPlanner, CapturedDomainForwardOnlyOwnersIncludeEveryPhysicalPar
 }
 
 /**
+ * @test Every logical plan line on an integrated GPU keeps the pool observation.
+ *
+ * A RankHostPool GPU carries its backing and uncapped pool sample. Hosted
+ * lookup execution adds further logical lines on the same GPU allocator; each
+ * must use the complete observation so the physical merge sees one allocator
+ * instead of a dedicated-looking duplicate. Discrete GPUs keep their behavior.
+ */
+TEST(Test__MemoryPlanner, IntegratedGPULogicalLinesShareOnePoolObservation)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    const auto &profile = source.metadata().memoryProfile();
+    for (const auto backing : {PhysicalMemoryBacking::Dedicated, PhysicalMemoryBacking::RankHostPool})
+    for (const DeviceId device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(std::string(toString(backing)) + " " + device.toString());
+        auto cfg = overlayDeviceConfig(device);
+        const std::array originalDevices{device};
+        cfg.native_ordering_events = test::NativeOrderingEventGroupReplayAccess::projection(originalDevices);
+        cfg.world_rank = 0;
+        cfg.device_total_bytes = cfg.device_free_bytes = 1ull << 40;
+        cfg.device_memory_backing = backing;
+        cfg.device_pool_available_bytes = backing == PhysicalMemoryBacking::RankHostPool ? 1ull << 40 : 0u;
+        cfg.first_layer = 0;
+        cfg.last_layer = profile.n_layers - 1;
+        cfg.max_seq_len = 4096;
+        cfg.weight_residency = DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count, std::vector<int>(static_cast<size_t>(profile.n_layers), 0));
+        cfg.ngram_execution_policy = ImmutableRowTablePolicy{ImmutableRowStoragePreference::RAM, 65536, 1024};
+        cfg.retained_host_services = test::planningHostServiceDeclarations(0, std::array{
+            RetainedHostServiceInstance{0, device, RetainedHostServiceRole::ImmutableLookupIO}});
+        cfg.ngram_host_placement = ImmutableRowTableHostPlacement::fromObservedNUMANode(0);
+        cfg.associated_host_memory = PhysicalMemoryResource{
+            .world_rank = 0, .device = DeviceId::cpu(),
+            .total_bytes = 1ull << 40, .admission_available_bytes = 1ull << 40};
+        const auto plan = MemoryPlanner::plan(profile, {cfg});
+        const auto *row = plan.physicalPlan().find({0, device});
+        ASSERT_NE(row, nullptr);
+        EXPECT_EQ(row->resource().backing, backing);
+        EXPECT_EQ(row->resource().pool_available_bytes, cfg.device_pool_available_bytes);
+        EXPECT_TRUE(row->resource().sameAllocator(cfg.deviceResource()));
+    }
+}
+
+/**
  * @test Original source geometry and actual stage declarations own handoff bytes.
  *
  * Sparse parser-native source metadata is never loaded as model weights. The

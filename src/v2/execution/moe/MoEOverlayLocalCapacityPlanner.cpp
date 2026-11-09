@@ -1164,8 +1164,7 @@ namespace llaminar2
                 const auto& source=config.native_context_preparation;
                 if(source->memory()->worldRank()!=rank_plan.rank)throw std::logic_error("ExpertOverlay source crossed original rank authority");
                 if(config.device.is_gpu()){
-                    const auto& original=source->originalResource(config.device);
-                    config.device_total_bytes=original.total_bytes;config.device_free_bytes=original.admission_available_bytes;
+                    config.adoptDeviceResource(source->originalResource(config.device));
                 }
                 if(config.associated_host_memory)config.associated_host_memory=source->originalResource(DeviceId::cpu());
             }
