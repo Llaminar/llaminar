@@ -12,6 +12,7 @@
  */
 #pragma once
 #include "CPURMSNormBorrow.h"
+#include "RMSNumericFatal.h"
 #include "../../common/DeviceFP32NumericalContract.h"
 #include "../../../utils/CPUFeatures.h"
 #include <algorithm>
@@ -36,8 +37,8 @@ namespace llaminar2::primitives::int32_rms_publication
  */
 [[noreturn]] inline void rejectNumeric()
 {
-    std::fputs("INT32 RMS row publication observed nonfinite/unrepresentable normalization or scale\n",stderr);
-    std::abort();
+    rms_numeric::rejectNumeric(rms_numeric::NumericFailure::UnrepresentablePublication,
+        "INT32 RMS row publication observed nonfinite/unrepresentable normalization or scale");
 }
 /** @brief Compute the original pointwise FP32 normalization with explicit round boundaries.
  * @param value Original integer; @param inverse Original row inverse.

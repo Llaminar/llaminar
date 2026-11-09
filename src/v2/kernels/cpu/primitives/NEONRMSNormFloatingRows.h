@@ -12,6 +12,7 @@
 #pragma once
 #include "NEONRMSNormReduction.h"
 #include "CPURMSNormBorrow.h"
+#include "RMSNumericFatal.h"
 #include <algorithm>
 #include <cmath>
 
@@ -79,10 +80,12 @@ template<Storage Encoding>
  * @param accumulation Explicit native FP64 or native T5 FP32 reduction program.
  * @param inverse_program Explicit staged FP64-mean or per-row FP32-mean inverse.
  * @throws std::invalid_argument For malformed output/gamma, forbidden aliases or policy.
- * @throws std::domain_error For nonfinite observed summaries or an undefined inverse.
  * @details Staged FP32 retains the guarded FP64-mean inverse; per-row FP32
  * and FP16/BF16 retain the distinct FP32 mean/sqrt/divide program. Undefined FP16/BF16 zero-denominator requests reject
  * before publication instead of hiding the error in a zero-output substitute.
+ * Nonfinite summaries or an unrepresentable inverse are fatal through one
+ * release-safe abort sink; no exception crosses an OpenMP collective. The
+ * already computed per-row values are checked at their phase boundaries.
  */
 template<Storage Encoding, std::size_t Count>
 inline void normalize(const OriginalRows<Encoding, Count> &input,
@@ -96,26 +99,26 @@ inline void normalize(const OriginalRows<Encoding, Count> &input,
         (Encoding != Storage::FP32 && accumulation != Accumulation::FP64) ||
         (inverse_program != Inverse::GuardedFP64Mean && inverse_program != Inverse::FP32Mean) ||
         (Encoding != Storage::FP32 && inverse_program != Inverse::FP32Mean))
-        throw std::invalid_argument("Native floating RMS requires a valid epsilon and storage-specific arithmetic policy");
+        rms_numeric::rejectPolicy("Native floating RMS requires a valid epsilon and storage-specific arithmetic policy");
     const auto columns = input.columns();
     if (!gamma.empty() && gamma.size() < columns)
-        throw std::invalid_argument("Native RMS immutable gamma is shorter than the original row");
+        rms_numeric::rejectPolicy("Native RMS immutable gamma is shorter than the original row");
     // Validate the complete tile before reduction or any output mutation. Binding
     // spans never invents capacity; caller-issued spans remain authoritative.
     detail::visit<Count>([&]<std::size_t Row> {
         if (output[Row].size() < columns || (columns && !output[Row].data()))
-            throw std::invalid_argument("Native RMS output row is missing or shorter than its original geometry");
+            rms_numeric::rejectPolicy("Native RMS output row is missing or shorter than its original geometry");
         const auto written = columns * sizeof(Unit<Encoding>);
         if (detail::overlaps(output[Row].data(), written, gamma.data(), gamma.size_bytes()))
-            throw std::invalid_argument("Native RMS publication aliases immutable gamma");
+            rms_numeric::rejectPolicy("Native RMS publication aliases immutable gamma");
         detail::visit<Count>([&]<std::size_t Other> {
             const auto original = input.template row<Other>();
             if (detail::overlaps(output[Row].data(), written, original.data(), original.size_bytes()) &&
                 !(Row == Other && output[Row].data() == original.data()))
-                throw std::invalid_argument("Native RMS publication aliases another original row or a partial source");
+                rms_numeric::rejectPolicy("Native RMS publication aliases another original row or a partial source");
             if (Row != Other && detail::overlaps(output[Row].data(), written,
                                                 output[Other].data(), written))
-                throw std::invalid_argument("Native RMS writable rows overlap");
+                rms_numeric::rejectPolicy("Native RMS writable rows overlap");
         });
     });
     if (!columns) return;
@@ -126,7 +129,8 @@ inline void normalize(const OriginalRows<Encoding, Count> &input,
     std::array<float, Count> inverse;
     detail::visit<Count>([&]<std::size_t Row> {
         if (!std::isfinite(sums[Row]))
-            throw std::domain_error("Native RMS observed a nonfinite original-row squared summary");
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                "Native RMS observed a nonfinite original-row squared summary");
         if (inverse_program == Inverse::GuardedFP64Mean)
         {
             const double denominator = sums[Row] / double(columns) + double(epsilon);
@@ -138,7 +142,8 @@ inline void normalize(const OriginalRows<Encoding, Count> &input,
             inverse[Row] = 1.0f / std::sqrt(mean + epsilon);
         }
         if (!std::isfinite(inverse[Row]))
-            throw std::domain_error("Native RMS original-row inverse is not representable");
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                "Native RMS original-row inverse is not representable");
     });
     for (std::size_t column = 0; column < columns; column += std::min<std::size_t>(4, columns - column))
     {

@@ -25,6 +25,7 @@
 #include <vector>
 #include <array>
 #include "CPUInt32RMSNormPublication.h"
+#include "RMSNumericFatal.h"
 
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/CPUFeatures.h"
@@ -619,9 +620,18 @@ namespace llaminar2::primitives
 
         for (std::size_t r = 0; r < rows; ++r)
         {
+            if (!std::isfinite(row_sumsq[r]))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                    "CPU RMS observed a nonfinite original-row squared summary");
             double val = row_sumsq[r] / denom + (double)epsilon;
             double inv = (val > 0.0) ? 1.0 / std::sqrt(val) : 0.0;
-            inv_out[r] = (float)inv;
+            const float rounded = (float)inv;
+            // A finite FP64 inverse may still round to FP32 infinity (tiny rows);
+            // the published FP32 value must be representable before any store.
+            if (!std::isfinite(rounded))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                    "CPU RMS FP32 inverse is not representable after the declared rounding");
+            inv_out[r] = rounded;
         }
     }
 
@@ -668,7 +678,8 @@ namespace llaminar2::primitives
                 else sum=opts.force_scalar?compute_sumsq_scalar(input.data(),cols):
                                             compute_sumsq_dispatch(input.data(),cols);
                 if (!std::isfinite(sum))
-                    throw std::domain_error("CPU RMS observed a nonfinite original-row squared summary");
+                    rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                        "CPU RMS observed a nonfinite original-row squared summary");
                 float inverse;
                 rmsnorm_compute_inv(&sum,1,cols,epsilon,&inverse);
                 if (inverse==0.0f) std::fill(output.begin(),output.end(),0.0f);
@@ -801,10 +812,10 @@ namespace llaminar2::primitives
          */
         ISALevel int32_rms_program(const RMSNormExecOptions &options)
         {
-            if(options.t5_compat_mode)throw std::invalid_argument("INT32 RMS has no declared T5 FP32 accumulation program");
+            if(options.t5_compat_mode)rms_numeric::rejectPolicy("INT32 RMS has no declared T5 FP32 accumulation program");
             const auto isa=options.force_scalar?ISALevel::Scalar:activeISALevel();
             if(isa!=ISALevel::Scalar&&!isNativeCPUExecutionISAPair(compiledCPUISALevel(),isa))
-                throw std::invalid_argument("INT32 RMS has no matching compiled native ISA");
+                rms_numeric::rejectPolicy("INT32 RMS has no matching compiled native ISA");
             return isa;
         }
         /** @brief Reduce one original row under an already admitted non-NEON program.
@@ -929,7 +940,7 @@ namespace llaminar2::primitives
         std::size_t rows,std::size_t cols,float epsilon,const RMSNormExecOptions &opts)
     {
         if(!std::isfinite(epsilon)||epsilon<0.0f)
-            throw std::invalid_argument("INT32 RMS requires finite nonnegative original epsilon");
+            rms_numeric::rejectPolicy("INT32 RMS requires finite nonnegative original epsilon");
         const auto bank=rmsnorm_operands::Int32QuantizationBorrow::bind(src,gamma,dst_int8,dst_row_scales,rows,cols);
         bank.requireMetadataReadOnly(&opts,sizeof(opts));
         const auto isa=int32_rms_program(opts);
@@ -993,6 +1004,9 @@ namespace llaminar2::primitives
         std::size_t cols,
         float epsilon)
     {
+        if (cols == 0) return; // Zero-width invocation is a no-op: no values or inverse.
+        if (!std::isfinite(epsilon) || epsilon < 0.0f)
+            rms_numeric::rejectPolicy("CPU FP32 RMS requires a finite nonnegative original epsilon");
         // Phase 1: Compute sum of squares (double precision)
         double sum_sq = 0.0;
         for (std::size_t c = 0; c < cols; ++c)
@@ -1000,15 +1014,31 @@ namespace llaminar2::primitives
             double val = static_cast<double>(src[c]);
             sum_sq += val * val;
         }
+        if (!std::isfinite(sum_sq))
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                "CPU FP32 RMS observed a nonfinite original-row squared summary");
 
-        // Phase 2: Compute inverse RMS
-        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
-        float inv_rms = 1.0f / rms;
+        // Phase 2: Compute inverse RMS (original FP32-mean program)
+        const float denominator = static_cast<float>(sum_sq / cols) + epsilon;
+        const float inv_rms = 1.0f / std::sqrt(denominator);
+        if (!std::isfinite(inv_rms))
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                "CPU FP32 RMS original-row inverse is not representable");
 
-        // Phase 3: Apply normalization
-        for (std::size_t c = 0; c < cols; ++c)
+        // Phase 3: Apply normalization; null gamma is admitted identity.
+        if (gamma)
         {
-            dst[c] = src[c] * inv_rms * gamma[c];
+            for (std::size_t c = 0; c < cols; ++c)
+            {
+                dst[c] = src[c] * inv_rms * gamma[c];
+            }
+        }
+        else
+        {
+            for (std::size_t c = 0; c < cols; ++c)
+            {
+                dst[c] = src[c] * inv_rms;
+            }
         }
     }
 
@@ -1020,6 +1050,9 @@ namespace llaminar2::primitives
         std::size_t cols,
         float epsilon)
     {
+        if (cols == 0) return; // Zero-width invocation is a no-op: no values or inverse.
+        if (!std::isfinite(epsilon) || epsilon < 0.0f)
+            rms_numeric::rejectPolicy("CPU FP32 RMS requires a finite nonnegative original epsilon");
         // Phase 1: Compute sum of squares with AVX2
         double sum_sq = 0.0;
         std::size_t c = 0;
@@ -1161,14 +1194,21 @@ namespace llaminar2::primitives
         // Phase 2: Compute inverse RMS
         float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
         float inv_rms = 1.0f / rms;
+        if (!std::isfinite(sum_sq))
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                "CPU FP32 RMS observed a nonfinite original-row squared summary");
+        if (!std::isfinite(inv_rms))
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                "CPU FP32 RMS original-row inverse is not representable");
         __m256 inv_rms_vec = _mm256_set1_ps(inv_rms);
 
         // Phase 3: Apply normalization with AVX2
         c = 0;
+        const __m256 ones = _mm256_set1_ps(1.0f);
         for (; c + 8 <= cols; c += 8)
         {
             __m256 src_vec = _mm256_loadu_ps(src + c);
-            __m256 gamma_vec = _mm256_loadu_ps(gamma + c);
+            __m256 gamma_vec = gamma ? _mm256_loadu_ps(gamma + c) : ones;
             __m256 normalized = _mm256_mul_ps(_mm256_mul_ps(src_vec, inv_rms_vec), gamma_vec);
             _mm256_storeu_ps(dst + c, normalized);
         }
@@ -1176,7 +1216,7 @@ namespace llaminar2::primitives
         // Scalar tail
         for (; c < cols; ++c)
         {
-            dst[c] = src[c] * inv_rms * gamma[c];
+            dst[c] = src[c] * inv_rms * (gamma ? gamma[c] : 1.0f);
         }
     }
 #endif
@@ -1189,6 +1229,9 @@ namespace llaminar2::primitives
         std::size_t cols,
         float epsilon)
     {
+        if (cols == 0) return; // Zero-width invocation is a no-op: no values or inverse.
+        if (!std::isfinite(epsilon) || epsilon < 0.0f)
+            rms_numeric::rejectPolicy("CPU FP32 RMS requires a finite nonnegative original epsilon");
         // Phase 1: Compute sum of squares with AVX512
         double sum_sq = 0.0;
         std::size_t c = 0;
@@ -1232,16 +1275,23 @@ namespace llaminar2::primitives
         }
 
         // Phase 2: Compute inverse RMS
+        if (!std::isfinite(sum_sq))
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                "CPU FP32 RMS observed a nonfinite original-row squared summary");
         float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
         float inv_rms = 1.0f / rms;
+        if (!std::isfinite(inv_rms))
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                "CPU FP32 RMS original-row inverse is not representable");
         __m512 inv_rms_vec = _mm512_set1_ps(inv_rms);
 
         // Phase 3: Normalize and convert back with AVX512
         c = 0;
+        const __m512 ones = _mm512_set1_ps(1.0f);
         for (; c + 16 <= cols; c += 16)
         {
             __m512 fp32_vals = _mm512_loadu_ps(src + c);
-            __m512 gamma_vec = _mm512_loadu_ps(gamma + c);
+            __m512 gamma_vec = gamma ? _mm512_loadu_ps(gamma + c) : ones;
             __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
             _mm512_storeu_ps(dst + c, normalized);
         }
@@ -1250,7 +1300,7 @@ namespace llaminar2::primitives
         for (; c < cols; ++c)
         {
             float val = src[c];
-            float normalized = val * inv_rms * gamma[c];
+            float normalized = val * inv_rms * (gamma ? gamma[c] : 1.0f);
             dst[c] = normalized;
         }
     }
@@ -1263,6 +1313,9 @@ namespace llaminar2::primitives
         std::size_t cols,
         float epsilon)
     {
+        if (cols == 0) return; // Zero-width invocation is a no-op: no residual, output or inverse.
+        if (!std::isfinite(epsilon) || epsilon < 0.0f)
+            rms_numeric::rejectPolicy("CPU FP32 RMS requires a finite nonnegative original epsilon");
         // Pass 1: residual += input, accumulate sum of squares (double precision)
         double sum_sq = 0.0;
         std::size_t c = 0;
@@ -1308,16 +1361,23 @@ namespace llaminar2::primitives
         }
 
         // Compute inverse RMS
+        if (!std::isfinite(sum_sq))
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                "CPU FP32 RMS observed a nonfinite original-row squared summary");
         float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
         float inv_rms = 1.0f / rms;
+        if (!std::isfinite(inv_rms))
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                "CPU FP32 RMS original-row inverse is not representable");
         __m512 inv_rms_vec = _mm512_set1_ps(inv_rms);
 
         // Pass 2: output = gamma * residual * inv_rms
         c = 0;
+        const __m512 ones = _mm512_set1_ps(1.0f);
         for (; c + 16 <= cols; c += 16)
         {
             __m512 v_res = _mm512_loadu_ps(residual + c);
-            __m512 v_gamma = _mm512_loadu_ps(gamma + c);
+            __m512 v_gamma = gamma ? _mm512_loadu_ps(gamma + c) : ones;
             __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(v_res, inv_rms_vec), v_gamma);
             _mm512_storeu_ps(output + c, normalized);
         }
@@ -1325,7 +1385,7 @@ namespace llaminar2::primitives
         // Scalar tail for pass 2
         for (; c < cols; ++c)
         {
-            output[c] = residual[c] * inv_rms * gamma[c];
+            output[c] = residual[c] * inv_rms * (gamma ? gamma[c] : 1.0f);
         }
     }
 #endif
@@ -1385,6 +1445,9 @@ namespace llaminar2::primitives
             std::size_t cols,
             float epsilon)
         {
+            if (cols == 0) return; // Zero-width invocation is a no-op: no values or inverse.
+            if (!std::isfinite(epsilon) || epsilon < 0.0f)
+                rms_numeric::rejectPolicy("CPU BF16 RMS requires a finite nonnegative original epsilon");
             // Phase 1: Compute sum of squares
             double sum_sq = 0.0;
             for (std::size_t c = 0; c < cols; ++c)
@@ -1392,17 +1455,35 @@ namespace llaminar2::primitives
                 float val = bf16_to_fp32_scalar(src_row[c]);
                 sum_sq += static_cast<double>(val) * static_cast<double>(val);
             }
+            if (!std::isfinite(sum_sq))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                    "CPU BF16 RMS observed a nonfinite original-row squared summary");
 
-            // Phase 2: Compute inverse RMS
-            float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
-            float inv_rms = 1.0f / rms;
+            // Phase 2: Compute inverse RMS (original FP32-mean program)
+            const float denominator = float(sum_sq / double(cols)) + epsilon;
+            const float inv_rms = 1.0f / std::sqrt(denominator);
+            if (!std::isfinite(inv_rms))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                    "CPU BF16 RMS original-row inverse is not representable");
 
-            // Phase 3: Normalize and convert back
-            for (std::size_t c = 0; c < cols; ++c)
+            // Phase 3: Normalize and convert back; null gamma is admitted identity.
+            if (gamma)
             {
-                float val = bf16_to_fp32_scalar(src_row[c]);
-                float normalized = val * inv_rms * gamma[c];
-                dst_row[c] = fp32_to_bf16_scalar(normalized);
+                for (std::size_t c = 0; c < cols; ++c)
+                {
+                    float val = bf16_to_fp32_scalar(src_row[c]);
+                    float normalized = val * inv_rms * gamma[c];
+                    dst_row[c] = fp32_to_bf16_scalar(normalized);
+                }
+            }
+            else
+            {
+                for (std::size_t c = 0; c < cols; ++c)
+                {
+                    float val = bf16_to_fp32_scalar(src_row[c]);
+                    float normalized = val * inv_rms;
+                    dst_row[c] = fp32_to_bf16_scalar(normalized);
+                }
             }
         }
 
@@ -1415,6 +1496,9 @@ namespace llaminar2::primitives
             std::size_t cols,
             float epsilon)
         {
+            if (cols == 0) return; // Zero-width invocation is a no-op: no values or inverse.
+            if (!std::isfinite(epsilon) || epsilon < 0.0f)
+                rms_numeric::rejectPolicy("CPU BF16 RMS requires a finite nonnegative original epsilon");
             // Phase 1: Compute sum of squares with AVX512
             double sum_sq = 0.0;
             std::size_t c = 0;
@@ -1454,18 +1538,25 @@ namespace llaminar2::primitives
                 float val = bf16_to_fp32_scalar(src_row[c]);
                 sum_sq += static_cast<double>(val) * static_cast<double>(val);
             }
+            if (!std::isfinite(sum_sq))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                    "CPU BF16 RMS observed a nonfinite original-row squared summary");
 
             // Phase 2: Compute inverse RMS
             float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
             float inv_rms = 1.0f / rms;
+            if (!std::isfinite(inv_rms))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                    "CPU BF16 RMS original-row inverse is not representable");
             __m512 inv_rms_vec = _mm512_set1_ps(inv_rms);
 
             // Phase 3: Normalize and convert back with AVX512
             c = 0;
+            const __m512 ones = _mm512_set1_ps(1.0f);
             for (; c + 16 <= cols; c += 16)
             {
                 __m512 fp32_vals = bf16_to_fp32_avx512(src_row + c);
-                __m512 gamma_vec = _mm512_loadu_ps(gamma + c);
+                __m512 gamma_vec = gamma ? _mm512_loadu_ps(gamma + c) : ones;
                 __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
                 fp32_to_bf16_avx512(normalized, dst_row + c);
             }
@@ -1474,7 +1565,7 @@ namespace llaminar2::primitives
             for (; c < cols; ++c)
             {
                 float val = bf16_to_fp32_scalar(src_row[c]);
-                float normalized = val * inv_rms * gamma[c];
+                float normalized = val * inv_rms * (gamma ? gamma[c] : 1.0f);
                 dst_row[c] = fp32_to_bf16_scalar(normalized);
             }
         }
@@ -1490,6 +1581,9 @@ namespace llaminar2::primitives
             std::size_t cols,
             float epsilon)
         {
+            if (cols == 0) return; // Zero-width invocation is a no-op: no values or inverse.
+            if (!std::isfinite(epsilon) || epsilon < 0.0f)
+                rms_numeric::rejectPolicy("CPU FP16 RMS requires a finite nonnegative original epsilon");
             // Phase 1: Compute sum of squares
             double sum_sq = 0.0;
             for (std::size_t c = 0; c < cols; ++c)
@@ -1497,17 +1591,35 @@ namespace llaminar2::primitives
                 float val = fp16_to_fp32_scalar(src_row[c]);
                 sum_sq += static_cast<double>(val) * static_cast<double>(val);
             }
+            if (!std::isfinite(sum_sq))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                    "CPU FP16 RMS observed a nonfinite original-row squared summary");
 
-            // Phase 2: Compute inverse RMS
-            float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
-            float inv_rms = 1.0f / rms;
+            // Phase 2: Compute inverse RMS (original FP32-mean program)
+            const float denominator = float(sum_sq / double(cols)) + epsilon;
+            const float inv_rms = 1.0f / std::sqrt(denominator);
+            if (!std::isfinite(inv_rms))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                    "CPU FP16 RMS original-row inverse is not representable");
 
-            // Phase 3: Normalize and convert back
-            for (std::size_t c = 0; c < cols; ++c)
+            // Phase 3: Normalize and convert back; null gamma is admitted identity.
+            if (gamma)
             {
-                float val = fp16_to_fp32_scalar(src_row[c]);
-                float normalized = val * inv_rms * gamma[c];
-                dst_row[c] = fp32_to_fp16_scalar(normalized);
+                for (std::size_t c = 0; c < cols; ++c)
+                {
+                    float val = fp16_to_fp32_scalar(src_row[c]);
+                    float normalized = val * inv_rms * gamma[c];
+                    dst_row[c] = fp32_to_fp16_scalar(normalized);
+                }
+            }
+            else
+            {
+                for (std::size_t c = 0; c < cols; ++c)
+                {
+                    float val = fp16_to_fp32_scalar(src_row[c]);
+                    float normalized = val * inv_rms;
+                    dst_row[c] = fp32_to_fp16_scalar(normalized);
+                }
             }
         }
 
@@ -1520,6 +1632,9 @@ namespace llaminar2::primitives
             std::size_t cols,
             float epsilon)
         {
+            if (cols == 0) return; // Zero-width invocation is a no-op: no values or inverse.
+            if (!std::isfinite(epsilon) || epsilon < 0.0f)
+                rms_numeric::rejectPolicy("CPU FP16 RMS requires a finite nonnegative original epsilon");
             // Phase 1: Compute sum of squares with AVX512
             double sum_sq = 0.0;
             std::size_t c = 0;
@@ -1559,18 +1674,25 @@ namespace llaminar2::primitives
                 float val = fp16_to_fp32_scalar(src_row[c]);
                 sum_sq += static_cast<double>(val) * static_cast<double>(val);
             }
+            if (!std::isfinite(sum_sq))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                    "CPU FP16 RMS observed a nonfinite original-row squared summary");
 
             // Phase 2: Compute inverse RMS
             float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
             float inv_rms = 1.0f / rms;
+            if (!std::isfinite(inv_rms))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                    "CPU FP16 RMS original-row inverse is not representable");
             __m512 inv_rms_vec = _mm512_set1_ps(inv_rms);
 
             // Phase 3: Normalize and convert back with AVX512
             c = 0;
+            const __m512 ones = _mm512_set1_ps(1.0f);
             for (; c + 16 <= cols; c += 16)
             {
                 __m512 fp32_vals = fp16_to_fp32_avx512(src_row + c);
-                __m512 gamma_vec = _mm512_loadu_ps(gamma + c);
+                __m512 gamma_vec = gamma ? _mm512_loadu_ps(gamma + c) : ones;
                 __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
                 fp32_to_fp16_avx512(normalized, dst_row + c);
             }
@@ -1579,7 +1701,7 @@ namespace llaminar2::primitives
             for (; c < cols; ++c)
             {
                 float val = fp16_to_fp32_scalar(src_row[c]);
-                float normalized = val * inv_rms * gamma[c];
+                float normalized = val * inv_rms * (gamma ? gamma[c] : 1.0f);
                 dst_row[c] = fp32_to_fp16_scalar(normalized);
             }
         }
@@ -1594,6 +1716,9 @@ namespace llaminar2::primitives
             std::size_t cols,
             float epsilon)
         {
+            if (cols == 0) return; // Zero-width invocation is a no-op: no values or inverse.
+            if (!std::isfinite(epsilon) || epsilon < 0.0f)
+                rms_numeric::rejectPolicy("CPU FP16 RMS requires a finite nonnegative original epsilon");
             // Phase 1: Compute sum of squares with AVX2
             float sum_sq_f = 0.0f;
             std::size_t c = 0;
@@ -1628,17 +1753,25 @@ namespace llaminar2::primitives
                 sum_sq_f += val * val;
             }
 
+            if (!std::isfinite(sum_sq_f))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                    "CPU FP16 RMS observed a nonfinite original-row squared summary");
+
             // Phase 2: Compute inverse RMS
             float rms = std::sqrt(sum_sq_f / cols + epsilon);
             float inv_rms = 1.0f / rms;
+            if (!std::isfinite(inv_rms))
+                rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                    "CPU FP16 RMS original-row inverse is not representable");
             __m256 inv_rms_vec = _mm256_set1_ps(inv_rms);
 
             // Phase 3: Normalize and convert back
             c = 0;
+            const __m256 ones = _mm256_set1_ps(1.0f);
             for (; c + 8 <= cols; c += 8)
             {
                 __m256 fp32_vals = fp16_to_fp32_avx2(src_row + c);
-                __m256 gamma_vec = _mm256_loadu_ps(gamma + c);
+                __m256 gamma_vec = gamma ? _mm256_loadu_ps(gamma + c) : ones;
                 __m256 normalized = _mm256_mul_ps(_mm256_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
                 fp32_to_fp16_avx2(normalized, dst_row + c);
             }
@@ -1647,7 +1780,7 @@ namespace llaminar2::primitives
             for (; c < cols; ++c)
             {
                 float val = fp16_to_fp32_scalar(src_row[c]);
-                float normalized = val * inv_rms * gamma[c];
+                float normalized = val * inv_rms * (gamma ? gamma[c] : 1.0f);
                 dst_row[c] = fp32_to_fp16_scalar(normalized);
             }
         }
@@ -1703,6 +1836,10 @@ namespace llaminar2::primitives
     {
         const auto bank=rmsnorm_operands::FloatingBorrow<uint16_t>::bind(src,gamma,dst,rows,cols,epsilon);
         bank.requireMetadataReadOnly(&opts,sizeof(opts));
+        // BF16 has no declared T5 FP32 accumulation program; reject cold before
+        // any workshare so no worker sees an exception it cannot propagate.
+        if (opts.t5_compat_mode)
+            rms_numeric::rejectPolicy("BF16 RMS has no declared T5 FP32 accumulation program");
         if (!::llaminar::v2::beginWorkshare(!bank.empty())) return;
 #if defined(__aarch64__) && defined(__ARM_NEON)
         if (use_native_rmsnorm(opts))
@@ -1735,6 +1872,10 @@ namespace llaminar2::primitives
     {
         const auto bank=rmsnorm_operands::FloatingBorrow<uint16_t>::bind(src,gamma,dst,rows,cols,epsilon);
         bank.requireMetadataReadOnly(&opts,sizeof(opts));
+        // FP16 has no declared T5 FP32 accumulation program; reject cold before
+        // any workshare so no worker sees an exception it cannot propagate.
+        if (opts.t5_compat_mode)
+            rms_numeric::rejectPolicy("FP16 RMS has no declared T5 FP32 accumulation program");
         if (!::llaminar::v2::beginWorkshare(!bank.empty())) return;
 #if defined(__aarch64__) && defined(__ARM_NEON)
         if (use_native_rmsnorm(opts))
@@ -3105,7 +3246,8 @@ namespace llaminar2::primitives
      * @param output Disjoint floating row; @param cols Complete32-value geometry.
      * @param epsilon Original finite nonnegative policy.
      * @throws std::invalid_argument For malformed original spans/aliases/policy.
-     * @throws std::domain_error For a nonfinite summary or undefined inverse.
+     * @details Nonfinite summary or undefined inverse is fatal through the
+     * release-safe sink, never an exception across an OpenMP boundary.
      */
     static void rmsnorm_q16_1_fp32_row_avx2(const Q16_1Block *input,const float *gamma,
                                            float *output,std::size_t cols,float epsilon)
@@ -3131,9 +3273,11 @@ namespace llaminar2::primitives
             _mm_add_pd(_mm256_castpd256_pd128(low),_mm256_extractf128_pd(low,1)),
             _mm_add_pd(_mm256_castpd256_pd128(high),_mm256_extractf128_pd(high,1)));
         const double sum=_mm_cvtsd_f64(folded)+_mm_cvtsd_f64(_mm_unpackhi_pd(folded,folded));
-        if(!std::isfinite(sum))throw std::domain_error("AVX2 Q16 RMS observed a nonfinite FP32-square summary");
+        if(!std::isfinite(sum))rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+            "AVX2 Q16 RMS observed a nonfinite FP32-square summary");
         const float inverse=1.0f/std::sqrt(float(sum/double(cols))+epsilon);
-        if(!std::isfinite(inverse))throw std::domain_error("AVX2 Q16 RMS inverse is not representable");
+        if(!std::isfinite(inverse))rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+            "AVX2 Q16 RMS inverse is not representable");
         const auto inv=_mm256_set1_ps(inverse);
         for(std::size_t block=0;block<cols/32;++block)
         {
@@ -3180,10 +3324,12 @@ namespace llaminar2::primitives
         }
 
         // Compute RMS and inverse through the original FP32-mean program.
-        if(!std::isfinite(sum_sq))throw std::domain_error("Scalar Q16 RMS observed a nonfinite FP32-square summary");
+        if(!std::isfinite(sum_sq))rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+            "Scalar Q16 RMS observed a nonfinite FP32-square summary");
         float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
         float inv_rms = 1.0f / rms;
-        if(!std::isfinite(inv_rms))throw std::domain_error("Scalar Q16 RMS inverse is not representable");
+        if(!std::isfinite(inv_rms))rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+            "Scalar Q16 RMS inverse is not representable");
 
         // Pass 2: Dequantize + normalize + gamma + write
         for (size_t blk = 0; blk < n_blocks; ++blk)
@@ -3254,10 +3400,12 @@ namespace llaminar2::primitives
         double sum_sq = _mm512_reduce_add_pd(sum_total_d);
 
         // Compute RMS and inverse
-        if(!std::isfinite(sum_sq))throw std::domain_error("AVX512 Q16 RMS observed a nonfinite FP32-square summary");
+        if(!std::isfinite(sum_sq))rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+            "AVX512 Q16 RMS observed a nonfinite FP32-square summary");
         float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
         const float inverse=1.0f/rms;
-        if(!std::isfinite(inverse))throw std::domain_error("AVX512 Q16 RMS inverse is not representable");
+        if(!std::isfinite(inverse))rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+            "AVX512 Q16 RMS inverse is not representable");
         __m512 inv_rms_vec = _mm512_set1_ps(inverse);
 
         // Pass 2: Vectorized dequant + normalize + gamma + write
@@ -3311,7 +3459,7 @@ namespace llaminar2::primitives
         const auto bank=rmsnorm_operands::Q16ExpansionBorrow::bind(input,gamma,output,rows,cols,epsilon);
         bank.requireMetadataReadOnly(&opts,sizeof(opts));
         if(opts.t5_compat_mode)
-            throw std::invalid_argument("Q16 RMS FP32-square policy is distinct from FP32 T5 accumulation");
+            rms_numeric::rejectPolicy("Q16 RMS FP32-square policy is distinct from FP32 T5 accumulation");
 #if defined(__aarch64__) && defined(__ARM_NEON)
         if(use_native_rmsnorm(opts))
         {
@@ -3331,7 +3479,7 @@ namespace llaminar2::primitives
 #if defined(__AVX512F__)
             case ISALevel::AVX512:row_fn=rmsnorm_q16_1_fp32_row_avx512;break;
 #endif
-            default:throw std::runtime_error("Q16 RMS active ISA has no matching native compiler implementation");
+            default:rms_numeric::rejectRuntimePolicy("Q16 RMS active ISA has no matching native compiler implementation");
             }
         }
         const auto blocks=cols/32;

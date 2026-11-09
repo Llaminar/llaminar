@@ -12,6 +12,7 @@
 #pragma once
 #include "CPURMSNormBorrow.h"
 #include "NEONRMSNormReduction.h"
+#include "RMSNumericFatal.h"
 #include "../../../tensors/NEONFP32.h"
 #include <array>
 #include <cmath>
@@ -54,16 +55,17 @@ namespace detail
  * @param bank Complete original-bank/policy borrow, protecting all source/gamma bytes.
  * @param first Original first row; never a worker-local rebased coordinate.
  * @throws std::out_of_range For a tile outside the checked original row bank.
- * @throws std::domain_error For nonfinite summaries or an unrepresentable FP32 inverse.
  * @details All tile summaries/inverses complete before publication. Previously
  * retired tiles are not rolled back after later corrupt input is rejected.
+ * Nonfinite summaries or an unrepresentable inverse are fatal through one
+ * release-safe abort sink; no exception crosses an OpenMP collective.
  */
 template<std::size_t Count>
 inline void normalizeQ16(const rmsnorm_operands::Q16ExpansionBorrow &bank,std::size_t first)
 {
     static_assert(Count>=1&&Count<=4);
     if(first>bank.rows()||Count>bank.rows()-first)
-        throw std::out_of_range("Native Q16 RMS tile outside original row bank");
+        rms_numeric::rejectRangePolicy("Native Q16 RMS tile outside original row bank");
     if(bank.empty())return;
     // Complete-bank admission and the checked tile interval prove these
     // contiguous original strides. Do not materialize span/pointer arrays:
@@ -85,7 +87,8 @@ inline void normalizeQ16(const rmsnorm_operands::Q16ExpansionBorrow &bank,std::s
         const auto &a=accumulators[Row];
         const auto folded=vaddq_f64(vaddq_f64(a[0],a[1]),vaddq_f64(a[2],a[3]));
         const double sum=vgetq_lane_f64(folded,0)+vgetq_lane_f64(folded,1);
-        if(!std::isfinite(sum))throw std::domain_error("Native Q16 RMS observed a nonfinite FP32-square summary");
+        if(!std::isfinite(sum))rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+            "Native Q16 RMS observed a nonfinite FP32-square summary");
         const float mean=float(sum/double(columns));
         denominator=vsetq_lane_f32(mean+bank.epsilon(),denominator,Row);
     });
@@ -94,7 +97,8 @@ inline void normalizeQ16(const rmsnorm_operands::Q16ExpansionBorrow &bank,std::s
     const auto inverse=vdivq_f32(vdupq_n_f32(1.0f),vsqrtq_f32(denominator));
     detail::visit<Count>([&]<std::size_t Row>{
         if(!std::isfinite(vgetq_lane_f32(inverse,Row)))
-            throw std::domain_error("Native Q16 RMS inverse is not representable");
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteInverse,
+                "Native Q16 RMS inverse is not representable");
     });
     const auto gamma=bank.gamma();
     for(std::size_t block=0;block<blocks;++block)
