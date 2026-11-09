@@ -6,7 +6,8 @@
  * test-owned mpirun command. Every available NUMA endpoint is tested in short
  * and serialized form, together with the serialized unresolved endpoint used
  * by canonical single-CPU generation cells. Each child verifies the complete
- * physical-core team before any model or accelerator allocation is possible.
+ * physical-core team before any model or accelerator allocation is possible,
+ * including that every close team occupies the fastest physical cores first.
  *
  * The custom entry owns one lexical native GPU lifetime without probing a
  * device. Native workers/caches retire before process exit and MPI finalization.
@@ -22,7 +23,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <sched.h>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -86,6 +89,62 @@ namespace
     }
 
     /**
+     * @brief Prove every close team occupies the rank's fastest physical cores.
+     * @param details Receives the first mismatching (team width, worker, CPU).
+     * @return True when, for the full team and every narrower close team, each
+     *         worker t runs inside capacity-ordered place t of the rank mask.
+     * @details On GB10 this is the X925-first contract that serial master work,
+     * static partitions and a fastest-class team depend on. Hosts without
+     * published capacities check libgomp's own CPU-id core order instead.
+     */
+    bool workersFollowCapacityOrder(std::string &details)
+    {
+        cpu_set_t affinity;
+        CPU_ZERO(&affinity);
+        if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0)
+            return false;
+        std::vector<int> allowed;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+            if (CPU_ISSET(cpu, &affinity)) allowed.push_back(cpu);
+        // The master's own mask is its place after binding; collect the rank
+        // mask from every worker's place instead of from the bound master.
+        const int team = omp_get_max_threads();
+        std::vector<std::vector<int>> masks(team);
+#pragma omp parallel num_threads(team)
+        {
+            cpu_set_t own;
+            CPU_ZERO(&own);
+            if (sched_getaffinity(0, sizeof(own), &own) == 0)
+                for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+                    if (CPU_ISSET(cpu, &own)) masks[omp_get_thread_num()].push_back(cpu);
+        }
+        for (const auto &mask : masks) allowed.insert(allowed.end(), mask.begin(), mask.end());
+        std::sort(allowed.begin(), allowed.end());
+        allowed.erase(std::unique(allowed.begin(), allowed.end()), allowed.end());
+        const auto places = MPIBootstrapPhase::capacityOrderedCorePlaces(allowed);
+        std::vector<int> widths{team, (team + 1) / 2, 1};
+        widths.erase(std::unique(widths.begin(), widths.end()), widths.end());
+        for (const int width : widths)
+        {
+            std::vector<int> observed(width, -1);
+#pragma omp parallel num_threads(width)
+            observed[omp_get_thread_num()] = sched_getcpu();
+            for (int worker = 0; worker < width; ++worker)
+            {
+                const auto &place = places[std::size_t(worker) % places.size()];
+                if (std::find(place.begin(), place.end(), observed[worker]) == place.end())
+                {
+                    details += " capacity-order mismatch: width=" + std::to_string(width) +
+                        " worker=" + std::to_string(worker) + " cpu=" + std::to_string(observed[worker]);
+                    return false;
+                }
+            }
+        }
+        details += " capacity-ordered";
+        return true;
+    }
+
+    /**
      * @brief Run the real parser/bootstrap and check the resulting MPI worker team.
      * @param argc Argument count passed through MPI bootstrap unchanged.
      * @param argv Arguments naming one device and one MPI rank.
@@ -113,9 +172,10 @@ namespace
         std::string details;
         const bool affinity_ok = MPIBootstrapPhase::verifyStartupThreadAffinity(
             address.numa_node, true, details);
+        const bool order_ok = workersFollowCapacityOrder(details);
         const bool passed = config.device_for_this_rank_numa_explicit == address.hasValidNuma() &&
             world_size == 1 && expected_threads > 0 &&
-            omp_get_max_threads() == expected_threads && affinity_ok;
+            omp_get_max_threads() == expected_threads && affinity_ok && order_ok;
         std::cout << (passed ? "PASS " : "FAIL ") << address.toString()
                   << " workers=" << omp_get_max_threads()
                   << " expected=" << expected_threads << " affinity=" << details

@@ -31,9 +31,30 @@
 #include <map>
 #include <filesystem>
 #include <stdexcept>
+#include <cstdlib>
+#include <string_view>
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Whether this rank was self-launched with one worker per physical core.
+         * @return True when the production launcher exported LLAMINAR_SELF_BOOTSTRAPPED
+         *         together with OMP_PLACES=cores and OMP_PROC_BIND=close.
+         * @details These are the launcher's own exported runtime policies, read
+         * once in the child before any team is formed; sockets-placed ranks and
+         * externally launched processes keep their existing OpenMP placement.
+         */
+        bool selfBootstrappedCorePlaces()
+        {
+            const char *self = std::getenv("LLAMINAR_SELF_BOOTSTRAPPED");
+            const char *places = std::getenv("OMP_PLACES");
+            const char *bind = std::getenv("OMP_PROC_BIND");
+            return self && std::string_view(self) == "1" && places && std::string_view(places) == "cores" &&
+                bind && std::string_view(bind) == "close";
+        }
+    } // namespace
 
     BootstrapDeviceIntent MPIBootstrapPhase::classifyDeviceIntent(
         const OrchestrationConfig &config)
@@ -305,6 +326,85 @@ namespace llaminar2
         return cpus;
     }
 
+    std::vector<std::vector<int>> MPIBootstrapPhase::capacityOrderedCorePlaces(
+        const std::vector<int> &allowed_cpus, const std::string &sysfs_root)
+    {
+        // Group allowed CPUs by their physical core: the smallest CPU of the
+        // core's sibling list identifies it, as in physicalRepresentativeForCpu.
+        std::map<int, std::vector<int>> cores;
+        for (const int cpu : allowed_cpus)
+        {
+            int representative = cpu;
+            std::ifstream siblings_file(sysfs_root + "/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
+            std::string siblings;
+            if (siblings_file && std::getline(siblings_file, siblings))
+            {
+                const auto sibling_cpus = parseCpuList(siblings);
+                if (!sibling_cpus.empty())
+                    representative = *std::min_element(sibling_cpus.begin(), sibling_cpus.end());
+            }
+            cores[representative].push_back(cpu);
+        }
+        // Rank cores by their first allowed sibling, the same CPU the
+        // cluster path has always ranked, so the two orders cannot diverge.
+        std::vector<int> firsts;
+        std::map<int, const std::vector<int> *> by_first;
+        for (auto &[representative, cpus] : cores)
+        {
+            std::sort(cpus.begin(), cpus.end());
+            firsts.push_back(cpus.front());
+            by_first[cpus.front()] = &cpus;
+        }
+        std::vector<std::vector<int>> places;
+        places.reserve(firsts.size());
+        for (const int first : capacityOrderedCpus(std::move(firsts), sysfs_root))
+            places.push_back(*by_first.at(first));
+        return places;
+    }
+
+    void MPIBootstrapPhase::bindOpenMPWorkersFastestFirst()
+    {
+        // With OMP_PROC_BIND set, libgomp binds the initial thread to its
+        // first place before main(), so this thread's own mask is no longer
+        // the rank's. libgomp derived its place list from the original rank
+        // mask: their union is the admitted CPU set, never wider than it.
+        cpu_set_t affinity;
+        CPU_ZERO(&affinity);
+        if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0)
+            throw std::runtime_error("Cannot read rank affinity for OpenMP worker placement");
+        for (int place = 0; place < omp_get_num_places(); ++place)
+        {
+            std::vector<int> ids(static_cast<std::size_t>(std::max(0, omp_get_place_num_procs(place))));
+            if (!ids.empty())
+                omp_get_place_proc_ids(place, ids.data());
+            for (const int cpu : ids)
+                if (cpu >= 0 && cpu < CPU_SETSIZE)
+                    CPU_SET(cpu, &affinity);
+        }
+        std::vector<int> allowed;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+            if (CPU_ISSET(cpu, &affinity))
+                allowed.push_back(cpu);
+        const auto places = capacityOrderedCorePlaces(allowed);
+        if (places.empty())
+            throw std::runtime_error("Rank affinity contains no CPU for OpenMP worker placement");
+        int binding_failed = 0;
+        // One thread per place creates/reuses exactly the pool threads whose
+        // close-binding place is their thread number. Teams of the admitted
+        // size or smaller then never need an unbound replacement thread.
+#pragma omp parallel num_threads(static_cast<int>(places.size())) reduction(| : binding_failed)
+        {
+            const auto &place = places[static_cast<std::size_t>(omp_get_thread_num()) % places.size()];
+            cpu_set_t worker;
+            CPU_ZERO(&worker);
+            for (const int cpu : place)
+                CPU_SET(cpu, &worker);
+            binding_failed |= sched_setaffinity(0, sizeof(worker), &worker) != 0;
+        }
+        if (binding_failed)
+            throw std::runtime_error("Cannot bind OpenMP workers to their capacity-ordered physical cores");
+    }
+
     bool MPIBootstrapPhase::verifyStartupThreadAffinity(int required_numa,
                                                         bool require_physical_only,
                                                         std::string &details)
@@ -521,26 +621,10 @@ namespace llaminar2
         omp_set_dynamic(0);
         omp_set_num_threads(workers.omp_threads_per_rank);
 
-        // libgomp has no runtime setter for OMP_PLACES. Bind its persistent
-        // worker pool using the rank's own allowed CPU IDs instead of relying
-        // on environment strings changed after the runtime was loaded. Select
-        // an allowed sibling of each physical core, never an unavailable ID.
-        std::vector<int> worker_cpus;
-        for (const auto &[physical, allowed] : physical_cores)
-            worker_cpus.push_back(allowed);
-        // Fast cores first on heterogeneous hosts: worker 0 runs serial work
-        // and static partitions assign the lowest worker ids first.
-        worker_cpus = capacityOrderedCpus(std::move(worker_cpus));
-        int binding_failed = 0;
-#pragma omp parallel reduction(| : binding_failed)
-        {
-            cpu_set_t worker;
-            CPU_ZERO(&worker);
-            CPU_SET(worker_cpus[static_cast<std::size_t>(omp_get_thread_num()) % worker_cpus.size()], &worker);
-            binding_failed |= sched_setaffinity(0, sizeof(worker), &worker) != 0;
-        }
-        if (binding_failed)
-            throw std::runtime_error("Cannot bind MPI cluster rank's OpenMP workers to their physical cores");
+        // libgomp has no runtime setter for OMP_PLACES, and its environment may
+        // have been parsed before these strings changed. Bind the persistent
+        // pool to the rank's own capacity-ordered physical cores instead.
+        bindOpenMPWorkersFastestFirst();
     }
 
     BootstrapResult MPIBootstrapPhase::execute(const OrchestrationConfig &config,
@@ -564,6 +648,8 @@ namespace llaminar2
                 (!config.hostfile.empty() || config.execution_rank_selection ||
                  automatic_multi_rank_discovery || config.mpi_procs > 0))
                 configureClusterRankThreads(config);
+            else if (mpi_env.is_mpi_process && selfBootstrappedCorePlaces())
+                bindOpenMPWorkersFastestFirst();
             return {BootstrapResult::Action::CONTINUE, 0};
         }
 
