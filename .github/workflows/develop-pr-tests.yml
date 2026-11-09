@@ -47,8 +47,12 @@ jobs:
           PY
       - uses: docker/setup-buildx-action@v4
         with:
+          version: v0.38.1
           driver: docker-container
-          driver-opts: network=host
+          # Pin the same BuildKit image for both cloud workflows.
+          driver-opts: |
+            network=host
+            image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
           cache-binary: false
       - uses: ./.github/actions/cache-develop-toolchain
         with:
@@ -71,6 +75,7 @@ jobs:
           name: develop-pr-${{ github.event.pull_request.number }}-${{ matrix.cpu_isa }}-${{ github.run_id }}-${{ github.run_attempt }}
           # Logs/receipts only: no source snapshots, images or compiler cache.
           path: |
+            ${{ runner.temp }}/llaminar-toolchains/*-toolchain.json
             ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/develop-image-gate.json
             ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/*/build-*.log
             ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/*/build-timeline.jsonl

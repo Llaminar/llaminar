@@ -78,8 +78,8 @@ AVX512-VNNI. Unsupported hardware fails with the missing flags; the requested
 ISA is never changed. Build-only publication does not require native ISA support. It imports public registry layers with
 `LLAMINAR_DOCKER_BUILD_CACHE_ACCESS=import-only`; it never exports caches or logs
 into the registry. Before source compilation, the local
-`cache-develop-toolchain` action checkpoints completed dependencies in GitHub
-Actions cache. No registry-write permission is granted. The model-free image compiles Unit
+`cache-develop-toolchain` action restores or builds complete dependency images
+in GitHub Actions cache. No registry-write permission is granted. The model-free image compiles Unit
 and preflight executables, but `run_develop_pr_tests.py` executes only Unit
 and host. Unit retains unrestricted parallelism; host uses the production
 lane's serial scheduling. Both exact inventories must pass with no skips.
@@ -142,19 +142,36 @@ Registry access defaults to `read-write` for publication; PRs explicitly select
 `import-only`, with no registry cache export. Local host-path and registry cache
 authorities are mutually exclusive.
 
-Both cloud workflows first run `.github/actions/cache-develop-toolchain` on
-the same BuildKit worker used by the source-bound image driver. It exports
-`gpu-sdk` before RCCL and then `toolchain` before Llaminar compilation, using
-the GitHub Actions cache v2 backend in `mode=max`. A later build or test failure
-therefore retains completed dependency layers. The shared SDK scope is
-`llaminar-gpu-sdk`; the ISA-specific scopes are `llaminar-toolchain-avx512` and
-`llaminar-toolchain-avx2`. PR entries belong to their merge ref and cannot be
+Both cloud workflows first run `.github/actions/cache-develop-toolchain`.
+`toolchain_cache.py` constructs a restricted committed dependency context and
+keys a complete OCI toolchain image by those Git objects, policy version and
+CPU ISA. Source-only commits retain the key. SDK/installer, dependency-pin,
+Dockerfile and packaging-policy changes invalidate it. An undeclared dependency
+is absent from that build context and fails explicitly.
+
+An exact Actions cache hit restores the complete image. OCI descriptor hashes,
+layer bytes, platform and input/ISA labels must authenticate before admission;
+an invalid artifact fails instead of silently rebuilding. The source-bound
+image driver independently admits its dependency identity and passes the
+digest-pinned `toolchain=oci-layout://...` named context to Buildx. This replaces
+the toolchain stage directly, without depending on intermediate solver-cache
+hits. The builder declares its build arguments explicitly because an external
+image does not inherit in-file ARG state. Both cloud workflows pin Buildx and
+BuildKit to the same versions.
+
+On a cold image-cache miss, `gpu-sdk` is checkpointed through the GitHub Actions
+cache v2 backend in `mode=max` under `llaminar-gpu-sdk`. The complete toolchain
+then builds, exports as OCI and authenticates. It is saved before Llaminar
+compilation, so a later build/test failure retains the dependency image.
+Old mutable ISA toolchain layer-cache indexes are no longer used. PR entries
+belong to their merge ref and cannot be
 restored by develop publication or another PR. They remain reusable across
-updates to that PR. Develop exports the same scopes for inbound PRs to read.
-The repository's existing 10 GB cache limit remains unchanged; GitHub owns
-eviction. These checkpoints contain immutable dependency layers, not source
+updates to that PR. Develop populates the same dependency keys for inbound PRs to read.
+The repository's cache storage limit is configured in GitHub Actions settings;
+GitHub owns eviction. These caches contain dependency images, not source
 builds or compiler-object cache mounts. Ccache mounts are shared within a
-build job. Dependency cache steps use cache-only output, and the canonical
+build job. Per-ISA `*-toolchain.json` receipts record restore/build status,
+dependency fingerprint, image manifest, size and validation time. The canonical
 image driver still admits and builds the exact source snapshot. See
 [Docker's cache backend reference](https://docs.docker.com/build/cache/backends/gha/)
 and [GitHub's cache scope rules](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#restrictions-for-accessing-a-cache).

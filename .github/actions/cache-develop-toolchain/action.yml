@@ -1,5 +1,5 @@
 name: Cache develop toolchains
-description: Checkpoint shared GPU SDKs and ISA toolchains before source compilation
+description: Restore dependency-bound OCI toolchains before source compilation
 inputs:
   cpu-isa:
     description: AVX512, AVX2, or both for runtime publication
@@ -7,28 +7,43 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Configure dependency cache
+    - name: Prepare immutable toolchain cache keys and dependency context
       id: cache
       shell: bash
       env:
         CPU_ISA: ${{ inputs.cpu-isa }}
       run: |
         set -euo pipefail
-        case "$CPU_ISA" in
-          AVX512|AVX2|both) ;;
-          *) echo "Unsupported toolchain ISA: $CPU_ISA" >&2; exit 1 ;;
-        esac
+        python3 scripts/ci/toolchain_cache.py prepare \
+          --root "$RUNNER_TEMP/llaminar-toolchains" --cpu-isa "$CPU_ISA" \
+          --github-output "$GITHUB_OUTPUT"
         printf 'image=ghcr.io/%s:build-cache-develop\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-    # Cache writes use the event's ref: a PR can restore develop's cache, but
-    # its own entries are visible only to that PR. No package token is needed.
-    # Checkpoint before RCCL so its build/proof failures retain completed SDKs.
-    - name: Checkpoint shared CUDA and ROCm SDKs
+    - name: Restore complete AVX512 toolchain
+      id: restore-avx512
+      if: inputs.cpu-isa == 'AVX512' || inputs.cpu-isa == 'both'
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ steps.cache.outputs.path_avx512 }}
+        key: ${{ steps.cache.outputs.key_avx512 }}
+    - name: Restore complete AVX2 toolchain
+      id: restore-avx2
+      if: inputs.cpu-isa == 'AVX2' || inputs.cpu-isa == 'both'
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ steps.cache.outputs.path_avx2 }}
+        key: ${{ steps.cache.outputs.key_avx2 }}
+    # Only a cold complete-image cache needs BuildKit's SDK layer cache. A
+    # warm image is consumed directly, without solving the toolchain stages.
+    - name: Checkpoint shared CUDA and ROCm SDKs for cold toolchains
+      if: >-
+        ((inputs.cpu-isa == 'AVX512' || inputs.cpu-isa == 'both') && steps.restore-avx512.outputs.cache-hit != 'true') ||
+        ((inputs.cpu-isa == 'AVX2' || inputs.cpu-isa == 'both') && steps.restore-avx2.outputs.cache-hit != 'true')
       uses: docker/build-push-action@v7
       env:
         DOCKER_BUILD_RECORD_UPLOAD: "false"
         DOCKER_BUILD_SUMMARY: "false"
       with:
-        context: .
+        context: ${{ steps.cache.outputs.context }}
         network: host
         target: gpu-sdk
         outputs: type=cacheonly
@@ -39,41 +54,81 @@ runs:
           type=registry,ref=${{ steps.cache.outputs.image }}-avx512
           type=registry,ref=${{ steps.cache.outputs.image }}-avx2
         cache-to: type=gha,scope=llaminar-gpu-sdk,mode=max,version=2
-    - name: Checkpoint AVX512 toolchain
-      if: inputs.cpu-isa == 'AVX512' || inputs.cpu-isa == 'both'
+    - name: Build complete AVX512 toolchain on a cache miss
+      if: (inputs.cpu-isa == 'AVX512' || inputs.cpu-isa == 'both') && steps.restore-avx512.outputs.cache-hit != 'true'
       uses: docker/build-push-action@v7
       env:
         DOCKER_BUILD_RECORD_UPLOAD: "false"
         DOCKER_BUILD_SUMMARY: "false"
       with:
-        context: .
+        context: ${{ steps.cache.outputs.context }}
         network: host
         target: toolchain
         build-args: LLAMINAR_CPU_ISA=AVX512
-        outputs: type=cacheonly
+        labels: |
+          org.llaminar.toolchain_inputs=${{ steps.cache.outputs.fingerprint_avx512 }}
+          org.llaminar.toolchain_isa=AVX512
+        outputs: type=oci,dest=${{ steps.cache.outputs.path_avx512 }},tar=false
         provenance: false
         sbom: false
         cache-from: |
           type=gha,scope=llaminar-gpu-sdk,version=2
-          type=gha,scope=llaminar-toolchain-avx512,version=2
           type=registry,ref=${{ steps.cache.outputs.image }}-avx512
-        cache-to: type=gha,scope=llaminar-toolchain-avx512,mode=max,version=2
-    - name: Checkpoint AVX2 toolchain
-      if: inputs.cpu-isa == 'AVX2' || inputs.cpu-isa == 'both'
+    - name: Authenticate AVX512 toolchain bytes and inputs
+      if: inputs.cpu-isa == 'AVX512' || inputs.cpu-isa == 'both'
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.restore-avx512.outputs.cache-hit }}
+      run: |
+        python3 scripts/ci/toolchain_cache.py verify \
+          --root "$RUNNER_TEMP/llaminar-toolchains" --cpu-isa AVX512 \
+          --cache-hit "${CACHE_HIT:-false}"
+    # Save immediately: source compilation or a test failure cannot discard
+    # an already authenticated complete dependency image.
+    - name: Save complete AVX512 toolchain before compiling Llaminar
+      if: (inputs.cpu-isa == 'AVX512' || inputs.cpu-isa == 'both') && steps.restore-avx512.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ steps.cache.outputs.path_avx512 }}
+        key: ${{ steps.cache.outputs.key_avx512 }}
+    - name: Build complete AVX2 toolchain on a cache miss
+      if: (inputs.cpu-isa == 'AVX2' || inputs.cpu-isa == 'both') && steps.restore-avx2.outputs.cache-hit != 'true'
       uses: docker/build-push-action@v7
       env:
         DOCKER_BUILD_RECORD_UPLOAD: "false"
         DOCKER_BUILD_SUMMARY: "false"
       with:
-        context: .
+        context: ${{ steps.cache.outputs.context }}
         network: host
         target: toolchain
         build-args: LLAMINAR_CPU_ISA=AVX2
-        outputs: type=cacheonly
+        labels: |
+          org.llaminar.toolchain_inputs=${{ steps.cache.outputs.fingerprint_avx2 }}
+          org.llaminar.toolchain_isa=AVX2
+        outputs: type=oci,dest=${{ steps.cache.outputs.path_avx2 }},tar=false
         provenance: false
         sbom: false
         cache-from: |
           type=gha,scope=llaminar-gpu-sdk,version=2
-          type=gha,scope=llaminar-toolchain-avx2,version=2
           type=registry,ref=${{ steps.cache.outputs.image }}-avx2
-        cache-to: type=gha,scope=llaminar-toolchain-avx2,mode=max,version=2
+    - name: Authenticate AVX2 toolchain bytes and inputs
+      if: inputs.cpu-isa == 'AVX2' || inputs.cpu-isa == 'both'
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.restore-avx2.outputs.cache-hit }}
+      run: |
+        python3 scripts/ci/toolchain_cache.py verify \
+          --root "$RUNNER_TEMP/llaminar-toolchains" --cpu-isa AVX2 \
+          --cache-hit "${CACHE_HIT:-false}"
+    # Save immediately: source compilation or a test failure cannot discard
+    # an already authenticated complete dependency image.
+    - name: Save complete AVX2 toolchain before compiling Llaminar
+      if: (inputs.cpu-isa == 'AVX2' || inputs.cpu-isa == 'both') && steps.restore-avx2.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ steps.cache.outputs.path_avx2 }}
+        key: ${{ steps.cache.outputs.key_avx2 }}
+    - name: Bind the source image driver to the admitted toolchains
+      shell: bash
+      run: |
+        printf 'LLAMINAR_DOCKER_TOOLCHAIN_ROOT=%s/llaminar-toolchains\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
