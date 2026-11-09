@@ -96,6 +96,12 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_CPUNativeNEONPreparedProjection
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Numerics ByteExact Regression)
+    # Padding contract at N%4 = 1/2/3 tails: poisoned loaded padding is rejected
+    # before any write; benign padding keeps serial bytes for every family/policy.
+    v2_add_core_free_test(V2_Integration_CPUNativeNEONTailPaddingContract
+        COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
+            --gtest_filter=*TailPaddingContract
+        LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Metadata ByteExact Regression)
     v2_add_core_free_test(V2_Integration_CPUNativeSourceCoefficientMetadata_NEON
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
             --gtest_filter=CPUNativeNEONPreparedProjection.RejectsReservedSourceCoefficientBitsBeforeAnyWrite

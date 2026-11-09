@@ -29368,7 +29368,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantizedRow
 if(NOT LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     add_v2_test(V2_Integration_CPUNativeSourceCoefficientMetadata_X86
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
-            --gtest_filter=CPUNativeSourceMetadata.ReservedBitsRejectAtEveryVectorLane
+            --gtest_filter=CPUNativeSourceMetadata.ReservedBitsRejectAtEveryVectorLane:CPUNativeSourceMetadata.PartialChunkPaddingIsNormalizedForX86Readers
         LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;Metadata;Regression"
         TIMEOUT 60 NO_MODELS MPI_PROCS 1)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeSourceCoefficientMetadata_X86)
