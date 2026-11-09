@@ -172,16 +172,21 @@ arbitrary hard CPU-ID pinning; record advisory placement and actual evidence.
   or a complete FA2 certificate. A cold-bound one-candidate dot `Perf__` now
   retains raw samples and rejects no-op authentication; bounded register-reuse
   timing is not production MTP/FA2/scaling qualification. See the evidence record.
-- The latest completed five-Mac focused worktree matrix passes176/176 in baseline/DotProd
-  Release, DotProd ASan/UBSan, strict-warning Debug and LLVM Release; all136
-  configured preflights pass20 repetitions (2720 raw passes), including native
+- The latest completed five-Mac focused worktree matrix passes185/185 in baseline/DotProd
+  Release, explicitly optimized Integration DotProd ASan/UBSan, strict-warning
+  Debug and LLVM Release; all142 configured preflights pass20 repetitions
+  (2840 independently counted raw passes), including native
   reduction/production-TU RMSNorm ownership/bytes/portable half, original-Q16
   geometry/expansion/ISA-specific reductions and actual legacy callers, original
   AQ8 query-dot tiles, explicit Q8 value FMAs, nonempty/dirty-output benchmark
-  authentication, configure-host topology/receipt, real CTest retirement metadata
-  and image-fixture contracts. Actual XML/raw records were independently parsed without fail/skip.
-  The earlier151/115,157/119,159/121,167/128 and published170/130 checkpoints retain
-  narrower scopes; the176/136 worktree is not a whole-engine certificate.
+  authentication, actual immutable-lookup row decoding, real CMake initializer
+  lifecycle and independently compiled C/C++ configuration witnesses, configure-host
+  topology/receipt, real CTest retirement metadata and image-fixture contracts. Actual XML/raw records were independently parsed without fail/skip.
+  The earlier151/115,157/119,159/121,167/128, published170/130 and176/136 checkpoints
+  retain narrower scopes. Inspection exposed empty Integration caches in the
+  first focused GNU14 lookup run and old sanitizer configuration; those specific
+  passes remain unoptimized diagnostics. The failed stale-cache admission and explicit optimized successor
+  are separate evidence. The185/142 worktree is not a whole-engine certificate.
   The intervening136-test sanitizer
   projection-batch timeout remains RED. Its unchanged hashed binary passes20
   isolated-window repetitions, then the complete current matrix passes; no
@@ -333,6 +338,38 @@ without OOM. Main removes the unused include and adds explicit architecture
 preflight; actual current GNU14 stage syntax passes with the exact captured
 production command. No old packet was patched/retried and no complete target,
 Unit or serving pass is inferred. A new full-build successor is still required.
+
+The separately admitted73da/5adf successor, exact SDK4e8a/d211/a78, now configures
+in93.262s and stops its normal app+complete gate-target build after222.436s at
+`CPUImmutableLookupKernels.cpp:17` (`immintrin.h`). Main verifies return archive
+984a29…c863/all196 raw hashes, actual2138 parent commands/3430 SHOW-ONLY cells/
+3129 genuine timeout-owner pairs, unchanged7063-entry immediate maps and37.56GB
+peak/OOM0. No tests or app exist; its one build authorization is consumed and
+owner window released. Prior KV append now has an actual successful Ninja object
+record, not an engine pass. This failure is immutable and must never be patched
+or retried under another source claim.
+
+The native lookup repair goes beyond its header: original FP16/BF16 widen in
+NEON, IQ4 uses original register table lookups/products and bounded output, and
+all formats retain original row coordinates. Partial IQ4 physical blocks no
+longer flatten padding into another logical row or silently publish nothing;
+AVX2/AVX512 receive matching bounded masks. Empty retained calls complete after
+all geometry/alias checks, without a new team/post-release scan. Independent
+payload/fringe/guard/native-ISA controls and all24 source/M1/team comparisons use
+the actual production TU. Final optimized GNU14 runs8 cases and explicit
+registrations/repeats; old-coordinate/empty policy countercontrols fail as
+expected. Generic arithmetic of the other20 quantized formats is unchanged,
+not newly certified SIMD/economy. Full service/PMA/core/engine and Release
+performance still require a new sealed successor, fresh admission and real gates.
+
+The focused project's actual compile metadata also exposed after-project empty
+Integration caches. C/CXX defaults now initialize before language setup without
+clobbering authored final or normal/cache initializer values. Stale empty caches
+reject; a separately named optimized sanitizer successor retains the old RED.
+Real CMake cache tests are SDK-free, and actual C/C++ executable witnesses prove
+optimization/NDEBUG without runtime compilation. Exact O3/g and whole-TU policy
+remain separate compile-command obligations. See the evidence record for the
+initial noexec fixture and corrected authored-initializer regression history.
 
 The RMSNorm frontier now has a bounded native production-TU slice. Actual
 retained1×12288 all-ones execution reproduced per-caller partial ownership
