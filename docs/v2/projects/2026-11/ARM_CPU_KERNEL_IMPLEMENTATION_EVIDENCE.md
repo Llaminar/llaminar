@@ -2183,6 +2183,22 @@ The remaining failures are classified as follows.
 | `CPUJointBufferedSource` | 2 | WSL2 limitation | `/proc/self/io` is absent |
 | `CPUStartupAffinity`, `MoEOwnedSharedBackingNativeStartup` | 2 | WSL2 limitation | Open MPI `--cpu-set` fails silently there for any list, even `mpirun -np 1 --cpu-set 0-15 echo hi` exits 1 with no output; the unpinned selector passes, and the multi-rank probe fails fast with its exact-affinity diagnostic |
 
+### Cross-architecture greedy text identity
+
+Qwen3-0.6B Q8_0 (sha256 `9465e63a…bb031`), CPU only, `--no-mtp`, `-c 4096`,
+greedy (`--temperature 0 --seed 42`), 64 tokens, raw prompt through
+`llaminar2 oneshot`:
+
+| Host | ISA | Commit | Result |
+|---|---|---|---|
+| Ryzen 7800X3D (WSL2) | AVX512 | `05930d91a` | rc=0 |
+| Ryzen 7800X3D (WSL2) | AVX2 (`LLAMINAR_ISA_LEVEL=avx2`) | `05930d91a` | rc=0, byte-identical to AVX512 |
+| DGX Spark GB10, 20 cores | NEON dotprod | `be6658c38` | rc=0, response byte-identical to x86 (346 characters) |
+
+The two commits differ only in the compact multi-scale empty-tile admission,
+which this Q8_0 model does not reach. Seal:
+`K14-CROSSARCH-PROBE-GB10-20261107`.
+
 ## Preliminary ISA tuning, not timing certification
 
 One isolated AppleClang Release Q6_K / Rows4 / ASIMD / expert specialization
