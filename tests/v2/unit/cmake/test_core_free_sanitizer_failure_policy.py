@@ -4,6 +4,7 @@
 Only CMake/CTest metadata is configured: no runtime compiler, model or accelerator
 is needed. A minimal directory registrar exercises the wrapper interface, not a
 replacement native dependency or a claim that the complete engine gate ran.
+Named CPU-team resources must follow the same registration/omission boundary.
 """
 from pathlib import Path
 import argparse
@@ -31,12 +32,12 @@ function(add_v2_test name)
   if(V2_PERF_TESTS_ONLY AND NOT "${name}" MATCHES "^V2_Perf_")
     return()
   endif()
-  cmake_parse_arguments(PARSE_ARGV 1 OWN "NO_MPI;NO_MODELS" "MPI_PROCS;TIMEOUT" "COMMAND;LABELS;ENVIRONMENT")
+  cmake_parse_arguments(PARSE_ARGV 1 OWN "NO_MPI;NO_MODELS" "MPI_PROCS;TIMEOUT" "COMMAND;LABELS;ENVIRONMENT;RESOURCE_LOCK")
   if(NOT OWN_NO_MPI OR NOT OWN_NO_MODELS OR NOT OWN_MPI_PROCS EQUAL 1)
     message(FATAL_ERROR "core-free test escaped original device-free ownership")
   endif()
   add_test(NAME ${name} COMMAND ${OWN_COMMAND})
-  set_tests_properties(${name} PROPERTIES LABELS "${OWN_LABELS}" TIMEOUT "${OWN_TIMEOUT}" ENVIRONMENT "${OWN_ENVIRONMENT}")
+  set_tests_properties(${name} PROPERTIES LABELS "${OWN_LABELS}" TIMEOUT "${OWN_TIMEOUT}" ENVIRONMENT "${OWN_ENVIRONMENT}" RESOURCE_LOCK "${OWN_RESOURCE_LOCK}")
 endfunction()
 """ if wrapped else ""
         with tempfile.TemporaryDirectory(prefix="llaminar-core-free-sanitizer-policy-") as directory:
@@ -48,7 +49,7 @@ endfunction()
                 "project(CoreFreeSanitizerPolicy LANGUAGES NONE)\n"
                 "enable_testing()\n" + ("set(V2_PERF_TESTS_ONLY TRUE)\n" if perf_only else "") + registrar +
                 f'include("{MODULE.as_posix()}")\n'
-                'v2_add_core_free_test(PolicyProbe COMMAND "${CMAKE_COMMAND}" -E true LABELS V2 Unit DeviceFree)\n'
+                'v2_add_core_free_test(PolicyProbe COMMAND "${CMAKE_COMMAND}" -E true LABELS V2 Unit DeviceFree RESOURCE_LOCK OriginalCPUTeam)\n'
             )
             configured = subprocess.run(
                 [cmake, "-S", str(source), "-B", str(build), "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM:FILEPATH={ninja}"],
@@ -79,6 +80,7 @@ endfunction()
         self.assertIn("DeviceFree", properties["LABELS"])
         self.assertIn("UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1", properties["ENVIRONMENT"])
         self.assertEqual(sum(value.startswith("UBSAN_OPTIONS=") for value in properties["ENVIRONMENT"]), 1)
+        self.assertEqual(properties["RESOURCE_LOCK"], ["OriginalCPUTeam"])
 
     def test_standalone_registration_is_fatal(self) -> None:
         """The standalone portability registration must not recover a sanitizer error."""
