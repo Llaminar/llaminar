@@ -6,7 +6,8 @@
  * optimizer may still reassociate a completed result with its consumer. CPU
  * experts must execute the same program when ExpertOverlay moves a logical
  * expert between host and device tiers. These primitives therefore make every
- * published binary32 dependency edge explicit on all three backends. CUDA
+ * published binary32 dependency edge explicit on CPU, CUDA and ROCm. Native
+ * AArch64 register dependencies preserve those edges without volatile spills. CUDA
  * primitives also retain IEEE subnormal operands and results explicitly: the
  * translation unit's fast-math FTZ policy cannot override this byte contract.
  */
@@ -65,8 +66,9 @@ namespace llaminar2::device_fp32_contract
      * emits no memory traffic or synchronization. CUDA intrinsics already
      * retain this boundary, so CUDA returns the word directly. On x86 SSE,
      * scalar arithmetic has already rounded to binary32 in its XMM register;
-     * making the value an opaque register output prevents the next operation
-     * from contracting it without forcing every Newton step through memory.
+     * AArch64 retains the same boundary in an FP/SIMD register. Making either
+     * value an opaque register output prevents the next operation from
+     * contracting it without forcing every Newton step through memory.
      *
      * @param value Result of one explicit binary32 arithmetic operation.
      * @return The identical binary32 word with its dependency edge retained.
@@ -78,6 +80,9 @@ namespace llaminar2::device_fp32_contract
 #elif !defined(__CUDA_ARCH__) && defined(__SSE2__) && \
     (defined(__GNUC__) || defined(__clang__))
         asm volatile("" : "+x"(value));
+#elif !defined(__CUDA_ARCH__) && defined(__aarch64__) && \
+    (defined(__GNUC__) || defined(__clang__))
+        asm volatile("" : "+w"(value));
 #elif !defined(__CUDA_ARCH__)
         /*
          * Hosts without the x86 register constraint still require an explicit

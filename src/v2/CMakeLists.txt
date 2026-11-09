@@ -71,34 +71,10 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     endif()
 endif()
 
-# CPU ISA selection. Keep this explicit so the binary can be built for either
-# AVX512-capable hosts or an AVX2-only baseline without inheriting the builder's
-# full native ISA by accident.
-set(LLAMINAR_CPU_ISA "AVX512" CACHE STRING "Maximum x86 SIMD ISA to compile for: AVX512 or AVX2")
-set_property(CACHE LLAMINAR_CPU_ISA PROPERTY STRINGS AVX512 AVX2)
-string(TOUPPER "${LLAMINAR_CPU_ISA}" LLAMINAR_CPU_ISA_UPPER)
-
-set(LLAMINAR_CPU_AVX2_FLAGS "-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt")
-set(LLAMINAR_CPU_AVX512_FLAGS
-    "${LLAMINAR_CPU_AVX2_FLAGS} -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni")
-
-if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-    set(LLAMINAR_CPU_COMPILE_FLAGS "${LLAMINAR_CPU_AVX512_FLAGS}")
-    add_compile_definitions(
-        LLAMINAR_COMPILED_WITH_AVX2=1
-        LLAMINAR_COMPILED_WITH_AVX512=1)
-elseif(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX2")
-    set(LLAMINAR_CPU_COMPILE_FLAGS "${LLAMINAR_CPU_AVX2_FLAGS}")
-    add_compile_definitions(
-        LLAMINAR_COMPILED_WITH_AVX2=1
-        LLAMINAR_COMPILED_WITH_AVX512=0)
-else()
-    message(FATAL_ERROR "Unsupported LLAMINAR_CPU_ISA='${LLAMINAR_CPU_ISA}'. Use AVX512 or AVX2.")
-endif()
-
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${LLAMINAR_CPU_COMPILE_FLAGS}")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${LLAMINAR_CPU_COMPILE_FLAGS}")
-message(STATUS "V2: CPU ISA target: ${LLAMINAR_CPU_ISA_UPPER} (${LLAMINAR_CPU_COMPILE_FLAGS})")
+# The target toolchain selects the compiler envelope; never inject x86 flags
+# into an ARM compiler or silently reuse an incompatible cached ISA selection.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/CPUInstructionSet.cmake")
+llaminar_configure_cpu_instruction_set()
 
 # Backend options (Phase 6: Heterogeneous Multi-GPU)
 # CUDA and ROCm CAN coexist - compiled in separate translation units
@@ -187,6 +163,12 @@ message(STATUS "V2: ${LLAMINAR_OPENMPI_VERSION_LINE}")
 find_path(NUMA_INCLUDE_DIR NAMES numa.h)
 find_library(NUMA_LIBRARY NAMES numa)
 if(NOT NUMA_INCLUDE_DIR OR NOT NUMA_LIBRARY)
+    if(APPLE)
+        message(FATAL_ERROR
+            "Native macOS inference is not implemented: the CPU memory/placement backend requires Linux libnuma. "
+            "Do not substitute a NUMA stub. Focused native ARM primitive tests can be configured with "
+            "cmake -S tests/v2/portability -B build_arm_portability -G Ninja.")
+    endif()
     message(FATAL_ERROR
         "Llaminar requires libnuma headers and library. Install libnuma-dev/numactl-devel.")
 endif()

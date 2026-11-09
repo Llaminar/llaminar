@@ -60,12 +60,19 @@ namespace llaminar2
          * @param rank MPI rank (0-indexed)
          * @param world_size Total number of ranks
          * @param comm MPI communicator (default: MPI_COMM_WORLD)
+         * @details Defined after the owned topology is complete. Constructor
+         * cleanup may instantiate its unique_ptr deleter even on a normal
+         * inline construction path, so a forward declaration is insufficient.
          */
-        MPIContext(int rank, int world_size, MPI_Comm comm = MPI_COMM_WORLD)
-            : rank_(rank), world_size_(world_size), comm_(comm), local_rank_(rank) {}
+        MPIContext(int rank, int world_size, MPI_Comm comm = MPI_COMM_WORLD);
 
-        MPIContext(int rank, int world_size, int local_rank, MPI_Comm comm)
-            : rank_(rank), world_size_(world_size), comm_(comm), local_rank_(local_rank) {}
+        /**
+         * @brief Borrow a communicator with an explicit original host-local rank.
+         * @param rank Original communicator rank; @param world_size Communicator size.
+         * @param local_rank Actual host-local rank; @param comm Borrowed communicator.
+         * @details Out-of-line construction retains complete-type ownership cleanup.
+         */
+        MPIContext(int rank, int world_size, int local_rank, MPI_Comm comm);
 
         /** @brief Retire derived topology before releasing an owned communicator. */
         ~MPIContext() override;
@@ -437,7 +444,7 @@ namespace llaminar2
             size_t remainder = total_elements % world_size_;
 
             size_t start = rank_ * base_count + std::min(static_cast<size_t>(rank_), remainder);
-            size_t count = base_count + (rank_ < remainder ? 1 : 0);
+            size_t count = base_count + (static_cast<size_t>(rank_) < remainder ? 1 : 0);
 
             return {start, count};
         }

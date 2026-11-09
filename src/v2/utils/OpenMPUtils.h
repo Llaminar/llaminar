@@ -40,6 +40,25 @@ namespace llaminar::v2
 {
 
 /**
+ * @brief Admit useful work or complete an empty retained-team invocation.
+ * @param useful Whether immutable original publications admit any useful work.
+ * @return The supplied decision, after empty active-team members rendezvous.
+ * @details Every member of an existing active team calls this boundary. Empty
+ * operations need the same completion edge as an omp-for implicit barrier:
+ * otherwise a fast member can publish the next request before a late member
+ * has observed the current empty publication. Standalone empty calls create
+ * neither a team nor a barrier; nonempty work retains its ordinary workshare.
+ */
+[[nodiscard]] inline bool beginWorkshare(bool useful)
+{
+    if (!useful && omp_in_parallel())
+    {
+#pragma omp barrier
+    }
+    return useful;
+}
+
+/**
  * @brief Execute a worksharing lambda, creating a parallel region only if needed.
  *
  * If already inside a parallel region (omp_in_parallel() returns true),
