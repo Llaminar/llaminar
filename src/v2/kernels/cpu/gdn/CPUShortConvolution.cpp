@@ -61,10 +61,14 @@ namespace llaminar2
         float *state = conv_state + static_cast<size_t>(channel) * state_len;
         const float current_input = input_row[channel];
 
+        // Explicit FMA chain in increasing tap order, the same program as the
+        // SIMD prefill leaves. Implicit `sum += w * x` left contraction and SLP
+        // vectorization of the products to each inlining site, so the serial
+        // and verifier callers of this helper could round differently.
         float sum = bias ? bias[channel] : 0.0f;
         for (int k = 0; k < state_len; ++k)
-            sum += w[k] * state[k];
-        sum += w[state_len] * current_input;
+            sum = std::fma(w[k], state[k], sum);
+        sum = std::fma(w[state_len], current_input, sum);
 
         for (int k = 0; k < state_len - 1; ++k)
             state[k] = state[k + 1];
@@ -796,10 +800,11 @@ namespace llaminar2
                     for (int k = 0; k < kernel_size; ++k)
                     {
                         const int input_t = t - state_len + k;
+                        // Explicit FMA in increasing tap order, as in the SIMD leaves.
                         if (input_t >= 0)
-                            sum += w[k] * input[input_t * channels + c];
+                            sum = std::fma(w[k], input[input_t * channels + c], sum);
                         else if (conv_state)
-                            sum += w[k] * conv_state[c * state_len + state_len + input_t];
+                            sum = std::fma(w[k], conv_state[c * state_len + state_len + input_t], sum);
                     }
                     if (apply_silu)
                     {
