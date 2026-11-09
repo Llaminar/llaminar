@@ -19,14 +19,31 @@
 #include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, etc.
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
+#include "../CPUInvocationWorkspace.h"
+#include "../../rope/RoPEWorkspaceContract.h"
 #include <array>
+#include <cstddef>
 #include <cstring>
 
 namespace llaminar2
 {
 
-    // Thread-local state for decode optimization (mirrors CPURoPEKernelT)
-    static thread_local primitives::RoPEPersistentState tls_state_;
+    WorkspaceRequirements CPURoPEAngleWorkspaceConsumer::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        (void)k;
+        if (m <= 0 || n <= 0)
+            return {};
+        return cpu_rope_workspace::requirements({.graph_rows = m, .head_dim = n});
+    }
+
+    primitives::RoPEAngleRows CPURoPEAngleWorkspaceConsumer::borrowAngles(int rows, int values_per_row) const
+    {
+        // Missing, foreign or undersized bindings are fatal here; no call
+        // allocates, resizes or substitutes another participant's planes.
+        return primitives::carve_rope_angle_rows(
+            CPUInvocationWorkspace::available<std::byte>(workspace_, RoPEWorkspaceBuffers::CPU_ANGLES),
+            rows, values_per_row);
+    }
 
     namespace
     {
@@ -183,7 +200,8 @@ namespace llaminar2
                     Q, K,
                     seq_len, head_dim, eff_rotary,
                     n_heads, n_kv_heads,
-                    start_pos, rope_theta);
+                    start_pos, rope_theta,
+                    borrowAngles(seq_len, eff_rotary / 2));
             }
             else
             {
@@ -192,7 +210,7 @@ namespace llaminar2
                     seq_len, head_dim,
                     n_heads, n_kv_heads,
                     start_pos, rope_theta,
-                    (seq_len == 1) ? &tls_state_ : nullptr);
+                    borrowAngles(seq_len, head_dim / 2));
             }
             return true;
         }
@@ -219,7 +237,8 @@ namespace llaminar2
                     q_token, k_token,
                     1, head_dim, eff_rotary,
                     n_heads, n_kv_heads,
-                    position, rope_theta);
+                    position, rope_theta,
+                    borrowAngles(1, eff_rotary / 2));
             }
             else
             {
@@ -228,7 +247,7 @@ namespace llaminar2
                     1, head_dim,
                     n_heads, n_kv_heads,
                     position, rope_theta,
-                    &tls_state_);
+                    borrowAngles(1, head_dim / 2));
             }
         }
 
@@ -302,7 +321,7 @@ namespace llaminar2
                 seq_len, head_dim,
                 n_heads, n_kv_heads,
                 start_pos, rope_theta,
-                (seq_len == 1) ? &tls_state_ : nullptr);
+                borrowAngles(seq_len, head_dim / 2));
             return true;
         }
 
@@ -326,7 +345,7 @@ namespace llaminar2
                 1, head_dim,
                 n_heads, n_kv_heads,
                 position, rope_theta,
-                &tls_state_);
+                borrowAngles(1, head_dim / 2));
         }
 
         return true;
@@ -399,7 +418,7 @@ namespace llaminar2
                 seq_len, head_dim,
                 n_heads, n_kv_heads,
                 start_pos, rope_theta,
-                (seq_len == 1) ? &tls_state_ : nullptr);
+                borrowAngles(seq_len, head_dim / 2));
             return true;
         }
 
@@ -423,7 +442,7 @@ namespace llaminar2
                 1, head_dim,
                 n_heads, n_kv_heads,
                 position, rope_theta,
-                &tls_state_);
+                borrowAngles(1, head_dim / 2));
         }
 
         return true;
@@ -461,6 +480,8 @@ namespace llaminar2
                       << head_dim << ") must be divisible by 32 (Q8_1 block size)");
             return false;
         }
+        if (seq_len <= 0)
+            return true; // Nothing to do
 
         // Call pure-integer Q8_1 RoPE primitive
         primitives::apply_rope_q8_1_integer(
@@ -470,7 +491,7 @@ namespace llaminar2
             n_heads, n_kv_heads,
             head_dim,
             rope_theta,
-            (seq_len == 1) ? &tls_state_ : nullptr, pos_offset);
+            borrowAngles(seq_len, head_dim / 2), pos_offset);
 
         return true;
     }
@@ -591,7 +612,8 @@ namespace llaminar2
             n_kv_heads,
             pos_offset,
             rope_theta,
-            &tls_state_);
+            borrowAngles(verifier_rows,
+                (rotary_dim > 0 && rotary_dim < head_dim ? rotary_dim : head_dim) / 2));
         record_grouped_rope_route(
             "FP32", verifier_rows, n_heads, n_kv_heads,
             head_dim, rotary_dim);
@@ -691,7 +713,7 @@ namespace llaminar2
             n_kv_heads,
             pos_offset,
             rope_theta,
-            &tls_state_);
+            borrowAngles(verifier_rows, head_dim / 2));
         record_grouped_rope_route(
             "BF16", verifier_rows, n_heads, n_kv_heads,
             head_dim, rotary_dim);
@@ -791,7 +813,7 @@ namespace llaminar2
             n_kv_heads,
             pos_offset,
             rope_theta,
-            &tls_state_);
+            borrowAngles(verifier_rows, head_dim / 2));
         record_grouped_rope_route(
             "FP16", verifier_rows, n_heads, n_kv_heads,
             head_dim, rotary_dim);
@@ -899,7 +921,7 @@ namespace llaminar2
             head_dim,
             pos_offset,
             rope_theta,
-            &tls_state_);
+            borrowAngles(verifier_rows, head_dim / 2));
         record_grouped_rope_route(
             "Q8_1", verifier_rows, n_heads, n_kv_heads,
             head_dim, rotary_dim);
@@ -1337,7 +1359,7 @@ namespace llaminar2
             n_heads, n_kv_heads,
             head_dim,
             rope_theta,
-            (seq_len == 1) ? &tls_state_ : nullptr, pos_offset);
+            pos_offset);
 
         return true;
     }
@@ -1383,7 +1405,7 @@ namespace llaminar2
             n_heads, n_kv_heads,
             head_dim,
             rope_theta,
-            (seq_len == 1) ? &tls_state_ : nullptr, pos_offset);
+            pos_offset);
 
         return true;
     }

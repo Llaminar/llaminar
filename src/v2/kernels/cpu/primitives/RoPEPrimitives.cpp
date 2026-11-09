@@ -6,7 +6,14 @@
  * absolute-position coefficient authority, never a history-dependent recurrence.
  * Native floating pairs retain explicit rounding; quantized block cycles consume
  * both original halves before replacing their scale/payload. One head workshare
- * owns cached decode even inside retained teams, with no repeated bank rotation.
+ * owns one-row decode even inside retained teams, with no repeated bank rotation.
+ *
+ * Angle rows come from one function (fill_rope_angle_row) and live only in the
+ * caller's borrowed planes (RoPEAngleRows, the stage's admitted cpu_rope_angles
+ * workspace): no per-call vectors, no thread-local tables and no decode memo.
+ * Inside an existing team every member shares one omp-for fill whose implicit
+ * barrier publishes the planes before any head reads them. The Q16/hybrid
+ * family keeps its own Q15 angle authority and storage (tracked follow-up A).
  * @author David Sanftenberg
  */
 
@@ -412,50 +419,91 @@ namespace llaminar2::primitives
     }
 #endif
 
-    /**
-     * @brief Fill position-owned angles once, shared by all heads in each row.
-     * @param inv_freq Immutable inverse frequencies for the rotary geometry.
-     * @param first_position Absolute position of row zero, never a recurrence seed.
-     * @param rows Number of contiguous angle rows in the caller's storage.
-     * @param cos_table Caller-owned cosine plane, rows times frequency count.
-     * @param sin_table Matching caller-owned sine plane.
-     *
-     * The multiplication rounds to FP32 before libm evaluates either function.
-     * Every row is independent: restarting a prefill or rolling back MTP cannot
-     * change its value. Trigonometry is outside the per-head rotation loop.
-     */
-    static void fill_absolute_rope_angles(
-        const std::vector<float> &inv_freq, int first_position, int rows,
-        float *cos_table, float *sin_table)
+    void fill_rope_angle_row(const std::vector<float> &inv_freq, int position, float *cosine, float *sine)
     {
-        const auto compute_row = [&](int row)
+        // The multiplication rounds to FP32 before libm evaluates either
+        // function, and cosine/sine stay separate calls: a merged sincos is a
+        // different libm program. Every RoPE path computes a row only here, so
+        // serial, decode, verifier-row and prefill angles agree by construction.
+        for (size_t index = 0; index < inv_freq.size(); ++index)
         {
-            for (size_t index = 0; index < inv_freq.size(); ++index)
-            {
-                const float angle = static_cast<float>(first_position + row) * inv_freq[index];
-                const size_t offset = static_cast<size_t>(row) * inv_freq.size() + index;
-                cos_table[offset] = std::cos(angle);
-                sin_table[offset] = std::sin(angle);
-            }
-        };
-        auto compute = [&]()
-        {
-#pragma omp for schedule(static)
-            for (int row = 0; row < rows; ++row)
-                compute_row(row);
-        };
-        // A new team shares this caller's storage. In an existing outer team,
-        // each caller owns a PRIVATE table: every caller must fill its complete
-        // copy before the differently partitioned head workshare consumes it.
-        if (rows > 1 && !omp_in_parallel())
-        {
-            OMP_WORKSHARE_REGION(compute);
-        }
-        else
-        {
-            for (int row = 0; row < rows; ++row) compute_row(row);
+            const float angle = static_cast<float>(position) * inv_freq[index];
+            cosine[index] = std::cos(angle);
+            sine[index] = std::sin(angle);
         }
     }
+
+    namespace
+    {
+        /** @brief How a row with a negative position is published. */
+        enum class RoPEPaddingRows
+        {
+            Skip,    ///< Padding: the row stays inactive and is never rotated.
+            Compute, ///< The Q8_1 integer program rotates every row by its stored position.
+        };
+
+        /**
+         * @brief Fill the borrowed angle planes for every live row once.
+         * @tparam WithQ15 Also publish the Q8_1 format's truncated Q15 rows.
+         * @tparam PositionOf Callable mapping a row to its absolute position.
+         * @param inv_freq Immutable inverse frequencies; their count is the row width.
+         * @param angles Borrowed planes covering rows x inv_freq.size().
+         * @param rows Positive live rows.
+         * @param padding Negative-position policy of the calling format.
+         * @param position_of Row-to-position map, evaluated once per row.
+         *
+         * Rows are independent functions of their absolute position, so any
+         * partition of the rows stores identical bytes. Inside an existing team
+         * every member reaches this single omp-for; its implicit barrier (no
+         * nowait) publishes the complete planes before the head workshare reads
+         * them, and no member skips the fill. Standalone calls with one row fill
+         * it on the caller with the same row function; more rows get a team.
+         */
+        template <bool WithQ15, typename PositionOf>
+        void fill_shared_angle_rows(
+            const std::vector<float> &inv_freq, const RoPEAngleRows &angles,
+            int rows, RoPEPaddingRows padding, PositionOf position_of)
+        {
+            const int values = static_cast<int>(inv_freq.size());
+            require_rope_angle_rows(angles, rows, values);
+            const auto fill_row = [&](int row)
+            {
+                const int position = position_of(row);
+                const bool active = position >= 0 || padding == RoPEPaddingRows::Compute;
+                angles.active[static_cast<size_t>(row)] = active ? 1 : 0;
+                if (!active)
+                    return;
+                float *cosine = angles.cos_row(row);
+                float *sine = angles.sin_row(row);
+                fill_rope_angle_row(inv_freq, position, cosine, sine);
+                if constexpr (WithQ15)
+                {
+                    // The Q8 integer authority truncates the same FP32 values.
+                    int16_t *cos_q15 = angles.cos_q15_row(row);
+                    int16_t *sin_q15 = angles.sin_q15_row(row);
+                    for (int index = 0; index < values; ++index)
+                    {
+                        cos_q15[index] = static_cast<int16_t>(cosine[index] * 32767.0f);
+                        sin_q15[index] = static_cast<int16_t>(sine[index] * 32767.0f);
+                    }
+                }
+            };
+            auto fill = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int row = 0; row < rows; ++row)
+                    fill_row(row);
+            };
+            if (::llaminar::v2::inLexicalWorkshare() || rows > 1)
+            {
+                OMP_WORKSHARE_REGION(fill);
+            }
+            else
+            {
+                fill_row(0);
+            }
+        }
+    } // namespace
 
     /**
      * @brief Share angle preparation and one head workshare across Q and K.
@@ -467,22 +515,21 @@ namespace llaminar2::primitives
      * @param head_dim Complete physical head width.
      * @param first_position Absolute start of the input rows.
      * @param inv_freq Immutable inverse frequencies for these heads.
+     * @param angles Borrowed planes for rows x head_dim/2 pairs.
      * @param rotate Native single-head SIMD operation, preserving storage bytes.
      *
-     * Q and K have identical angle geometry even under GQA. Preparing separate
-     * planes doubled trigonometry, allocation and team-launch costs. Each worker
-     * still owns disjoint output heads, and no head reduction order changes.
+     * Q and K have identical angle geometry even under GQA, so one angle fill
+     * serves both. Each worker owns disjoint output heads; no head reduction
+     * order changes.
      */
     template <typename Native, typename Rotate>
     static void apply_rope_pair_positions(
         Native *q, Native *k, int rows, int q_heads, int k_heads, int head_dim,
-        int first_position, const std::vector<float> &inv_freq, Rotate rotate)
+        int first_position, const std::vector<float> &inv_freq, const RoPEAngleRows &angles, Rotate rotate)
     {
-        const int half_dim = head_dim / 2;
         const int heads = q_heads + (k ? k_heads : 0);
-        std::vector<float> cos_table(static_cast<size_t>(rows) * half_dim);
-        std::vector<float> sin_table(cos_table.size());
-        fill_absolute_rope_angles(inv_freq, first_position, rows, cos_table.data(), sin_table.data());
+        fill_shared_angle_rows<false>(inv_freq, angles, rows, RoPEPaddingRows::Skip,
+            [first_position](int row) { return first_position + row; });
         auto work = [&]()
         {
 #pragma omp for collapse(2) schedule(static)
@@ -492,7 +539,7 @@ namespace llaminar2::primitives
                     Native *data = head < q_heads
                         ? q + (static_cast<size_t>(row) * q_heads + head) * head_dim
                         : k + (static_cast<size_t>(row) * k_heads + head - q_heads) * head_dim;
-                    rotate(data, cos_table.data() + row * half_dim, sin_table.data() + row * half_dim);
+                    rotate(data, angles.cos_row(row), angles.sin_row(row));
                 }
         };
         OMP_WORKSHARE_REGION(work);
@@ -502,7 +549,7 @@ namespace llaminar2::primitives
     static void apply_rope_to_tensor_positions(
         float *q, float *k,
         int seq_len, int q_heads, int k_heads, int head_dim,
-        int n_past, const std::vector<float> &inv_freq)
+        int n_past, const std::vector<float> &inv_freq, const RoPEAngleRows &angles)
     {
         const auto rotate = [head_dim](float *head_ptr, const float *cos_ptr, const float *sin_ptr)
         {
@@ -527,41 +574,11 @@ namespace llaminar2::primitives
             }
 #endif
         };
-        apply_rope_pair_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, rotate);
-    }
-
-    void update_rope_cache(
-        int head_dim, float freq_base, int target_pos,
-        RoPEPersistentState &state)
-    {
-        // Reset state if parameters changed
-        if (state.cached_head_dim != head_dim ||
-            state.cached_freq_base != freq_base)
-        {
-            state.cached_head_dim = head_dim;
-            state.cached_freq_base = freq_base;
-            state.reset();
-        }
-
-        const auto &inv_freq = get_inv_freq_cached(head_dim, freq_base);
-        const int half_dim = head_dim / 2;
-
-        // Memoization only: forward jumps and backwards restores obey the same
-        // equation. No cached execution history is needed for correctness.
-        if (state.last_pos != target_pos)
-        {
-            state.cos_curr.resize(half_dim);
-            state.sin_curr.resize(half_dim);
-            fill_absolute_rope_angles(inv_freq, target_pos, 1, state.cos_curr.data(), state.sin_curr.data());
-            state.last_pos = target_pos;
-        }
+        apply_rope_pair_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, angles, rotate);
     }
 
     /**
-     * @brief Apply RoPE with persistent state (single-token decode optimization)
-     */
-    /**
-     * @brief Own each cached query/key head exactly once in standalone or retained execution.
+     * @brief Own each one-row query/key head exactly once in standalone or retained execution.
      * @tparam Native Original floating storage word.
      * @tparam Rotate Architecture-native single-head operation, not a whole-bank replay.
      * @param q Original writable query bank.
@@ -569,35 +586,33 @@ namespace llaminar2::primitives
      * @param q_heads Query head count.
      * @param k_heads Key head count when k is present.
      * @param head_dim Nonnegative even physical head width.
-     * @param state Calling participant's immutable, fully prepared angle cache.
+     * @param cosine Completed shared row of head_dim/2 cosines.
+     * @param sine Matching shared row of sines.
      * @param rotate One original-head rotation with borrowed coefficient pointers.
-     * @throws std::invalid_argument Before mutation on incomplete geometry/cache or writable aliases.
+     * @throws std::invalid_argument Before mutation on incomplete geometry or writable aliases.
      *
-     * Each retained-team caller has its own thread-local angle cache, but all
-     * callers share the output banks. Repeating a serial head loop per member
-     * transforms those banks multiple times. One head workshare and its final
-     * edge instead own publication, including the empty-head case.
+     * Retained-team callers share the output banks. Repeating a serial head
+     * loop per member would transform those banks multiple times. One head
+     * workshare and its final edge own publication, including no heads.
      */
     template <typename Native, typename Rotate>
-    static void apply_rope_cached_heads(
+    static void apply_rope_row_heads(
         Native *q, Native *k, int q_heads, int k_heads, int head_dim,
-        const RoPEPersistentState &state, Rotate rotate)
+        const float *cosine, const float *sine, Rotate rotate)
     {
         if (q_heads < 0 || k_heads < 0 || head_dim < 0 || head_dim % 2 != 0 ||
-            (q_heads && head_dim && !q) ||
-            state.cos_curr.size() != static_cast<std::size_t>(head_dim / 2) ||
-            state.sin_curr.size() != state.cos_curr.size())
-            throw std::invalid_argument("Cached CPU RoPE requires complete head and angle geometry");
+            (q_heads && head_dim && !q) || !cosine || !sine)
+            throw std::invalid_argument("One-row CPU RoPE requires complete head and angle geometry");
         const auto q_bytes = std::size_t(q_heads) * head_dim * sizeof(Native);
         const auto k_bytes = k ? std::size_t(k_heads) * head_dim * sizeof(Native) : 0;
-        const auto coefficient_bytes = state.cos_curr.size() * sizeof(float);
+        const auto coefficient_bytes = std::size_t(head_dim / 2) * sizeof(float);
         const auto reject_overlap = [](const void *a, std::size_t a_bytes, const void *b, std::size_t b_bytes) {
             const auto x = reinterpret_cast<std::uintptr_t>(a), y = reinterpret_cast<std::uintptr_t>(b);
             if (a_bytes && b_bytes && (x <= y ? y - x < a_bytes : x - y < b_bytes))
-                throw std::invalid_argument("Cached CPU RoPE writable banks alias another retained authority");
+                throw std::invalid_argument("One-row CPU RoPE writable banks alias another retained authority");
         };
         reject_overlap(q, q_bytes, k, k_bytes);
-        for (const auto *coefficients : {state.cos_curr.data(), state.sin_curr.data()})
+        for (const float *coefficients : {cosine, sine})
         {
             reject_overlap(q, q_bytes, coefficients, coefficient_bytes);
             reject_overlap(k, k_bytes, coefficients, coefficient_bytes);
@@ -611,7 +626,7 @@ namespace llaminar2::primitives
                 Native *data = head < q_heads
                     ? q + static_cast<std::size_t>(head) * head_dim
                     : k + static_cast<std::size_t>(head - q_heads) * head_dim;
-                rotate(data, state.cos_curr.data(), state.sin_curr.data());
+                rotate(data, cosine, sine);
             }
         };
         // The conditional macro creates a private one-thread region when its
@@ -620,39 +635,42 @@ namespace llaminar2::primitives
         OMP_WORKSHARE_REGION_IF(work, omp_in_parallel() || heads >= 4);
     }
 
-    /** @brief Rotate cached FP32 heads once through the shared participant workshare.
+    /** @brief Rotate one FP32 row's heads through the shared participant workshare.
      * @param q Original query bank.
      * @param k Optional original key bank.
      * @param q_heads Query head count.
      * @param k_heads Key head count when k is present.
      * @param head_dim Original even head width.
-     * @param state Participant-thread-owned immutable angle memoization.
+     * @param cosine Completed shared cosine row.
+     * @param sine Completed shared sine row.
      */
-    static void apply_rope_from_cache(
+    static void apply_rope_row_fp32(
         float *q, float *k,
         int q_heads, int k_heads, int head_dim,
-        const RoPEPersistentState &state)
+        const float *cosine, const float *sine)
     {
-        const auto rotate = [head_dim](float *head, const float *cosine, const float *sine)
+        const auto rotate = [head_dim](float *head, const float *c, const float *s)
         {
 #if LLAMINAR_COMPILED_WITH_NEON
-            apply_rope_to_head_cached_neon<neon_rope::Storage::FP32>(head, cosine, sine, head_dim);
+            apply_rope_to_head_cached_neon<neon_rope::Storage::FP32>(head, c, s, head_dim);
 #elif defined(__AVX512F__)
-            apply_rope_to_head_cached_avx512(head, cosine, sine, head_dim);
+            apply_rope_to_head_cached_avx512(head, c, s, head_dim);
 #elif defined(__AVX2__)
-            apply_rope_to_head_cached_avx2(head, cosine, sine, head_dim);
+            apply_rope_to_head_cached_avx2(head, c, s, head_dim);
 #else
             const int half = head_dim / 2;
             for (int i = 0; i < half; ++i)
             {
                 const float x = head[i], y = head[i + half];
-                head[i] = x * cosine[i] - y * sine[i];
-                head[i + half] = x * sine[i] + y * cosine[i];
+                head[i] = x * c[i] - y * s[i];
+                head[i + half] = x * s[i] + y * c[i];
             }
 #endif
         };
-        apply_rope_cached_heads(q, k, q_heads, k_heads, head_dim, state, rotate);
-    } // ============================================================================
+        apply_rope_row_heads(q, k, q_heads, k_heads, head_dim, cosine, sine, rotate);
+    }
+
+    // ============================================================================
     // Public API
     // ============================================================================
 
@@ -661,7 +679,7 @@ namespace llaminar2::primitives
         int seq_len, int head_dim,
         int q_heads, int k_heads,
         int n_past, float freq_base,
-        RoPEPersistentState *persistent_state)
+        const RoPEAngleRows &angles)
     {
         if (head_dim % 2 != 0)
         {
@@ -670,19 +688,17 @@ namespace llaminar2::primitives
 
         const auto &inv_freq = get_inv_freq_cached(head_dim, freq_base);
 
-        // Single-token decode with persistent state
-        if (seq_len == 1 && persistent_state)
+        if (seq_len == 1)
         {
-            update_rope_cache(head_dim, freq_base, n_past, *persistent_state);
-
-            apply_rope_from_cache(
-                q, k, q_heads, k_heads, head_dim,
-                *persistent_state);
+            // One shared row; every head reads it through one head workshare.
+            fill_shared_angle_rows<false>(inv_freq, angles, 1, RoPEPaddingRows::Skip,
+                [n_past](int) { return n_past; });
+            apply_rope_row_fp32(q, k, q_heads, k_heads, head_dim, angles.cos_row(0), angles.sin_row(0));
         }
         else
         {
             // Prefill uses the same position-owned angles as ordinary decode.
-            apply_rope_to_tensor_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq);
+            apply_rope_to_tensor_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, angles);
         }
     }
 
@@ -796,7 +812,8 @@ namespace llaminar2::primitives
         float *q, float *k,
         int seq_len, int head_dim, int rotary_dim,
         int q_heads, int k_heads,
-        int n_past, float freq_base)
+        int n_past, float freq_base,
+        const RoPEAngleRows &angles)
     {
         if (rotary_dim <= 0 || rotary_dim % 2 != 0)
             return;
@@ -806,10 +823,8 @@ namespace llaminar2::primitives
         const int half_rotary = rotary_dim / 2;
 
         // Partial rotation shares the same absolute-position angle authority.
-        std::vector<float> cos_table(seq_len * half_rotary);
-        std::vector<float> sin_table(seq_len * half_rotary);
-
-        fill_absolute_rope_angles(inv_freq, n_past, seq_len, cos_table.data(), sin_table.data());
+        fill_shared_angle_rows<false>(inv_freq, angles, seq_len, RoPEPaddingRows::Skip,
+            [n_past](int row) { return n_past + row; });
 
         // Apply rotation (head_dim for stride, rotary_dim for loop)
         auto do_partial_rope = [&]()
@@ -820,9 +835,9 @@ namespace llaminar2::primitives
             {
                 for (int h = 0; h < q_heads; ++h)
                 {
-                    float *head_ptr = q + (t * q_heads + h) * head_dim;
-                    const float *cos_ptr = cos_table.data() + t * half_rotary;
-                    const float *sin_ptr = sin_table.data() + t * half_rotary;
+                    float *head_ptr = q + (static_cast<size_t>(t) * q_heads + h) * head_dim;
+                    const float *cos_ptr = angles.cos_row(t);
+                    const float *sin_ptr = angles.sin_row(t);
                     rope_rotate_head_dispatch(head_ptr, cos_ptr, sin_ptr, half_rotary);
                 }
             }
@@ -835,9 +850,9 @@ namespace llaminar2::primitives
                 {
                     for (int h = 0; h < k_heads; ++h)
                     {
-                        float *head_ptr = k + (t * k_heads + h) * head_dim;
-                        const float *cos_ptr = cos_table.data() + t * half_rotary;
-                        const float *sin_ptr = sin_table.data() + t * half_rotary;
+                        float *head_ptr = k + (static_cast<size_t>(t) * k_heads + h) * head_dim;
+                        const float *cos_ptr = angles.cos_row(t);
+                        const float *sin_ptr = angles.sin_row(t);
                         rope_rotate_head_dispatch(head_ptr, cos_ptr, sin_ptr, half_rotary);
                     }
                 }
@@ -849,89 +864,37 @@ namespace llaminar2::primitives
     namespace
     {
         /**
-         * @brief Reusable native angle storage for a tiny verifier row group.
-         *
-         * Allocating several vectors per layer pollutes the CPU hot path at
-         * every supported verifier depth. Thread-local storage keeps ownership
-         * compatible with the executor's nested OpenMP model while retaining
-         * capacity across every layer and decode iteration.
-         */
-        struct VerifierAngleRows
-        {
-            std::vector<float> cos_values;
-            std::vector<float> sin_values;
-            std::vector<uint8_t> active_rows;
-            std::vector<int16_t> cos_q15;
-            std::vector<int16_t> sin_q15;
-            int values_per_row = 0;
-        };
-
-        thread_local VerifierAngleRows g_verifier_angle_rows;
-
-        /**
-         * @brief Materialize exactly the angle values produced by serial decode.
+         * @brief Materialize exactly the angle rows produced by serial decode.
+         * @tparam WithQ15 Also publish the Q8_1 format's truncated Q15 rows.
+         * @param position_ids Optional absolute position per row; null means pos_offset + row.
+         * @param verifier_rows Positive grouped rows.
+         * @param head_dim Physical head width.
+         * @param rotary_dim Rotated width; 0 or head_dim means full RoPE.
+         * @param pos_offset Contiguous first position when position_ids is null.
+         * @param freq_base RoPE frequency base.
+         * @param angles Borrowed planes covering verifier_rows x rotary pairs.
          *
          * Full and partial RoPE compute each absolute-position angle directly,
-         * including non-contiguous jumps. The full-head owner may memoize a row
-         * but never contributes numerical history. The resulting table can be
-         * consumed by one grouped row/head workshare without changing math.
+         * including non-contiguous jumps and padding rows, through the same row
+         * function as serial decode. One grouped row/head workshare then
+         * consumes the planes without changing arithmetic.
          */
-        VerifierAngleRows &prepare_verifier_angle_rows(
+        template <bool WithQ15>
+        void prepare_verifier_angle_rows(
             const int *position_ids,
             int verifier_rows,
             int head_dim,
             int rotary_dim,
             int pos_offset,
             float freq_base,
-            RoPEPersistentState *persistent_state)
+            const RoPEAngleRows &angles)
         {
             const int effective_rotary =
                 rotary_dim > 0 && rotary_dim < head_dim ? rotary_dim : head_dim;
-            const int values_per_row = effective_rotary / 2;
-            auto &workspace = g_verifier_angle_rows;
-            workspace.values_per_row = values_per_row;
-            workspace.cos_values.resize(
-                static_cast<size_t>(verifier_rows) * values_per_row);
-            workspace.sin_values.resize(
-                static_cast<size_t>(verifier_rows) * values_per_row);
-            workspace.active_rows.assign(static_cast<size_t>(verifier_rows), 0);
-
-            const bool full_rope = effective_rotary == head_dim;
-            const auto *partial_inv_freq = full_rope
-                                               ? nullptr
-                                               : &get_inv_freq_cached(effective_rotary, freq_base);
-            for (int row = 0; row < verifier_rows; ++row)
-            {
-                const int position = position_ids ? position_ids[row] : pos_offset + row;
-                if (position < 0)
-                    continue;
-
-                workspace.active_rows[static_cast<size_t>(row)] = 1;
-                float *row_cos = workspace.cos_values.data() +
-                                 static_cast<size_t>(row) * values_per_row;
-                float *row_sin = workspace.sin_values.data() +
-                                 static_cast<size_t>(row) * values_per_row;
-                if (full_rope)
-                {
-                    update_rope_cache(
-                        head_dim, freq_base, position, *persistent_state);
-                    std::memcpy(
-                        row_cos, persistent_state->cos_curr.data(),
-                        static_cast<size_t>(values_per_row) * sizeof(float));
-                    std::memcpy(
-                        row_sin, persistent_state->sin_curr.data(),
-                        static_cast<size_t>(values_per_row) * sizeof(float));
-                    continue;
-                }
-
-                for (int index = 0; index < values_per_row; ++index)
-                {
-                    const float angle = position * (*partial_inv_freq)[index];
-                    row_cos[index] = std::cos(angle);
-                    row_sin[index] = std::sin(angle);
-                }
-            }
-            return workspace;
+            const auto &inv_freq = get_inv_freq_cached(effective_rotary, freq_base);
+            fill_shared_angle_rows<WithQ15>(inv_freq, angles, verifier_rows, RoPEPaddingRows::Skip,
+                [position_ids, pos_offset](int row)
+                { return position_ids ? position_ids[row] : pos_offset + row; });
         }
     } // namespace
 
@@ -942,7 +905,7 @@ namespace llaminar2::primitives
         int head_dim, int rotary_dim,
         int q_heads, int k_heads,
         int pos_offset, float freq_base,
-        RoPEPersistentState *persistent_state)
+        const RoPEAngleRows &angles)
     {
         if (!q || verifier_rows <= 0 || head_dim <= 0 || (head_dim % 2) != 0)
             return;
@@ -951,12 +914,9 @@ namespace llaminar2::primitives
         if (eff_rotary <= 0 || (eff_rotary % 2) != 0)
             return;
 
-        if (!persistent_state)
-            return;
-
-        auto &angles = prepare_verifier_angle_rows(
+        prepare_verifier_angle_rows<false>(
             position_ids, verifier_rows, head_dim, rotary_dim,
-            pos_offset, freq_base, persistent_state);
+            pos_offset, freq_base, angles);
         const bool full_rope = eff_rotary == head_dim;
         const int q_row_stride = q_heads * head_dim;
         const int k_row_stride = k_heads * head_dim;
@@ -993,14 +953,12 @@ namespace llaminar2::primitives
             {
                 for (int head_index = 0; head_index < q_heads; ++head_index)
                 {
-                    if (!angles.active_rows[static_cast<size_t>(row)])
+                    if (!angles.active[static_cast<size_t>(row)])
                         continue;
                     float *head = q + static_cast<size_t>(row) * q_row_stride +
                                   static_cast<size_t>(head_index) * head_dim;
-                    const float *row_cos = angles.cos_values.data() +
-                                           static_cast<size_t>(row) * angles.values_per_row;
-                    const float *row_sin = angles.sin_values.data() +
-                                           static_cast<size_t>(row) * angles.values_per_row;
+                    const float *row_cos = angles.cos_row(row);
+                    const float *row_sin = angles.sin_row(row);
                     if (full_rope)
                         apply_full_head(head, row_cos, row_sin);
                     else
@@ -1016,14 +974,12 @@ namespace llaminar2::primitives
                 {
                     for (int head_index = 0; head_index < k_heads; ++head_index)
                     {
-                        if (!angles.active_rows[static_cast<size_t>(row)])
+                        if (!angles.active[static_cast<size_t>(row)])
                             continue;
                         float *head = k + static_cast<size_t>(row) * k_row_stride +
                                       static_cast<size_t>(head_index) * head_dim;
-                        const float *row_cos = angles.cos_values.data() +
-                                               static_cast<size_t>(row) * angles.values_per_row;
-                        const float *row_sin = angles.sin_values.data() +
-                                               static_cast<size_t>(row) * angles.values_per_row;
+                        const float *row_cos = angles.cos_row(row);
+                        const float *row_sin = angles.sin_row(row);
                         if (full_rope)
                             apply_full_head(head, row_cos, row_sin);
                         else
@@ -1363,7 +1319,7 @@ namespace llaminar2::primitives
     static void apply_rope_to_tensor_bf16_positions(
         uint16_t *q, uint16_t *k,
         int seq_len, int q_heads, int k_heads, int head_dim,
-        int n_past, const std::vector<float> &inv_freq)
+        int n_past, const std::vector<float> &inv_freq, const RoPEAngleRows &angles)
     {
         const auto rotate = [head_dim](uint16_t *head_ptr, const float *cos_ptr, const float *sin_ptr)
         {
@@ -1391,21 +1347,22 @@ namespace llaminar2::primitives
             }
 #endif
         };
-        apply_rope_pair_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, rotate);
+        apply_rope_pair_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, angles, rotate);
     }
 
-    /** @brief Rotate cached BFloat16 heads once through the shared participant workshare.
+    /** @brief Rotate one row of BFloat16 heads once through the shared participant workshare.
      * @param q Original query bank.
      * @param k Optional original key bank.
      * @param q_heads Query head count.
      * @param k_heads Key head count when k is present.
      * @param head_dim Original even head width.
-     * @param state Participant-thread-owned immutable angle memoization.
+     * @param cosine Completed shared cosine row.
+     * @param sine Completed shared sine row.
      */
-    static void apply_rope_bf16_from_cache(
+    static void apply_rope_row_bf16(
         uint16_t *q, uint16_t *k,
         int q_heads, int k_heads, int head_dim,
-        const RoPEPersistentState &state)
+        const float *cosine, const float *sine)
     {
         const auto rotate = [head_dim](uint16_t *head, const float *cosine, const float *sine)
         {
@@ -1425,7 +1382,7 @@ namespace llaminar2::primitives
             }
 #endif
         };
-        apply_rope_cached_heads(q, k, q_heads, k_heads, head_dim, state, rotate);
+        apply_rope_row_heads(q, k, q_heads, k_heads, head_dim, cosine, sine, rotate);
     }
 
     static void apply_rope_to_tensor_bf16_direct(
@@ -1466,7 +1423,7 @@ namespace llaminar2::primitives
         int seq_len, int head_dim,
         int q_heads, int k_heads,
         int n_past, float freq_base,
-        RoPEPersistentState *persistent_state)
+        const RoPEAngleRows &angles)
     {
         if (head_dim % 2 != 0)
         {
@@ -1475,15 +1432,16 @@ namespace llaminar2::primitives
 
         const auto &inv_freq = get_inv_freq_cached(head_dim, freq_base);
 
-        // Single-token decode with persistent state optimization
-        if (seq_len == 1 && persistent_state)
+        if (seq_len == 1)
         {
-            update_rope_cache(head_dim, freq_base, n_past, *persistent_state);
-            apply_rope_bf16_from_cache(q_bf16, k_bf16, q_heads, k_heads, head_dim, *persistent_state);
+            // One shared row; every head reads it through one head workshare.
+            fill_shared_angle_rows<false>(inv_freq, angles, 1, RoPEPaddingRows::Skip,
+                [n_past](int) { return n_past; });
+            apply_rope_row_bf16(q_bf16, k_bf16, q_heads, k_heads, head_dim, angles.cos_row(0), angles.sin_row(0));
             return;
         }
 
-        // Short sequences avoid allocating a shared table.
+        // Short multi-row sequences keep their direct per-head program.
         if (seq_len < 32)
         {
             apply_rope_to_tensor_bf16_direct(q_bf16, seq_len, q_heads, head_dim, n_past, inv_freq);
@@ -1492,7 +1450,7 @@ namespace llaminar2::primitives
         else
         {
             // Share each absolute-position angle across the head workshare.
-            apply_rope_to_tensor_bf16_positions(q_bf16, k_bf16, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq);
+            apply_rope_to_tensor_bf16_positions(q_bf16, k_bf16, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, angles);
         }
     }
 
@@ -1503,17 +1461,17 @@ namespace llaminar2::primitives
         int head_dim,
         int q_heads, int k_heads,
         int pos_offset, float freq_base,
-        RoPEPersistentState *persistent_state)
+        const RoPEAngleRows &angles)
     {
-        if (!q_bf16 || !persistent_state || verifier_rows <= 0 ||
+        if (!q_bf16 || verifier_rows <= 0 ||
             head_dim <= 0 || (head_dim % 2) != 0)
         {
             return;
         }
 
-        auto &angles = prepare_verifier_angle_rows(
+        prepare_verifier_angle_rows<false>(
             position_ids, verifier_rows, head_dim, 0,
-            pos_offset, freq_base, persistent_state);
+            pos_offset, freq_base, angles);
         const int q_row_stride = q_heads * head_dim;
         const int k_row_stride = k_heads * head_dim;
 
@@ -1552,15 +1510,13 @@ namespace llaminar2::primitives
             {
                 for (int head_index = 0; head_index < q_heads; ++head_index)
                 {
-                    if (!angles.active_rows[static_cast<size_t>(row)])
+                    if (!angles.active[static_cast<size_t>(row)])
                         continue;
                     uint16_t *head =
                         q_bf16 + static_cast<size_t>(row) * q_row_stride +
                         static_cast<size_t>(head_index) * head_dim;
-                    const float *row_cos = angles.cos_values.data() +
-                                           static_cast<size_t>(row) * angles.values_per_row;
-                    const float *row_sin = angles.sin_values.data() +
-                                           static_cast<size_t>(row) * angles.values_per_row;
+                    const float *row_cos = angles.cos_row(row);
+                    const float *row_sin = angles.sin_row(row);
                     apply_head(head, row_cos, row_sin);
                 }
             }
@@ -1572,15 +1528,13 @@ namespace llaminar2::primitives
                 {
                     for (int head_index = 0; head_index < k_heads; ++head_index)
                     {
-                        if (!angles.active_rows[static_cast<size_t>(row)])
+                        if (!angles.active[static_cast<size_t>(row)])
                             continue;
                         uint16_t *head =
                             k_bf16 + static_cast<size_t>(row) * k_row_stride +
                             static_cast<size_t>(head_index) * head_dim;
-                        const float *row_cos = angles.cos_values.data() +
-                                               static_cast<size_t>(row) * angles.values_per_row;
-                        const float *row_sin = angles.sin_values.data() +
-                                               static_cast<size_t>(row) * angles.values_per_row;
+                        const float *row_cos = angles.cos_row(row);
+                        const float *row_sin = angles.sin_row(row);
                         apply_head(head, row_cos, row_sin);
                     }
                 }
@@ -1907,7 +1861,7 @@ namespace llaminar2::primitives
     static void apply_rope_to_tensor_fp16_positions(
         uint16_t *q, uint16_t *k,
         int seq_len, int q_heads, int k_heads, int head_dim,
-        int n_past, const std::vector<float> &inv_freq)
+        int n_past, const std::vector<float> &inv_freq, const RoPEAngleRows &angles)
     {
         const auto rotate = [head_dim](uint16_t *head_ptr, const float *cos_ptr, const float *sin_ptr)
         {
@@ -1935,21 +1889,22 @@ namespace llaminar2::primitives
             }
 #endif
         };
-        apply_rope_pair_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, rotate);
+        apply_rope_pair_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, angles, rotate);
     }
 
-    /** @brief Rotate cached Half heads once through the shared participant workshare.
+    /** @brief Rotate one row of Half heads once through the shared participant workshare.
      * @param q Original query bank.
      * @param k Optional original key bank.
      * @param q_heads Query head count.
      * @param k_heads Key head count when k is present.
      * @param head_dim Original even head width.
-     * @param state Participant-thread-owned immutable angle memoization.
+     * @param cosine Completed shared cosine row.
+     * @param sine Completed shared sine row.
      */
-    static void apply_rope_fp16_from_cache(
+    static void apply_rope_row_fp16(
         uint16_t *q, uint16_t *k,
         int q_heads, int k_heads, int head_dim,
-        const RoPEPersistentState &state)
+        const float *cosine, const float *sine)
     {
         const auto rotate = [head_dim](uint16_t *head, const float *cosine, const float *sine)
         {
@@ -1969,7 +1924,7 @@ namespace llaminar2::primitives
             }
 #endif
         };
-        apply_rope_cached_heads(q, k, q_heads, k_heads, head_dim, state, rotate);
+        apply_rope_row_heads(q, k, q_heads, k_heads, head_dim, cosine, sine, rotate);
     }
 
     static void apply_rope_to_tensor_fp16_direct(
@@ -2010,7 +1965,7 @@ namespace llaminar2::primitives
         int seq_len, int head_dim,
         int q_heads, int k_heads,
         int n_past, float freq_base,
-        RoPEPersistentState *persistent_state)
+        const RoPEAngleRows &angles)
     {
         if (head_dim % 2 != 0)
         {
@@ -2019,15 +1974,16 @@ namespace llaminar2::primitives
 
         const auto &inv_freq = get_inv_freq_cached(head_dim, freq_base);
 
-        // Single-token decode with persistent state optimization
-        if (seq_len == 1 && persistent_state)
+        if (seq_len == 1)
         {
-            update_rope_cache(head_dim, freq_base, n_past, *persistent_state);
-            apply_rope_fp16_from_cache(q_fp16, k_fp16, q_heads, k_heads, head_dim, *persistent_state);
+            // One shared row; every head reads it through one head workshare.
+            fill_shared_angle_rows<false>(inv_freq, angles, 1, RoPEPaddingRows::Skip,
+                [n_past](int) { return n_past; });
+            apply_rope_row_fp16(q_fp16, k_fp16, q_heads, k_heads, head_dim, angles.cos_row(0), angles.sin_row(0));
             return;
         }
 
-        // Short sequences avoid allocating a shared table.
+        // Short multi-row sequences keep their direct per-head program.
         if (seq_len < 32)
         {
             apply_rope_to_tensor_fp16_direct(q_fp16, seq_len, q_heads, head_dim, n_past, inv_freq);
@@ -2036,7 +1992,7 @@ namespace llaminar2::primitives
         else
         {
             // Share each absolute-position angle across the head workshare.
-            apply_rope_to_tensor_fp16_positions(q_fp16, k_fp16, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq);
+            apply_rope_to_tensor_fp16_positions(q_fp16, k_fp16, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, angles);
         }
     }
 
@@ -2047,17 +2003,17 @@ namespace llaminar2::primitives
         int head_dim,
         int q_heads, int k_heads,
         int pos_offset, float freq_base,
-        RoPEPersistentState *persistent_state)
+        const RoPEAngleRows &angles)
     {
-        if (!q_fp16 || !persistent_state || verifier_rows <= 0 ||
+        if (!q_fp16 || verifier_rows <= 0 ||
             head_dim <= 0 || (head_dim % 2) != 0)
         {
             return;
         }
 
-        auto &angles = prepare_verifier_angle_rows(
+        prepare_verifier_angle_rows<false>(
             position_ids, verifier_rows, head_dim, 0,
-            pos_offset, freq_base, persistent_state);
+            pos_offset, freq_base, angles);
         const int q_row_stride = q_heads * head_dim;
         const int k_row_stride = k_heads * head_dim;
 
@@ -2096,15 +2052,13 @@ namespace llaminar2::primitives
             {
                 for (int head_index = 0; head_index < q_heads; ++head_index)
                 {
-                    if (!angles.active_rows[static_cast<size_t>(row)])
+                    if (!angles.active[static_cast<size_t>(row)])
                         continue;
                     uint16_t *head =
                         q_fp16 + static_cast<size_t>(row) * q_row_stride +
                         static_cast<size_t>(head_index) * head_dim;
-                    const float *row_cos = angles.cos_values.data() +
-                                           static_cast<size_t>(row) * angles.values_per_row;
-                    const float *row_sin = angles.sin_values.data() +
-                                           static_cast<size_t>(row) * angles.values_per_row;
+                    const float *row_cos = angles.cos_row(row);
+                    const float *row_sin = angles.sin_row(row);
                     apply_head(head, row_cos, row_sin);
                 }
             }
@@ -2116,15 +2070,13 @@ namespace llaminar2::primitives
                 {
                     for (int head_index = 0; head_index < k_heads; ++head_index)
                     {
-                        if (!angles.active_rows[static_cast<size_t>(row)])
+                        if (!angles.active[static_cast<size_t>(row)])
                             continue;
                         uint16_t *head =
                             k_fp16 + static_cast<size_t>(row) * k_row_stride +
                             static_cast<size_t>(head_index) * head_dim;
-                        const float *row_cos = angles.cos_values.data() +
-                                               static_cast<size_t>(row) * angles.values_per_row;
-                        const float *row_sin = angles.sin_values.data() +
-                                               static_cast<size_t>(row) * angles.values_per_row;
+                        const float *row_cos = angles.cos_row(row);
+                        const float *row_sin = angles.sin_row(row);
                         apply_head(head, row_cos, row_sin);
                     }
                 }
@@ -2733,13 +2685,15 @@ namespace llaminar2::primitives
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        RoPEPersistentState *persistent_state,
+        const RoPEAngleRows &angles,
         int pos_offset)
     {
         if (head_dim % 32 != 0)
         {
             return; // head_dim must be divisible by Q8_1 block size
         }
+        if (seq_len <= 0)
+            return;
 
         const int blocks_per_head = head_dim / 32;
         const int q_stride_blocks = n_heads * blocks_per_head;
@@ -2749,97 +2703,43 @@ namespace llaminar2::primitives
         // Get inverse frequencies
         const auto &inv_freq = get_inv_freq_cached(head_dim, rope_theta);
 
-        // Precompute sin/cos tables (Q15)
-        // Use thread_local to avoid allocation overhead for small batches (decode)
-        thread_local std::vector<int16_t> tls_cos_table;
-        thread_local std::vector<int16_t> tls_sin_table;
-
-        size_t required_size = seq_len * half_dim;
-        if (tls_cos_table.size() < required_size)
-        {
-            tls_cos_table.resize(required_size);
-            tls_sin_table.resize(required_size);
-        }
-
-        int16_t *cos_table = tls_cos_table.data();
-        int16_t *sin_table = tls_sin_table.data();
-
-        // Optimization for single-token decode with persistent state
-        if (seq_len == 1 && persistent_state)
-        {
-            int pos = position_ids ? position_ids[0] : pos_offset;
-            if (pos >= 0)
-            {
-                // Memoize this absolute position, independent of earlier calls.
-                update_rope_cache(head_dim, rope_theta, pos, *persistent_state);
-
-                // Convert cached floats to Q15 integers
-                const float *cos_curr = persistent_state->cos_curr.data();
-                const float *sin_curr = persistent_state->sin_curr.data();
-
-                for (int i = 0; i < half_dim; ++i)
-                {
-                    cos_table[i] = (int16_t)(cos_curr[i] * 32767.0f);
-                    sin_table[i] = (int16_t)(sin_curr[i] * 32767.0f);
-                }
-            }
-        }
-        else
-        {
-            // Native Q15 angles derive from absolute positions just like FP32.
-            // Contiguity never selects another numerical scheme.
-            const auto compute_row = [&](int row)
-            {
-                const int position = position_ids ? position_ids[row] : pos_offset + row;
-                for (int index = 0; index < half_dim; ++index)
-                {
-                    const float angle = static_cast<float>(position) * inv_freq[index];
-                    const size_t offset = static_cast<size_t>(row) * half_dim + index;
-                    cos_table[offset] = static_cast<int16_t>(std::cos(angle) * 32767.0f);
-                    sin_table[offset] = static_cast<int16_t>(std::sin(angle) * 32767.0f);
-                }
-            };
-            auto compute_angles = [&]()
-            {
-#pragma omp for schedule(static)
-                for (int row = 0; row < seq_len; ++row) compute_row(row);
-            };
-            // The retained Q15 table is thread-local, so an outer team must
-            // populate each private table rather than split one across owners.
-            if (seq_len > 1 && !omp_in_parallel())
-            {
-                OMP_WORKSHARE_REGION(compute_angles);
-            }
-            else
-            {
-                for (int row = 0; row < seq_len; ++row) compute_row(row);
-            }
-        }
+        // Q15 rows truncate the shared FP32 row function's values. This integer
+        // program rotates every row by its stored position, padding included,
+        // so a one-row call no longer reads a previous call's table.
+        fill_shared_angle_rows<true>(inv_freq, angles, seq_len, RoPEPaddingRows::Compute,
+            [position_ids, pos_offset](int row)
+            { return position_ids ? position_ids[row] : pos_offset + row; });
+        const int16_t *cos_table = angles.cos_q15.data();
+        const int16_t *sin_table = angles.sin_q15.data();
 
         // Apply RoPE using precomputed tables
         // Collapse heads and tokens for better load balancing
         if (seq_len == 1)
         {
-            // Serial execution for single token (decode optimization)
-            int offset = 0; // t=0
-            const int16_t *c_ptr = cos_table + offset;
-            const int16_t *s_ptr = sin_table + offset;
-
-            // Apply to Q
-            for (int h = 0; h < n_heads; ++h)
+            // One row: standalone callers rotate every head on the caller.
+            // Inside an existing team the banks are shared, so one head
+            // workshare owns each head exactly once instead of every member
+            // rotating all of them.
+            const int16_t *c_ptr = cos_table;
+            const int16_t *s_ptr = sin_table;
+            const int heads = n_heads + (K ? n_kv_heads : 0);
+            const auto rotate = [&](int head)
             {
-                Q8_1Block *head_ptr = Q + h * blocks_per_head;
+                Q8_1Block *head_ptr = head < n_heads
+                    ? Q + static_cast<size_t>(head) * blocks_per_head
+                    : K + static_cast<size_t>(head - n_heads) * blocks_per_head;
                 apply_rope_q8_1_integer_head(head_ptr, blocks_per_head, c_ptr, s_ptr);
-            }
-
-            // Apply to K
-            if (K)
+            };
+            if (::llaminar::v2::inLexicalWorkshare())
             {
-                for (int h = 0; h < n_kv_heads; ++h)
-                {
-                    Q8_1Block *head_ptr = K + h * blocks_per_head;
-                    apply_rope_q8_1_integer_head(head_ptr, blocks_per_head, c_ptr, s_ptr);
-                }
+#pragma omp for schedule(static)
+                for (int head = 0; head < heads; ++head)
+                    rotate(head);
+            }
+            else
+            {
+                for (int head = 0; head < heads; ++head)
+                    rotate(head);
             }
         }
         else
@@ -2891,36 +2791,18 @@ namespace llaminar2::primitives
         int head_dim,
         int pos_offset,
         float rope_theta,
-        RoPEPersistentState *persistent_state)
+        const RoPEAngleRows &angles)
     {
-        if (!Q || !persistent_state || verifier_rows <= 0 ||
+        if (!Q || verifier_rows <= 0 ||
             head_dim <= 0 || head_dim % Q8_1Block::BLOCK_SIZE != 0)
         {
             return;
         }
 
-        auto &angles = prepare_verifier_angle_rows(
+        // Q15 rows truncate the same FP32 rows as one-token Q8 decode.
+        prepare_verifier_angle_rows<true>(
             position_ids, verifier_rows, head_dim, 0,
-            pos_offset, rope_theta, persistent_state);
-        const size_t angle_count =
-            static_cast<size_t>(verifier_rows) * angles.values_per_row;
-        angles.cos_q15.resize(angle_count);
-        angles.sin_q15.resize(angle_count);
-        for (int row = 0; row < verifier_rows; ++row)
-        {
-            if (!angles.active_rows[static_cast<size_t>(row)])
-                continue;
-            const size_t row_offset =
-                static_cast<size_t>(row) * angles.values_per_row;
-            for (int index = 0; index < angles.values_per_row; ++index)
-            {
-                // Match one-token Q8 decode's truncating FP32-to-Q15 cast.
-                angles.cos_q15[row_offset + index] = static_cast<int16_t>(
-                    angles.cos_values[row_offset + index] * 32767.0f);
-                angles.sin_q15[row_offset + index] = static_cast<int16_t>(
-                    angles.sin_values[row_offset + index] * 32767.0f);
-            }
-        }
+            pos_offset, rope_theta, angles);
 
         const int blocks_per_head = head_dim / Q8_1Block::BLOCK_SIZE;
         const int q_row_stride = n_heads * blocks_per_head;
@@ -2932,18 +2814,16 @@ namespace llaminar2::primitives
             {
                 for (int head_index = 0; head_index < n_heads; ++head_index)
                 {
-                    if (!angles.active_rows[static_cast<size_t>(row)])
+                    if (!angles.active[static_cast<size_t>(row)])
                         continue;
                     Q8_1Block *head =
                         Q + static_cast<size_t>(row) * q_row_stride +
                         static_cast<size_t>(head_index) * blocks_per_head;
-                    const size_t angle_offset =
-                        static_cast<size_t>(row) * angles.values_per_row;
                     apply_rope_q8_1_integer_head(
                         head,
                         blocks_per_head,
-                        angles.cos_q15.data() + angle_offset,
-                        angles.sin_q15.data() + angle_offset);
+                        angles.cos_q15_row(row),
+                        angles.sin_q15_row(row));
                 }
             }
 
@@ -2954,18 +2834,16 @@ namespace llaminar2::primitives
                 {
                     for (int head_index = 0; head_index < n_kv_heads; ++head_index)
                     {
-                        if (!angles.active_rows[static_cast<size_t>(row)])
+                        if (!angles.active[static_cast<size_t>(row)])
                             continue;
                         Q8_1Block *head =
                             K + static_cast<size_t>(row) * k_row_stride +
                             static_cast<size_t>(head_index) * blocks_per_head;
-                        const size_t angle_offset =
-                            static_cast<size_t>(row) * angles.values_per_row;
                         apply_rope_q8_1_integer_head(
                             head,
                             blocks_per_head,
-                            angles.cos_q15.data() + angle_offset,
-                            angles.sin_q15.data() + angle_offset);
+                            angles.cos_q15_row(row),
+                            angles.sin_q15_row(row));
                     }
                 }
             }
@@ -3604,8 +3482,7 @@ namespace llaminar2::primitives
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        float rope_theta,
-        RoPEPersistentState *persistent_state)
+        float rope_theta)
     {
         if (head_dim % 32 != 0)
         {
@@ -3687,7 +3564,6 @@ namespace llaminar2::primitives
         };
         OMP_WORKSHARE_REGION(do_grouped_work);
 
-        (void)persistent_state; // TODO: Add persistent state optimization for decode
     }
 
     // =========================================================================
@@ -4996,7 +4872,6 @@ namespace llaminar2::primitives
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        RoPEPersistentState *,
         int pos_offset)
     {
         constexpr int BLOCK_SIZE = static_cast<int>(BlockType::BLOCK_SIZE);
@@ -5085,9 +4960,9 @@ namespace llaminar2::primitives
     }
 
     // Explicit template instantiations for high-level wrapper
-    template void apply_rope_q16_integer<Q16_1Block>(Q16_1Block *, Q16_1Block *, const int *, int, int, int, int, float, RoPEPersistentState *, int);
-    template void apply_rope_q16_integer<Q16_1Block_64>(Q16_1Block_64 *, Q16_1Block_64 *, const int *, int, int, int, int, float, RoPEPersistentState *, int);
-    template void apply_rope_q16_integer<Q16_1Block_128>(Q16_1Block_128 *, Q16_1Block_128 *, const int *, int, int, int, int, float, RoPEPersistentState *, int);
+    template void apply_rope_q16_integer<Q16_1Block>(Q16_1Block *, Q16_1Block *, const int *, int, int, int, int, float, int);
+    template void apply_rope_q16_integer<Q16_1Block_64>(Q16_1Block_64 *, Q16_1Block_64 *, const int *, int, int, int, int, float, int);
+    template void apply_rope_q16_integer<Q16_1Block_128>(Q16_1Block_128 *, Q16_1Block_128 *, const int *, int, int, int, int, float, int);
 
     /**
      * @brief Runtime dispatch for Q16 RoPE based on Q16BlockSize enum
@@ -5101,8 +4976,7 @@ namespace llaminar2::primitives
         int n_heads,
         int n_kv_heads,
         int head_dim,
-        float rope_theta,
-        RoPEPersistentState *persistent_state)
+        float rope_theta)
     {
         switch (block_size)
         {
@@ -5110,19 +4984,19 @@ namespace llaminar2::primitives
             apply_rope_q16_integer<Q16_1Block>(
                 static_cast<Q16_1Block *>(Q),
                 static_cast<Q16_1Block *>(K),
-                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, persistent_state);
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta);
             break;
         case Q16BlockSize::BLOCK_64:
             apply_rope_q16_integer<Q16_1Block_64>(
                 static_cast<Q16_1Block_64 *>(Q),
                 static_cast<Q16_1Block_64 *>(K),
-                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, persistent_state);
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta);
             break;
         case Q16BlockSize::BLOCK_128:
             apply_rope_q16_integer<Q16_1Block_128>(
                 static_cast<Q16_1Block_128 *>(Q),
                 static_cast<Q16_1Block_128 *>(K),
-                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, persistent_state);
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta);
             break;
         default:
             LOG_ERROR("apply_rope_q16_integer_dispatch: unsupported block size");

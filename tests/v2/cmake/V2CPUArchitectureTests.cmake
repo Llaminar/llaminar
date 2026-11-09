@@ -960,9 +960,34 @@ v2_add_core_free_test(V2_Integration_CPURoPECachedRetained
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE ByteExact Regression)
 
+# CPU RoPE angles live only in the admitted cpu_rope_angles workspace.
+foreach(_rope_storage_suite IN ITEMS Unit Integration)
+    if(_rope_storage_suite STREQUAL "Unit")
+        set(_rope_storage_labels V2 Unit CPU DeviceFree RoPE SourcePolicy)
+    else()
+        set(_rope_storage_labels V2 Integration ProductionTestPreflight CPU DeviceFree RoPE SourcePolicy Regression)
+    endif()
+    v2_add_core_free_test(V2_${_rope_storage_suite}_CPURoPEAngleStorageSourcePolicy
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/scripts/check_cpu_rope_angle_storage_policy.py"
+            --repo-root "${V2_CPU_ARCHITECTURE_ROOT}"
+        LABELS ${_rope_storage_labels})
+    v2_add_core_free_test(V2_${_rope_storage_suite}_CPURoPEAngleStorageSourcePolicyNegativeControls
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/scripts/test_cpu_rope_angle_storage_policy.py"
+        LABELS ${_rope_storage_labels})
+endforeach()
+v2_add_core_free_test(V2_Integration_CPURoPESharedAngleFill
+    COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
+        --gtest_filter=CPURoPEWorkshare.SharedAngleFillCompletesBeforeRotationInRetainedTeams
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE ByteExact Ownership Regression)
+v2_add_core_free_test(V2_Integration_CPURoPEAngleBindingRejection
+    COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
+        --gtest_filter=CPURoPEWorkshare.AngleRowsRejectMissingOrUndersizedPlanes
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Ownership Geometry Regression)
 v2_add_core_free_test(V2_Integration_CPURoPEInverseFrequencyLookup
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>
-        --gtest_filter=CPURoPEWorkshare.InverseFrequencyLookupIsStableAcrossThreadsAndEvictions
+        --gtest_filter=CPURoPEWorkshare.InverseFrequencyLookupIsStableAcrossThreadsAndEvictions:CPURoPEWorkshare.InverseFrequencyLookupAlternatesConfigurationsInRetainedTeams
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RoPE Ownership Regression)
 v2_add_core_free_test(V2_Integration_CPURoPEInlineBoundedCoefficients
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_workshare>

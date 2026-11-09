@@ -13609,6 +13609,15 @@ add_v2_test(V2_Unit_ComputeStage
     MPI_PROCS 1  # Tests CPU stages locally, no MPI needed
 )
 
+# CPU RoPE angle planes: one admitted binding per serial graph family.
+add_executable(v2_integration_cpu_rope_angle_workspace
+    integration/kernels/cpu/Test__CPURoPEAngleWorkspaceLifecycle.cpp)
+target_link_libraries(v2_integration_cpu_rope_angle_workspace llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CPURoPEAngleWorkspaceLifecycle
+    COMMAND $<TARGET_FILE:v2_integration_cpu_rope_angle_workspace>
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;RoPE;Workspace;Lifecycle;ByteExact;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
 # Test: GEMMStage (GEMM compute stage with workspace support)
 # Tests construction, IWorkspaceConsumerStage delegation, params validation, metrics
 add_executable(v2_test_gemm_stage unit/execution/compute_stages/stages/Test__GEMMStage.cpp)
@@ -27106,6 +27115,11 @@ add_v2_test(V2_Unit_WorkspaceMemoryEstimator
     LABELS "V2;Unit;Planning;WorkspaceMemoryEstimator;Workspace"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CPURoPEAngleWorkspaceAdmission
+    COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
+        --gtest_filter=Test__WorkspaceMemoryEstimator.RoPEWorkspacePricesCPUAngleRowsAndGPUPublication
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Planning;RoPE;Workspace;PhysicalMemoryAuthority;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_CPUSharedGDNWorkspaceAdmission
     COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
         --gtest_filter=Test__WorkspaceMemoryEstimator.CPUSharedGDNSnapshotPerLayerWorkspace*
