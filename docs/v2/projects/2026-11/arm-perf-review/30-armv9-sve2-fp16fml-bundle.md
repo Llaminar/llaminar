@@ -108,3 +108,17 @@ decision; plan-first doc.
 - Decision: if X925-256 -> resume SVE2 candidate (DGX lane); if 128 ->
   prioritize NEONDotProd/I8MM + emitted-FP16 verification (idea 31 +
   vfmlalq check).
+
+## FINAL VERDICT (2026-11-09) — SVE2 CLOSED on SPARKS
+
+- Corrected VALID probe (arm-sparks, saved sve-vl-probe-gb10-v2.txt):
+  GET_VL=16; **SET_VL(32) -> returns 16 (errno=0), svcntb()=16** — the
+  kernel ACCEPTS and CLAMPS to 16 = 128-bit HARD CEILING; SET_VL(64/128/
+  8192/16) all -> 16; HWCAP SVE/SVE2/SVEI8MM/BF16/I8MM = Y (SVEBF16: v1 Y /
+  v2 n — bit-10 hardcode discrepancy, note only; SVE2 class Y both);
+  default sysctl 16 (RO, untouched).
+- DECISION: even valid requests clamp to 16 -> **SVE2 closed on SPARKS**
+  (128-bit; ~NEON parity per DGX sweep evidence; no 256-bit width play).
+  Idea 30 = CLOSED/deprioritized (evidence complete). ISA queue = idea 31
+  (S=4 spillfixes; census: NibbleLUT 22/22+6, IQ4_XS 31/20, Q5_K GNU clean
+  = AppleClang-only, Q6_K classifier gap) + FP16/FMLAL verification.
