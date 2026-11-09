@@ -39731,6 +39731,28 @@ add_v2_test(V2_Integration_ExpertGemmRegistryHashDistribution
 )
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertGemmRegistryHashDistribution)
 
+# nvcc --split-compile partitions a module nondeterministically, so register
+# allocation and the fatal spill verdict changed between identical compiles.
+# Large kernel families use persistent TU shards instead. The self-test proves
+# both detectors; the preflight cell checks every CMake declaration and this
+# build's actual device compile commands.
+add_test(NAME V2_Unit_DeterministicGPUCompilationPolicySelfTest
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_deterministic_gpu_compilation.py
+            --self-test)
+set_tests_properties(V2_Unit_DeterministicGPUCompilationPolicySelfTest PROPERTIES
+    LABELS "V2;Unit;BuildSystem;CUDA;ROCm;SourcePolicy;Regression"
+    TIMEOUT 30)
+add_test(NAME V2_Integration_DeterministicGPUCompilation
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_deterministic_gpu_compilation.py
+            --repo-root ${CMAKE_SOURCE_DIR}/../..
+            --build-dir ${CMAKE_BINARY_DIR})
+set_tests_properties(V2_Integration_DeterministicGPUCompilation PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;CUDA;ROCm;Regression"
+    TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeterministicGPUCompilation)
+
 # The strong grouped trainer times candidates and uses serial decode only as
 # a numerical oracle. Adaptation must not demand unmeasured serial speed ratios.
 if(Python3_Interpreter_FOUND)
