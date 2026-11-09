@@ -5,8 +5,10 @@
  *
  * FP32 matrix normalization retains complete original rows within one worker
  * transaction: summary, inverse and publication have the same lexical owner.
- * Native ARM tiles share gamma across1..4 rows and need no row scratch bank;
- * their fixed arithmetic is independent of M or worker count. Explicit T5
+ * Native ARM floating and original-Q16 tiles share gamma across1..4 rows
+ * without decoded row scratch. Q16 retains FP32 squares before FP64 accumulation,
+ * unlike floating RMSNorm's widen-before-square program. Their fixed arithmetic
+ * is independent of M or worker count. Explicit T5
  * accumulation remains a distinct program. Original tensors/gamma retain their
  * caller-owned storage authority. Other typed publication APIs keep their own
  * numerical programs:
@@ -572,13 +574,17 @@ namespace llaminar2::primitives
      * 3. Apply normalization and gamma scaling
      * 4. Write FP32 output
      *
-     * Memory access: 1 read (Q16_1) + 1 write (FP32) - single pass
+     * Two original-block traversals: FP32 squares widen to a linear FP64
+     * diagnostic summary; publication retains the FP32 mean/sqrt/inverse program.
+     * Complete32-value geometry and disjoint expansion/gamma banks are required.
      *
      * @param input Input Q16_1 blocks [blocks_per_row blocks]
      * @param gamma Gamma weights [cols] (FP32)
      * @param output Output FP32 row [cols]
      * @param cols Number of columns (hidden_dim)
      * @param epsilon Epsilon for numerical stability
+     * @throws std::invalid_argument For malformed complete-row geometry, policy or aliases.
+     * @throws std::domain_error For nonfinite arithmetic or an undefined inverse.
      */
     void rmsnorm_q16_1_fp32_row_scalar(
         const Q16_1Block *input,
@@ -590,14 +596,18 @@ namespace llaminar2::primitives
     /**
      * @brief RMSNorm with Q16_1 input, FP32 output (AVX512 per-row)
      *
-     * Vectorized version using AVX512 intrinsics for high performance.
-     * Dequantizes and normalizes in SIMD registers for memory efficiency.
+     * Uses the actual AVX512 program and original-block register decoding.
+     * A non-AVX512 compiler envelope rejects this named entry; it never
+     * substitutes a scalar or another ISA implementation.
      *
      * @param input Input Q16_1 blocks [blocks_per_row blocks]
      * @param gamma Gamma weights [cols] (FP32)
      * @param output Output FP32 row [cols]
      * @param cols Number of columns (hidden_dim)
      * @param epsilon Epsilon for numerical stability
+     * @throws std::invalid_argument For malformed complete-row geometry, policy or aliases.
+     * @throws std::domain_error For nonfinite arithmetic or an undefined inverse.
+     * @throws std::runtime_error If the compiler envelope does not contain AVX512.
      */
     void rmsnorm_q16_1_fp32_row_avx512(
         const Q16_1Block *input,
@@ -609,8 +619,13 @@ namespace llaminar2::primitives
     /**
      * @brief Fused Q16_1 RMSNorm for multiple rows (parallelized)
      *
-     * Dispatches to AVX512 or scalar implementation based on availability.
-     * Uses OpenMP for row-level parallelization on large inputs.
+     * Native ARM processes1..4 original compressed rows per shared-gamma tile;
+     * AVX2/AVX512 select their genuine arithmetic programs. Scalar execution is
+     * explicitly requested diagnostic/backend intent, never an ISA substitute.
+     * Complete source/output/gamma/options spans are checked before worksharing.
+     * Retained teams complete even for small or empty invocations. No decoded
+     * row, invocation workspace or persistent scale/gamma bank is constructed.
+     * T5 FP32 accumulation is a distinct program and is not admitted here.
      *
      * @param input Input Q16_1 blocks [rows * blocks_per_row]
      * @param gamma Gamma weights [cols] (FP32)
@@ -618,7 +633,11 @@ namespace llaminar2::primitives
      * @param rows Number of rows
      * @param cols Number of columns (hidden_dim, must be multiple of 32)
      * @param epsilon Epsilon for numerical stability
-     * @param opts Execution options
+     * @param opts Original immutable execution options; retained by the caller through completion.
+     * @throws std::invalid_argument For malformed geometry, policy or original-bank/metadata aliases.
+     * @throws std::runtime_error For an active ISA without a matching compiled implementation.
+     * @note Arithmetic corruption inside the collective is fatal: exceptions
+     * cannot cross an OpenMP parallel boundary. No zero-output repair is used.
      */
     void rmsnorm_q16_1_fp32_fused(
         const Q16_1Block *input,
