@@ -156,3 +156,19 @@ Evidence: `~/llaminar-spark-results/K14-CUDA-SPILL-MIGRATION-a62696317`.
   identical, spill-free 121 / 120;121 / 6-arch; new commits on #43).
 - Qwen3.8-UD per-bucket trace (idea 25 Dir B) waits on the same decision +
   the GB10 CUDA build; arm-sparks standby (.79 reserved), no probe.
+
+## Root cause found (2026-11-09, Main, spill lane)
+
+- nvcc --split-compile is NONDETERMINISTIC: identical compile of
+  CUDANativeQuantisedPrefillKernels.cu for 120;121 gave 4 / 30 / 56 spilling
+  functions across runs; each 12.x target lands in 121- or 128-reg
+  allocation depending on partition; shipped 80;86;89;90 SASS differs
+  between identical split compiles (2 hashes in 3 runs). Explains host-to-
+  host BK64 disagreement.
+- WITHOUT split-compile: deterministic; BK64 clean on both 12.x targets;
+  only the known BK256 pair left. FlashAttention 12.x spills are
+  DETERMINISTIC real spills (18 kernels per target without split).
+- Fix plan upcoming (direction: avoid split-compile for 12.x or make it
+  deterministic). Main confirmed it will take R1 (5d4e3716a) after the
+  current spill checkpoint; handover doc =
+  /Users/floriankinder/repo/arm-addon-notes/r1-handover.md.
