@@ -463,3 +463,10 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - 75 tests; Mac E2E 3 configs; /usr/bin/c++ + Xcode clang bound.
 - GB10 census = FIRST real exercise of GNU lookup + typed admission
   (requested; fix-back if rejection).
+
+- SOURCE123 census FULLY GREEN (sealed K14-SOURCE123-CENSUS-20261109): PASS
+  176; 4/4; proof GNU-14 NEON_I8MM 242/1274; lifecycle 1; 9/9 cells
+  single=0 grouped=budget 0 mismatches. NO program-lookup/typed-admission
+  rejection — real g++-14 lookups (bare `as`→PATH; cc1plus →
+  /usr/libexec/gcc/…/14/; multiarch; search-dirs) accepted; nothing to fix
+  back. Reviewer SOURCE123 (source) pending.
