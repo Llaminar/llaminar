@@ -7,9 +7,10 @@
  * precision without changing cache bytes, SIMD instructions or reduction order.
  *
  * Closed form: limit(T) = min(2047, floor(INT32_MAX / (32768 * T))) for the
- * T products of one integer reduction. Callers reduce at most
- * T = min(head_dim, block_elems) products in integer arithmetic; wider heads
- * convert each block's dot to FP32 before combining blocks. Worst magnitudes:
+ * T products of one integer reduction. Every whole-head integer reduction
+ * runs only when head_dim <= block_elems; multi-block heads reduce at most
+ * block_elems products per block and combine the blocks in FP32. Either way
+ * one integer reduction has at most T = min(head_dim, block_elems) products. Worst magnitudes:
  * T=256 -> 255 (2,139,095,040), T=128 -> 511, T=64 -> 1023, T=32 -> 2047,
  * all at most INT32_MAX, so every partial sum in any order is exact in int32.
  */

@@ -114,6 +114,7 @@ namespace llaminar2::cpu::native_quantised
     }
 
     class CPUNativeQuantisedWeightView;
+    class CPUNativeQuantisedPublishedBytes;
 
     /**
      * @brief Proof that one exact byte range passed complete metadata admission.
@@ -171,6 +172,11 @@ namespace llaminar2::cpu::native_quantised
                 descriptor.is_asymmetric == identity_.is_asymmetric;
         }
 
+    private:
+        // Only the byte owner, while deep-copying bytes it holds, may move a
+        // seal to a new root; nobody can attach a seal to arbitrary bytes.
+        friend class CPUNativeQuantisedPublishedBytes;
+
         /**
          * @brief The same proof for a content-identical copy at another root.
          * @param bytes Deep copy of the sealed range, written in full.
@@ -186,7 +192,6 @@ namespace llaminar2::cpu::native_quantised
             return copy;
         }
 
-    private:
         CPUNativeQuantisedMetadataSeal(const CPUNativeQuantisedWeightDescriptor &identity, std::span<const std::uint8_t> bytes) noexcept
             : identity_(identity), root_(bytes.data()), extent_(bytes.size()) {}
 
