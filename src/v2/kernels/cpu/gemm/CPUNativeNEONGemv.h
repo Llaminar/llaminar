@@ -495,8 +495,11 @@ namespace llaminar2::cpu::native_quantised
         for (int p = 0; p < plan.count; ++p)
         {
             const auto &d = descriptors[p];
+            // MTP verifier rows are ordinary serial-equivalent rows on ARM: the
+            // purpose selects evidence identity, never a different arithmetic tree.
             if (!d.packed || d.rows < 0 || d.N != d.packed->N || d.policy_n < 0 ||
-                (d.purpose != ProjectionRowsPurpose::Decode && d.purpose != ProjectionRowsPurpose::Prefill))
+                (d.purpose != ProjectionRowsPurpose::Decode && d.purpose != ProjectionRowsPurpose::Prefill &&
+                 d.purpose != ProjectionRowsPurpose::MTPVerifier))
                 throw std::invalid_argument("Native ARM fused descriptor has incomplete original geometry");
             plan.rows[p] = d.rows ? d.rows : rows;
             neon_execution::geometry(*d.packed, plan.rows[p], d.ldc);
