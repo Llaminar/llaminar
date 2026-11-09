@@ -1,5 +1,5 @@
 /**
- * @file CUDANativeQuantisedPrefillKernels.cu
+ * @file CUDANativeQuantisedPrefillShardImpl.cu.inc
  * @brief All-format native-quantised tensor-core prefill kernels for CUDA.
  *
  * Weights stay in their compact native payload form in VRAM. Each CTA decodes
@@ -14,8 +14,10 @@
  * directly by both CUDA quantizers. Scales and activation bytes remain
  * row-major; no extra transpose, workspace, or metadata copy is required.
  * The BK64 arithmetic and staged-operand candidates live in the shared
- * CUDANativeQuantisedPrefillDevice.cuh body; this file owns public planning, launch
- * selection and resource queries. Production staging remains RegisterDecode
+ * CUDANativeQuantisedPrefillDevice.cuh body; this file owns launch selection
+ * and resource queries for one physical codebook shard. Public planning and
+ * the extern "C" ABI belong to CUDANativeQuantisedPrefillDispatch.cu, and host
+ * policy/state to CUDANativeQuantisedPrefillHostPolicy.h. Production staging remains RegisterDecode
  * until an authenticated candidate tournament authorizes a different schedule.
  * A certified exact cell owns its complete producer before any generic Q4_0
  * BK256 heuristic runs; workspace admission and execution share that identity.
@@ -27,20 +29,35 @@
  * ordered reducer is admitted; no destination initialization is necessary.
  * IQ4_XS physical24 retains raw source factors; secondary metadata stages with
  * the existing primary plane and resolves before the unchanged source4 tree.
+ *
+ * Shard mechanics: each CUDANativeQuantisedPrefillShardN.cu defines its index
+ * and symbol mapper, then includes this file. Only codebooks whose
+ * prefillShardIndexForCodebook() equals that index are instantiated; the
+ * owned*() wrappers below discard every other codebook at template level, so
+ * a shard never emits another shard's kernels. The dispatcher calls exactly
+ * one shard per runtime codebook.
  */
+
+#ifndef LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD
+#error "CUDANativeQuantisedPrefillShardImpl.cu.inc requires a physical shard index"
+#endif
+#if LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD < 0 || \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD > 7
+#error "CUDA NativeQuantised prefill shard index must be in [0, 7]"
+#endif
+#ifndef LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD_SYMBOL
+#error "CUDA NativeQuantised prefill shard must define its external symbol mapper"
+#endif
 
 #include <cuda_runtime.h>
 
-#include "CUDADenseProductionPrefillOverlayGenerated.inc"
+#include "CUDANativeQuantisedPrefillHostPolicy.h"
+#include "CUDANativeQuantisedPrefillShard.h"
 #include "CUDANativeQuantisedPrefillDiagnostics.h"
 #include "CUDANativeQuantisedPrefillDevice.cuh"
 #include "CUDANativeQuantisedDecodeCommon.cuh"
-#include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "kernels/common/WorkspaceOverwriteContract.h"
-#include "backends/cuda/CUDAHardwareMetadata.h"
-#include "CUDANativeQuantisedWorkspaceHardware.h"
 #include "utils/DebugEnv.h"
-#include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -49,111 +66,16 @@
 #include <limits>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
-
-extern "C" bool cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(
-    uint8_t codebook_id,
-    int n,
-    int k,
-    int sm_count,
-    int *uses_ordered_reducer,
-    int *k_partitions);
-
-/** @brief Return whether the generated serial policy owns this codebook. */
-extern "C" bool cudaNativeQuantisedGemvTuned_supportsCodebook(
-    uint8_t codebook_id);
-
-// =========================================================================
-// Per-device prefill context. Owned by KernelFactory, one per device.
-// =========================================================================
-struct CUDAPrefillContext_
-{
-    int device_id = -1;
-    float *workspace_canonical_kpart_partials = nullptr;
-    size_t workspace_canonical_kpart_partials_size = 0;
-};
-
-struct LastLaunchSelection_
-{
-    int tile_id = -1;
-    int k_partitions = 1;
-    int used_bk256 = 0;
-    int used_canonical_kpart = 0;
-    int used_exact_overlay = 0;
-    llaminar2::cuda::prefill::PrefillStagingSchedule staging =
-        llaminar2::cuda::prefill::PrefillStagingSchedule::RegisterDecode;
-};
-
-// Thread-local because tile sweep benchmarks can launch from multiple worker
-// threads. Diagnostics read back the selection on the same thread.
-static thread_local LastLaunchSelection_ g_last_launch_selection;
-
-static inline void recordLastLaunchSelection(
-    int tile_id,
-    int k_partitions,
-    bool used_bk256,
-    bool used_canonical_kpart = false,
-    bool used_exact_overlay = false,
-    llaminar2::cuda::prefill::PrefillStagingSchedule staging =
-        llaminar2::cuda::prefill::PrefillStagingSchedule::RegisterDecode)
-{
-    g_last_launch_selection.tile_id = tile_id;
-    g_last_launch_selection.k_partitions = k_partitions;
-    g_last_launch_selection.used_bk256 = used_bk256 ? 1 : 0;
-    g_last_launch_selection.used_canonical_kpart =
-        used_canonical_kpart ? 1 : 0;
-    g_last_launch_selection.used_exact_overlay =
-        used_exact_overlay ? 1 : 0;
-    g_last_launch_selection.staging = staging;
-}
-
-/**
- * @brief Borrow physical SM geometry from the one admitted CUDA inventory.
- * @param ctx Prepared or planning-only context with its exact participant ordinal.
- * @return Real physical count; query failure cannot manufacture an 82-SM device.
- * @throws std::invalid_argument On an absent projection owner.
- */
-static int querySmCount(const CUDAPrefillContext_ *ctx)
-{
-    if (!ctx)
-        throw std::invalid_argument("CUDA prefill requires its prepared device owner");
-    return llaminar2::cudaHardwareMetadata().at(ctx->device_id).sm_count;
-}
 
 namespace
 {
+    using namespace llaminar2::cuda::prefill_host;
     using llaminar2::cuda_native_quantised::fp16_bits_to_float;
 
     using namespace llaminar2::cuda::prefill;
 
-    // ─── Sweep-derived tile dispatch ───────────────────────────────────
-    // Tile configurations validated across production geometries. K reduction
-    // is not a free tuning dimension: only full-K and canonical public-M1
-    // partition schedules are admissible.
-
-    enum class TileId : uint8_t
-    {
-        T64x64_w2x2,   // BM=64  BN=64  WM=2 WN=2  (128 threads)
-        T64x128_w2x2,  // BM=64  BN=128 WM=2 WN=2  (128 threads)
-        T64x128_w4x2,  // BM=64  BN=128 WM=4 WN=2  (256 threads)
-        T64x128_w2x4,  // BM=64  BN=128 WM=2 WN=4  (256 threads)
-        T128x128_w4x2, // BM=128 BN=128 WM=4 WN=2  (256 threads)
-        T128x128_w4x4, // BM=128 BN=128 WM=4 WN=4  (512 threads)
-        Count,
-    };
-
-    constexpr int kDensePrefillTileCount = static_cast<int>(TileId::Count);
-
-    /** Return whether an integer names one registered BK64 tile geometry. */
-    constexpr bool isDensePrefillTileId(int tile_id)
-    {
-        return tile_id >= 0 && tile_id < kDensePrefillTileCount;
-    }
-
-    struct TileChoice
-    {
-        TileId tile;
-    };
 
     // Fold public-M1 K-partition partials into the final output. The loop order
     // is part of the byte-equivalence contract and must remain ascending.
@@ -769,214 +691,6 @@ namespace
 #endif
     }
 
-    // =========================================================================
-    // Tile force: override output geometry for sweep benchmarks. K reduction
-    // policy is intentionally not forceable independently of public M=1.
-    // =========================================================================
-    static int g_force_tile_id = []()
-    {
-        return llaminar2::debugEnv().gemm.cuda_force_prefill_tile;
-    }();
-    // Candidate control for the economical K-parallel implementation. This
-    // route inherits the exact public M=1 partition count and boundaries
-    // instead of accepting an independent reduction geometry.
-    static bool g_force_canonical_kpart = false;
-
-    // A diagnostic scope may change operand delivery on its own host thread.
-    // Normal inference retains the certified default; no implicit promotion is
-    // made from a successful resource query or an isolated timing sample.
-    static thread_local PrefillStagingSchedule g_staging_schedule =
-        PrefillStagingSchedule::RegisterDecode;
-
-    // Profilers must measure the generic policy and every concrete candidate
-    // independently of any previously installed exact cells. Production keeps
-    // this enabled for the lifetime of the process; only the isolated sweep
-    // harness scopes it off while gathering replacement evidence.
-    static bool g_dense_prefill_exact_overlay_enabled = true;
-
-    // BK256 mode: 0=auto (heuristic), 1=force ON, -1=force OFF
-    // Set via LLAMINAR_BK256_MODE env var or extern C API.
-    static int g_bk256_force_mode = []()
-    {
-        return llaminar2::debugEnv().gemm.cuda_bk256_mode;
-    }();
-
-    /**
-     * @brief Result of consulting the installed dense-prefill exact overlay.
-     *
-     * `Invalid` is deliberately distinct from `NotSelected`: a malformed
-     * generated entry is a production-policy failure and must never silently
-     * continue through the generic heuristic. `NotSelected` means either that
-     * the runtime key was not explicitly swept or that a profiler force control
-     * owns this process-local launch.
-     */
-    enum class DensePrefillOverlayStatus : uint8_t
-    {
-        NotSelected,
-        Selected,
-        Invalid,
-    };
-
-    /**
-     * @brief Return whether an identifier has a compiled NativeQuantised prefill path.
-     *
-     * Workspace planning and launch dispatch must accept exactly the same
-     * codebook set. Centralizing the inventory prevents a newly implemented
-     * format from becoming launchable without also receiving a valid persistent
-     * workspace contract.
-     */
-    constexpr bool isSupportedNativeQuantisedPrefillCodebook(uint8_t codebook)
-    {
-        switch (codebook)
-        {
-        case 0:
-        case 4:
-        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
-        case 5:
-        case 6:
-        case 7:
-        case 8:
-        case 9:
-        case 10:
-        case 11:
-        case 12:
-        case 13:
-        case 14:
-        case 15:
-        case 16:
-        case 17:
-        case 19:
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
-            return true;
-        default:
-            return false;
-        }
-    }
-
-    /**
-     * @brief Validate one generated overlay tuple before it controls execution.
-     *
-     * BK256 launch identifiers exist only for Q4_0 and cannot preserve the
-     * canonical public-M1 partition tree. Ordinary BK64 tiles cover every
-     * supported codebook and may select either direct or canonical arithmetic.
-     */
-    constexpr bool isValidDensePrefillOverlayConfig(
-        uint8_t codebook,
-        const llaminar2::cuda::generated::CUDADensePrefillOverlayConfig &config)
-    {
-        if (!isKnownPrefillStagingSchedule(config.staging))
-            return false;
-        const bool ordinary_tile = isDensePrefillTileId(config.tile_id);
-        const bool valid_bk256 =
-            codebook == 0 && config.bk256 && !config.canonical_kpart &&
-            config.staging == PrefillStagingSchedule::RegisterDecode &&
-            (config.tile_id == -3 || config.tile_id == -2);
-        const bool valid_bk64 = !config.bk256 && ordinary_tile;
-        return valid_bk256 || valid_bk64;
-    }
-
-    /**
-     * @brief Resolve one authenticated dense-prefill launch before capture.
-     *
-     * Exact overlays use source4 for the explicit IQ4 tuple family and otherwise
-     * the runtime-visible codebook and matrix
-     * geometry `(M,N,K)`. Profiler force controls have higher precedence so the
-     * sweep can continue to measure every physical candidate after an overlay
-     * has been installed. Ordinary production has no such controls and sees the
-     * exact overlay before the total generic policy.
-     *
-     * @param codebook Runtime NativeQuantised execution codebook.
-     * @param M Number of prefill rows in the captured bucket.
-     * @param N Projection output width.
-     * @param K Projection reduction width.
-     * @param config Receives the concrete launch tuple on `Selected`.
-     * @return Selection status, retaining malformed generated state as fatal.
-     */
-    DensePrefillOverlayStatus selectDensePrefillOverlay(
-        uint8_t codebook,
-        int M,
-        int N,
-        int K,
-        llaminar2::cuda::generated::CUDADensePrefillOverlayConfig &config)
-    {
-        const bool profiler_override =
-            !g_dense_prefill_exact_overlay_enabled ||
-            g_force_canonical_kpart ||
-            g_staging_schedule != PrefillStagingSchedule::RegisterDecode ||
-            g_force_tile_id >= 0 ||
-            g_bk256_force_mode != 0;
-        if (profiler_override)
-            return DensePrefillOverlayStatus::NotSelected;
-
-        // IQ4_XS owns physical24 kernels and resources, but retains exactly
-        // the source4 tile/staging/reduction schedule rather than losing its
-        // admitted cells when the physical metadata identity changes.
-        const uint8_t policy_codebook = codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
-            ? uint8_t{4} : codebook;
-        if (!llaminar2::cuda::generated::selectCUDADensePrefillOverlay(
-                policy_codebook, M, N, K, config))
-        {
-            return DensePrefillOverlayStatus::NotSelected;
-        }
-
-        return isValidDensePrefillOverlayConfig(codebook, config)
-                   ? DensePrefillOverlayStatus::Selected
-                   : DensePrefillOverlayStatus::Invalid;
-    }
-
-    /**
-     * @brief Query bytes for one row count using the public M=1 reduction tree.
-     *
-     * The partition boundaries are owned by the serial-decode policy. Prefill
-     * may reuse that arithmetic only after this query proves an ordered reducer
-     * with more than one partition on the selected device.
-     */
-    bool queryCanonicalPrefillWorkspaceForRows(
-        uint8_t codebook_id,
-        int rows,
-        int N,
-        int K,
-        int sm_count,
-        size_t *canonical_kpart_partials_bytes,
-        int *planned_k_partitions)
-    {
-        int uses_ordered_reducer = 0;
-        int k_partitions = 0;
-        if (!cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(
-                codebook_id,
-                N,
-                K,
-                sm_count,
-                &uses_ordered_reducer,
-                &k_partitions) ||
-            uses_ordered_reducer == 0 || k_partitions <= 1)
-        {
-            return false;
-        }
-
-        const size_t partitions = static_cast<size_t>(k_partitions);
-        const size_t row_count = static_cast<size_t>(rows);
-        const size_t columns = static_cast<size_t>(N);
-        constexpr size_t element_bytes = sizeof(float);
-        if (row_count > std::numeric_limits<size_t>::max() / partitions ||
-            row_count * partitions >
-                std::numeric_limits<size_t>::max() / columns ||
-            row_count * partitions * columns >
-                std::numeric_limits<size_t>::max() / element_bytes)
-        {
-            return false;
-        }
-
-        if (canonical_kpart_partials_bytes)
-        {
-            *canonical_kpart_partials_bytes =
-                partitions * row_count * columns * element_bytes;
-        }
-        if (planned_k_partitions)
-            *planned_k_partitions = k_partitions;
-        return true;
-    }
-
     // ─── Format complexity classification ─────────────────────────────
     // Format complexity used by the total ordinary-prefill heuristic. Learned
     // dispatch is intentionally limited to M=1 and grouped verifier rows.
@@ -1086,8 +800,8 @@ namespace
                                  uint8_t codebook = 0)
     {
         // Force-tile override for sweep benchmarks
-        if (isDensePrefillTileId(g_force_tile_id))
-            return {static_cast<TileId>(g_force_tile_id)};
+        if (isDensePrefillTileId(hostState().force_tile_id))
+            return {static_cast<TileId>(hostState().force_tile_id)};
 
         // Asymmetric/dual-scale formats: specialized heuristic biased
         // toward w2x2 due to higher register pressure from min-correction
@@ -1211,20 +925,6 @@ namespace
         return {tile};
     }
 
-    /**
-     * @brief Read the selected device's admitted architecture without another query.
-     * @param device_id CUDA ordinal whose prefill capability is being admitted.
-     * @return True only for an admitted Ampere-or-newer device.
-     *
-     * Parallel participant capture can inspect different ordinals at once.
-     * Caching an ordinal and result in separate statics races their publication.
-     * Physical facts instead share the immutable startup authority; this family
-     * predicate is independent of its prepared operand and arithmetic policy.
-     */
-    bool isAmperePlus(int device_id)
-    {
-        return llaminar2::cudaHardwareMetadata().at(device_id).sm_major >= 8;
-    }
 
     /** Map a compile-time output geometry back to its stable policy ID. */
     template <int BM, int BN, int WM, int WN>
@@ -1808,7 +1508,7 @@ namespace
         DensePrefillKernelResources &primary,
         DensePrefillKernelResources &auxiliary)
     {
-        if (g_last_launch_selection.used_bk256)
+        if (lastLaunchSelection().used_bk256)
         {
             if constexpr (CB != 0)
             {
@@ -1831,12 +1531,12 @@ namespace
                 {
                     return false;
                 }
-                if (g_last_launch_selection.tile_id == -3)
+                if (lastLaunchSelection().tile_id == -3)
                 {
                     return queryDensePrefillBK256Resources<128, 64, 4, 2>(
                         ordered_reducer != 0, primary, auxiliary);
                 }
-                if (g_last_launch_selection.tile_id == -2)
+                if (lastLaunchSelection().tile_id == -2)
                 {
                     return queryDensePrefillBK256Resources<128, 128, 4, 4>(
                         ordered_reducer != 0, primary, auxiliary);
@@ -1846,9 +1546,9 @@ namespace
         }
 
         return queryDensePrefillTileResources<CB>(
-            g_last_launch_selection.tile_id,
-            g_last_launch_selection.used_canonical_kpart != 0,
-            g_last_launch_selection.staging,
+            lastLaunchSelection().tile_id,
+            lastLaunchSelection().used_canonical_kpart != 0,
+            lastLaunchSelection().staging,
             primary,
             auxiliary);
     }
@@ -1892,11 +1592,11 @@ namespace
                 : Q40PrefillRoute::BK256Wide;
         };
 
-        if (g_force_canonical_kpart)
+        if (hostState().force_canonical_kpart)
             return Q40PrefillRoute::Generic;
-        if (g_bk256_force_mode > 0)
+        if (hostState().bk256_force_mode > 0)
             return bk256_geometry();
-        if (isDensePrefillTileId(g_force_tile_id))
+        if (isDensePrefillTileId(hostState().force_tile_id))
             return Q40PrefillRoute::Generic;
 
         /*
@@ -1912,7 +1612,7 @@ namespace
         if ((M > 32) && (N <= 1024) && (K > 2 * N))
             return Q40PrefillRoute::ProfiledT64x64;
 
-        const bool bk256_disabled = (g_bk256_force_mode < 0);
+        const bool bk256_disabled = (hostState().bk256_force_mode < 0);
         const int SM = querySmCount(prefill_ctx);
         const int t64x128 = ((M + 63) / 64) * ((N + 127) / 128);
         if (!bk256_disabled && (K > 2 * N) && (t64x128 < SM))
@@ -1925,7 +1625,7 @@ namespace
     //
     // Dispatch priority:
     //   1. BK256 path (CB=0 only): large-K shapes where BK64 can't fill GPU
-    //   2. Force-tile override (g_force_tile_id): for sweep benchmarks
+    //   2. Force-tile override (hostState().force_tile_id): for sweep benchmarks
     //   3. Total heuristic dispatch (choosePrefillTile with format complexity)
     //   4. Tile launch: full-K or exact public-M1 K partitioning
     // =========================================================================
@@ -1957,7 +1657,7 @@ namespace
         const bool use_exact_overlay =
             overlay_status == DensePrefillOverlayStatus::Selected;
         const PrefillStagingSchedule staging = use_exact_overlay
-            ? exact_overlay.staging : g_staging_schedule;
+            ? exact_overlay.staging : stagingSchedule();
         if constexpr (CB != 0)
         {
             if (use_exact_overlay && exact_overlay.bk256)
@@ -2029,9 +1729,9 @@ namespace
             {
                 tc = {TileId::T64x64_w2x2};
             }
-            else if (isDensePrefillTileId(g_force_tile_id))
+            else if (isDensePrefillTileId(hostState().force_tile_id))
             {
-                tc = {static_cast<TileId>(g_force_tile_id)};
+                tc = {static_cast<TileId>(hostState().force_tile_id)};
             }
             else
             {
@@ -2041,10 +1741,10 @@ namespace
                     M, N, K, prefill_ctx, complexity, CB);
             }
         }
-        else if (isDensePrefillTileId(g_force_tile_id))
+        else if (isDensePrefillTileId(hostState().force_tile_id))
         {
             // Force-tile: bypass everything for sweep benchmarks
-            tc = {static_cast<TileId>(g_force_tile_id)};
+            tc = {static_cast<TileId>(hostState().force_tile_id)};
         }
         else
         {
@@ -2057,7 +1757,7 @@ namespace
         // either one complete K walk or the exact public-M1 partition tree.
         const bool use_canonical_kpart = use_exact_overlay
                                              ? exact_overlay.canonical_kpart
-                                             : g_force_canonical_kpart;
+                                             : hostState().force_canonical_kpart;
         if (!densePrefillTileIsResourceEligible<CB>(
                 tc.tile, use_canonical_kpart, staging))
         {
@@ -2070,7 +1770,7 @@ namespace
              */
             if (use_exact_overlay ||
                 staging != PrefillStagingSchedule::RegisterDecode ||
-                isDensePrefillTileId(g_force_tile_id))
+                isDensePrefillTileId(hostState().force_tile_id))
             {
                 return false;
             }
@@ -2132,89 +1832,252 @@ namespace
     }
 }
 
+namespace
+{
+    /** @brief Whether this physical shard owns (and instantiates) a codebook. */
+    template <uint8_t CB>
+    inline constexpr bool kShardOwnsCodebook =
+        prefillShardIndexForCodebook(CB) == LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD;
+
+    /** @brief Launch an owned codebook; other codebooks are never instantiated here. */
+    template <uint8_t CB, class... Args>
+    bool ownedLaunchGenericPrefillBK64(Args &&...args)
+    {
+        if constexpr (kShardOwnsCodebook<CB>)
+            return launchGenericPrefillBK64<CB>(std::forward<Args>(args)...);
+        else
+            return false;
+    }
+
+    /** @brief Query the last-launched specialization of an owned codebook. */
+    template <uint8_t CB, class... Args>
+    bool ownedQueryLastDensePrefillKernelResources(Args &&...args)
+    {
+        if constexpr (kShardOwnsCodebook<CB>)
+            return queryLastDensePrefillKernelResources<CB>(std::forward<Args>(args)...);
+        else
+            return false;
+    }
+
+    /** @brief Query one BK64 tile candidate of an owned codebook. */
+    template <uint8_t CB, class... Args>
+    bool ownedQueryDensePrefillTileResources(Args &&...args)
+    {
+        if constexpr (kShardOwnsCodebook<CB>)
+            return queryDensePrefillTileResources<CB>(std::forward<Args>(args)...);
+        else
+            return false;
+    }
+
+    /** @brief BK256 is a Q4_0 family; only the shard owning codebook 0 holds it. */
+    template <int BM, int BN, int WM, int WN, class... Args>
+    bool ownedQueryDensePrefillBK256Resources(Args &&...args)
+    {
+        if constexpr (kShardOwnsCodebook<0>)
+            return queryDensePrefillBK256Resources<BM, BN, WM, WN>(std::forward<Args>(args)...);
+        else
+            return false;
+    }
+} // namespace
+
 extern "C"
 {
-    bool cudaNativeQuantisedPrefill_setStagingSchedule(PrefillStagingSchedule schedule)
-    {
-        if (!isKnownPrefillStagingSchedule(schedule))
-            return false;
-        g_staging_schedule = schedule;
-        return true;
-    }
-
-    PrefillStagingSchedule cudaNativeQuantisedPrefill_getStagingSchedule()
-    {
-        return g_staging_schedule;
-    }
-
-    PrefillStagingSchedule cudaNativeQuantisedPrefill_getLastLaunchStagingSchedule()
-    {
-        return g_last_launch_selection.staging;
-    }
-
-    // BK256 force mode: 0=auto(heuristic), 1=force ON, -1=force OFF
-    void cudaNativeQuantisedPrefill_setBK256Mode(int mode)
-    {
-        g_bk256_force_mode = mode;
-    }
-
-    int cudaNativeQuantisedPrefill_getBK256Mode()
-    {
-        return g_bk256_force_mode;
-    }
-
-    /** Select the exact public-M1 ordered K-partition candidate for a sweep. */
-    void cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(bool enabled)
-    {
-        g_force_canonical_kpart = enabled;
-    }
-
-    /** Return whether the exact public-M1 K-partition candidate is forced. */
-    bool cudaNativeQuantisedPrefill_getCanonicalKPartitionMode()
-    {
-        return g_force_canonical_kpart;
-    }
-
-    /** Enable or bypass installed exact cells for an isolated policy sweep. */
-    void cudaNativeQuantisedPrefill_setExactOverlayEnabled(bool enabled)
-    {
-        g_dense_prefill_exact_overlay_enabled = enabled;
-    }
-
-    /** Return whether ordinary production may consult installed exact cells. */
-    bool cudaNativeQuantisedPrefill_getExactOverlayEnabled()
-    {
-        return g_dense_prefill_exact_overlay_enabled;
-    }
-
-    void cudaNativeQuantisedPrefill_getLastLaunchSelection(
-        int *tile_id,
-        int *k_partitions,
-        int *used_bk256,
-        int *used_canonical_kpart)
-    {
-        if (tile_id)
-            *tile_id = g_last_launch_selection.tile_id;
-        if (k_partitions)
-            *k_partitions = g_last_launch_selection.k_partitions;
-        if (used_bk256)
-            *used_bk256 = g_last_launch_selection.used_bk256;
-        if (used_canonical_kpart)
-            *used_canonical_kpart =
-                g_last_launch_selection.used_canonical_kpart;
-    }
-
     /**
-     * @brief Report whether the last launch came from an installed exact cell.
+     * @brief Launch one owned codebook on its exact producer stream.
      *
-     * The value is thread-local for the same reason as the remaining launch
-     * diagnostics: sweep workers configure and inspect their own launch
-     * transaction. Production PerfStats uses this provenance to distinguish a
-     * measured overlay from the total generic policy.
+     * The dispatcher has already validated pointers/geometry, admitted the
+     * device and resolved the public-M1 schedule; this body keeps only the
+     * per-format operand checks and the format's launch policy.
+     * @return True after a successful launch; false for a foreign codebook or
+     *         a rejected operand set.
      */
-    int cudaNativeQuantisedPrefill_getLastLaunchUsedExactOverlay()
+    bool LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD_SYMBOL(cudaNativeQuantisedPrefill_launch)(
+        const int8_t *d_A_int8,
+        const uint8_t *d_payload,
+        const uint16_t *d_scales,
+        const uint16_t *d_mins,
+        const uint32_t *d_emins,
+        float *d_C_fp32,
+        const float *d_scales_A_block,
+        const int32_t *d_sums_A_block,
+        int M,
+        int N,
+        int K,
+        float alpha,
+        float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        uint8_t codebook_id,
+        int serial_m1_k_partitions,
+        int serial_m1_uses_ordered_reducer,
+        cudaStream_t cuda_stream,
+        CUDAPrefillContext *prefill_ctx)
     {
-        return g_last_launch_selection.used_exact_overlay;
+        bool ok = false;
+        switch (codebook_id)
+        {
+        // --- Single-scale formats (no min correction) ---
+        case 0:
+            ok = ownedLaunchGenericPrefillBK64<0>(
+                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 4:
+            ok = ownedLaunchGenericPrefillBK64<4>(
+                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
+            if (!d_mins) return false;
+            ok = ownedLaunchGenericPrefillBK64<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(
+                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 6: // Q5_0
+            ok = ownedLaunchGenericPrefillBK64<6>(
+                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 11: // IQ3_S
+            if (!d_mins) return false; // Mandatory original source nibble.
+            ok = ownedLaunchGenericPrefillBK64<11>(
+                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 12: // IQ3_XXS
+            ok = ownedLaunchGenericPrefillBK64<12>(
+                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 15: // IQ2_XXS
+            ok = ownedLaunchGenericPrefillBK64<15>(
+                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+
+        // --- Asymmetric formats (need min correction, d_mins required) ---
+        case 5: // Q4_1 / Q4_K
+            if (!d_mins)
+                return false;
+            ok = ownedLaunchGenericPrefillBK64<5>(
+                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 7: // Q5_1 / Q5_K
+            if (!d_mins)
+                return false;
+            ok = ownedLaunchGenericPrefillBK64<7>(
+                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 16: // IQ1_S
+            if (!d_mins)
+                return false;
+            ok = ownedLaunchGenericPrefillBK64<16>(
+                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+
+        // --- Dual-scale formats (separate lo/hi scales via split MMA) ---
+        case 8: // Q6_K
+            if (!d_mins)
+                return false;
+            ok = ownedLaunchGenericPrefillBK64<8>(
+                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 9: // Q3_K
+            if (!d_mins)
+                return false;
+            ok = ownedLaunchGenericPrefillBK64<9>(
+                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 10: // Q2_K (dual-scale + asymmetric via emins)
+            if (!d_mins)
+                return false;
+            ok = ownedLaunchGenericPrefillBK64<10>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 13: // IQ2_S
+            if (!d_mins)
+                return false;
+            ok = ownedLaunchGenericPrefillBK64<13>(
+                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 14: // IQ2_XS
+            if (!d_mins)
+                return false;
+            ok = ownedLaunchGenericPrefillBK64<14>(
+                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+        case 17: // IQ1_M (dual-scale + delta correction)
+            if (!d_mins)
+                return false;
+            ok = ownedLaunchGenericPrefillBK64<17>(
+                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+
+        // --- 8-bit format (no decode overhead, single-scale) ---
+        case 19: // Q8_0
+            ok = ownedLaunchGenericPrefillBK64<19>(
+                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
+
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
+            if (!d_mins || !d_sums_A_block)
+                return false;
+            ok = ownedLaunchGenericPrefillBK64<
+                llaminar2::kNativeQuantisedExpandedInt8MinCodebook>(
+                d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32,
+                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta,
+                d_C_existing, d_bias, serial_m1_k_partitions,
+                serial_m1_uses_ordered_reducer, cuda_stream, prefill_ctx);
+            break;
+
+        default:
+            return false;
+        }
+        return ok;
     }
 
     /**
@@ -2230,7 +2093,7 @@ extern "C"
      *         have valid compiler attributes and non-zero theoretical
      *         occupancy; `false` for stale or unsupported launch identity.
      */
-    bool cudaNativeQuantisedPrefill_queryLastLaunchResources(
+    bool LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD_SYMBOL(cudaNativeQuantisedPrefill_queryLastLaunchResources)(
         uint8_t codebook_id,
         int n,
         int k,
@@ -2250,7 +2113,7 @@ extern "C"
         bool queried = false;
 #define QUERY_LAST_DENSE_PREFILL_CODEBOOK(CB)                                \
     case CB:                                                                  \
-        queried = queryLastDensePrefillKernelResources<CB>(                  \
+        queried = ownedQueryLastDensePrefillKernelResources<CB>(                  \
             n, k, cuda_device_id, *primary, *auxiliary);                      \
         break
 
@@ -2284,7 +2147,7 @@ extern "C"
         return queried;
     }
 
-    bool cudaNativeQuantisedPrefill_queryCandidateResources(
+    bool LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD_SYMBOL(cudaNativeQuantisedPrefill_queryCandidateResources)(
         uint8_t codebook_id,
         int tile_id,
         int canonical_kpart,
@@ -2312,10 +2175,10 @@ extern "C"
                 return false;
             if (tile_id == -3)
             {
-                return queryDensePrefillBK256Resources<128, 64, 4, 2>(
+                return ownedQueryDensePrefillBK256Resources<128, 64, 4, 2>(
                     ordered_bk256 != 0, *primary, *auxiliary);
             }
-            return queryDensePrefillBK256Resources<128, 128, 4, 4>(
+            return ownedQueryDensePrefillBK256Resources<128, 128, 4, 4>(
                 ordered_bk256 != 0, *primary, *auxiliary);
         }
         if (!isDensePrefillTileId(tile_id) || ordered_bk256 != 0)
@@ -2324,7 +2187,7 @@ extern "C"
         bool queried = false;
 #define QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(CB)                           \
     case CB:                                                                  \
-        queried = queryDensePrefillTileResources<CB>(                        \
+        queried = ownedQueryDensePrefillTileResources<CB>(                        \
             tile_id, canonical_kpart != 0, staging, *primary, *auxiliary);    \
         break
 
@@ -2357,586 +2220,4 @@ extern "C"
 
         return queried;
     }
-
-    // Force output-tile geometry for sweep benchmarks. K partitioning remains
-    // bound to the public M=1 arithmetic contract.
-    void cudaNativeQuantisedPrefill_setForceTile(int tile_id)
-    {
-        g_force_tile_id = tile_id;
-    }
-
-    void cudaNativeQuantisedPrefill_getForceTile(int *tile_id)
-    {
-        if (tile_id)
-            *tile_id = g_force_tile_id;
-    }
-
-    // Return the number of tiles for a given tile config + shape
-    int cudaNativeQuantisedPrefill_getTileCount(int tile_id, int M, int N)
-    {
-        int bm = 64, bn = 64;
-        switch (static_cast<TileId>(tile_id))
-        {
-        case TileId::T64x64_w2x2:
-            bm = 64;
-            bn = 64;
-            break;
-        case TileId::T64x128_w2x2:
-        case TileId::T64x128_w4x2:
-        case TileId::T64x128_w2x4:
-            bm = 64;
-            bn = 128;
-            break;
-        case TileId::T128x128_w4x2:
-        case TileId::T128x128_w4x4:
-            bm = 128;
-            bn = 128;
-            break;
-        case TileId::Count:
-            return 0;
-        }
-        return ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
-    }
-    // -----------------------------------------------------------------
-    // Prefill context lifetime
-    // -----------------------------------------------------------------
-    CUDAPrefillContext *cudaPrefillContext_create(int device_id)
-    {
-        auto *ctx = new (std::nothrow) CUDAPrefillContext_();
-        if (!ctx)
-            return nullptr;
-        ctx->device_id = device_id;
-        return ctx;
-    }
-
-    void cudaPrefillContext_destroy(CUDAPrefillContext *ctx)
-    {
-        if (!ctx)
-            return;
-        delete ctx;
-    }
-
-    void cudaPrefillContext_bindWorkspace(
-        CUDAPrefillContext *ctx,
-        float *canonical_kpart_partials,
-        size_t canonical_kpart_partials_bytes)
-    {
-        if (!ctx)
-            return;
-        ctx->workspace_canonical_kpart_partials = canonical_kpart_partials;
-        ctx->workspace_canonical_kpart_partials_size =
-            canonical_kpart_partials_bytes;
-    }
-
-    /**
-     * @brief Plan prefill workspace using distinct decode and arithmetic formats.
-     *
-     * The execution codebook selects the physical decoder and any learned
-     * prefill overlay. The arithmetic-policy codebook selects the serial-M1
-     * reduction tree that every row must reproduce. They differ after a cold
-     * CPU tier promotes a compact asymmetric matrix into codebook 23.
-     */
-    bool cudaNativeQuantisedPrefill_getWorkspacePlanWithPolicy(
-        uint8_t codebook_id,
-        uint8_t arithmetic_policy_codebook_id,
-        int M,
-        int N,
-        int K,
-        int cuda_device_id,
-        size_t *canonical_kpart_partials_bytes,
-        int *planned_k_partitions)
-    {
-        if (canonical_kpart_partials_bytes)
-            *canonical_kpart_partials_bytes = 0;
-        if (planned_k_partitions)
-            *planned_k_partitions = 1;
-        if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
-            return false;
-        if (!isSupportedNativeQuantisedPrefillCodebook(codebook_id))
-            return false;
-        if (!cudaNativeQuantisedGemvTuned_supportsCodebook(
-                arithmetic_policy_codebook_id))
-            return false;
-
-        llaminar2::cuda::generated::CUDADensePrefillOverlayConfig
-            exact_overlay{};
-        const DensePrefillOverlayStatus overlay_status =
-            selectDensePrefillOverlay(
-                codebook_id, M, N, K, exact_overlay);
-        if (overlay_status == DensePrefillOverlayStatus::Invalid)
-            return false;
-        const bool needs_canonical_kpart =
-            g_force_canonical_kpart ||
-            (overlay_status == DensePrefillOverlayStatus::Selected &&
-             exact_overlay.canonical_kpart);
-        if (!needs_canonical_kpart)
-            return true;
-        return queryCanonicalPrefillWorkspaceForRows(
-            arithmetic_policy_codebook_id,
-            M,
-            N,
-            K,
-            llaminar2::cudaHardwareMetadata().at(cuda_device_id).sm_count,
-            canonical_kpart_partials_bytes,
-            planned_k_partitions);
-    }
-
-    /** @brief Plan a self-describing matrix whose policy equals its decoder. */
-    bool cudaNativeQuantisedPrefill_getWorkspacePlan(
-        uint8_t codebook_id,
-        int M,
-        int N,
-        int K,
-        int cuda_device_id,
-        size_t *canonical_kpart_partials_bytes,
-        int *planned_k_partitions)
-    {
-        return cudaNativeQuantisedPrefill_getWorkspacePlanWithPolicy(
-            codebook_id,
-            codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
-            M,
-            N,
-            K,
-            cuda_device_id,
-            canonical_kpart_partials_bytes,
-            planned_k_partitions);
-    }
-
-    /** @brief Plan the maximum workspace for an explicit arithmetic policy. */
-    static bool workspaceEnvelopeWithHardwareBinding(
-        uint8_t codebook_id,
-        uint8_t arithmetic_policy_codebook_id,
-        int max_M,
-        int N,
-        int K,
-        int cuda_device_id,
-        const llaminar2::cuda::NativeQuantisedWorkspaceHardware *hardware,
-        size_t *canonical_kpart_partials_bytes,
-        int *planned_k_partitions,
-        int *planned_rows)
-    {
-        if (canonical_kpart_partials_bytes)
-            *canonical_kpart_partials_bytes = 0;
-        if (planned_k_partitions)
-            *planned_k_partitions = 1;
-        if (planned_rows)
-            *planned_rows = 0;
-        if (max_M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
-            return false;
-        if (!isSupportedNativeQuantisedPrefillCodebook(codebook_id))
-            return false;
-        if (!cudaNativeQuantisedGemvTuned_supportsCodebook(
-                arithmetic_policy_codebook_id))
-            return false;
-
-        int canonical_rows = 0;
-        if (g_force_canonical_kpart)
-        {
-            canonical_rows = max_M;
-        }
-        else
-        {
-            const bool exact_overlay_controls_launch =
-                g_dense_prefill_exact_overlay_enabled &&
-                g_force_tile_id < 0 &&
-                g_bk256_force_mode == 0;
-            if (exact_overlay_controls_launch)
-            {
-                /*
-                 * Generated cells are sparse in geometry and non-monotonic in
-                 * launch family. Scan the complete installed policy rather
-                 * than assuming the largest M represents every smaller replay.
-                 * This occurs during graph/workspace planning and is cached by
-                 * the C++ adapter; no scan occurs in captured execution.
-                 */
-                for (const auto &entry :
-                     llaminar2::cuda::generated::kCUDADensePrefillOverlayEntries)
-                {
-                    if (entry.codebook != (codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id) ||
-                        entry.n != N || entry.k != K ||
-                        entry.m <= 1 || entry.m > max_M)
-                    {
-                        continue;
-                    }
-                    if (!isValidDensePrefillOverlayConfig(
-                            codebook_id, entry.config))
-                    {
-                        return false;
-                    }
-                    if (entry.config.canonical_kpart)
-                        canonical_rows = std::max(canonical_rows, entry.m);
-                }
-            }
-        }
-
-        if (canonical_rows == 0)
-            return true;
-        if (!queryCanonicalPrefillWorkspaceForRows(
-                arithmetic_policy_codebook_id,
-                canonical_rows,
-                N,
-                K,
-                hardware ? hardware->smCount() : llaminar2::cudaHardwareMetadata().at(cuda_device_id).sm_count,
-                canonical_kpart_partials_bytes,
-                planned_k_partitions))
-        {
-            return false;
-        }
-        if (planned_rows)
-            *planned_rows = canonical_rows;
-        return true;
-    }
-
-    /** @brief Runtime ABI binds the admitted participant only when installed policy consumes its SM count. */
-    bool cudaNativeQuantisedPrefill_getWorkspaceEnvelopeWithPolicy(
-        uint8_t codebook_id, uint8_t arithmetic_policy_codebook_id, int max_M, int N, int K,
-        int cuda_device_id, size_t *bytes, int *partitions, int *rows)
-    {
-        return workspaceEnvelopeWithHardwareBinding(codebook_id, arithmetic_policy_codebook_id,
-            max_M, N, K, cuda_device_id, nullptr, bytes, partitions, rows);
-    }
-
-    /** @brief Plan a self-describing matrix whose policy equals its decoder. */
-    bool cudaNativeQuantisedPrefill_getWorkspaceEnvelope(
-        uint8_t codebook_id,
-        int max_M,
-        int N,
-        int K,
-        int cuda_device_id,
-        size_t *canonical_kpart_partials_bytes,
-        int *planned_k_partitions,
-        int *planned_rows)
-    {
-        return cudaNativeQuantisedPrefill_getWorkspaceEnvelopeWithPolicy(
-            codebook_id,
-            codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
-            max_M,
-            N,
-            K,
-            cuda_device_id,
-            canonical_kpart_partials_bytes,
-            planned_k_partitions,
-            planned_rows);
-    }
 } // extern "C"
-
-bool llaminar2::cuda::nativeQuantisedPrefillWorkspaceEnvelopeForHardware(
-    std::uint8_t codebook, std::uint8_t arithmetic_codebook, int max_rows, int n, int k,
-    const NativeQuantisedWorkspaceHardware &hardware, std::size_t *bytes, int *partitions, int *rows)
-{
-    return workspaceEnvelopeWithHardwareBinding(codebook, arithmetic_codebook, max_rows, n, k,
-        hardware.deviceOrdinal(), &hardware, bytes, partitions, rows);
-}
-
-
-// Profitability gate removed: NativeQuantised is now the only CUDA GEMM path.
-// TC/CUTLASS expanded fallback has been sunset. All codebooks always use
-// the NativeQuantised prefill kernel regardless of shape.
-
-/**
- * @brief Execute NativeQuantised prefill with explicit decoder and arithmetic IDs.
- *
- * `codebook_id` describes the bytes read by the templated kernel, while
- * `arithmetic_policy_codebook_id` owns the serial-M1 split tree. Keeping both
- * values explicit prevents representation normalization during expert
- * migration from changing FP32 publication order.
- */
-extern "C" bool cudaNativeQuantisedPrefill_fp32_withPolicy(
-    const int8_t *d_A_int8,
-    const uint8_t *d_payload,
-    const uint16_t *d_scales,
-    const uint16_t *d_mins,
-    const uint32_t *d_emins,
-    float *d_C_fp32,
-    const float *d_scales_A_block,
-    const int32_t *d_sums_A_block,
-    int M,
-    int N,
-    int K,
-    float alpha,
-    float beta,
-    const float *d_C_existing,
-    const float *d_bias,
-    uint8_t codebook_id,
-    uint8_t arithmetic_policy_codebook_id,
-    int cuda_device_id,
-    void *stream,
-    CUDAPrefillContext *prefill_ctx)
-{
-    if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
-        return false;
-    if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
-        return false;
-    if (!prefill_ctx)
-        return false;
-    if (!cudaNativeQuantisedGemvTuned_supportsCodebook(
-            arithmetic_policy_codebook_id))
-        return false;
-    if (!isAmperePlus(cuda_device_id))
-        return false;
-    if (cudaSetDevice(cuda_device_id) != cudaSuccess)
-        return false;
-
-    cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-    int serial_m1_uses_ordered_reducer = 0;
-    int serial_m1_k_partitions = 0;
-    if (!cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(
-            arithmetic_policy_codebook_id,
-            N,
-            K,
-            querySmCount(prefill_ctx),
-            &serial_m1_uses_ordered_reducer,
-            &serial_m1_k_partitions))
-    {
-        return false;
-    }
-
-    bool ok = false;
-    switch (codebook_id)
-    {
-    // --- Single-scale formats (no min correction) ---
-    case 0:
-        ok = launchGenericPrefillBK64<0>(
-            d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 4:
-        ok = launchGenericPrefillBK64<4>(
-            d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
-        if (!d_mins) return false;
-        ok = launchGenericPrefillBK64<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(
-            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 6: // Q5_0
-        ok = launchGenericPrefillBK64<6>(
-            d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 11: // IQ3_S
-        if (!d_mins) return false; // Mandatory original source nibble.
-        ok = launchGenericPrefillBK64<11>(
-            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 12: // IQ3_XXS
-        ok = launchGenericPrefillBK64<12>(
-            d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 15: // IQ2_XXS
-        ok = launchGenericPrefillBK64<15>(
-            d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-
-    // --- Asymmetric formats (need min correction, d_mins required) ---
-    case 5: // Q4_1 / Q4_K
-        if (!d_mins)
-            return false;
-        ok = launchGenericPrefillBK64<5>(
-            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 7: // Q5_1 / Q5_K
-        if (!d_mins)
-            return false;
-        ok = launchGenericPrefillBK64<7>(
-            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 16: // IQ1_S
-        if (!d_mins)
-            return false;
-        ok = launchGenericPrefillBK64<16>(
-            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-
-    // --- Dual-scale formats (separate lo/hi scales via split MMA) ---
-    case 8: // Q6_K
-        if (!d_mins)
-            return false;
-        ok = launchGenericPrefillBK64<8>(
-            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 9: // Q3_K
-        if (!d_mins)
-            return false;
-        ok = launchGenericPrefillBK64<9>(
-            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 10: // Q2_K (dual-scale + asymmetric via emins)
-        if (!d_mins)
-            return false;
-        ok = launchGenericPrefillBK64<10>(
-            d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 13: // IQ2_S
-        if (!d_mins)
-            return false;
-        ok = launchGenericPrefillBK64<13>(
-            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 14: // IQ2_XS
-        if (!d_mins)
-            return false;
-        ok = launchGenericPrefillBK64<14>(
-            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-    case 17: // IQ1_M (dual-scale + delta correction)
-        if (!d_mins)
-            return false;
-        ok = launchGenericPrefillBK64<17>(
-            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-
-    // --- 8-bit format (no decode overhead, single-scale) ---
-    case 19: // Q8_0
-        ok = launchGenericPrefillBK64<19>(
-            d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
-            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
-            cuda_stream, prefill_ctx);
-        break;
-
-    case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
-        if (!d_mins || !d_sums_A_block)
-            return false;
-        ok = launchGenericPrefillBK64<
-            llaminar2::kNativeQuantisedExpandedInt8MinCodebook>(
-            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32,
-            d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta,
-            d_C_existing, d_bias, serial_m1_k_partitions,
-            serial_m1_uses_ordered_reducer, cuda_stream, prefill_ctx);
-        break;
-
-    default:
-        return false;
-    }
-
-    if (ok && llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
-    {
-        int tile_id = -1;
-        int k_partitions = 1;
-        int used_bk256 = 0;
-        int used_canonical_kpart = 0;
-        int used_exact_overlay = 0;
-        cudaNativeQuantisedPrefill_getLastLaunchSelection(
-            &tile_id,
-            &k_partitions,
-            &used_bk256,
-            &used_canonical_kpart);
-        used_exact_overlay =
-            cudaNativeQuantisedPrefill_getLastLaunchUsedExactOverlay();
-        llaminar2::PerfStatsCollector::addCounter(
-            "kernel",
-            "cuda_native_quantised_prefill_calls",
-            1.0,
-            "gemm",
-            "cuda:" + std::to_string(cuda_device_id),
-            llaminar2::PerfStatsCollector::Tags{
-                {"codebook", std::to_string(static_cast<int>(codebook_id))},
-                {"arithmetic_policy_codebook",
-                 std::to_string(
-                     static_cast<int>(arithmetic_policy_codebook_id))},
-                {"m", std::to_string(M)},
-                {"n", std::to_string(N)},
-                {"k", std::to_string(K)},
-                {"tile_id", std::to_string(tile_id)},
-                {"k_partitions", std::to_string(k_partitions)},
-                {"bk256", used_bk256 ? "1" : "0"},
-                {"canonical_kpart", used_canonical_kpart ? "1" : "0"},
-                {"staging_schedule", std::to_string(static_cast<int>(
-                    cudaNativeQuantisedPrefill_getLastLaunchStagingSchedule()))},
-                {"exact_overlay", used_exact_overlay ? "1" : "0"},
-                {"sums_a", d_sums_A_block ? "1" : "0"}});
-    }
-    return ok;
-}
-
-/** @brief Execute a self-describing matrix with its own arithmetic policy. */
-extern "C" bool cudaNativeQuantisedPrefill_fp32(
-    const int8_t *d_A_int8,
-    const uint8_t *d_payload,
-    const uint16_t *d_scales,
-    const uint16_t *d_mins,
-    const uint32_t *d_emins,
-    float *d_C_fp32,
-    const float *d_scales_A_block,
-    const int32_t *d_sums_A_block,
-    int M,
-    int N,
-    int K,
-    float alpha,
-    float beta,
-    const float *d_C_existing,
-    const float *d_bias,
-    uint8_t codebook_id,
-    int cuda_device_id,
-    void *stream,
-    CUDAPrefillContext *prefill_ctx)
-{
-    return cudaNativeQuantisedPrefill_fp32_withPolicy(
-        d_A_int8,
-        d_payload,
-        d_scales,
-        d_mins,
-        d_emins,
-        d_C_fp32,
-        d_scales_A_block,
-        d_sums_A_block,
-        M,
-        N,
-        K,
-        alpha,
-        beta,
-        d_C_existing,
-        d_bias,
-        codebook_id,
-        codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
-        cuda_device_id,
-        stream,
-        prefill_ctx);
-}
