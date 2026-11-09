@@ -14,8 +14,12 @@ configured objdump and audit the instructions actually assembled.
 - Object image: sections (with executable extents), the complete symbol table
   (raw linker name, binding, type, defining section, value, ELF size) and the
   relocation tables of every executable section (type, raw target symbol,
-  addend; ELF RELA, or extern Mach-O entries - scattered, section-relative and
-  ADDEND forms fail) are read from the object itself. Function starts and
+  addend) are read from the object itself, which must be a relocatable object
+  (ELF ET_REL / Mach-O MH_OBJECT). Relocation records are admitted by their
+  native fields: complete, bounded ELF RELA records with valid section links,
+  an admitted code relocation type and an aligned in-section offset; extern
+  Mach-O records whose type has the r_pcrel / r_length combination required by
+  mach-o/arm64/reloc.h. Anything else fails before comparison. Function starts and
   extents (ELF symbol size; Mach-O next distinct defined address) must be
   instruction aligned, lie in their section and never overlap; every
   non-padding instruction and every relocation belongs to one.
@@ -82,9 +86,17 @@ configured objdump and audit the instructions actually assembled.
   preprocessing dependencies only, and the assembler can read further files or
   construct directives through macros and substitution. Rather than model the
   assembler, the preprocessed translation unit (same flags) is retained and
-  C++-tokenized, and every asm construct must have an empty template (a
-  compiler barrier) or a single plain symbol (an asm label); any other template
-  fails closed, as do assembler options in the compile command.
+  C++-tokenized; every asm keyword (including ones nested in operands or
+  lambdas) must be an empty-template barrier or a declaration asm label (one
+  plain symbol, no qualifiers or operands, after a declarator, outside
+  executable code); anything else fails closed. Opaque compiler inputs fail:
+  PCH markers, clang module pragmas or remaining include/import/embed
+  directives in the translation unit; precompiled headers the GNU compile
+  reports reading (-H); PCH, module, plugin, specs, -B, wrapper, config and
+  assembler options. The driver's expanded jobs (-###) of the exact compile are
+  validated: one integrated clang -cc1 -emit-obj job, or one GNU cc1plus job
+  and one as job whose only input is the compiler's output, no specs or
+  configuration file read. Every job program is hashed into the proof.
 
 Verify phase (Unit/preflight): no compiler is invoked, but every recorded input
 (including absolute system/SDK headers named by the compiler) must be present
@@ -290,6 +302,18 @@ MACHO_RELOCATIONS = {0: "ARM64_RELOC_UNSIGNED", 1: "ARM64_RELOC_SUBTRACTOR", 2: 
                      8: "ARM64_RELOC_TLVP_LOAD_PAGE21", 9: "ARM64_RELOC_TLVP_LOAD_PAGEOFF12", 10: "ARM64_RELOC_ADDEND"}
 
 
+# Relocations admitted on instructions, and (for Mach-O, from mach-o/arm64/reloc.h) their required
+# r_pcrel / r_length (2 = 4 bytes).
+CODE_RELOCATIONS = frozenset({"R_AARCH64_CALL26", "R_AARCH64_JUMP26", "R_AARCH64_CONDBR19", "R_AARCH64_TSTBR14",
+                              "R_AARCH64_ADR_PREL_PG_HI21", "R_AARCH64_ADR_GOT_PAGE", "R_AARCH64_ADD_ABS_LO12_NC",
+                              "R_AARCH64_LDST8_ABS_LO12_NC", "R_AARCH64_LDST16_ABS_LO12_NC",
+                              "R_AARCH64_LDST32_ABS_LO12_NC", "R_AARCH64_LDST64_ABS_LO12_NC",
+                              "R_AARCH64_LDST128_ABS_LO12_NC", "R_AARCH64_LD64_GOT_LO12_NC"})
+MACHO_CODE_RELOCATIONS = {"ARM64_RELOC_BRANCH26": (1, 2), "ARM64_RELOC_PAGE21": (1, 2),
+                          "ARM64_RELOC_PAGEOFF12": (0, 2), "ARM64_RELOC_GOT_LOAD_PAGE21": (1, 2),
+                          "ARM64_RELOC_GOT_LOAD_PAGEOFF12": (0, 2)}
+
+
 def _add_relocation(table: dict, section: str, address: int, record: tuple[str, str, int]) -> None:
     if address in table.setdefault(section, {}):
         raise ValueError(f"two relocations at {section}+{address:#x}")
@@ -315,6 +339,8 @@ def read_object(data: bytes) -> ObjectImage:
 
 
 def _read_elf(data: bytes) -> ObjectImage:
+    if _field(data, 0x10, 2) != 1 or _field(data, 0x14, 4) != 1 or data[6] != 1:
+        raise ValueError("the witness object is not an ELF relocatable object (ET_REL, version 1)")
     shoff, shentsize, shnum, shstrndx = (_field(data, 0x28, 8), _field(data, 0x3A, 2), _field(data, 0x3C, 2),
                                          _field(data, 0x3E, 2))
     if shentsize != 64 or not 0 < shstrndx < shnum:
@@ -364,29 +390,38 @@ def _read_elf(data: bytes) -> ObjectImage:
             raise ValueError(f"symbol {name} names a nonexistent section")
         symbols.append(ObjectSymbol(name, section, _field(data, base + 8, 8), _field(data, base + 16, 8), kind, binding))
     relocations: dict[str, dict[int, tuple[str, str, int]]] = {}
-    for header in headers:
-        if header["type"] not in (4, 9) or not 0 < header["link"] < len(headers) or \
-                not 0 < header.get("info", 0) < len(headers):
+    for number, header in enumerate(headers):
+        if header["type"] not in (4, 9):
             continue
+        if not 0 < header["info"] < len(headers) or not 0 < header["link"] < len(headers):
+            raise ValueError(f"relocation section {names[number]} has an invalid section reference")
         target = headers[header["info"]]
         if not target["flags"] & 0x4:
             continue  # Relocations of data sections are not analysed.
         if header["type"] == 9 or header["entsize"] != 24 or headers[header["link"]] is not table:
             raise ValueError("executable-section relocations must be RELA entries against the symbol table")
-        section = names[headers.index(target)]
+        if header["size"] % 24 or header["offset"] + header["size"] > len(data):
+            raise ValueError(f"relocation section {names[number]} holds a partial or truncated record")
+        section = names[header["info"]]
         for entry in range(header["size"] // 24):
             base = header["offset"] + entry * 24
-            info = _field(data, base + 8, 8)
+            offset, info = _field(data, base, 8), _field(data, base + 8, 8)
             if not 0 < info >> 32 < len(indexed):
                 raise ValueError(f"relocation in {section} names no symbol")
-            kind = ELF_RELOCATIONS.get(info & 0xFFFFFFFF, f"R_AARCH64_UNSUPPORTED_{info & 0xFFFFFFFF}")
-            addend = int.from_bytes(data[base + 16:base + 24], "little", signed=True)
-            _add_relocation(relocations, section, target["address"] + _field(data, base, 8),
-                            (kind, indexed[info >> 32], addend))
+            kind = ELF_RELOCATIONS.get(info & 0xFFFFFFFF)
+            if kind not in CODE_RELOCATIONS:
+                raise ValueError(f"relocation type {info & 0xFFFFFFFF} is not admitted in code ({section})")
+            if offset % 4 or offset >= target["size"]:
+                raise ValueError(f"relocation offset {offset:#x} is not an instruction of {section}")
+            addend = _field(data, base + 16, 8)
+            addend -= (1 << 64) if addend >= 1 << 63 else 0
+            _add_relocation(relocations, section, target["address"] + offset, (kind, indexed[info >> 32], addend))
     return ObjectImage(False, sections, symbols, relocations)
 
 
 def _read_macho(data: bytes) -> ObjectImage:
+    if _field(data, 12, 4) != 1:
+        raise ValueError("the witness object is not a Mach-O relocatable object (MH_OBJECT)")
     commands, offset = _field(data, 16, 4), 32
     sections: dict[str, Section] = {}
     ordered: list[str | None] = [None]
@@ -444,11 +479,17 @@ def _read_macho(data: bytes) -> ObjectImage:
             continue
         for entry in range(count):
             address, info = _field(data, offset + entry * 8, 4), _field(data, offset + entry * 8 + 4, 4)
-            symbol, external, kind = info & 0xFFFFFF, (info >> 27) & 1, info >> 28
-            if address & 0x80000000 or not external or kind == 10 or not symbol < len(indexed):
-                raise ValueError(f"unsupported relocation form in {name} (scattered, section-relative or addend)")
-            _add_relocation(relocations, name, sections[name].address + address,
-                            (MACHO_RELOCATIONS.get(kind, f"ARM64_RELOC_UNSUPPORTED_{kind}"), indexed[symbol], 0))
+            symbol, pcrel, length = info & 0xFFFFFF, (info >> 24) & 1, (info >> 25) & 3
+            external, kind = (info >> 27) & 1, info >> 28
+            name_of = MACHO_RELOCATIONS.get(kind)
+            if address & 0x80000000 or not external or not symbol < len(indexed):
+                raise ValueError(f"unsupported relocation form in {name} (scattered or section-relative)")
+            if name_of not in MACHO_CODE_RELOCATIONS or (pcrel, length) != MACHO_CODE_RELOCATIONS[name_of]:
+                raise ValueError(f"relocation {name_of or kind} with pcrel={pcrel} length={length} is not admitted "
+                                 f"in code ({name})")
+            if address % 4 or address >= sections[name].size:
+                raise ValueError(f"relocation address {address:#x} is not an instruction of {name}")
+            _add_relocation(relocations, name, sections[name].address + address, (name_of, indexed[symbol], 0))
     return ObjectImage(True, sections, symbols, relocations)
 
 
@@ -1552,15 +1593,9 @@ def bind_inputs(paths: list[str]) -> dict[str, dict]:
 
 
 def executed_command(command: list[str], source: str, obj: Path, dependencies: Path) -> list[str]:
-    return command + WITNESS_FLAGS + ["-c", source, "-o", str(obj), "-MD", "-MF", str(dependencies), "-MT", "probe"]
-
-
-def require_no_assembler_options(command: list[str]) -> None:
-    """Options handed to the assembler can add inputs no dependency list names: rejected."""
-    for argument in command:
-        if argument.startswith(("-Wa,", "--param=as")) or argument in ("-Xassembler", "-save-temps") or \
-                argument.startswith("-save-temps="):
-            raise ValueError(f"the witness compile command passes assembler options: {argument}")
+    """The witness compile; -H reports every header and precompiled header the compiler actually read."""
+    return command + WITNESS_FLAGS + ["-c", source, "-o", str(obj), "-MD", "-MF", str(dependencies), "-MT", "probe",
+                                      "-H"]
 
 
 def require_absolute_source(source: str) -> None:
@@ -1636,50 +1671,175 @@ def decode_literal(token: re.Match) -> str:
     return "".join(decoded)
 
 
-def cxx_tokens(preprocessed: str):
-    """Significant C++ tokens of a preprocessed translation unit; an unterminated literal fails."""
+OPAQUE_DIRECTIVES = re.compile(r"^[ \t]*#[ \t]*(?:pragma[ \t]+(?:GCC[ \t]+pch_preprocess|clang[ \t]+module)\b|import\b"
+                               r"|include\b|include_next\b|embed\b)")
+NAMESPACE_INTRODUCERS = frozenset({"namespace"})
+CLASS_KEYS = frozenset({"class", "struct", "union", "enum"})
+LABEL_PRECEDERS = frozenset({")", "]"})
+
+
+def cxx_tokens(preprocessed: str) -> list[re.Match]:
+    """Significant C++ tokens of a preprocessed translation unit.
+
+    Linemarkers and ordinary pragmas are skipped. Directives that hand the compiler content -E does not show
+    (a PCH marker, a clang module pragma, a remaining include/import/embed) fail; so does an unterminated
+    literal.
+    """
+    tokens = []
     for token in CXX_TOKEN.finditer(preprocessed):
         kind = token.lastgroup
-        if kind in ("space", "directive"):
+        if kind == "directive":
+            if OPAQUE_DIRECTIVES.match(token.group()):
+                raise ValueError(f"translation unit uses opaque compiler input: {token.group().strip()[:80]}")
+            continue
+        if kind == "space":
             continue
         if kind == "punctuator" and token.group() in "\"'":
             raise ValueError(f"unterminated literal at offset {token.start()}")
-        yield token
+        tokens.append(token)
+    return tokens
+
+
+def scope_kinds(tokens: list[re.Match]) -> list[bool]:
+    """For every token, whether it lies in executable code (a function body, lambda or initializer braces).
+
+    A brace opens a declaration scope only when the declaration preceding it (since the last ';', '{' or '}')
+    starts with 'namespace' / 'inline namespace' / 'extern "..."', or names a class key with no parenthesis;
+    any other brace is treated as code, which only makes the label rule stricter.
+    """
+    stack, kinds, start = [], [], 0
+    for index, token in enumerate(tokens):
+        text = token.group()
+        kinds.append(bool(stack) and stack[-1])
+        if text == "{":
+            head = [other.group() for other in tokens[start:index]]
+            words = [word for word in head if word not in ("inline", "export")]
+            declaration = bool(words) and (words[0] in NAMESPACE_INTRODUCERS or
+                                           (words[0] == "extern" and len(words) == 2 and words[1].startswith('"')) or
+                                           (any(word in CLASS_KEYS for word in words) and "(" not in words))
+            stack.append(not declaration or bool(stack and stack[-1]))
+            start = index + 1
+        elif text == "}":
+            if not stack:
+                raise ValueError(f"unbalanced braces at offset {token.start()}")
+            stack.pop()
+            start = index + 1
+        elif text == ";":
+            start = index + 1
+    return kinds
 
 
 def inline_assembly_violations(preprocessed: str) -> list[str]:
-    """Inline-assembly templates the witness cannot prove free of assembler-side inputs.
+    """Inline-assembly constructs the witness cannot prove free of assembler-side inputs.
 
-    The compiler's dependency lists name preprocessing inputs only; the assembler can read further files
-    (.include/.incbin) and can construct such directives through macros or substitution. Rather than model
-    assembler semantics, every asm construct of the tokenized translation unit must have an empty template
-    (a compiler barrier) or a single plain symbol (an asm label); any other template fails closed.
+    The compiler's dependency lists name preprocessing inputs only; the assembler can read further files and
+    construct directives through macros or substitution. Rather than model the assembler, every asm keyword of
+    the tokenized translation unit (including one nested in another asm's operands or in a lambda) must be
+    either an empty-template statement (a compiler barrier) or a declaration asm label: a single plain symbol,
+    without qualifiers or operands, directly after a declarator, outside executable code. Anything else fails.
     """
-    findings, tokens = [], cxx_tokens(preprocessed)
-    for token in tokens:
+    tokens = cxx_tokens(preprocessed)
+    code = scope_kinds(tokens)
+    findings = []
+    for index, token in enumerate(tokens):
         if token.lastgroup != "identifier" or token.group() not in ASM_KEYWORDS:
             continue
-        following = next(tokens, None)
-        while following is not None and following.lastgroup == "identifier" and following.group() in ASM_QUALIFIERS:
-            following = next(tokens, None)
-        if following is None or following.group() != "(":
+        position, qualified = index + 1, False
+        while position < len(tokens) and tokens[position].group() in ASM_QUALIFIERS:
+            position, qualified = position + 1, True
+        if position >= len(tokens) or tokens[position].group() != "(":
             raise ValueError(f"unclassifiable inline assembly at offset {token.start()}")
-        template, following = [], next(tokens, None)
-        while following is not None and following.lastgroup in ("string", "raw"):
-            template.append(decode_literal(following))
-            following = next(tokens, None)
-        if not template or following is None or following.group() not in (")", ":"):
+        position += 1
+        template = []
+        while position < len(tokens) and tokens[position].lastgroup in ("string", "raw"):
+            template.append(decode_literal(tokens[position]))
+            position += 1
+        if not template or position >= len(tokens) or tokens[position].group() not in (")", ":"):
             raise ValueError(f"inline assembly without a literal template at offset {token.start()}")
-        depth = 1 if following.group() == ":" else 0
-        while depth:
-            following = next(tokens, None)
-            if following is None:
-                raise ValueError("unterminated inline assembly")
-            depth += {"(": 1, ")": -1}.get(following.group(), 0)
         text = "".join(template)
-        if text.strip() and not ASM_LABEL.fullmatch(text):
+        if not text.strip():
+            continue  # Empty template: emits nothing; operands are visited as ordinary tokens.
+        previous = tokens[index - 1] if index else None
+        label = (not qualified and tokens[position].group() == ")" and not code[index] and previous is not None
+                 and (previous.group() in LABEL_PRECEDERS or
+                      (previous.lastgroup == "identifier" and previous.group() not in ASM_KEYWORDS))
+                 and ASM_LABEL.fullmatch(text))
+        if not label:
             findings.append(f"offset {token.start()}: {text[:80]!r}")
     return findings
+
+
+# Driver routing. The expanded jobs of the exact compile (-###) are the authority for what the compiler and
+# assembler read: one compiler job and, for GNU, one assembler job whose sole input is the compiler's output.
+REJECTED_JOB_ARGUMENTS = re.compile(r"^(?:-Wa,.*|-Xassembler|-save-temps.*|--param=as.*|-include-pch|-emit-pch|-fpch-preprocess|-fmodules|-fcxx-modules|"
+                                    r"-fmodules-ts|-fmodule-file.*|-fmodule-map-file=.*|-fprebuilt-module-path.*|"
+                                    r"-fimplicit-modules|-fmodule-mapper.*|-fplugin.*|-load|-plugin|-add-plugin|"
+                                    r"-fpass-plugin.*|-specs.*|--specs.*|-B.*|-wrapper|@.*)$")
+GNU_ASSEMBLER_OPTIONS = re.compile(r"^(?:-EL|--gdwarf-\d|-march=[\w+.-]+|-mcpu=[\w+.-]+|-mabi=lp64)$")
+CONFIGURATION_LINES = re.compile(r"^(?:Reading specs from|Configuration file:|Using specs)", re.MULTILINE)
+
+
+def driver_jobs(command: list[str], directory: str, identity: str, source: str, obj: Path) -> list[list[str]]:
+    """Validate the expanded jobs (-###) of the exact witness compile and return them."""
+    for argument in command:
+        if REJECTED_JOB_ARGUMENTS.match(argument) or argument in ("-no-integrated-as", "-fno-integrated-as",
+                                                                   "--config") or argument.startswith("--config="):
+            raise ValueError(f"the witness compile command routes inputs outside the dependency closure: {argument}")
+    expansion = subprocess.run(command + ["-###"], cwd=directory, capture_output=True, text=True)
+    if expansion.returncode:
+        raise ValueError(f"the compiler driver rejected the witness command: {expansion.stderr[-300:]}")
+    if CONFIGURATION_LINES.search(expansion.stderr):
+        raise ValueError("the compiler driver reads a specs or configuration file")
+    jobs = [shlex.split(line) for line in expansion.stderr.splitlines() if line.startswith(" ")]
+    for job in jobs:
+        for argument in job:
+            if REJECTED_JOB_ARGUMENTS.match(argument):
+                raise ValueError(f"a compiler job reads opaque input: {argument}")
+    if identity.startswith(("AppleClang-", "Clang-")):
+        if len(jobs) != 1 or len(jobs[0]) < 2 or jobs[0][1] != "-cc1" or "-emit-obj" not in jobs[0]:
+            raise ValueError(f"the clang driver must run exactly one integrated -cc1 -emit-obj job: {jobs}")
+        if jobs[0][jobs[0].index("-o") + 1] != str(obj):
+            raise ValueError("the clang job does not write the witness object")
+        return jobs
+    if len(jobs) != 2 or Path(jobs[0][0]).name not in ("cc1plus", "cc1") or Path(jobs[1][0]).name != "as":
+        raise ValueError(f"the GNU driver must run exactly one cc1plus job and one as job: {[job[:1] for job in jobs]}")
+    if source not in jobs[0]:
+        raise ValueError("the GNU compiler job does not compile the probe")
+    assembly = jobs[0][jobs[0].index("-o") + 1] if "-o" in jobs[0] else None
+    assembler, position, inputs = jobs[1], 1, []
+    while position < len(assembler):
+        argument = assembler[position]
+        if argument in ("-I", "-o"):
+            if argument == "-o" and assembler[position + 1] != str(obj):
+                raise ValueError("the GNU assembler job does not write the witness object")
+            position += 2
+            continue
+        if argument.startswith("-"):
+            if not GNU_ASSEMBLER_OPTIONS.match(argument):
+                raise ValueError(f"unadmitted GNU assembler option: {argument}")
+        else:
+            inputs.append(argument)
+        position += 1
+    if assembly is None or inputs != [assembly]:
+        raise ValueError(f"the GNU assembler job reads inputs other than the compiler output: {inputs}")
+    return jobs
+
+
+def resolve_program(program: str, directory: str, search: str) -> str:
+    """Absolute path of a job's program (GNU prints the assembler bare; it is found on COMPILER_PATH/PATH)."""
+    if os.path.isabs(program):
+        return program
+    for entry in [part for part in search.split(os.pathsep) if part]:
+        candidate = os.path.join(entry if os.path.isabs(entry) else os.path.join(directory, entry), program)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return os.path.realpath(candidate)
+    raise ValueError(f"cannot resolve job program {program}")
+
+
+def precompiled_headers(header_trace: str) -> list[str]:
+    """PCH files the GNU compiler used or tried: -H prints them after the include depth dots (possibly none)
+    marked '!' (valid) or 'x' (invalid)."""
+    return [line for line in header_trace.splitlines() if re.match(r"^\.*[!x] \S", line)]
 
 
 def build(args: argparse.Namespace) -> None:
@@ -1695,7 +1855,6 @@ def build(args: argparse.Namespace) -> None:
                   output.with_suffix(".s"), output.with_suffix(".sym")):
         stale.unlink(missing_ok=True)
     command, directory = envelope.target_command(args)
-    require_no_assembler_options(command)
     version = subprocess.check_output([command[0], "--version"], cwd=directory, text=True)
     identity = compiler_identity(version)
     if identity != args.identity:
@@ -1708,7 +1867,18 @@ def build(args: argparse.Namespace) -> None:
     if unproved:
         raise ValueError(f"inline assembly the dependency closure cannot bind (non-empty template): {unproved[:2]}")
     executed = executed_command(command, args.source, obj, dependencies)
-    subprocess.run(executed, cwd=directory, check=True)
+    jobs = driver_jobs(executed, directory, identity, args.source, obj)
+    search = os.pathsep.join(re.findall(r"^COMPILER_PATH=(.*)$", subprocess.run(
+        executed + ["-###"], cwd=directory, capture_output=True, text=True).stderr, re.MULTILINE) +
+        [os.environ.get("PATH", "")])
+    programs = {program: envelope.digest(Path(program))
+                for program in (resolve_program(job[0], directory, search) for job in jobs)}
+    compiled = subprocess.run(executed, cwd=directory, capture_output=True, text=True)
+    if compiled.returncode:
+        raise ValueError(f"the witness compile failed: {compiled.stderr[-2000:]}")
+    used = precompiled_headers(compiled.stderr)
+    if used:
+        raise ValueError(f"the witness compile read precompiled headers: {used[:2]}")
     closure = read_depfile(dependencies, directory)
     if closure != sorted(before):
         raise ValueError("the compilation's dependency closure differs from its preprocessing closure")
@@ -1721,13 +1891,14 @@ def build(args: argparse.Namespace) -> None:
     counts = audit(obj.read_bytes(), disassembly, args.mode)
     require_registers(counts, args.identity, args.mode)
     result = {
-        "schema": 6, "signature": args.signature, "identity": identity, "mode": args.mode,
+        "schema": 7, "signature": args.signature, "identity": identity, "mode": args.mode,
         "checker_sha256": envelope.digest(Path(__file__)),
         "envelope_sha256": envelope.digest(_ENVELOPE),
         "budget_sha256": envelope.digest(BUDGET_PATH),
         "compiler_version": version,
         "executed_command": executed, "executed_directory": directory,
         "target_command_sha256": envelope.command_digest(command, directory),
+        "driver_jobs": jobs, "job_programs": programs,
         "inputs": after,
         "object_file": obj.name, "object_sha256": envelope.digest(obj),
         "disassembler": args.disassembler, "disassembler_version": tool_version,
@@ -1749,7 +1920,7 @@ def verify(args: argparse.Namespace) -> None:
     require_absolute_source(args.source)
     proof_path = Path(args.proof)
     proof = json.loads(proof_path.read_text())
-    if (proof.get("schema") != 6 or proof.get("signature") != args.signature or
+    if (proof.get("schema") != 7 or proof.get("signature") != args.signature or
             proof.get("identity") != args.identity or proof.get("mode") != args.mode):
         raise ValueError("tile register proof has a foreign schema/configuration")
     if compiler_identity(str(proof.get("compiler_version", ""))) != args.identity:
@@ -1767,7 +1938,6 @@ def verify(args: argparse.Namespace) -> None:
         if not os.path.isfile(path) or input_identity(path) != expected:
             raise ValueError(f"stale tile register input (source, header or symlink changed): {path}")
     command, directory = envelope.target_command(args)
-    require_no_assembler_options(command)
     if proof.get("target_command_sha256") != envelope.command_digest(command, directory):
         raise ValueError("actual target compile command changed after the register witness")
     obj = proof_path.with_suffix(".o")
@@ -1776,6 +1946,10 @@ def verify(args: argparse.Namespace) -> None:
         raise ValueError("recorded witness invocation is not the target command over the probe")
     if not obj.is_file() or proof.get("object_sha256") != envelope.digest(obj):
         raise ValueError("tile register object is missing or changed")
+    programs = proof.get("job_programs")
+    if not isinstance(programs, dict) or not programs or \
+            any(not os.path.isfile(path) or envelope.digest(Path(path)) != digest for path, digest in programs.items()):
+        raise ValueError("a compiler or assembler program of the witness compile changed")
     if proof.get("disassembler") != args.disassembler or \
             proof.get("disassembler_sha256") != envelope.digest(Path(os.path.realpath(args.disassembler))):
         raise ValueError("configured disassembler changed after the register witness")
@@ -1800,7 +1974,6 @@ def census(args: argparse.Namespace) -> None:
     """Maintainer tool: print the per-program spill census for qualifying a budget (no budget applied)."""
     require_absolute_source(args.source)
     command, directory = envelope.target_command(args)
-    require_no_assembler_options(command)
     version = subprocess.check_output([command[0], "--version"], cwd=directory, text=True)
     obj = Path(args.proof).with_suffix(".census.o")
     obj.parent.mkdir(parents=True, exist_ok=True)
