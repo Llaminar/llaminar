@@ -18789,12 +18789,10 @@ target_include_directories(v2_perf_cpu_fused_verifier PRIVATE ${CMAKE_CURRENT_SO
 # The existing fixture proves real aligned output geometry while retaining its
 # independent padded guard replays. Keep this model-free correctness slice
 # distinct from Performance labels and from any measured-throughput claim.
-if(NOT V2_PERF_TESTS_ONLY)
-    foreach(_layout_isa AVX2 AVX512)
-        if(_layout_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-            continue()
-        endif()
-        string(TOLOWER "${_layout_isa}" _layout_runtime_isa)
+# The fixture asserts the x86 shared-K plan identity, so it is x86-only.
+if(NOT V2_PERF_TESTS_ONLY AND V2_CPU_TARGET_X86)
+    foreach(_layout_isa IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+        v2_cpu_native_isa_runtime("${_layout_isa}" _layout_runtime_isa)
         foreach(_layout_slice gate down)
             set(_layout_test V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_${_layout_slice}_${_layout_isa})
             add_v2_test(${_layout_test}
@@ -27402,11 +27400,8 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_MoEExpertPaths
 
 # This reuses the actual all-format stage replay; transported rows additionally
 # prove the native slot permutation can be retired/rebuilt between invocations.
-foreach(V2_ROUTER_Q8_STAGE_ISA AVX2 AVX512)
-    if(V2_ROUTER_Q8_STAGE_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${V2_ROUTER_Q8_STAGE_ISA}" V2_ROUTER_Q8_STAGE_RUNTIME_ISA)
+foreach(V2_ROUTER_Q8_STAGE_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_ROUTER_Q8_STAGE_ISA}" V2_ROUTER_Q8_STAGE_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPURouterQ8UniqueSourceStageReplay_${V2_ROUTER_Q8_STAGE_ISA}
         COMMAND $<TARGET_FILE:v2_test_moe_expert_compute_stage> --gtest_brief=1
             --gtest_filter=MoEExpertComputeStageTest.MoEFFN_RuntimeMVerifierMatchesSerialDecode_AllNativeFormatsRouterQ8Reuse
@@ -36921,10 +36916,7 @@ if(NOT V2_PERF_TESTS_ONLY)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_NativeModuleReleaseSelection
         V2_Integration_ReleaseExplicitNativeTestSelection)
-    foreach(_cpu_checkpoint_isa AVX2 AVX512)
-        if(_cpu_checkpoint_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-            continue()
-        endif()
+    foreach(_cpu_checkpoint_isa IN LISTS V2_CPU_NATIVE_ISA_CELLS)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
             V2_Integration_CPURouterQ8UniqueLiveSourceReplay_${_cpu_checkpoint_isa}
             V2_Integration_CPURouterQ8UniqueSourceStageReplay_${_cpu_checkpoint_isa}
@@ -36937,9 +36929,12 @@ if(NOT V2_PERF_TESTS_ONLY)
             V2_Integration_CPU_NativeQuantisedPairwiseContiguousOwnership_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedPrefillContiguousMixedPolicies_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedSamePanelPairRunReplay_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_gate_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_down_${_cpu_checkpoint_isa})
+            V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_${_cpu_checkpoint_isa})
+        if(V2_CPU_TARGET_X86)
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_gate_${_cpu_checkpoint_isa}
+                V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_down_${_cpu_checkpoint_isa})
+        endif()
     endforeach()
 endif()
 

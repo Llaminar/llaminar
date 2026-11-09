@@ -212,6 +212,9 @@ namespace
         }
     }
 
+#if !defined(__aarch64__)
+    // Asserts the x86 shared-K plan identity (K partitions and partial route);
+    // the ARM register-K plan has whole-K tiles and no partial route.
     /**
      * @test Replay one actual model slice and live bundle with optional enabled counter evidence.
      *
@@ -1023,6 +1026,8 @@ namespace
         }
         ASSERT_TRUE(PerfStatsCollector::flushFromEnv());
     }
+
+#endif // !defined(__aarch64__)
 
     /**
      * @test Many narrow members (routed-expert gate/up) pooled into one bundle.
