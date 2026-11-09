@@ -408,3 +408,21 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   with unchanged rendering.
 - Precision: asm("nop") ASM_LABEL context; synthetic fixtures (unset
   type/version/filetype) described accurately; native re-audits separate.
+
+## SOURCE122 successor 69a672e40 (2026-11-09)
+
+- P1a every asm (nested/lambda) + declaration-label-only templates (scope
+  tracked; no-exec-code labels; asm("nop") + function/volatile/operand labels
+  fail; real TUs clean).
+- P1b driver-as-authority rejection: pch/module/include/import/embed fail;
+  -### job validation (clang single -cc1 -emit-obj; GNU cc1plus+as single-
+  input; admitted options only); specs/config/extra-jobs/assember options fail;
+  -H any PCH fail; job programs resolved+hashed.
+- P2 native fields: ELF ET_REL/EV_CURRENT or MH_OBJECT; Mach-O extern-only
+  approved relocs w/ required r_pcrel/r_length at aligned in-section
+  addresses; ELF invalid/link-info/REL/remainder/truncation/ABS64-in-code/
+  unaligned fail; bounded addends.
+- Precision: asm("nop") closed; fixture docstring synthetic; native re-audits
+  separate.
+- NOTE: GNU job validation + -H PCH check first REAL build on GB10 census
+  (requested); 74 tests; Mac E2E 3 configs.
