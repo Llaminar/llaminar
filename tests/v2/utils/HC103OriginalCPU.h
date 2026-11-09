@@ -180,6 +180,36 @@ static inline __m256 fast_silu(__m256 vx)
         }
 }
 #endif
+#if defined(__aarch64__)
+/** @brief Independent per-lane replica of the CPU polynomial exponential program.
+ * Each step is separately rounded except the explicit FMAs, as in the AVX2 and
+ * NEON vector programs; the oracle shares no code with either. */
+namespace lane {
+inline float fastExp(float x)
+{
+    volatile float bounded = std::min(std::max(x, -88.0f), 88.0f);
+    volatile float scaled = bounded * 1.4426950408889634f;
+    const float integer = std::nearbyint(scaled);
+    volatile float fraction = scaled - integer;
+    float polynomial = std::fma(0.001333355814642f, fraction, 0.009618129107629f);
+    polynomial = std::fma(polynomial, fraction, 0.055504108664822f);
+    polynomial = std::fma(polynomial, fraction, 0.240226506959101f);
+    polynomial = std::fma(polynomial, fraction, 0.693147180559945f);
+    polynomial = std::fma(polynomial, fraction, 1.0f);
+    const auto bits = static_cast<std::uint32_t>(static_cast<std::int32_t>(integer) + 127) << 23;
+    float power;
+    std::memcpy(&power, &bits, sizeof(power));
+    return polynomial * power;
+}
+inline float fastSigmoid(float x)
+{
+    volatile float negated = 0.0f - x;
+    volatile float denominator = 1.0f + fastExp(negated);
+    return 1.0f / denominator;
+}
+inline float fastSilu(float x) { return x * fastSigmoid(x); }
+}
+#endif
 namespace cpu_detail {
 #if defined(__AVX512F__)
 inline __m512 sigmoid(__m512 value)
@@ -204,6 +234,10 @@ inline __m512 sigmoid(__m512 value)
 #endif
 inline int vectorWidth()
 {
+#if defined(__aarch64__)
+    // Native ARM ISAs evaluate the four-lane program; scalar stays scalar.
+    return activeISALevel() == ISALevel::Scalar ? 1 : 4;
+#endif
 #if defined(__AVX512F__)
     if (activeISALevel() == ISALevel::AVX512) return 16;
 #endif
@@ -259,6 +293,15 @@ inline void residualDown(const ResidualDownArgs &a, void *)
                     _mm256_storeu_ps(a.output + base + channel, avx2::fast_silu(value));
                 }
 #endif
+#if defined(__aarch64__)
+            if (vectorWidth == 4)
+                for (; channel + 4 <= end; channel += 4)
+                    for (int lane = 0; lane < 4; ++lane)
+                    {
+                        volatile float value = a.input[base + channel + lane] * 0.25f;
+                        a.output[base + channel + lane] = lane::fastSilu(value);
+                    }
+#endif
             for (; channel < end; ++channel)
             {
                 const float scaled = a.input[base + channel] * 0.25f;
@@ -301,6 +344,20 @@ inline void residualRead(const ResidualReadArgs &a, void *)
                     }
                     _mm256_storeu_ps(a.output + row * hidden + channel, _mm256_mul_ps(sum, _mm256_set1_ps(0.25f)));
                 }
+#endif
+#if defined(__aarch64__)
+            if (vectorWidth == 4)
+                for (; channel + 4 <= end; channel += 4)
+                    for (int lane = 0; lane < 4; ++lane)
+                    {
+                        float sum = 0.0f;
+                        for (int branch = 0; branch < 4; ++branch)
+                        {
+                            const auto offset = (row * 4 + branch) * hidden + channel + lane;
+                            sum = std::fma(lane::fastSigmoid(a.gateLogits[offset]), a.normalized[offset], sum);
+                        }
+                        a.output[row * hidden + channel + lane] = sum * 0.25f;
+                    }
 #endif
             for (; channel < end; ++channel)
             {

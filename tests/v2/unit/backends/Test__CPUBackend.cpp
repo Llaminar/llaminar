@@ -9,6 +9,7 @@
  * @author David Sanftenberg
  */
 
+#include "../../utils/HostNUMANodes.h"
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
@@ -38,7 +39,7 @@ namespace llaminar2
         {
             // Even with different NUMA nodes, each rank sees exactly 1 device
             CPUBackend backend0(0);
-            CPUBackend backend1(1);
+            CPUBackend backend1(llaminar2::test::hostLastNUMANode());
             CPUBackend backendNeg(-1);
 
             EXPECT_EQ(backend0.deviceCount(), 1);
@@ -62,11 +63,12 @@ namespace llaminar2
 
         TEST(Test__CPUBackend, DeviceNameShowsNumaNode)
         {
+            const int last = llaminar2::test::hostLastNUMANode();
             CPUBackend backend0(0);
-            CPUBackend backend1(1);
+            CPUBackend backend1(last);
 
             EXPECT_EQ(backend0.deviceName(0), "CPU:NUMA0");
-            EXPECT_EQ(backend1.deviceName(0), "CPU:NUMA1");
+            EXPECT_EQ(backend1.deviceName(0), "CPU:NUMA" + std::to_string(last));
         }
 
         TEST(Test__CPUBackend, DeviceNameShowsAllForNoNuma)
@@ -383,12 +385,13 @@ namespace llaminar2
 
         TEST(Test__CPUBackend, NumaNodeAccessor)
         {
+            const int last = llaminar2::test::hostLastNUMANode();
             CPUBackend backend0(0);
-            CPUBackend backend1(1);
+            CPUBackend backend1(last);
             CPUBackend backendNeg(-1);
 
             EXPECT_EQ(backend0.numaNode(), 0);
-            EXPECT_EQ(backend1.numaNode(), 1);
+            EXPECT_EQ(backend1.numaNode(), last);
             EXPECT_EQ(backendNeg.numaNode(), -1);
         }
 

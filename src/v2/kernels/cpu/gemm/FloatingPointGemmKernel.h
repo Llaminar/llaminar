@@ -193,7 +193,10 @@ namespace llaminar2
 
             /*
              * MTP verifier rows need decode-equivalent FP32 accumulation, so we
-             * keep the scalar kk order used by one-row decode. The ordinary
+             * keep the scalar kk order used by one-row decode. Every product is
+             * an explicit std::fma: implicit `acc += a * b` left contraction to
+             * each loop shape, and AArch64 GCC fused the one-row loop but not
+             * the shared-weight tile, breaking serial/grouped byte equality. The ordinary
              * row/column loop below is correct, but it reloads the same B row
              * once per verifier row. This grouped-column path tiles runtime M
              * in fixed four-row groups and reuses that B row while maintaining
@@ -242,7 +245,7 @@ namespace llaminar2
                             {
                                 float acc0 = 0.0f;
                                 for (int kk = 0; kk < K; ++kk)
-                                    acc0 += a0[kk] * b_row[kk];
+                                    acc0 = std::fma(a0[kk], b_row[kk], acc0);
                                 accumulators[0] = acc0;
                             }
                             else if (tile_rows == 2)
@@ -253,8 +256,8 @@ namespace llaminar2
                                 for (int kk = 0; kk < K; ++kk)
                                 {
                                     const float b = b_row[kk];
-                                    acc0 += a0[kk] * b;
-                                    acc1 += a1[kk] * b;
+                                    acc0 = std::fma(a0[kk], b, acc0);
+                                    acc1 = std::fma(a1[kk], b, acc1);
                                 }
                                 accumulators[0] = acc0;
                                 accumulators[1] = acc1;
@@ -269,9 +272,9 @@ namespace llaminar2
                                 for (int kk = 0; kk < K; ++kk)
                                 {
                                     const float b = b_row[kk];
-                                    acc0 += a0[kk] * b;
-                                    acc1 += a1[kk] * b;
-                                    acc2 += a2[kk] * b;
+                                    acc0 = std::fma(a0[kk], b, acc0);
+                                    acc1 = std::fma(a1[kk], b, acc1);
+                                    acc2 = std::fma(a2[kk], b, acc2);
                                 }
                                 accumulators[0] = acc0;
                                 accumulators[1] = acc1;
@@ -289,10 +292,10 @@ namespace llaminar2
                                 for (int kk = 0; kk < K; ++kk)
                                 {
                                     const float b = b_row[kk];
-                                    acc0 += a0[kk] * b;
-                                    acc1 += a1[kk] * b;
-                                    acc2 += a2[kk] * b;
-                                    acc3 += a3[kk] * b;
+                                    acc0 = std::fma(a0[kk], b, acc0);
+                                    acc1 = std::fma(a1[kk], b, acc1);
+                                    acc2 = std::fma(a2[kk], b, acc2);
+                                    acc3 = std::fma(a3[kk], b, acc3);
                                 }
                                 accumulators[0] = acc0;
                                 accumulators[1] = acc1;
@@ -329,12 +332,12 @@ namespace llaminar2
                         {
                             const float *b_row = B + static_cast<size_t>(col) * K;
                             for (int kk = 0; kk < K; ++kk)
-                                acc += a_row[kk] * b_row[kk];
+                                acc = std::fma(a_row[kk], b_row[kk], acc);
                         }
                         else
                         {
                             for (int kk = 0; kk < K; ++kk)
-                                acc += a_row[kk] * B[static_cast<size_t>(kk) * N + col];
+                                acc = std::fma(a_row[kk], B[static_cast<size_t>(kk) * N + col], acc);
                         }
 
                         float *output = C + static_cast<size_t>(row) * N + col;
@@ -411,7 +414,7 @@ namespace llaminar2
                             {
                                 const uint16_t *a_row =
                                     A + static_cast<size_t>(first_row + tile_row) * K;
-                                accumulators[tile_row] += decode(a_row[kk]) * b;
+                                accumulators[tile_row] = std::fma(decode(a_row[kk]), b, accumulators[tile_row]);
                             }
                         }
 
@@ -540,7 +543,7 @@ namespace llaminar2
                             {
                                 const float *a_row =
                                     A + static_cast<size_t>(first_row + tile_row) * K;
-                                accumulators[tile_row] += a_row[kk] * b;
+                                accumulators[tile_row] = std::fma(a_row[kk], b, accumulators[tile_row]);
                             }
                         }
 
