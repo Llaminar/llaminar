@@ -1381,6 +1381,17 @@ without driving maintenance.
 
 ## Development
 
+### CI and branch approvals
+
+PRs into `develop` build AVX512 and AVX2 test images in parallel on separate
+64-core GitHub-hosted runners. Each runs the complete device-free Unit suite
+and the host lane of production preflight; both checks and owner approval
+are required. CUDA, ROCm and exclusive preflight lanes remain production checks.
+After merge, the same runner size builds and publishes the AVX512 and AVX2
+Release development images without running tests. Production validation and
+release certification remain separate. Different PRs can run concurrently; a
+new develop merge cancels any older image build. See [the CI workflow](docs/production-ci.md).
+
 ### Build from source
 
 The recommended development environment is the repository's

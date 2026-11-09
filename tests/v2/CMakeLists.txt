@@ -5154,6 +5154,28 @@ add_v2_test(V2_Integration_NativeGTestRequiredExecution
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CampaignFramework;Inventory;Regression"
     ENVIRONMENT "LLAMINAR_TEST_MPI_SESSION_HELPER=$<TARGET_FILE:llaminar_mpi_session>"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+# The Docker toolchain must retain staged linker sources through RCCL certification.
+add_v2_test(V2_Unit_DockerToolchainClosure
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_docker_toolchain_closure.py
+    LABELS "V2;Unit;DeviceFree;Dependencies;Packaging;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_DockerToolchainClosure
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_docker_toolchain_closure.py
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Dependencies;Packaging;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+# Lean CUDA builders must install native resource-inspection tools before NCCL proof.
+add_v2_test(V2_Unit_CUDABuilderProvisioning
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cuda_builder_provisioning.py
+    LABELS "V2;Unit;DeviceFree;Dependencies;Packaging;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_CUDABuilderProvisioning
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cuda_builder_provisioning.py
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Dependencies;Packaging;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 # Numeric CTest selection must remain exact beyond the legacy regex compiler limit.
 add_test(NAME V2_Integration_ProductionPreflightIndexSelection
     COMMAND ${Python3_EXECUTABLE}

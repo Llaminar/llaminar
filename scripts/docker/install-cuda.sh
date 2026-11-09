@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# install-cuda.sh
+## @file install-cuda.sh
+# @brief Provision matched CUDA compiler, binary-inspection and runtime profiles.
 #
 # Install the NVIDIA CUDA 13 build/runtime libraries from NVIDIA's official
 # apt repository. Matches NCCL to the CUDA 13 series.
 #
 # MODE=full     (default) — minimal builder set: nvcc + CUDA runtime,
-#                            cuBLAS/NCCL headers and shared libraries.
+#                            cuobjdump, cuBLAS/NCCL headers and shared libraries.
 # MODE=runtime             — shared libraries only. Slim runtime stage.
 # INSTALL_CUDA_PROFILERS=1 — additionally install the CUDA-series-matched
 #                            Nsight Compute, Nsight Systems, and CUPTI packages.
@@ -84,10 +85,12 @@ apt-get "${APT_OPTS[@]}" update
 if [[ "${MODE}" == "full" ]]; then
     # Build-minimal CUDA: avoid cuda-toolkit-13-0, which also pulls Nsight,
     # OpenJDK, GTK, profilers, docs, and other tools not needed to compile
-    # Llaminar.
+    # Llaminar. Native NCCL resource certification uses cuobjdump before the
+    # test image is sealed, so the lean builder must provide it explicitly.
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         --allow-change-held-packages \
         cuda-nvcc-13-0 \
+        cuda-cuobjdump-13-0 \
         cuda-cudart-dev-13-0 \
         libcublas-dev-13-0 \
         "libnccl2=*+cuda13.0" \
