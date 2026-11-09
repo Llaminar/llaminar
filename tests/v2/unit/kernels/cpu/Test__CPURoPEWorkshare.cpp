@@ -23,6 +23,7 @@
 #include <limits>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -693,27 +694,42 @@ template <class Word> struct OrdinaryBanks
         : query(std::size_t(rows) * kOrdinaryQueryHeads * kOrdinaryDim),
           key(std::size_t(rows) * kOrdinaryKeyHeads * kOrdinaryDim)
     { seedBank(query, 17); seedBank(key, 31); }
-    /** @return Canonical query then key bytes. */
-    std::vector<std::uint8_t> bytes() const
+    /** @return Unmodified query then key bytes. */
+    std::vector<std::uint8_t> rawBytes() const
     {
-        auto out = canonicalBytes(query);
-        const auto k = canonicalBytes(key);
+        const auto *q = reinterpret_cast<const std::uint8_t *>(query.data());
+        const auto *k = reinterpret_cast<const std::uint8_t *>(key.data());
+        std::vector<std::uint8_t> out(q, q + query.size() * sizeof(Word));
+        out.insert(out.end(), k, k + key.size() * sizeof(Word));
+        return out;
+    }
+    /** @return Query then key bytes with signed zeros folded to +0. */
+    std::vector<std::uint8_t> canonicalBytes() const
+    {
+        auto out = llaminar2::test::canonicalBytes(query);
+        const auto k = llaminar2::test::canonicalBytes(key);
         out.insert(out.end(), k.begin(), k.end());
         return out;
     }
 };
 
 /**
- * @brief Original serial arithmetic for every row, built only from positive positions.
+ * @brief Rotation of every row at its position, assembled from positive single-row calls.
  *
  * A row at non-negative position P is rotated alone at P. Rotation is odd
  * in its angle: cos(-a) == cos(a) and sin(-a) == -sin(a) with the angle
  * product exact under negation, and every multiply, add and fused
  * multiply-add, as well as FP16/BF16 round-to-nearest-even, commutes with
  * sign. A row at P < 0 therefore equals the conjugate of its conjugated input
- * rotated at -P. These standalone, positive single-row calls never read a
- * padding row, so they reproduce the original table arithmetic (every
- * position computed by the one row function) without the code under test.
+ * rotated at -P, except that an exactly cancelled pair may differ in the sign
+ * of its zero; the comparison folds signed zeros for that reason.
+ *
+ * This is not independent arithmetic: it calls the current implementation's
+ * one-row path at non-negative positions, which never meets a padding row.
+ * Its equality with the original base translation unit is established
+ * outside this test by the cross-TU byte harness.
+ *
+ * @return Query then key bytes with signed zeros folded.
  */
 template <Ordinary Call> std::vector<std::uint8_t> ordinaryReference(int rows, int first)
 {
@@ -738,36 +754,73 @@ template <Ordinary Call> std::vector<std::uint8_t> ordinaryReference(int rows, i
             conjugateRows(k, kOrdinaryKeyHeads, rotary);
         }
     }
-    return banks.bytes();
+    return banks.canonicalBytes();
 }
 
+/** @brief Prior content of the borrowed planes and active flags before the call under test. */
+enum class Workspace
+{
+    Clean,         ///< Freshly value-initialized storage, never written.
+    NaNFlagsSet,   ///< Every byte 0xff: NaN angles, every flag set.
+    FiniteStale,   ///< Every byte 0x41: finite wrong angles, every flag set.
+    PriorPositive, ///< Left behind by a complete earlier call at positive positions.
+};
+
+/** @brief Output of one call under test and the team width that actually executed it. */
+struct OrdinaryRun
+{
+    std::vector<std::uint8_t> raw;       ///< Unmodified output bytes.
+    std::vector<std::uint8_t> canonical; ///< Output bytes with signed zeros folded.
+    int width = 0;                       ///< Members observed inside the call's team.
+};
+
 /**
- * @brief Rotate contiguous rows from a negative start through dirty borrowed planes.
- * @param poison Byte written over the planes and active flags beforehand.
+ * @brief Rotate contiguous rows from a negative start through a prepared borrowed workspace.
+ * @param workspace Prior content of the planes and flags.
  * @param team Members of an existing team that all enter the call; 1 is standalone.
  */
-template <Ordinary Call> std::vector<std::uint8_t> ordinaryDirty(int rows, int first, std::uint8_t poison, int team)
+template <Ordinary Call> OrdinaryRun ordinaryRun(int rows, int first, Workspace workspace, int team)
 {
     OrdinaryBanks<OrdinaryWord<Call>> banks(rows);
     RoPEAngleTestStorage storage(rows, kOrdinaryDim / 2);
     auto bytes = storage.aligned();
-    std::memset(bytes.data(), poison, bytes.size());
     const auto angles = storage.view(rows, ordinaryRotaryWidth(Call) / 2);
+    if (workspace == Workspace::NaNFlagsSet)
+        std::memset(bytes.data(), 0xff, bytes.size());
+    else if (workspace == Workspace::FiniteStale)
+        std::memset(bytes.data(), 0x41, bytes.size());
+    else if (workspace == Workspace::PriorPositive)
+    {
+        OrdinaryBanks<OrdinaryWord<Call>> earlier(rows);
+        callOrdinary<Call>(earlier.query.data(), earlier.key.data(), rows, 17231, angles);
+    }
+    OrdinaryRun run;
     if (team <= 1)
+    {
         callOrdinary<Call>(banks.query.data(), banks.key.data(), rows, first, angles);
+        run.width = 1;
+    }
     else
     {
+        int observed = 0;
 #pragma omp parallel num_threads(team)
         {
+            // Member 0 records the width without a barrier, so the late member
+            // still enters the call after the others.
+            if (omp_get_thread_num() == 0)
+                observed = omp_get_num_threads();
             if (omp_get_thread_num() == team - 1)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             callOrdinary<Call>(banks.query.data(), banks.key.data(), rows, first, angles);
         }
+        run.width = observed;
     }
-    return banks.bytes();
+    run.raw = banks.rawBytes();
+    run.canonical = banks.canonicalBytes();
+    return run;
 }
 
-/** @brief Check one ordinary entry point over negative starts, dirty planes and teams. */
+/** @brief Check one ordinary entry point over negative starts, dirty workspaces and teams. */
 template <Ordinary Call> void checkOrdinaryNegativePositions(std::initializer_list<int> row_counts)
 {
     Budget budget;
@@ -775,12 +828,23 @@ template <Ordinary Call> void checkOrdinaryNegativePositions(std::initializer_li
         for (const int first : {-1, -3})
         {
             const auto expected = ordinaryReference<Call>(rows, first);
-            // NaN planes with set flags, finite stale planes, and zeroed planes with clear flags.
-            for (const std::uint8_t poison : {std::uint8_t{0xff}, std::uint8_t{0x41}, std::uint8_t{0x00}})
+            const auto clean = ordinaryRun<Call>(rows, first, Workspace::Clean, 1);
+            for (const Workspace workspace : {Workspace::Clean, Workspace::NaNFlagsSet, Workspace::FiniteStale,
+                     Workspace::PriorPositive})
                 for (const int team : {1, 3})
-                    EXPECT_TRUE(ordinaryDirty<Call>(rows, first, poison, team) == expected)
-                        << "call=" << int(Call) << " rows=" << rows << " first=" << first
-                        << " poison=" << int(poison) << " team=" << team;
+                {
+                    const auto run = ordinaryRun<Call>(rows, first, workspace, team);
+                    const auto where = [&] {
+                        return "call=" + std::to_string(int(Call)) + " rows=" + std::to_string(rows) +
+                               " first=" + std::to_string(first) + " workspace=" + std::to_string(int(workspace)) +
+                               " team=" + std::to_string(team);
+                    };
+                    ASSERT_EQ(run.width, team) << where() << ": the team did not execute at its requested width";
+                    // Unrestricted byte equality: the output does not depend on prior workspace content.
+                    EXPECT_TRUE(run.raw == clean.raw) << where() << ": raw bytes differ from a clean workspace";
+                    // Equality modulo signed zero with rotation at the row's own position.
+                    EXPECT_TRUE(run.canonical == expected) << where() << ": differs from per-row rotation";
+                }
         }
 }
 
@@ -789,11 +853,14 @@ template <Ordinary Call> void checkOrdinaryNegativePositions(std::initializer_li
  *
  * Contiguous-position entry points rotate every row; before the borrowed
  * angle workspace they computed every row's angles, including negative
- * positions. Each such row must still publish its angles: the result is
- * independent of whatever the planes held and equals the original serial
- * arithmetic. Covers one-row decode, FP32 multi-row and partial-rotary
- * tables, and the BF16/FP16 shared tables at 32+ rows (their shorter direct
- * program computes angles inline and is not a table consumer).
+ * positions. Each such row must still publish its angles. Two properties are
+ * checked: raw output bytes are identical whatever the workspace held
+ * beforehand (clean, NaN, finite stale, or a prior complete call), and the
+ * output equals per-row rotation at each row's own position modulo signed
+ * zero. Teams must actually execute at their requested width. Covers one-row
+ * decode, FP32 multi-row and partial-rotary tables, and the BF16/FP16 shared
+ * tables at 32+ rows (their shorter direct program computes angles inline
+ * and is not a table consumer).
  */
 TEST(CPURoPEWorkshare, OrdinaryNegativePositionsIgnoreDirtyAngleWorkspace)
 {
