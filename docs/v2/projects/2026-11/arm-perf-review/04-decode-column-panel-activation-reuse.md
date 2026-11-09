@@ -72,3 +72,16 @@ implemented within the ARM stack only (no MXFP4 coordination/wait). Keep the
 Ops seam (pairDot / activation-pair API) encoding-agnostic so the MXFP4 lane
 (PR #40) can adapt and adopt it later without a rewrite; note the compatibility
 in the plan. Any NibbleMap touch points must remain seam-based.
+
+## R2 in progress (2026-11-09)
+
+- WIP rebased onto 5d4e3716a (local: f9aa1e10e C2c FA admission →
+  217520f11 C4 panels → f41f0adc6 tournament harness; 6 TUs syntax-clean;
+  NOT pushed yet). Plan: WIP review vs R1 (panels vs fatal-bound admittedUnit
+  + register witness); C2c ISA-neutral (3/6/11% + 5/10/20% check costs in
+  commit body); C3 (Ops seam) split from C4 (panels); C4 byte auth vs serial
+  (every encoding × Rows × M × N tails × workers) + PanelTailsMatchSerial
+  preflight; register-witness inventory → panel programs (Rows=1 zero
+  spills, budgets only down); GB10 tournament + engine E2E (A1; windows via
+  arm-perf — coordinate with CUDA lane on .79); self-gate → fresh reviewer
+  checkpoint → WSL at R2 tip. R1 merged (5d4e3716a) — R1 DONE.
