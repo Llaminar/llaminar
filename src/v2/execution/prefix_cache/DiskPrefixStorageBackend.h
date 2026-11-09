@@ -549,6 +549,13 @@ namespace llaminar2
         std::unordered_map<PrefixCacheKey, RecordIndex, PrefixCacheKeyHasher> records_;
         std::condition_variable_any compaction_changed_;
         CompactionStatus compaction_status_;
+        /**
+         * A request arrived while this worker was copying or publishing. The
+         * copy's finite tail can carry history appended after its snapshot,
+         * so that request must start one more rewrite after publication
+         * instead of being absorbed by the rewrite already in flight.
+         */
+        bool compaction_requested_during_rewrite_ = false;
 
         /*
          * Declaration order is intentional: reverse destruction frees the
