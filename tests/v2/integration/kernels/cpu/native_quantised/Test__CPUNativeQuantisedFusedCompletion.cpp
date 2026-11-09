@@ -245,12 +245,25 @@ TEST(CPUNativeQuantisedFusedCompletion, SharedBank)
 #include "CPUNativeQuantisedFusedPerfIdentity.inc"
 
 #include "CPUNativeQuantisedOrderedNibbleReplay.inc"
+// Execution-exact overlays key on the x86 build/runtime ISA pair; ARM has no
+// execution-exact table (its NEON overlays are retired).
+#if !defined(__aarch64__)
 #include "CPUNativeQuantisedExecutionExactPolicy.inc"
+#endif
 
+// The live-plan prefix lifecycle drives the x86 fused-rows planner directly.
+#if !defined(__aarch64__)
 #include "CPUNativeQuantisedFusedLivePrefixLifecycle.inc"
+#endif
 
 #include "CPUNativeQuantisedUnsignedWeightDotLifecycle.inc"
 
+// Same-panel pair runs are a job layout of the x86 fused-rows planner.
+#if !defined(__aarch64__)
 #include "CPUNativeQuantisedSamePanelPairRunReplay.inc"
+#endif
 
+// OrderedThreeRows is an x86 (AVX512) Prefill schedule of the x86 planner.
+#if !defined(__aarch64__)
 #include "CPUNativeQuantisedOrderedThreeRowNibbleLifecycle.inc"
+#endif
