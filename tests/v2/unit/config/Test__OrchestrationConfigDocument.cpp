@@ -327,7 +327,14 @@ TEST(OrchestrationConfigDocument, EveryMissingOrExtraObjectFieldIsRejected)
             {
                 auto missing = document;
                 missing[path].erase(key);
-                EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()), std::invalid_argument) << path << "/" << key;
+                // The adaptive table's local-hot cache is the one additive
+                // optional arm: pre-feature documents omit it and decode as
+                // "no local-hot cache". Every other field stays mandatory.
+                if (key == "local_hot_cache" && path.back() == "gpu_adaptive")
+                    EXPECT_NO_THROW((void)deserializeOrchestrationConfig(missing.dump())) << path;
+                else
+                    EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()), std::invalid_argument)
+                        << path << "/" << key;
                 self(self, value, path / key);
             }
         }
