@@ -87,16 +87,31 @@ configured objdump and audit the instructions actually assembled.
   construct directives through macros and substitution. Rather than model the
   assembler, the preprocessed translation unit (same flags) is retained and
   C++-tokenized; every asm keyword (including ones nested in operands or
-  lambdas) must be an empty-template barrier or a declaration asm label (one
-  plain symbol, no qualifiers or operands, after a declarator, outside
-  executable code); anything else fails closed. Opaque compiler inputs fail:
-  PCH markers, clang module pragmas or remaining include/import/embed
-  directives in the translation unit; precompiled headers the GNU compile
-  reports reading (-H); PCH, module, plugin, specs, -B, wrapper, config and
-  assembler options. The driver's expanded jobs (-###) of the exact compile are
-  validated: one integrated clang -cc1 -emit-obj job, or one GNU cc1plus job
-  and one as job whose only input is the compiler's output, no specs or
-  configuration file read. Every job program is hashed into the proof.
+  lambdas) must be an empty-template barrier or a declaration asm label. The
+  label rule is a conservative syntactic approximation (one plain symbol, no
+  qualifiers or operands, at namespace or extern "..." scope, after ')' / ']'
+  or a non-keyword identifier, followed by ';', ',', '=' or __attribute__);
+  anything else fails closed. Opaque preprocessor input (PCH markers, module
+  pragmas, remaining include/import/embed) fails, as does any precompiled
+  header the GNU compile reports reading (-H).
+- Driver plan: the expanded jobs (-###) of the exact compile are the input
+  authority. Every argument of every job is admitted by its type (flag,
+  checked value, include search root, closure-bound file, or one of the
+  designated source/object/dependency/assembly/directory paths); unknown
+  options, positionals and values fail - e.g. clang -remap-file, VFS
+  overlays, profile inputs, plugins or an extra assembler input. The plan is
+  one integrated clang -cc1 -emit-obj job, or one GNU cc1plus job plus one as
+  job reading only the compiler's output; a driver that reads specs or
+  configuration files fails, as does any failing driver query.
+- Programs: the driver and every job program are identified logically -
+  absolute, or for GNU looked up as the driver does (its program directories
+  from -print-search-dirs, then PATH), cross-checked against the driver's
+  -print-prog-name answer - with the directories examined before the
+  selection, the symlinks followed, the resolved file and its hash; the
+  identities must be equal before and after compiling. The receipt records the
+  plan and exactly one identity per program; verification revalidates the plan
+  with the same pure validator and replays every lookup (content, symlink
+  retargets, search shadowing).
 
 Verify phase (Unit/preflight): no compiler is invoked, but every recorded input
 (including absolute system/SDK headers named by the compiler) must be present
@@ -1674,8 +1689,15 @@ def decode_literal(token: re.Match) -> str:
 OPAQUE_DIRECTIVES = re.compile(r"^[ \t]*#[ \t]*(?:pragma[ \t]+(?:GCC[ \t]+pch_preprocess|clang[ \t]+module)\b|import\b"
                                r"|include\b|include_next\b|embed\b)")
 NAMESPACE_INTRODUCERS = frozenset({"namespace"})
-CLASS_KEYS = frozenset({"class", "struct", "union", "enum"})
 LABEL_PRECEDERS = frozenset({")", "]"})
+LABEL_FOLLOWERS = frozenset({";", ",", "=", "__attribute__"})
+# Identifiers that can never be the end of a declarator.
+KEYWORDS = frozenset("""__extension__ alignas alignof asm auto break case catch char class co_await co_return
+    co_yield concept const consteval constexpr constinit continue decltype default delete do double else enum
+    explicit export extern false float for friend goto if inline int long mutable namespace new noexcept nullptr
+    operator private protected public register requires return short signed sizeof static static_assert
+    struct switch template this throw true try typedef typename union unsigned using virtual void volatile
+    while __asm __asm__ __volatile__ __inline __inline__ __restrict __restrict__ _Pragma""".split())
 
 
 def cxx_tokens(preprocessed: str) -> list[re.Match]:
@@ -1701,11 +1723,12 @@ def cxx_tokens(preprocessed: str) -> list[re.Match]:
 
 
 def scope_kinds(tokens: list[re.Match]) -> list[bool]:
-    """For every token, whether it lies in executable code (a function body, lambda or initializer braces).
+    """For every token, whether it lies outside namespace scope (code, class bodies, lambdas, initializers).
 
-    A brace opens a declaration scope only when the declaration preceding it (since the last ';', '{' or '}')
-    starts with 'namespace' / 'inline namespace' / 'extern "..."', or names a class key with no parenthesis;
-    any other brace is treated as code, which only makes the label rule stricter.
+    A brace opens a namespace-level scope only when the declaration preceding it (since the last ';', '{' or
+    '}') is exactly 'namespace' [name] / 'inline namespace' [name] / 'extern "..."'; every other brace -
+    function bodies, lambdas, class bodies, initializers - counts as non-declaration scope, which only makes the
+    label rule stricter.
     """
     stack, kinds, start = [], [], 0
     for index, token in enumerate(tokens):
@@ -1714,9 +1737,9 @@ def scope_kinds(tokens: list[re.Match]) -> list[bool]:
         if text == "{":
             head = [other.group() for other in tokens[start:index]]
             words = [word for word in head if word not in ("inline", "export")]
-            declaration = bool(words) and (words[0] in NAMESPACE_INTRODUCERS or
-                                           (words[0] == "extern" and len(words) == 2 and words[1].startswith('"')) or
-                                           (any(word in CLASS_KEYS for word in words) and "(" not in words))
+            declaration = (bool(words) and words[0] in NAMESPACE_INTRODUCERS and len(words) <= 2 and
+                           all(re.fullmatch(r"[A-Za-z_]\w*", word) for word in words)) or \
+                (len(words) == 2 and words[0] == "extern" and words[1].startswith('"'))
             stack.append(not declaration or bool(stack and stack[-1]))
             start = index + 1
         elif text == "}":
@@ -1735,8 +1758,10 @@ def inline_assembly_violations(preprocessed: str) -> list[str]:
     The compiler's dependency lists name preprocessing inputs only; the assembler can read further files and
     construct directives through macros or substitution. Rather than model the assembler, every asm keyword of
     the tokenized translation unit (including one nested in another asm's operands or in a lambda) must be
-    either an empty-template statement (a compiler barrier) or a declaration asm label: a single plain symbol,
-    without qualifiers or operands, directly after a declarator, outside executable code. Anything else fails.
+    either an empty-template statement (a compiler barrier) or a declaration asm label. The label rule is a
+    conservative syntactic approximation, not a C++ parse: a single plain symbol, without qualifiers or
+    operands, at namespace or extern "..." scope, after ')' or ']' or a non-keyword identifier, and followed by
+    ';', ',', '=' or __attribute__. Anything else fails.
     """
     tokens = cxx_tokens(preprocessed)
     code = scope_kinds(tokens)
@@ -1760,80 +1785,224 @@ def inline_assembly_violations(preprocessed: str) -> list[str]:
         if not text.strip():
             continue  # Empty template: emits nothing; operands are visited as ordinary tokens.
         previous = tokens[index - 1] if index else None
+        following = tokens[position + 1] if position + 1 < len(tokens) else None
         label = (not qualified and tokens[position].group() == ")" and not code[index] and previous is not None
                  and (previous.group() in LABEL_PRECEDERS or
-                      (previous.lastgroup == "identifier" and previous.group() not in ASM_KEYWORDS))
+                      (previous.lastgroup == "identifier" and previous.group() not in KEYWORDS))
+                 and following is not None and following.group() in LABEL_FOLLOWERS
                  and ASM_LABEL.fullmatch(text))
         if not label:
             findings.append(f"offset {token.start()}: {text[:80]!r}")
     return findings
 
 
-# Driver routing. The expanded jobs of the exact compile (-###) are the authority for what the compiler and
-# assembler read: one compiler job and, for GNU, one assembler job whose sole input is the compiler's output.
-REJECTED_JOB_ARGUMENTS = re.compile(r"^(?:-Wa,.*|-Xassembler|-save-temps.*|--param=as.*|-include-pch|-emit-pch|-fpch-preprocess|-fmodules|-fcxx-modules|"
-                                    r"-fmodules-ts|-fmodule-file.*|-fmodule-map-file=.*|-fprebuilt-module-path.*|"
-                                    r"-fimplicit-modules|-fmodule-mapper.*|-fplugin.*|-load|-plugin|-add-plugin|"
-                                    r"-fpass-plugin.*|-specs.*|--specs.*|-B.*|-wrapper|@.*)$")
-GNU_ASSEMBLER_OPTIONS = re.compile(r"^(?:-EL|--gdwarf-\d|-march=[\w+.-]+|-mcpu=[\w+.-]+|-mabi=lp64)$")
+# Driver plan. The expanded jobs of the exact compile (-###) are the authority for what the compiler and
+# assembler read, and every argument of every job must be admitted by its type. Kinds: flag (no value);
+# value (a regex-checked opaque value); search (an include search root - files found through it are reported
+# by -MD and bound); closure (a file that must be in the bound dependency closure); source, object, deps,
+# assembly, dumpdir (the designated witness paths); directory (the executed directory, debug metadata only).
+# Unknown options, unknown positionals and any other value shape fail.
+WARNING = re.compile(r"^-W(?:no-)?(?:error=)?[a-z][a-z0-9-]*$")
+CLANG_CC1 = {
+    "-cc1": "flag", "-emit-obj": "flag", "-disable-free": "flag", "-clear-ast-before-backend": "flag",
+    "-disable-llvm-verifier": "flag", "-discard-value-names": "flag", "-fdefine-target-os-macros": "flag",
+    "-fdeprecated-macro": "flag", "-fdwarf2-cfi-asm": "flag", "-fencode-extended-block-signature": "flag",
+    "-fexceptions": "flag", "-fcxx-exceptions": "flag", "-fblocks": "flag", "-fcommon": "flag",
+    "-fno-assume-unique-vtables": "flag", "-fno-cxx-modules": "flag", "-fno-implicit-modules": "flag",
+    "-fno-modulemap-allow-subdirectory-search": "flag", "-fno-odr-hash-protocols": "flag",
+    "-fno-rounding-math": "flag", "-fno-sized-deallocation": "flag", "-fno-strict-return": "flag",
+    "-fobjc-msgsend-selector-stubs": "flag", "-fregister-global-dtors-with-atexit": "flag",
+    "-fskip-odr-check-in-gmf": "flag", "-fstack-check": "flag", "-fvisibility-inlines-hidden-static-local-var": "flag",
+    "-mdarwin-stkchk-strong-link": "flag", "-skip-unused-modulemap-deps": "flag", "-sys-header-deps": "flag",
+    "-vectorize-loops": "flag", "-vectorize-slp": "flag", "-enable-tlsdesc": "flag", "-O3": "flag", "-H": "flag",
+    "-triple": r"arm64-apple-macosx[\d.]+", "-main-file-name": "main-file-name", "-mrelocation-model": "pic",
+    "-pic-level": "2", "-target-sdk-version=": r"[\d.]+", "-fmax-type-align=": "16", "-mframe-pointer=": "non-leaf",
+    "-ffp-contract=": "on", "-funwind-tables=": "1", "-target-cpu": "generic", "-target-feature": r"[+-][\w.-]+",
+    "-target-abi": "darwinpcs", "-target-linker-version": r"[\d.]+", "-debug-info-kind=": "standalone",
+    "-dwarf-version=": "5", "-debugger-tuning=": "lldb", "-std=": r"c\+\+20", "-fgnuc-version=": r"[\d.]+",
+    "-ferror-limit": r"\d+", "-stack-protector": "1", "-mllvm": "-extra-vectorizer-passes",
+    "-clang-vendor-feature=": r"\+\w+", "-Werror=": r"[a-z][a-z0-9-]*", "-Wno-error=": r"[a-z][a-z0-9-]*",
+    "-Wundef-prefix=": r"[A-Z_]+", "-D": r"[A-Za-z_]\w*(?:=[\w.+-]*)?", "-x": r"c\+\+", "-MT": "probe",
+    "-I": "search", "-isystem": "search", "-internal-isystem": "search", "-internal-externc-isystem": "search",
+    "-internal-iframework": "search", "-isysroot": "search", "-resource-dir": "search",
+    "-fdepfile-entry=": "closure", "-dependency-file": "deps", "-o": "object",
+    "-fdebug-compilation-dir=": "directory", "-fcoverage-compilation-dir=": "directory",
+}
+GNU_CC1PLUS = {
+    "-quiet": "flag", "-mlittle-endian": "flag", "-g": "flag", "-O3": "flag", "-fPIE": "flag", "-fno-lto": "flag",
+    "-fasynchronous-unwind-tables": "flag", "-fstack-protector-strong": "flag", "-fstack-clash-protection": "flag",
+    "-H": "flag", "-imultiarch": r"aarch64-linux-gnu", "-mcpu=": "generic", "-march=": r"armv8-a(?:\+\w+)*",
+    "-mabi=": "lp64", "-std=": r"(?:gnu|c)\+\+20", "-fno-sanitize=": "all", "-D": r"[A-Za-z_]\w*(?:=[\w.+-]*)?",
+    "-MT": "probe", "-MD": "md", "-MF": "deps", "-I": "search", "-dumpdir": "dumpdir",
+    "-dumpbase": r"[\w.+-]+", "-dumpbase-ext": r"\.cpp", "-o": "assembly",
+}
+GNU_AS = {"-EL": "flag", "--gdwarf-5": "flag", "-march=": r"armv8-a(?:\+\w+)*", "-mabi=": "lp64", "-I": "search",
+          "-o": "object"}
 CONFIGURATION_LINES = re.compile(r"^(?:Reading specs from|Configuration file:|Using specs)", re.MULTILINE)
 
 
-def driver_jobs(command: list[str], directory: str, identity: str, source: str, obj: Path) -> list[list[str]]:
-    """Validate the expanded jobs (-###) of the exact witness compile and return them."""
-    for argument in command:
-        if REJECTED_JOB_ARGUMENTS.match(argument) or argument in ("-no-integrated-as", "-fno-integrated-as",
-                                                                   "--config") or argument.startswith("--config="):
-            raise ValueError(f"the witness compile command routes inputs outside the dependency closure: {argument}")
-    expansion = subprocess.run(command + ["-###"], cwd=directory, capture_output=True, text=True)
-    if expansion.returncode:
-        raise ValueError(f"the compiler driver rejected the witness command: {expansion.stderr[-300:]}")
-    if CONFIGURATION_LINES.search(expansion.stderr):
-        raise ValueError("the compiler driver reads a specs or configuration file")
-    jobs = [shlex.split(line) for line in expansion.stderr.splitlines() if line.startswith(" ")]
-    for job in jobs:
-        for argument in job:
-            if REJECTED_JOB_ARGUMENTS.match(argument):
-                raise ValueError(f"a compiler job reads opaque input: {argument}")
-    if identity.startswith(("AppleClang-", "Clang-")):
-        if len(jobs) != 1 or len(jobs[0]) < 2 or jobs[0][1] != "-cc1" or "-emit-obj" not in jobs[0]:
-            raise ValueError(f"the clang driver must run exactly one integrated -cc1 -emit-obj job: {jobs}")
-        if jobs[0][jobs[0].index("-o") + 1] != str(obj):
-            raise ValueError("the clang job does not write the witness object")
-        return jobs
-    if len(jobs) != 2 or Path(jobs[0][0]).name not in ("cc1plus", "cc1") or Path(jobs[1][0]).name != "as":
-        raise ValueError(f"the GNU driver must run exactly one cc1plus job and one as job: {[job[:1] for job in jobs]}")
-    if source not in jobs[0]:
-        raise ValueError("the GNU compiler job does not compile the probe")
-    assembly = jobs[0][jobs[0].index("-o") + 1] if "-o" in jobs[0] else None
-    assembler, position, inputs = jobs[1], 1, []
-    while position < len(assembler):
-        argument = assembler[position]
-        if argument in ("-I", "-o"):
-            if argument == "-o" and assembler[position + 1] != str(obj):
-                raise ValueError("the GNU assembler job does not write the witness object")
-            position += 2
+class JobPaths(NamedTuple):
+    source: str
+    obj: str
+    deps: str
+    directory: str
+    closure: frozenset
+
+
+def admit_job(job: list[str], table: dict[str, str], paths: JobPaths, positional: str) -> dict[str, list[str]]:
+    """Admit every argument of one expanded job by its type; return the designated paths it names."""
+    named: dict[str, list[str]] = {}
+    position = 1
+    while position < len(job):
+        argument = job[position]
+        if not argument.startswith("-") or argument == "-":
+            named.setdefault("positional", []).append(argument)
+            position += 1
             continue
-        if argument.startswith("-"):
-            if not GNU_ASSEMBLER_OPTIONS.match(argument):
-                raise ValueError(f"unadmitted GNU assembler option: {argument}")
+        if argument in table:
+            option, kind = argument, table[argument]
+            if kind == "flag":
+                position += 1
+                continue
+            if position + 1 >= len(job):
+                raise ValueError(f"job option {argument} lacks its value")
+            value, position = job[position + 1], position + 2
         else:
-            inputs.append(argument)
-        position += 1
-    if assembly is None or inputs != [assembly]:
-        raise ValueError(f"the GNU assembler job reads inputs other than the compiler output: {inputs}")
-    return jobs
+            joined = next((name for name in sorted(table, key=len, reverse=True)
+                           if name.endswith("=") and argument.startswith(name)), None)
+            if joined is None and argument[:2] in ("-D", "-I") and argument[:2] in table:
+                joined = argument[:2]
+            if joined is None:
+                if WARNING.match(argument) and table is not GNU_AS:
+                    position += 1
+                    continue
+                raise ValueError(f"job argument not admitted: {argument}")
+            option, kind, value, position = joined, table[joined], argument[len(joined):], position + 1
+        if kind in ("search", "closure", "deps", "md", "object", "assembly", "dumpdir", "directory", "main-file-name"):
+            named.setdefault(kind, []).append(value)
+            if kind == "search" and not os.path.isabs(value):
+                raise ValueError(f"relative include search root {value}")
+            if kind == "closure" and value not in paths.closure:
+                raise ValueError(f"job input {value} is not in the bound dependency closure")
+            if kind == "directory" and value != paths.directory:
+                raise ValueError(f"job directory {value} is not the executed directory")
+            if kind == "main-file-name" and value != os.path.basename(paths.source):
+                raise ValueError(f"job main file name {value} is not the probe")
+            continue
+        if not re.fullmatch(kind, value):
+            raise ValueError(f"job value {option} {value} not admitted")
+    if named.get("positional", []) != [positional]:
+        raise ValueError(f"job positional inputs {named.get('positional')} are not exactly {positional}")
+    return named
 
 
-def resolve_program(program: str, directory: str, search: str) -> str:
-    """Absolute path of a job's program (GNU prints the assembler bare; it is found on COMPILER_PATH/PATH)."""
+def validate_plan(jobs: list[list[str]], identity: str, paths: JobPaths) -> None:
+    """Pure validation of a recorded driver plan (used at build and in compiler-free verification)."""
+    if not isinstance(jobs, list) or not all(isinstance(job, list) and job and all(isinstance(a, str) for a in job)
+                                             for job in jobs):
+        raise ValueError("malformed driver plan")
+    if identity.startswith(("AppleClang-", "Clang-")):
+        if len(jobs) != 1 or Path(jobs[0][0]).name != "clang" or not os.path.isabs(jobs[0][0]):
+            raise ValueError(f"the clang driver must run exactly one absolute integrated clang job: {jobs}")
+        named = admit_job(jobs[0], CLANG_CC1, paths, paths.source)
+        if named.get("object") != [paths.obj] or named.get("deps") != [paths.deps] or \
+                "-emit-obj" not in jobs[0] or jobs[0][1] != "-cc1":
+            raise ValueError("the clang job does not compile the probe into the witness object and deps")
+        return
+    if len(jobs) != 2 or Path(jobs[0][0]).name != "cc1plus" or not os.path.isabs(jobs[0][0]) or jobs[1][0] != "as":
+        raise ValueError(f"the GNU driver must run exactly one cc1plus job and one as job: {[job[:1] for job in jobs]}")
+    compiler = admit_job(jobs[0], GNU_CC1PLUS, paths, paths.source)
+    # GNU passes -MD the object-derived name; -MF selects the file actually written.
+    if compiler.get("deps") != [paths.deps] or len(compiler.get("md", [])) != 1 or \
+            compiler["md"][0] not in (paths.deps, os.path.splitext(paths.obj)[0] + ".d") or \
+            len(compiler.get("assembly", [])) != 1 or \
+            len(compiler.get("dumpdir", [])) > 1:
+        raise ValueError("the GNU compiler job does not write the witness dependencies and one assembly")
+    assembler = admit_job(jobs[1], GNU_AS, paths, compiler["assembly"][0])
+    if assembler.get("object") != [paths.obj]:
+        raise ValueError("the GNU assembler job does not write the witness object")
+
+
+def observe(command: list[str], directory: str) -> str:
+    """One driver query; a failing or erroring query is fatal."""
+    result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
+    if result.returncode:
+        raise ValueError(f"the compiler driver query failed: {' '.join(command[-1:])}: {result.stderr[-300:]}")
+    return result.stdout + result.stderr
+
+
+def driver_plan(executed: list[str], directory: str, identity: str, paths: JobPaths) -> dict:
+    """Observe and validate the driver plan: its jobs and, for GNU, its program lookup authority."""
+    expansion = observe(executed + ["-###"], directory)
+    if CONFIGURATION_LINES.search(expansion):
+        raise ValueError("the compiler driver reads a specs or configuration file")
+    jobs = [shlex.split(line) for line in expansion.splitlines() if line.startswith(" ")]
+    validate_plan(jobs, identity, paths)
+    plan = {"jobs": jobs, "program_dirs": [], "path": []}
+    if not identity.startswith(("AppleClang-", "Clang-")):
+        dirs = re.findall(r"^programs: =(.*)$", observe(executed + ["-print-search-dirs"], directory), re.MULTILINE)
+        if len(dirs) != 1:
+            raise ValueError("the GNU driver did not report its program search directories")
+        plan["program_dirs"] = [entry for entry in dirs[0].split(os.pathsep) if entry]
+        plan["path"] = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry]
+        for job in jobs:
+            answer = observe(executed + [f"-print-prog-name={Path(job[0]).name}"], directory).strip()
+            selected = lookup_program(job[0], plan)["selected"]
+            if (os.path.isabs(answer) and resolve(answer)[0] != resolve(selected)[0]) or \
+                    (not os.path.isabs(answer) and (answer != job[0] or selection_source(job[0], plan) != "path")):
+                raise ValueError(f"the driver selects {answer} for {job[0]}, the witness lookup selects {selected}")
+    return plan
+
+
+def selection_source(program: str, plan: dict) -> str:
     if os.path.isabs(program):
-        return program
-    for entry in [part for part in search.split(os.pathsep) if part]:
-        candidate = os.path.join(entry if os.path.isabs(entry) else os.path.join(directory, entry), program)
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return os.path.realpath(candidate)
-    raise ValueError(f"cannot resolve job program {program}")
+        return "absolute"
+    for entry in plan["program_dirs"]:
+        if os.path.isfile(os.path.join(entry, program)):
+            return "program_dirs"
+    return "path"
+
+
+def lookup_program(program: str, plan: dict) -> dict:
+    """Logical selection of a job program, replayable without the compiler.
+
+    An absolute program is itself; a bare name is looked up as the GNU driver does - its program directories,
+    then the executable search PATH. The record names the logical program, the directories examined before
+    the selection (which must stay empty of it), the selected path, the symlinks followed resolving it, the
+    resolved file and its content hash.
+    """
+    if os.path.isabs(program):
+        examined, selected = [], program
+    else:
+        examined, selected = [], None
+        for entry in plan["program_dirs"] + plan["path"]:
+            candidate = os.path.join(entry, program)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                selected = candidate
+                break
+            examined.append(entry)
+        if selected is None or not os.path.isabs(selected):
+            raise ValueError(f"cannot select job program {program}")
+    resolved, links = resolve(selected)
+    return {"program": program, "examined": examined, "selected": selected, "links": links,
+            "resolved": resolved, "sha256": envelope.digest(Path(resolved))}
+
+
+def program_identities(plan: dict, driver: str) -> dict[str, dict]:
+    """Identity of the driver and of every job program of the plan."""
+    identities = {"driver": lookup_program(driver if os.path.isabs(driver) else shutil_which(driver), plan)}
+    identities["driver"]["program"] = identities["driver"]["selected"]
+    for index, job in enumerate(plan["jobs"]):
+        identities[f"job{index}"] = lookup_program(job[0], plan)
+    return identities
+
+
+def shutil_which(program: str) -> str:
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(entry, program)
+        if entry and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise ValueError(f"cannot find the compiler driver {program}")
 
 
 def precompiled_headers(header_trace: str) -> list[str]:
@@ -1867,12 +2036,9 @@ def build(args: argparse.Namespace) -> None:
     if unproved:
         raise ValueError(f"inline assembly the dependency closure cannot bind (non-empty template): {unproved[:2]}")
     executed = executed_command(command, args.source, obj, dependencies)
-    jobs = driver_jobs(executed, directory, identity, args.source, obj)
-    search = os.pathsep.join(re.findall(r"^COMPILER_PATH=(.*)$", subprocess.run(
-        executed + ["-###"], cwd=directory, capture_output=True, text=True).stderr, re.MULTILINE) +
-        [os.environ.get("PATH", "")])
-    programs = {program: envelope.digest(Path(program))
-                for program in (resolve_program(job[0], directory, search) for job in jobs)}
+    paths = JobPaths(args.source, str(obj), str(dependencies), directory, frozenset(before))
+    plan = driver_plan(executed, directory, identity, paths)
+    programs = program_identities(plan, command[0])
     compiled = subprocess.run(executed, cwd=directory, capture_output=True, text=True)
     if compiled.returncode:
         raise ValueError(f"the witness compile failed: {compiled.stderr[-2000:]}")
@@ -1886,19 +2052,21 @@ def build(args: argparse.Namespace) -> None:
     if after != before:
         changed = sorted(path for path in closure if before[path] != after[path])
         raise ValueError(f"inputs changed while the witness compiled: {changed[:3]}")
+    if program_identities(plan, command[0]) != programs:
+        raise ValueError("a compiler or assembler program changed while the witness compiled")
     disassembly, disassembly_command, tool_version = disassemble(args.disassembler, obj)
     disassembly_path.write_text(disassembly)
     counts = audit(obj.read_bytes(), disassembly, args.mode)
     require_registers(counts, args.identity, args.mode)
     result = {
-        "schema": 7, "signature": args.signature, "identity": identity, "mode": args.mode,
+        "schema": 8, "signature": args.signature, "identity": identity, "mode": args.mode,
         "checker_sha256": envelope.digest(Path(__file__)),
         "envelope_sha256": envelope.digest(_ENVELOPE),
         "budget_sha256": envelope.digest(BUDGET_PATH),
         "compiler_version": version,
         "executed_command": executed, "executed_directory": directory,
         "target_command_sha256": envelope.command_digest(command, directory),
-        "driver_jobs": jobs, "job_programs": programs,
+        "driver_plan": plan, "programs": programs,
         "inputs": after,
         "object_file": obj.name, "object_sha256": envelope.digest(obj),
         "disassembler": args.disassembler, "disassembler_version": tool_version,
@@ -1920,7 +2088,7 @@ def verify(args: argparse.Namespace) -> None:
     require_absolute_source(args.source)
     proof_path = Path(args.proof)
     proof = json.loads(proof_path.read_text())
-    if (proof.get("schema") != 7 or proof.get("signature") != args.signature or
+    if (proof.get("schema") != 8 or proof.get("signature") != args.signature or
             proof.get("identity") != args.identity or proof.get("mode") != args.mode):
         raise ValueError("tile register proof has a foreign schema/configuration")
     if compiler_identity(str(proof.get("compiler_version", ""))) != args.identity:
@@ -1946,10 +2114,25 @@ def verify(args: argparse.Namespace) -> None:
         raise ValueError("recorded witness invocation is not the target command over the probe")
     if not obj.is_file() or proof.get("object_sha256") != envelope.digest(obj):
         raise ValueError("tile register object is missing or changed")
-    programs = proof.get("job_programs")
-    if not isinstance(programs, dict) or not programs or \
-            any(not os.path.isfile(path) or envelope.digest(Path(path)) != digest for path, digest in programs.items()):
-        raise ValueError("a compiler or assembler program of the witness compile changed")
+    plan = proof.get("driver_plan")
+    if not isinstance(plan, dict) or set(plan) != {"jobs", "program_dirs", "path"} or \
+            not all(isinstance(plan[key], list) and all(isinstance(entry, str) for entry in plan[key])
+                    for key in ("program_dirs", "path")):
+        raise ValueError("tile register proof lacks a well-formed driver plan")
+    paths = JobPaths(args.source, str(obj), str(proof_path.with_suffix(".deps")), directory, frozenset(inputs))
+    validate_plan(plan["jobs"], args.identity, paths)
+    expected_keys = {"driver"} | {f"job{index}" for index in range(len(plan["jobs"]))}
+    programs = proof.get("programs")
+    if not isinstance(programs, dict) or set(programs) != expected_keys or \
+            any(programs[f"job{index}"].get("program") != job[0] for index, job in enumerate(plan["jobs"])):
+        raise ValueError("tile register proof does not identify exactly the driver and every job program")
+    try:
+        current = program_identities(plan, programs["driver"].get("program", ""))
+    except (ValueError, OSError) as error:
+        raise ValueError(f"a compiler or assembler program of the witness compile changed: {error}")
+    if current != programs:
+        raise ValueError("a compiler or assembler program of the witness compile changed (content, symlink, "
+                         "selection or search shadowing)")
     if proof.get("disassembler") != args.disassembler or \
             proof.get("disassembler_sha256") != envelope.digest(Path(os.path.realpath(args.disassembler))):
         raise ValueError("configured disassembler changed after the register witness")
