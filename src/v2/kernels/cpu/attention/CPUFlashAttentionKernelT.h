@@ -63,7 +63,8 @@
 #include "../turboquant/TurboQuantContext.h"
 #include "CPUFlashAttentionLaunchPolicy.h"
 #include "TQFusedAttentionPrimitives.h"
-#include "CPUAttentionKeyQ8.h"
+#include "CPUAttentionKeyQ8Dot.h"
+#include "CPUQ8AttentionValue.h"
 #include "CPUQ16AttentionMath.h"
 #include "../primitives/VectorPrimitives.h"
 #if LLAMINAR_COMPILED_WITH_NEON
@@ -945,12 +946,14 @@ namespace llaminar2
             // decode, grouped verification, and prefill. No FP32 shadow cache
             // is materialized for any query-row count.
             // ---------------------------------------------------------------
-#if defined(__AVX512F__) || defined(__AVX2__)
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             if (K->native_type() == TensorType::AQ8 && batch_size == 1)
                 return compute_aq8kv(Q_base->fp32_data(), dynamic_cast<const AttentionKeyQ8Tensor *>(K),
                     V, O_base->mutable_data(), seq_len, kv_len, n_heads, n_kv_heads, head_dim,
                     causal, window_size, std::max(0, kv_len - seq_len), head_start, gqa_n_rep,
                     execution_policy, kv_logical_view);
+#endif // AQ8 has a genuine native decoder/dot/value program on ARM and x86.
+#if defined(__AVX512F__) || defined(__AVX2__)
             if (K->native_type() == TensorType::Q8_1 &&
                 V->native_type() == TensorType::Q8_1 &&
                 batch_size == 1)
@@ -1245,7 +1248,7 @@ namespace llaminar2
                             view);
                     });
             }
-#if defined(__AVX512F__) || defined(__AVX2__)
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             else if (key_type == TensorType::AQ8)
             {
                 success = run_requests([&](int request, const float *query, float *result,
@@ -1257,6 +1260,8 @@ namespace llaminar2
                         execution_policy, view);
                 });
             }
+#endif // AQ8 request-sliced entry has the same native operand authority.
+#if defined(__AVX512F__) || defined(__AVX2__)
             else if (key_type == TensorType::Q8_1 &&
                      value_type == TensorType::Q8_1)
             {
@@ -1579,6 +1584,17 @@ namespace llaminar2
                     if (K->native_type() == TensorType::Q8_1 &&
                         V->native_type() == TensorType::Q8_1)
                         return "q8_1";
+                    if (K->native_type() == TensorType::AQ8)
+                    {
+                        using Pair = cpu::fa2_policy::CPUFA2KVStoragePair;
+                        switch (V->native_type())
+                        {
+                        case TensorType::Q8_1: return cpu::fa2_policy::cpuFA2KVStoragePairName(Pair::AQ8_Q8_1);
+                        case TensorType::TQ4: return cpu::fa2_policy::cpuFA2KVStoragePairName(Pair::AQ8_TQ4);
+                        case TensorType::TQ8: return cpu::fa2_policy::cpuFA2KVStoragePairName(Pair::AQ8_TQ8);
+                        default: LLAMINAR_UNREACHABLE("Successful AQ8 verifier call has no admitted value format");
+                        }
+                    }
                     if (K->native_type() == TensorType::TQ4 &&
                         V->native_type() == TensorType::TQ4)
                         return "tq4_k_tq4_v";
@@ -6154,7 +6170,9 @@ namespace llaminar2
         /**
          * @brief Accumulate weighted dequantized Q8_1 V block into output.
          *
-         * out[d] += weight * (qs[d] * scale)  for d in [0, 32)
+         * Round combined=weight*scale, then intentionally FMA each original
+         * signed code into the numerator. Native ISA leaves share one checked
+         * original-block authority; no decoded value row or scalar replacement.
          *
          * @param out     Output accumulator (32 floats at current block offset)
          * @param v_block Pointer to Q8_1Block for V
@@ -6163,31 +6181,7 @@ namespace llaminar2
         static inline void accum_weighted_v_q8_1_block(
             float *out, const Q8_1Block *v_block, float weight)
         {
-#if defined(__AVX512F__) && defined(__F16C__)
-            const float v_scale = _cvtsh_ss(v_block->d);
-            const float combined = weight * v_scale;
-            const __m512 vw = _mm512_set1_ps(combined);
-
-            const __m256i qs_raw = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i *>(v_block->qs));
-            const __m512i lo_i32 = _mm512_cvtepi8_epi32(_mm256_castsi256_si128(qs_raw));
-            const __m512i hi_i32 = _mm512_cvtepi8_epi32(_mm256_extracti128_si256(qs_raw, 1));
-
-            const __m512 lo_f = _mm512_cvtepi32_ps(lo_i32);
-            const __m512 hi_f = _mm512_cvtepi32_ps(hi_i32);
-
-            __m512 o0 = _mm512_loadu_ps(out);
-            __m512 o1 = _mm512_loadu_ps(out + 16);
-            o0 = _mm512_fmadd_ps(lo_f, vw, o0);
-            o1 = _mm512_fmadd_ps(hi_f, vw, o1);
-            _mm512_storeu_ps(out, o0);
-            _mm512_storeu_ps(out + 16, o1);
-#else
-            const float v_scale = fp16_to_fp32(v_block->d);
-            const float combined = weight * v_scale;
-            for (int i = 0; i < 32; ++i)
-                out[i] += combined * static_cast<float>(v_block->qs[i]);
-#endif
+            cpu::q8_attention::accumulateValueBlock({out,32},*v_block,weight);
         }
 
         /**
@@ -7050,8 +7044,13 @@ namespace llaminar2
                 accumulate_tile,
                 finalize_row);
         }
-#include "CPUFlashAttentionAQ8.inl"
 #endif // __AVX512F__ || __AVX2__ (TQ fused)
+
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
+        // AQ8 uses native shared codec/value authorities independently of the
+        // separate TQ-key adapter above; do not hide it in an x86-only section.
+#include "CPUFlashAttentionAQ8.inl"
+#endif // Native AQ8 adapter; scalar production AQ8 is not advertised.
 
         /**
          * @brief Validate and expose prebound context-summary storage.

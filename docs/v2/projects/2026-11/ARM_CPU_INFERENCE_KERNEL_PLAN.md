@@ -1,6 +1,6 @@
 # Native ARM CPU inference: implementation, numerical proof and tuning plan
 
-Created: 2026-11-04; progress updated 2026-11-05.
+Created: 2026-11-04; progress updated 2026-11-06.
 Base: `feat/qfn-ngram-continuation` at `2cba3ca1d`.
 Working branch: `codex/qfn-ngram-continuation-arm64`.
 
@@ -155,14 +155,33 @@ arbitrary hard CPU-ID pinning; record advisory placement and actual evidence.
   Helper/KV/factory/runtime admission remains unfinished. Later class edits are
   outside the frozen Spark certificate; syntax/leaf/scope checks do not qualify
   their runtime. All four softmax and both rotation entries resolve.
-- The latest completed five-Mac focused matrix passes170/170 in baseline/DotProd
-  Release, DotProd ASan/UBSan, strict-warning Debug and LLVM Release; all130
-  configured preflights pass20 repetitions (2600 raw passes), including native
+- Original AQ8 scores now use checked immutable query/anchor/native-ISA bindings
+  and register-only decoded fragments instead of `key[D]`. All head widths and
+  query tiles1..4 retain their declared component/M1 words; independent RN and
+  actual non-power-of-two publication controls protect both decode boundaries.
+  Passing only pointer roots by value removes initial hot descriptor stack loads.
+  A separate explicit native Q8 V-accumulation leaf replaces the ARM/AVX2 plain
+  loop while retaining the rounded combined-weight/FMA program. This common leaf
+  also changes the symmetric Q8 caller; full-core coverage must retain it.
+  Source review found AQ8 entries/include still hidden in x86-only guards. Only
+  AQ8 was separated; genuine GNU14 preprocessing proves the actual adapter is
+  present and production class/regression-TU syntax passes. Its new full-core
+  preflight uses real ring/workspace/tensor/verifier/two-request entrypoints with
+  NaN-poisoned outputs, but has not linked/run. Query widths2–4 remain leaf-only,
+  and the focused fixture is not PMA admission, wrap/context-summary lifecycle
+  or a complete FA2 certificate. A cold-bound one-candidate dot `Perf__` now
+  retains raw samples and rejects no-op authentication; bounded register-reuse
+  timing is not production MTP/FA2/scaling qualification. See the evidence record.
+- The latest completed five-Mac focused worktree matrix passes176/176 in baseline/DotProd
+  Release, DotProd ASan/UBSan, strict-warning Debug and LLVM Release; all136
+  configured preflights pass20 repetitions (2720 raw passes), including native
   reduction/production-TU RMSNorm ownership/bytes/portable half, original-Q16
-  geometry/expansion/ISA-specific reductions and actual legacy callers,
-  configure-host topology/receipt, real CTest retirement metadata and image-fixture
-  contracts. Actual XML/raw records were independently parsed without fail/skip.
-  The earlier151/115,157/119,159/121 and167/128 checkpoints retain narrower scopes.
+  geometry/expansion/ISA-specific reductions and actual legacy callers, original
+  AQ8 query-dot tiles, explicit Q8 value FMAs, nonempty/dirty-output benchmark
+  authentication, configure-host topology/receipt, real CTest retirement metadata
+  and image-fixture contracts. Actual XML/raw records were independently parsed without fail/skip.
+  The earlier151/115,157/119,159/121,167/128 and published170/130 checkpoints retain
+  narrower scopes; the176/136 worktree is not a whole-engine certificate.
   The intervening136-test sanitizer
   projection-batch timeout remains RED. Its unchanged hashed binary passes20
   isolated-window repetitions, then the complete current matrix passes; no
@@ -346,12 +365,15 @@ accuracy obligations; the named entry separately proves implementation or exact
 rejection, and rejects nonfinite output as evidence. The canonical Unit name and
 explicit legacy/tree preflights use the actual core-free production TU.
 
-A genuine AVX2 body and both x86 syntax envelopes exist, but new native x86
-runtime still needs qualification. The old native SDK now directly proves both
-CMake/CTest3.28.3, not the required4.x serializer. An initial SDK producer stopped
-before install at BuildKit registry resolution; its failure remains immutable.
-The authorized exact-local offline SDK successor requires actual tool/native
-proof before source tests, without host changes or alternate-base substitution.
+The genuine AVX2 body is now executed natively, not merely syntax-qualified.
+An exact-local/offline authenticated SDKf492 supplies real CMake/CTest4.0.3;
+its failed BuildKit and ignored-empty-entrypoint predecessors remain RED.
+Main independently checked the source73da/d18 WSL return archive/all178 raw
+hashes:20 registered cells/ISA, eight focused cells×20=160 passes/ISA, then the
+actual AVX512 binaries/runtime-AVX2 lane14 RMS+9 legacy GTests, no skips/failures.
+Actual ISA/FP/compile-command/terminal evidence and complete7063-entry immediate
+before/after maps agree. This closes only frozen73da's focused x86 correctness,
+not later AQ8, full engine/gates, runtime/factory lifetimes or performance.
 Four-row AppleClang/GNU14 static resources have no hot stack accesses/calls
 (28/23 SIMD identities); this is not PMU, latency/scaling or final performance
 qualification.
