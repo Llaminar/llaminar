@@ -28,6 +28,8 @@
 #include "tensors/NativeQuantisedQ6Scale.h"
 
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -493,9 +495,26 @@ namespace llaminar2::cpu::native_quantised
             return bytes_.data() + (std::size_t(chunk) * blocks_per_row + block) * interleaved_block_stride;
         }
 
-        /** @brief Unit address for coordinates an admitted binding already proved in range. */
+        /**
+         * @brief Unit address for coordinates an admitted binding already proved in range.
+         * @details The bound is still tested, and a violation is fatal (never an
+         * exception). The guarded branch is also a scheduling boundary: without
+         * it compilers hoist later metadata/payload loads into the dot program
+         * and spill vector registers (measured with gcc-14 and gcc-16).
+         */
         [[nodiscard]] const std::uint8_t *admittedUnit(int chunk, int block) const noexcept
-        { return bytes_.data() + (std::size_t(chunk) * blocks_per_row + block) * interleaved_block_stride; }
+        {
+            if (chunk < 0 || chunk >= N_padded / 64 || block < 0 || block >= blocks_per_row) [[unlikely]]
+                rejectOutsideAdmittedPublication();
+            return bytes_.data() + (std::size_t(chunk) * blocks_per_row + block) * interleaved_block_stride;
+        }
+
+        /** @brief Fatal diagnostic for a coordinate outside an admitted publication. */
+        [[noreturn, gnu::cold, gnu::noinline]] static void rejectOutsideAdmittedPublication() noexcept
+        {
+            std::fputs("ERROR: native CPU weight coordinate outside its admitted publication\n", stderr);
+            std::abort();
+        }
 
         std::span<const std::uint8_t> bytes_; ///< Borrowed immutable stream; storage remains prepared-store owned.
     };
