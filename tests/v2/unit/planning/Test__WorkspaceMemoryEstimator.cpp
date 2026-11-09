@@ -2607,7 +2607,7 @@ TEST(Test__WorkspaceMemoryEstimator, QFNWorkspaceAdmissionPreservesConventionalD
  * @test CPU participants price one shared set of RoPE angle planes; GPU keeps its publication ABI.
  *
  * The CPU extent is the largest graph invocation (batch x bucket rows, or the
- * grouped verifier rows) at the physical head width, priced through the same
+ * grouped verifier rows) at the effective rotated width, priced through the same
  * contract the CPU RoPE kernel declares; estimate() adds this contribution.
  */
 TEST(Test__WorkspaceMemoryEstimator, RoPEWorkspacePricesCPUAngleRowsAndGPUPublication)
@@ -2628,10 +2628,17 @@ TEST(Test__WorkspaceMemoryEstimator, RoPEWorkspacePricesCPUAngleRowsAndGPUPublic
     cpu.first_layer = 0;
     cpu.last_layer = 0;
     EXPECT_EQ(WorkspaceMemoryEstimator::ropeWorkspaceBytes(profile, cpu),
-              cpu_rope_workspace::requirements({.graph_rows = 128, .head_dim = 128}).total_bytes_with_alignment());
+              cpu_rope_workspace::requirements({.graph_rows = 128, .rotary_dim = 128}).total_bytes_with_alignment());
     cpu.mtp_target_query_rows = 200;
     EXPECT_EQ(WorkspaceMemoryEstimator::ropeWorkspaceBytes(profile, cpu),
-              cpu_rope_workspace::requirements({.graph_rows = 200, .head_dim = 128}).total_bytes_with_alignment());
+              cpu_rope_workspace::requirements({.graph_rows = 200, .rotary_dim = 128}).total_bytes_with_alignment());
+    // Partial RoPE prices only the rotated prefix's pairs.
+    profile.rope_dimension_count = 32;
+    EXPECT_EQ(WorkspaceMemoryEstimator::ropeWorkspaceBytes(profile, cpu),
+              primitives::rope_angle_layout(200, 16).bytes);
+    profile.rope_dimension_count = 128;
+    EXPECT_EQ(WorkspaceMemoryEstimator::ropeWorkspaceBytes(profile, cpu),
+              primitives::rope_angle_layout(200, 64).bytes);
 
     WorkspaceMemoryGeometry gpu = cpu;
     gpu.device = DeviceId::cuda(0);
