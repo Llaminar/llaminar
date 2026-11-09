@@ -108,3 +108,21 @@ in the plan. Any NibbleMap touch points must remain seam-based.
   walk = REAL feature defect (grouping drops products; 816 = 864 − 48 →
   group boundary/trailing partial chunk). Lane fix-back; arm-sparks holds
   (b)/(c) until the cell is green at the fixed SHA.
+
+## R2 grouping fix — f3b28a120 (2026-11-09)
+
+- ROOT CAUSE = TEST ORACLE, not kernel: 'serial' side ran the INSTALLED S=2
+  panel width; panel computes sealed PADDING strip terms (never stored):
+  48 = Rows×blocks×8 = 2×3×8; 864 = 816 + 48; SMMLA had every live product.
+- FIX (test only + public accessor): oracle pinned to STRIP WALK
+  (executeWith<SDOTOps,1>); new stronger asserts (panel terms = oracle +
+  exactly Rows×blocks×8×padding_strips; oracle sub-multiset via
+  std::includes; compact padding_strips=0); `panelStrips<Ops>()` public
+  constexpr (no code change). Kernel UNCHANGED; folded into C4 (72e234169);
+  C2c/C3 range-diff `=`; harness rebased to f3b28a120.
+- Lane GB10 verify (tree 2dc344326 = f3b28a120^{tree}; g++-14 Integration
+  flags; scratch): 21/21 ×3 (incl. I8MMOperandGrouping, PanelWidths,
+  I8MMRowPairsMatchSDOT, DotLane); scratch removed; no timing. Mac 14/14.
+- Reviewer note (for R2 checkpoint): S=2 ≤1 padding strip per final chunk,
+  compute-only, never stored; panel-width/tail tests prove no store past N.
+- arm-sparks resume (a) gate → (b) tournament → (c) A1 at f3b28a120.
