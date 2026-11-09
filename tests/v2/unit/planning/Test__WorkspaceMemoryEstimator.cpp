@@ -465,9 +465,15 @@ TEST(Test__WorkspaceMemoryEstimator,
     ASSERT_NE(runtime_contract.find(attention_workspace::kPartialM), nullptr);
     ASSERT_NE(runtime_contract.find(attention_workspace::kPartialL), nullptr);
     EXPECT_EQ(runtime_contract.total_bytes_with_alignment(), 177408u);
+    // The full-attention layers' RoPE borrows one set of CPU angle planes for
+    // the graph's rows at the full head width; it coexists with attention.
+    const auto rope_angles = cpu_rope_workspace::requirements({
+        .graph_rows = geometry.batch_size * geometry.resident_graph_rows,
+        .rotary_dim = profile.head_dim,
+    });
     EXPECT_EQ(
         WorkspaceMemoryEstimator::estimate(profile, geometry),
-        runtime_contract.total_bytes_with_alignment());
+        runtime_contract.total_bytes_with_alignment() + rope_angles.total_bytes_with_alignment());
 }
 
 TEST(Test__WorkspaceMemoryEstimator, GPU_HasMinimumFloor)
@@ -2472,8 +2478,21 @@ TEST(Test__WorkspaceMemoryEstimator, QFNSelectedMainAttentionAdmission)
         const auto with = WorkspaceMemoryEstimator::estimate(profile, geometry);
         // The marker also names the unchanged RoPE owner. Account its exact
         // canonical ABI; the regression removes only nonexistent dense attention.
-        const auto rope = device.is_gpu() ? rope_workspace::requirements(
-            {.graph_rows = geometry.resident_graph_rows}).total_bytes_with_alignment() : 0u;
+        // GPU RoPE publishes positions per graph row; CPU RoPE borrows angle
+        // planes for the largest invocation (prefill rows or retained verifier
+        // rows) at the effective, possibly partial, rotated width.
+        const auto rope_bytes = [&](const WorkspaceMemoryGeometry &g) -> size_t
+        {
+            if (g.device.is_gpu())
+                return rope_workspace::requirements({.graph_rows = g.resident_graph_rows})
+                    .total_bytes_with_alignment();
+            const int rows = std::max(std::max(1, g.batch_size) * std::max(1, g.resident_graph_rows),
+                                      g.mtp_target_query_rows);
+            return cpu_rope_workspace::requirements({.graph_rows = rows,
+                                                     .rotary_dim = profile.effectiveRotaryDimension()})
+                .total_bytes_with_alignment();
+        };
+        const auto rope = rope_bytes(geometry);
         EXPECT_EQ(with, without + rope)
             << "QSA remains arena-owned while its existing RoPE publication stays admitted";
         if (device.is_gpu())
@@ -2489,8 +2508,7 @@ TEST(Test__WorkspaceMemoryEstimator, QFNSelectedMainAttentionAdmission)
         // Large-to-small request geometry reuses the same immutable metadata;
         // adding a main bucket cannot change the separately dense predictor charge.
         geometry.resident_graph_rows = 16;
-        const auto compact_rope = device.is_gpu() ? rope_workspace::requirements(
-            {.graph_rows = geometry.resident_graph_rows}).total_bytes_with_alignment() : 0u;
+        const auto compact_rope = rope_bytes(geometry);
         EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry),
             WorkspaceMemoryEstimator::estimate(withoutQFNMainQueryMarker(profile), geometry) + compact_rope);
     }
