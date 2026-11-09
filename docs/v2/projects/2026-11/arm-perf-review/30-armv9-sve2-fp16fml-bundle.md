@@ -1,6 +1,15 @@
 # Idea 30 — ARMv9 ISA bundle: SVE2 (incl. SVE I8MM/BF16) + FP16/fp16fml
 
-Status: OPEN (proposal 2026-11-09; not started — operator decision).
+Status: **QUEUED** (2026-11-09, operator) — next-lane candidate.
+
+QUEUE ENTRY: this bundle is queued as a possible task for a lane that
+finishes its current work. Natural owner: the addon lane (01a1bbe6) after
+R2 completes (it owns the ISA envelope+leaf+register-witness machinery:
+i8mm, panels, audit) — trigger = R2 pushed + reviewer + WSL green. If the
+operator prefers, SVE2 becomes its own new lane (plan-first per the
+standard). First steps on start: verify X925 SVE2/BF16/fp16fml on .80
+cpuinfo; order fp16fml (cheap) vs SVE2 (big); envelope+leaf+HWCAP admission
+decision; plan-first doc.
 
 ## Candidate 1: SVE2 (BIG)
 - Features (Grace/Neoverse-V2 confirmed via DGX cpuinfo): sve sve2 svei8mm
