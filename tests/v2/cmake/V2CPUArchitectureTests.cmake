@@ -31,6 +31,11 @@ foreach(_ctest_metadata_suite IN ITEMS Unit Integration)
             "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_ctest_timeout_metadata.py"
             --cmake "${CMAKE_COMMAND}" --ctest "${CMAKE_CTEST_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}"
         LABELS ${_ctest_metadata_labels})
+    v2_add_core_free_test(V2_${_ctest_metadata_suite}_CPUCoreFreeSanitizerFailurePolicy
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_core_free_sanitizer_failure_policy.py"
+            --cmake "${CMAKE_COMMAND}" --ctest "${CMAKE_CTEST_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}"
+        LABELS ${_ctest_metadata_labels})
     v2_add_core_free_test(V2_${_ctest_metadata_suite}_CPUPortabilityIntegrationFlags
         COMMAND "${Python3_EXECUTABLE}" -B
             "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_portability_build_types.py"
@@ -572,6 +577,7 @@ add_executable(v2_test_cpu_qwen_sparse_attention
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/Test__QwenSparseAttention.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQwenSparseLifetime.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQwenSparseExactBasis.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQwenSparseIndexerProgram.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/Test__QwenSparseTerminalCounters.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/attention/CPUQwenSparseAttention.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/config/TensorParallelConfig.cpp"
@@ -585,7 +591,7 @@ target_include_directories(v2_test_cpu_qwen_sparse_attention PRIVATE
 target_link_libraries(v2_test_cpu_qwen_sparse_attention PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
 v2_add_core_free_test(V2_Unit_CPUQwenSparseNativeEntries
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
-        --gtest_filter=QwenSparseAttention.ExplicitRepresentationAndStaticBindingValidation:QwenSparseAttention.OrdinaryTailNoOpAndExactAcceptedPrefix:QwenSparseAttention.NativeSelectedAttentionIsGroupedSerialByteEquivalent:CPUQwenSparseLifetime.CompleteOriginalExclusionsRejectBeforePublication:CPUQwenSparseLifetime.OriginalReplayIntervalRejectsBeforeAnyWordLoad:CPUQwenSparseLifetime.FullSameHeadQueryAliasMatchesOriginalNativeProgram:CPUQwenSparseLifetime.EmptyAndNonemptyCallsCompleteBeforeOuterJoin:CPUQwenSparseLifetime.CanonicalCounterOverflowIsFatalAtPublicPublication:CPUQwenSparseLifetime.ConsumedIndexerNumericCorruptionIsFatalNotClamped:CPUQwenSparseExactBasis.OriginalNonsymmetricBasisAndQueryAliasMatchOrderedFMABytes
+        --gtest_filter=QwenSparseAttention.ExplicitRepresentationAndStaticBindingValidation:QwenSparseAttention.OrdinaryTailNoOpAndExactAcceptedPrefix:QwenSparseAttention.NativeSelectedAttentionIsGroupedSerialByteEquivalent:CPUQwenSparseLifetime.CompleteOriginalExclusionsRejectBeforePublication:CPUQwenSparseLifetime.OriginalReplayIntervalRejectsBeforeAnyWordLoad:CPUQwenSparseLifetime.FullSameHeadQueryAliasMatchesOriginalNativeProgram:CPUQwenSparseLifetime.EmptyAndNonemptyCallsCompleteBeforeOuterJoin:CPUQwenSparseLifetime.CanonicalCounterOverflowIsFatalAtPublicPublication:CPUQwenSparseLifetime.ConsumedIndexerNumericCorruptionIsFatalNotClamped:CPUQwenSparseExactBasis.OriginalNonsymmetricBasisAndQueryAliasMatchOrderedFMABytes:CPUQwenSparseIndexerProgram.FP32MeanAndRopeCastEdgesCannotContractAfterInlining:QwenSparseAttention.ProvenNoRankingPreservesRequiredStateWithoutQueryBanks:CPUQwenSparseIndexerProgram.IndexerAnalyticElementariesCannotMerge:CPUQwenSparseIndexerProgram.NativeRankingScoresRetainOriginalHeadProgram
     LABELS V2 Unit CPU DeviceFree Attention QwenSparse ByteExact)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseOriginalCacheProgram
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
@@ -595,6 +601,34 @@ v2_add_core_free_test(V2_Integration_CPUQwenSparseAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseLifetime.CompleteOriginalExclusionsRejectBeforePublication
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+v2_add_core_free_test(V2_Unit_CPUQwenSparseRepresentationCast
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseIndexerProgram.NativeRepresentationCastsRetainIndependentIEEEWordBoundaries
+    LABELS V2 Unit CPU DeviceFree Attention QwenSparse ByteExact)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseNoRankingNullScoreAddress
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=QwenSparseAttention.ProvenNoRankingPreservesRequiredStateWithoutQueryBanks
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerAnalyticElementaries
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseIndexerProgram.IndexerAnalyticElementariesCannotMerge
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact NumericalContract Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerScoreProgram
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseIndexerProgram.NativeRankingScoresRetainOriginalHeadProgram
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact NumericalContract Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerNoContraction
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseIndexerProgram.FP32MeanAndRopeCastEdgesCannotContractAfterInlining
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseRepresentationCast
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseIndexerProgram.NativeRepresentationCastsRetainIndependentIEEEWordBoundaries
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerRepresentation
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseIndexerProgram.OriginalRepresentationAndPartialRopeMatchIndependentBytes
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseExactOriginalBasis
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseExactBasis.OriginalNonsymmetricBasisAndQueryAliasMatchOrderedFMABytes
