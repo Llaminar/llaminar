@@ -32,6 +32,29 @@ namespace
      * smaller block because they scale through their grid instead.
      */
     constexpr unsigned int kSingleRowThreads = 512u;
+    /**
+     * @brief Threads for one single-row dispatch kernel on the current device.
+     * @param kernel The exact dispatch kernel about to be launched.
+     * @return The 512-thread schedule capped by that kernel's compiled bound,
+     *         or 0 when CUDA cannot report the bound.
+     *
+     * The shared device bound (kSingleRowDispatchThreads) is 256 in sm_120+
+     * code and 512 elsewhere. The cubin or JIT image the driver selects for
+     * this device owns the real limit, so ask the kernel itself rather than
+     * inferring the image from the device's compute capability. The kernel
+     * bodies stride by blockDim.x, so either width covers every element.
+     * The query enqueues nothing and is legal during stream capture.
+     */
+    template <typename Kernel>
+    unsigned int singleRowDispatchThreads(Kernel kernel) noexcept
+    {
+        cudaFuncAttributes attributes{};
+        if (cudaFuncGetAttributes(&attributes, kernel) != cudaSuccess ||
+            attributes.maxThreadsPerBlock <= 0)
+            return 0u;
+        return std::min(kSingleRowThreads,
+                        static_cast<unsigned int>(attributes.maxThreadsPerBlock));
+    }
     /** Bounded route-slot blocks; each block walks additional slots grid-stride. */
     constexpr unsigned int kSparseRoutePayloadBlocks = 256u;
 
@@ -207,8 +230,12 @@ extern "C" bool cudaMoEOverlayActivationPackSingleRowDispatch(
         return false;
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    const unsigned int threads = singleRowDispatchThreads(
+        llaminar2::moe_activation_packet_device::packSingleRowDispatchKernel);
+    if (threads == 0u)
+        return false;
     llaminar2::moe_activation_packet_device::packSingleRowDispatchKernel
-        <<<1u, kSingleRowThreads, 0u, cuda_stream>>>(*launch);
+        <<<1u, threads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -223,8 +250,12 @@ extern "C" bool cudaMoEOverlayActivationConsumeSingleRowDispatch(
         return false;
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    const unsigned int threads = singleRowDispatchThreads(
+        llaminar2::moe_activation_packet_device::consumeSingleRowDispatchKernel);
+    if (threads == 0u)
+        return false;
     llaminar2::moe_activation_packet_device::consumeSingleRowDispatchKernel
-        <<<1u, kSingleRowThreads, 0u, cuda_stream>>>(*launch);
+        <<<1u, threads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -271,8 +302,12 @@ extern "C" bool cudaMoEOverlayActivationPackSingleRowDispatchBatch(
         return false;
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    const unsigned int threads = singleRowDispatchThreads(
+        llaminar2::moe_activation_packet_device::packSingleRowDispatchBatchKernel);
+    if (threads == 0u)
+        return false;
     llaminar2::moe_activation_packet_device::packSingleRowDispatchBatchKernel
-        <<<launch->lane_count, kSingleRowThreads, 0u, cuda_stream>>>(*launch);
+        <<<launch->lane_count, threads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
