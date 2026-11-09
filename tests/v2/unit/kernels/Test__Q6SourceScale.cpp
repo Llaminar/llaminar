@@ -22,6 +22,7 @@
 #include "kernels/cpu/gemm/CPUNativeQuantisedQ6Kernels.h"
 #endif
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 
 namespace llaminar2::test
