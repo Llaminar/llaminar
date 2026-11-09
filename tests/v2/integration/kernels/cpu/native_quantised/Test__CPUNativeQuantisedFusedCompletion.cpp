@@ -239,6 +239,21 @@ TEST(CPUNativeQuantisedFusedCompletion, SharedBank)
 {
     proveFusedCompletion(NativeQuantisedFusedPartialRoute::SharedBank);
 }
+#else
+/**
+ * @test The native ARM schedule owns output N itself. Auto and Current name that
+ * mapping; explicit x86 job layouts are rejected by name, never reinterpreted,
+ * and an out-of-range enum value is rejected before any payload write.
+ */
+TEST(CPUNativeQuantisedFusedCompletion, NativeARMOutputJobOwnershipAdmission)
+{
+    using namespace cpu::native_quantised;
+    EXPECT_NO_THROW(requireNativeNEONFusedOutputJobOwnership(FusedOutputJobOwnership::Auto));
+    EXPECT_NO_THROW(requireNativeNEONFusedOutputJobOwnership(FusedOutputJobOwnership::Current));
+    EXPECT_THROW(requireNativeNEONFusedOutputJobOwnership(FusedOutputJobOwnership::Contiguous), std::invalid_argument);
+    EXPECT_THROW(requireNativeNEONFusedOutputJobOwnership(FusedOutputJobOwnership::PanelBlocks), std::invalid_argument);
+    EXPECT_THROW(requireNativeNEONFusedOutputJobOwnership(static_cast<FusedOutputJobOwnership>(2)), std::invalid_argument);
+}
 #endif
 } // namespace llaminar2::test
 

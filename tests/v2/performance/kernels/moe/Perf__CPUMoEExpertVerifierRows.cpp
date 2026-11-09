@@ -284,6 +284,9 @@ namespace
         if(requested==FusedOutputJobOwnership::Current ||
            tags.at("requested_ownership")!=fusedOutputJobOwnershipName(requested) ||
            tags.at("k")!=std::to_string(k) || tags.at("descriptors")!=std::to_string(descriptors))fail();
+#if defined(__aarch64__)
+        fail(); // ARM never publishes an ownership record (selectedJobOwnership admits Current only).
+#else
         if(requested==FusedOutputJobOwnership::Auto) {
             if(tags.at("effective_ownership")=="Current") {
                 if(tags.at("partition_rule")!="current")fail();
@@ -307,6 +310,7 @@ namespace
         if(tags.at("single_tile_order")!=(blocks?"panel_major":"row_major") ||
            tags.at("grouped_tile_order")!="panel_major" || tags.at("purpose")!="prefill" ||
            tags.at("partition_rule")!=(blocks?"block_cyclic":"equal_job_chunks"))fail();
+#endif
     }
 
     /**
@@ -318,7 +322,14 @@ namespace
     FusedOutputJobOwnership selectedJobOwnership(const char *name)
     {
         const char *raw = std::getenv(name);
-        return parseJobOwnership(raw ? raw : "Current");
+        const auto ownership = parseJobOwnership(raw ? raw : "Current");
+#if defined(__aarch64__)
+        // The native ARM schedule owns output N itself and publishes no
+        // job-ownership record, so no explicit diagnostic can be proven here.
+        if (ownership != FusedOutputJobOwnership::Current)
+            throw std::invalid_argument("CPU FFN job ownership diagnostics are x86-only; ARM requires Current");
+#endif
+        return ownership;
     }
 
     /** @brief Explicit timing scope; no absent numerical policy becomes a zero cost. */
