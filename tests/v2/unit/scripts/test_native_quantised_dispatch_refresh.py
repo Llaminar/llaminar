@@ -36,6 +36,15 @@ class NativeQuantisedDispatchRefreshTest(unittest.TestCase):
         return subprocess.run(["bash", str(SCRIPT), *map(str, arguments)],
                               capture_output=True, text=True, cwd=ROOT)
 
+    def test_cpu_new_choice_is_explicit_and_forwarded_only_in_expert_scope(self):
+        args=driver.parser().parse_args(['--backend','cpu','--stage','expert-only',
+            '--output-dir','/unused','--expert-model-family','qwen4exp','--expert-tp-degree','2',
+            '--expert-layout','intermediate_shard','--expert-isa','AVX512:AVX512',
+            '--expert-purpose','prefill','--expert-ordered-three'])
+        self.assertIn('--expert-ordered-three',driver.cpu_command(args))
+        args.expert_ordered_three=False
+        self.assertNotIn('--expert-ordered-three',driver.cpu_command(args))
+
     def test_retired_training_command_has_no_executable_generic_path(self):
         result = subprocess.run(["bash", str(RETIRED), "--backend", "cpu", "--install"],
                                 capture_output=True, text=True)

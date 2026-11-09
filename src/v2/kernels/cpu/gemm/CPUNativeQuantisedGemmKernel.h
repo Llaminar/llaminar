@@ -17,6 +17,8 @@
  * publication; scalar and SIMD execution share the canonical interleaved bank.
  * Packed ownership handoffs retain physical-allocation leases; explicit clone
  * destinations allocate new bytes through their own admitted storage authority.
+ * Explicit output-job ownership is invocation-local and independent of row
+ * arithmetic; both stable-FFN phases are authenticated before payload mutation.
  */
 
 #pragma once
@@ -1249,14 +1251,17 @@ namespace llaminar2::cpu::native_quantised
          * @param descriptor_count Number of valid entries in @p descriptors.
          * @param k Shared logical activation width.
          * @param partial_storage Admitted invocation bank shared by every team worker.
+         * @param job_ownership Independent explicit ordinary-prefill output ownership.
          * @return `true` after every projection completes; `false` when the
          *         explicit eager/unrotated NativeQuantised contract is invalid.
+         * @throws std::invalid_argument Before phase writes for unsupported explicit ownership.
          */
         static bool multiply_batched_preq_decode_equivalent(
             const BatchedPrequantizedProjectionDesc *descriptors,
             int descriptor_count,
             int k,
-            std::span<float> partial_storage)
+            std::span<float> partial_storage,
+            FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Current)
         {
             if (!descriptors || descriptor_count <= 0 ||
                 descriptor_count > kMaxBatchedPrequantizedProjections ||
@@ -1309,20 +1314,7 @@ namespace llaminar2::cpu::native_quantised
                     return false;
                 }
 
-                fused_descriptors[static_cast<size_t>(projection)] = {
-                    .packed = &kernel->packed_,
-                    .output = source.output,
-                    .bias = source.bias,
-                    .N = source.n,
-                    .ldc = source.ldc,
-                    .rows = source.rows,
-                    .input = source.input_q8,
-                    .decode_schedule = DecodeSchedulePolicy::Auto,
-                    .verifier_schedule = source.rows > 1
-                        ? source.verifier_schedule
-                        : VerifierRowsPolicy::Auto,
-                    .purpose = source.purpose,
-                };
+                fused_descriptors[static_cast<size_t>(projection)] = fusedPrequantizedDescriptor(source);
                 total_rows += source.rows;
                 max_rows = std::max(max_rows, source.rows);
             }
@@ -1343,7 +1335,7 @@ namespace llaminar2::cpu::native_quantised
                     partial_storage,
                     descriptor_count,
                     /*default_rows unused by explicit descriptors=*/1,
-                    blocks_per_row))
+                    blocks_per_row, ISAPath::AUTO, job_ownership))
             {
                 return false;
             }
@@ -1402,7 +1394,10 @@ namespace llaminar2::cpu::native_quantised
          * @param down_descriptors Down projections for all local experts.
          * @param down_count Number of valid down descriptors.
          * @param partial_storage Admitted bank reused only after each phase's readers retire.
+         * @param gate_up_ownership Independent explicit gate/up output ownership.
+         * @param down_ownership Independent explicit down output ownership.
          * @return `true` only when every team participant completes every phase.
+         * @throws std::invalid_argument Before any phase writes for unsupported explicit ownership.
          */
         static bool execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
             const BatchedPrequantizedProjectionDesc *gate_up_descriptors,
@@ -1416,7 +1411,9 @@ namespace llaminar2::cpu::native_quantised
             int activation_blocks_per_row,
             const BatchedPrequantizedProjectionDesc *down_descriptors,
             int down_count,
-            std::span<float> partial_storage)
+            std::span<float> partial_storage,
+            FusedOutputJobOwnership gate_up_ownership = FusedOutputJobOwnership::Current,
+            FusedOutputJobOwnership down_ownership = FusedOutputJobOwnership::Current)
         {
             if (!gate_up_descriptors || gate_up_count <= 0 ||
                 !down_descriptors || down_count <= 0 ||
@@ -1469,13 +1466,19 @@ namespace llaminar2::cpu::native_quantised
                 return false;
             }
 
+            // Both explicit phases must be legal before gate/up can mutate any
+            // payload. The same original planner is used again under the actual
+            // team; no alternate eligibility model or arithmetic is introduced.
+            requireBatchedOutputJobOwnership(gate_up_descriptors, gate_up_count, gate_up_ownership);
+            requireBatchedOutputJobOwnership(down_descriptors, down_count, down_ownership);
+
             std::atomic<bool> transaction_ok{true};
             auto execute_participant = [&]()
             {
                 if (!multiply_batched_preq_decode_equivalent(
                         gate_up_descriptors,
                         gate_up_count,
-                        hidden_width, partial_storage))
+                        hidden_width, partial_storage, gate_up_ownership))
                 {
                     transaction_ok.store(false, std::memory_order_relaxed);
                 }
@@ -1492,7 +1495,7 @@ namespace llaminar2::cpu::native_quantised
                 if (!multiply_batched_preq_decode_equivalent(
                         down_descriptors,
                         down_count,
-                        intermediate, partial_storage))
+                        intermediate, partial_storage, down_ownership))
                 {
                     transaction_ok.store(false, std::memory_order_relaxed);
                 }
@@ -1786,6 +1789,60 @@ namespace llaminar2::cpu::native_quantised
         }
 
     private:
+        /**
+         * @brief Preserve the original prepared descriptor projection in one authority.
+         * @param source Already validated original batched member.
+         * @return Identical fused metadata for execution and explicit cold preflight.
+         */
+        static FusedVerifierRowsDesc fusedPrequantizedDescriptor(const BatchedPrequantizedProjectionDesc &source)
+        {
+            return {
+                .packed = &source.kernel->packed_,
+                .output = source.output,
+                .bias = source.bias,
+                .N = source.n,
+                .ldc = source.ldc,
+                .rows = source.rows,
+                .input = source.input_q8,
+                .decode_schedule = DecodeSchedulePolicy::Auto,
+                .verifier_schedule = source.rows > 1
+                    ? source.verifier_schedule
+                    : VerifierRowsPolicy::Auto,
+                .purpose = source.purpose,
+            };
+        }
+
+        /**
+         * @brief Reject an unsupported explicit phase before any FFN payload write.
+         * @param descriptors Original already validated source members.
+         * @param count Live descriptor prefix.
+         * @param ownership Explicit ownership; Current performs no extra planning.
+         * @throws std::invalid_argument Unless the original planner admits the requested diagnostic.
+         *
+         * Uses invocation-local fixed storage and the original live-prefix planner.
+         * It creates no heap, shared cache, retained plan or additional barrier.
+         */
+        static void requireBatchedOutputJobOwnership(const BatchedPrequantizedProjectionDesc *descriptors,
+            int count, FusedOutputJobOwnership ownership)
+        {
+            (void)fusedOutputJobOwnershipName(ownership);
+            if (ownership == FusedOutputJobOwnership::Current) return;
+            alignas(FusedVerifierRowsDesc) std::array<std::byte,
+                sizeof(FusedVerifierRowsDesc) * kMaxBatchedPrequantizedProjections> descriptor_storage;
+            auto *const fused = ::new (static_cast<void *>(descriptor_storage.data()))
+                FusedVerifierRowsDesc[static_cast<size_t>(count)];
+            for (int member = 0; member < count; ++member)
+                fused[member] = fusedPrequantizedDescriptor(descriptors[member]);
+            alignas(FusedVerifierRowsPlan) std::array<std::byte,
+                sizeof(FusedVerifierRowsPlan) * kMaxBatchedPrequantizedProjections> plan_storage;
+            detail::NativeQuantisedFusedRowsLiveView live_plan(plan_storage, static_cast<size_t>(count));
+            const auto bundle = detail::fillNativeQuantisedFusedRowsPlans(
+                live_plan.mutableProjections(), {fused, static_cast<size_t>(count)},
+                1, nativeQuantisedInvocationWorkerCount());
+            detail::requireFusedOutputJobOwnership(ownership,
+                {fused, static_cast<size_t>(count)}, live_plan.projections(), bundle.partial_route);
+        }
+
         /**
          * @brief Borrow and authenticate query row work before any OpenMP team starts.
          * @param physicalRows Original matrix/scratch row capacity.

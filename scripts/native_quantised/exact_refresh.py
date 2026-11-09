@@ -61,6 +61,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--expert-layout", choices=("complete", "intermediate_shard", "down_columns"))
     result.add_argument("--expert-isa", choices=("AVX2:AVX2", "AVX512:AVX2", "AVX512:AVX512"))
     result.add_argument("--expert-purpose", choices=("decode", "mtp_verifier", "prefill"), action="append")
+    result.add_argument("--expert-ordered-three",action="store_true",
+                        help="Fresh applicable CPU expert Prefill choice-ABI2 observations; historical plans unchanged")
     result.add_argument("--expert-role-format", action="append", default=[])
     result.add_argument("--exclude-expert-role-format", action="append", default=[])
     result.add_argument("--threads", type=int,
@@ -185,6 +187,7 @@ def cpu_command(args: argparse.Namespace) -> list[str]:
         command += ["--reuse-completed-root", str(args.reuse_completed_root)]
     if args.stage == "expert-only":
         command += ["--prefill-row-policy", args.prefill_row_policy, "--tournament", args.tournament]
+        if getattr(args,"expert_ordered_three",False):command.append("--expert-ordered-three")
         for name in ("expert_model_family", "expert_tp_degree", "expert_layout", "expert_isa"):
             value=getattr(args,name)
             if value is not None:command += ["--"+name.replace("_","-"),str(value)]
@@ -474,7 +477,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.backend != "cpu":cli.error("expert-only first slice requires --backend cpu")
         if any(getattr(args,name) is None for name in ("expert_model_family", "expert_tp_degree", "expert_layout", "expert_isa")):
             cli.error("expert-only requires explicit catalog model/TP/layout and build:runtime ISA")
-    elif expert_selection or args.tournament != "full" or args.prefill_row_policy != "exact-points":
+    elif expert_selection or args.expert_ordered_three or args.tournament != "full" or args.prefill_row_policy != "exact-points":
         cli.error("adaptive expert selection belongs to --stage expert-only")
     backends = ("cpu", "cuda", "rocm") if args.backend == "all" else (args.backend,)
     env = dict(os.environ)

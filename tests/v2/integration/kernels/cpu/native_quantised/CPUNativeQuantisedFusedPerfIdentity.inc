@@ -19,12 +19,15 @@ constexpr const char* kProjectionLaunchFamily =
 /** @brief Restore the caller's collection policy after three explicit test measurement lifetimes. */
 class FusedProjectionCollectionScope final {
 public:
-    /** @brief Enable only the original family under test; no production collector policy is changed. */
-    FusedProjectionCollectionScope() {
+    /**
+     * @brief Enable only the original family under test; production policy is unchanged.
+     * @param family Existing production record family, defaulting to projection evidence.
+     */
+    explicit FusedProjectionCollectionScope(const char *family=kProjectionLaunchFamily) {
         if(const char* value=std::getenv("LLAMINAR_PERF_STATS_JSON")) prior_json_=value;
         if(const char* value=std::getenv("LLAMINAR_PERF_STATS_FILTER")) prior_filter_=value;
         setenv("LLAMINAR_PERF_STATS_JSON","1",1);
-        setenv("LLAMINAR_PERF_STATS_FILTER",kProjectionLaunchFamily,1);
+        setenv("LLAMINAR_PERF_STATS_FILTER",family,1);
         PerfStatsCollector::reset();
     }
     /** @brief Drop only this test's observations and restore the original immutable-policy source. */

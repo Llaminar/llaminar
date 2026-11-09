@@ -40,6 +40,12 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
     ASSERT_EQ(manifest.at("schema").get<std::string>(),
         tournament ? "cpu_execution_exact_batch_v2" : "cpu_execution_exact_batch_v1");
     ASSERT_TRUE(manifest.at("requests").is_array()); ASSERT_FALSE(manifest.at("requests").empty());
+    // ABI1 keeps its original forceable roster/diagnostic meaning. Only a
+    // freshly declared ABI2 campaign can qualify the distinct third choice.
+    ASSERT_TRUE(!manifest.contains("execution_exact_choice_abi") ||
+                manifest.at("execution_exact_choice_abi").is_number_integer());
+    const int choice_abi=manifest.value("execution_exact_choice_abi",1);
+    ASSERT_TRUE(choice_abi==1 || choice_abi==2);
     const int n = dimension("LLAMINAR_CPU_FUSED_VERIFIER_N_A", 320);
     const int k = dimension("LLAMINAR_CPU_FUSED_VERIFIER_K", 2560);
     const int policy_n = dimension("LLAMINAR_CPU_FUSED_VERIFIER_POLICY_N", n);
@@ -91,7 +97,8 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
         if (request.candidate_name == "Auto") request.candidate = VerifierRowsPolicy::Auto;
         else if (request.candidate_name == "Pairwise") request.candidate = VerifierRowsPolicy::Pairwise;
         else if (request.candidate_name == "OrderedThreeRows") {
-            ASSERT_FALSE(tournament) << "New explicit physical candidates require full-grade diagnostic clocks";
+            ASSERT_TRUE(!tournament || choice_abi==2)
+                << "OrderedThreeRows tournament requires its freshly declared choice ABI";
             ASSERT_EQ(request.purpose,ProjectionRowsPurpose::Prefill);
             request.candidate=VerifierRowsPolicy::OrderedThreeRows;
         }
@@ -188,13 +195,14 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
     std::uint64_t sample_observations = 0;
     std::array<size_t, 2> live_root_floats{};
     const CPUExecutionExactBatchRequest *current = nullptr;
-    const auto policy_id = [](const FusedVerifierRowsPlan &member) -> uint32_t
+    const auto policy_id = [choice_abi](const FusedVerifierRowsPlan &member) -> uint32_t
     {
         if (member.rows == 1) return static_cast<uint32_t>(member.effective_decode_schedule);
         if (member.effective_verifier_schedule == VerifierRowsPolicy::Pairwise) return 0;
         if (member.effective_verifier_schedule == VerifierRowsPolicy::WideRows) return 1;
         if(member.effective_verifier_schedule==VerifierRowsPolicy::OrderedThreeRows)
-            return uint32_t{0x10000}+static_cast<uint32_t>(VerifierRowsPolicy::OrderedThreeRows);
+            return choice_abi==2?uint32_t{2}:
+                uint32_t{0x10000}+static_cast<uint32_t>(VerifierRowsPolicy::OrderedThreeRows);
         throw std::runtime_error("Exact filled K-part class cannot emit a foreign physical row policy");
     };
     const auto bind_request = [&](bool refresh_inputs = true)
@@ -369,12 +377,14 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
             {"activation_row_offsets", std::vector<size_t>(live_offsets.begin(), live_offsets.begin() + live_projections)},
             {"output_role", role}, {"placement", {{"workers", workers}, {"admitted_physical_cores", allowed_physical_cores.size()},
                 {"disjoint_single_core_masks", disjoint_masks}}}};
+        if(choice_abi==2)evidence["execution_exact_choice_abi"]=2;
         if(current->candidate==VerifierRowsPolicy::OrderedThreeRows) {
-            // Keep the explicit new mechanism distinct from legacy WideRows
-            // and its installed-choice ABI. Existing Python admission rejects
-            // this diagnostic name/foreign policy ID until separately extended.
-            evidence["explicit_candidate_scope"]="ordered_three_rows_prefill_contiguous_diagnostic_v1";
-            evidence["promotion_eligible"]=false;
+            if(choice_abi==1) {
+                // Preserve the original diagnostic contract. Old artifacts are
+                // never rewritten or granted new publication authority.
+                evidence["explicit_candidate_scope"]="ordered_three_rows_prefill_contiguous_diagnostic_v1";
+                evidence["promotion_eligible"]=false;
+            } else evidence["promotion_eligible"]=true;
         }
         if (profiling)
         {
@@ -552,7 +562,10 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
                 {
                     const auto authenticate_baseline = [&]() {
                         verify_live_bytes();
-                        const auto baseline_name = baseline_policies[current->target_descriptor] == 0 ? "Pairwise" : "WideRows";
+                        const auto baseline_policy=baseline_policies[current->target_descriptor];
+                        ASSERT_LE(baseline_policy,2u);
+                        const auto baseline_name=baseline_policy==0?"Pairwise":
+                            (baseline_policy==1?"WideRows":"OrderedThreeRows");
                         uint64_t observed = 0; baseline_routes[contest] = nlohmann::json::array();
                         for (const auto& record : PerfStatsCollector::snapshot({"kernel.cpu_native_quantised_fused_verifier_rows_projection_launch"}))
                         {
@@ -576,6 +589,11 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
                         ASSERT_LT(baseline_index, members.size()) << "Actual Auto baseline missing from forceable roster";
                         ASSERT_TRUE(roster.count("Pairwise"));
                         ASSERT_EQ(roster.count("WideRows"), static_cast<size_t>(plan.use_avx512 && current->m >= 3));
+                        const auto& target_packed=*descriptors[current->target_descriptor].packed;
+                        const bool ordered_eligible=choice_abi==2 && plan.use_avx512 && current->m>=3 &&
+                            current->purpose==ProjectionRowsPurpose::Prefill && target_packed.usesNibbleLUT() &&
+                            plan.projections[current->target_descriptor].k_tiles>1;
+                        ASSERT_EQ(roster.count("OrderedThreeRows"),static_cast<size_t>(ordered_eligible));
                     };
                     authenticate_baseline(); stop = ::testing::Test::HasFatalFailure();
                 }

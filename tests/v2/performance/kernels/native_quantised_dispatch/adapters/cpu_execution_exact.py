@@ -24,6 +24,8 @@ from ..cpu_exact_overlay import (
     CPUExecutionExactKey, canonical_digest, validate_filled_bundle,
     is_execution_exact_batch_timing,
     require_execution_exact_batch_timing_collection_disabled,
+    CPU_EXECUTION_EXACT_CANDIDATE_IDS, execution_exact_choice_id, execution_exact_choice_name,
+    execution_exact_candidate_names, ordered_three_execution_supported,
 )
 from ..format_registry import format_spec
 from ..schema import Backend, NativeQuantisedObservation, classify_aspect
@@ -45,7 +47,8 @@ def _json_array(raw: str, name: str) -> list:
 
 def _exact_timing_key(raw: Mapping[str, str]) -> tuple:
     """Extend existing timing identity with all producer and bundle authority."""
-    return (_timing_key(raw), *(raw[name] for name in sorted(EXACT_IDENTITY_COLUMNS)))
+    return (_timing_key(raw), *(raw[name] for name in sorted(EXACT_IDENTITY_COLUMNS)),
+            raw.get("execution_exact_choice_abi","1"))
 
 
 def adapt_cpu_execution_exact_row(
@@ -85,9 +88,11 @@ def adapt_cpu_execution_exact_row(
         raise ValueError("CPU exact effective ISA disagrees with its actual runtime key")
     effective = _json_array(raw["descriptor_policies"], "descriptor_policies")
     baseline = _json_array(raw["baseline_descriptor_policies"], "baseline_descriptor_policies")
-    requested = {"Pairwise": 0, "cpu.native_quantised.verifier.pairwise": 0,
-                 "WideRows": 1, "cpu.native_quantised.verifier.wide_rows": 1}.get(raw["candidate_id"])
-    if requested is None or len(effective) != len(members) or len(baseline) != len(members):
+    choice_abi=int(raw.get("execution_exact_choice_abi","1"))
+    requested=execution_exact_choice_id(raw["candidate_id"])
+    if execution_exact_choice_name(requested) not in execution_exact_candidate_names(key,choice_abi):
+        raise ValueError("CPU exact candidate is outside its declared choice ABI/domain")
+    if len(effective) != len(members) or len(baseline) != len(members):
         raise ValueError("CPU exact witness requires a complete effective/baseline policy vector")
     if any(type(v) is not int or not 0 <= v <= 0xFFFFFFFF for v in (*effective, *baseline)):
         raise ValueError("CPU exact witness policy vector contains an invalid original policy ID")
@@ -97,14 +102,19 @@ def adapt_cpu_execution_exact_row(
     base = adapt_cpu_verifier_row(raw, context, timing_samples, native_timing=native_timing)
     if base.backend != Backend.CPU:
         raise ValueError("CPU exact producer cannot be a foreign backend")
-    if base.candidate_id not in {"cpu.native_quantised.verifier.pairwise", "cpu.native_quantised.verifier.wide_rows"}:
-        raise ValueError("CPU exact K-part class only admits Pairwise/WideRows candidates")
+    if base.candidate_id not in CPU_EXECUTION_EXACT_CANDIDATE_IDS:
+        raise ValueError("CPU exact K-part class requires a registered physical row choice")
     witness = {**base.physical_launch_evidence,
                "schema": "cpu-execution-exact-witness-v1", "key": key.scalars(),
                "descriptors": [member.scalars() for member in members],
                "timing_basis": "whole_fused_bundle", "team_lifetime": raw["team_lifetime"],
                "holdout": raw["holdout"] == "1",
                "descriptor_policies": effective, "baseline_descriptor_policies": baseline}
+    if choice_abi==2:witness["execution_exact_choice_abi"]=2
+    if requested==2:
+        witness["promotion_eligible"]=raw.get("promotion_eligible")=="1"
+        if not witness["promotion_eligible"]:
+            raise ValueError("OrderedThreeRows requires fresh promotable native evidence")
     # Existing common operation/bundle fields provide exact separation. The
     # original full vector remains provenance; policy never divides its cost.
     # The common exact oracle sees the actual whole operation and one canonical
@@ -231,13 +241,36 @@ def adapt_cpu_execution_exact_native(
     if installed_choices is not None:
         if requested_candidate != "Auto" or key not in installed_choices:
             raise ValueError("installed validation requires Auto and a measured full-key hit")
-        candidate = ("Pairwise", "WideRows")[installed_choices[key]]
+        candidate = execution_exact_choice_name(installed_choices[key])
         expected_hits = sum(CPUExecutionExactKey.from_scalars(values) in installed_choices
                             for values in payload["descriptor_keys"])
         if expected_hits == 0 or counters["execution_exact_hits"] != expected_hits:
             raise ValueError("installed Auto did not execute the exact generated full-key choices")
-    elif candidate not in {"Pairwise", "WideRows"}:
+    elif candidate not in {"Pairwise", "WideRows", "OrderedThreeRows"}:
         raise ValueError("Auto/disabled evidence is a control, not a measured exact candidate")
+    choice_abi=payload.get("execution_exact_choice_abi",1)
+    if type(choice_abi) is not int or choice_abi not in (1,2):
+        raise ValueError("unknown native CPU execution-exact choice ABI")
+    if candidate=="OrderedThreeRows" and (choice_abi!=2 or
+            (installed_choices is None and payload.get("promotion_eligible") is not True) or payload.get("explicit_candidate_scope") is not None):
+        raise ValueError("OrderedThreeRows diagnostic records cannot become fresh publication evidence")
+    if candidate=="OrderedThreeRows":
+        expected_targets=sum(tuple(values)==key.scalars() for values in members)
+        target_observations=0
+        target_tags=dict(m=str(key.rows),n=str(key.physical_n),policy_n=str(key.policy_n),
+            k=str(key.k),codebook=str(key.source_codebook),k_tiles=str(key.k_tiles),
+            purpose="prefill",isa="AVX512")
+        for record in counters["route_records"]:
+            tags=record.get("tags",{})
+            if all(tags.get(name)==value for name,value in target_tags.items()):
+                if (type(record.get("count")) is not int or record["count"]<=0 or
+                        tags.get("requested_verifier_policy")!=requested_candidate or
+                        tags.get("effective_verifier_policy")!="OrderedThreeRows" or
+                        tags.get("physical_row_tile")!="3"):
+                    raise ValueError("OrderedThreeRows lacks actual requested/effective three-row route proof")
+                target_observations+=record["count"]
+        if target_observations!=expected_targets:
+            raise ValueError("OrderedThreeRows route multiplicity differs from its exact target vector")
     source_format = payload["source_format"]
     spec = format_spec(source_format)
     for name, expected in (("source_superblock", bool(key.source_superblock)),
@@ -273,6 +306,8 @@ def adapt_cpu_execution_exact_native(
         "partial_route": payload["partial_route"], "team_lifetime": payload["team_lifetime"],
         "output_layout": payload["output_layout"], "holdout": str(int(holdout)),
     }
+    if choice_abi==2:raw["execution_exact_choice_abi"]="2"
+    if candidate=="OrderedThreeRows":raw["promotion_eligible"]="1"
     result = adapt_cpu_execution_exact_row(raw, context, samples, native_timing=tournament)
     return replace(result, physical_launch_evidence={**result.physical_launch_evidence,
         "native_evidence_path": str(Path(path).resolve()),

@@ -38,7 +38,12 @@ namespace llaminar2::cpu::native_quantised
         FilledKPartOutputTileLocal = 1,
     };
     /** @brief Existing byte-equivalent physical rows; no arithmetic-policy choice. */
-    enum class CPUExecutionExactChoice : std::uint32_t { Pairwise = 0, WideRows = 1 };
+    enum class CPUExecutionExactChoice : std::uint32_t
+    {
+        Pairwise = 0,
+        WideRows = 1,
+        OrderedThreeRows = 2, ///< AVX512 canonical nibble Prefill only; preserves old choices.
+    };
 
     /**
      * @brief ABI v1 full-width key shared by runtime and the canonical emitter.

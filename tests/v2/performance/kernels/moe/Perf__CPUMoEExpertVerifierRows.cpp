@@ -40,20 +40,32 @@
  * The independent one-row arithmetic oracle remains Decode.
  * Optional GATE_UP_POLICY/DOWN_POLICY independently name explicit existing
  * kernel policies; they inherit the old shared VERIFIER_POLICY by default.
+ * GATE_UP_OWNERSHIP/DOWN_OWNERSHIP=Current|Contiguous independently select
+ * diagnostic output-job ownership. Current preserves all original receipts;
+ * Contiguous requires aligned Pairwise ordinary Prefill and records a distinct
+ * ownership identity, never a new row policy or installed exact observation.
  * MEASURE_POLICY=both|native|aligned makes timing scope explicit (default both).
  * Missing numerical-domain columns are NaN, never invented costs. Clocked
  * warmups/samples reuse the same quiescent PerfStats suppression as exact batch;
  * fresh actual phase authentication and isolated profiler work remain outside.
+ * Existing PROFILE_REQUEST_ID/PERF_STATS_PATH opt into one isolated gate/up or
+ * down invocation on warmed retained workers. Preparation, byte checks, two
+ * warmups and fresh actual route/ownership proof remain outside that interval.
+ * Phase buffers use the production64B-aligned storage type in both ownership
+ * controls, preserving original tight FP32/Q8 strides. Metadata and raw clocks
+ * identify this layout revision; older std::vector clocks are not relabeled.
  * Geometry is authored without reconstructing a recorded model route vector.
  */
 
 #include "../../../utils/NativeQuantisedTestPartialStorage.h"
 #include "../../../utils/CPUPerfStatsTimingCollectionScope.h"
+#include "../native_quantised_dispatch/NativeQuantisedProfilerControl.h"
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "utils/CPUFeatures.h"
+#include "tensors/AlignedVector.h"
 #include "utils/QuantizedVerifierFormats.h"
 
 #include <algorithm>
@@ -82,6 +94,8 @@
 using namespace llaminar2;
 using llaminar2::cpu::native_quantised::CPUNativeQuantisedGemmKernel;
 using llaminar2::cpu::native_quantised::VerifierRowsPolicy;
+using llaminar2::cpu::native_quantised::FusedOutputJobOwnership;
+using llaminar2::cpu::native_quantised::fusedOutputJobOwnershipName;
 using llaminar2::cpu::native_quantised::ProjectionRowsPurpose;
 using llaminar2::cpu::native_quantised::projectionRowsPurposeName;
 using llaminar2::cpu::native_quantised::cpuNativeQuantisedSerialEquivalentPolicyN;
@@ -227,6 +241,31 @@ namespace
         catch(const std::invalid_argument& error){throw std::invalid_argument(std::string(name)+": "+error.what());}
     }
 
+    /**
+     * @brief Parse independent job ownership without selecting another row kernel.
+     * @param value Explicit case-sensitive diagnostic token.
+     * @return Original or contiguous independent job ownership.
+     * @throws std::invalid_argument For an unknown or empty token.
+     */
+    FusedOutputJobOwnership parseJobOwnership(std::string_view value)
+    {
+        if (value == "Current") return FusedOutputJobOwnership::Current;
+        if (value == "Contiguous") return FusedOutputJobOwnership::Contiguous;
+        throw std::invalid_argument("CPU FFN ownership must be Current or Contiguous");
+    }
+
+    /**
+     * @brief Read one phase's explicit diagnostic from the existing fixture controls.
+     * @param name Exact fixture-owned environment key.
+     * @return Explicit phase ownership; absence preserves the original schedule.
+     * @throws std::invalid_argument For an unknown or empty explicit token.
+     */
+    FusedOutputJobOwnership selectedJobOwnership(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        return parseJobOwnership(raw ? raw : "Current");
+    }
+
     /** @brief Explicit timing scope; no absent numerical policy becomes a zero cost. */
     enum class MeasurementPolicy { Both, Native, Aligned };
     /** @brief Parse the existing numerical domains without changing their arithmetic. */
@@ -256,6 +295,30 @@ namespace
             return ProfilePolicy::Aligned;
         throw std::invalid_argument(
             "LLAMINAR_CPU_MOE_EXPERT_PROFILE_POLICY must be native or aligned");
+    }
+
+    /**
+     * @brief Validate isolated profiler scope before any weights or output are created.
+     * @param request Existing immutable LinuxPerfControl request ID.
+     * @param output Existing per-worker counter output path, paired with request.
+     * @param batch Existing batch key; unsupported by this single-phase owner.
+     * @param calls Exactly one profiled call; legacy repeated profiling is separate.
+     * @param phase Exactly gate_up or down, never a composed FFN transaction.
+     * @param formats Number of selected source-format transactions.
+     * @param all_formats Whether selection requests the broad canonical matrix.
+     * @param policy The one concrete numerical domain this process executes.
+     * @throws std::invalid_argument For incomplete or ambiguous isolated scope.
+     */
+    void requireIsolatedFFNProfileOptions(std::string_view request, std::string_view output,
+        std::string_view batch, int calls, std::string_view phase, size_t formats,
+        bool all_formats, ProfilePolicy policy)
+    {
+        if (!batch.empty()) throw std::invalid_argument("FFN isolated profiling does not support a profile batch");
+        if (request.empty() && output.empty()) return; // Preserve all legacy timing/profile options.
+        if (request.empty() || output.empty() || calls != 1 || formats != 1 || all_formats ||
+            (phase != "gate_up" && phase != "down") ||
+            (policy != ProfilePolicy::Native && policy != ProfilePolicy::Aligned))
+            throw std::invalid_argument("FFN isolated profiling requires paired request/output, one format, numerical domain, gate_up/down phase and exactly one call");
     }
 
     /** @brief Parse the optional comma-separated format selection. */
@@ -319,10 +382,22 @@ namespace
         return rows;
     }
 
-    /** @brief Produce deterministic, non-trivial router-published hidden rows. */
-    std::vector<float> makeHiddenRows(int rows, int d_model)
+    /**
+     * @brief Validate the original contiguous FP32 row layout without reading payloads.
+     * @param base Actual output/expert-slice address from the owning aligned buffer.
+     * @param ldc Original physical row stride; never padded to manufacture alignment.
+     * @return True only for a non-null64B base and positive64B row stride.
+     */
+    bool alignedFFNFloatRows(const float* base,int ldc)
     {
-        std::vector<float> hidden(
+        return base && ldc>0 && reinterpret_cast<std::uintptr_t>(base)%AlignedVector<float>::ALIGNMENT==0 &&
+            (static_cast<size_t>(ldc)*sizeof(float))%AlignedVector<float>::ALIGNMENT==0;
+    }
+
+    /** @brief Produce deterministic, non-trivial router-published hidden rows. */
+    AlignedVector<float> makeHiddenRows(int rows, int d_model)
+    {
+        AlignedVector<float> hidden(
             static_cast<size_t>(rows) * static_cast<size_t>(d_model));
         for (size_t index = 0; index < hidden.size(); ++index)
         {
@@ -339,8 +414,8 @@ namespace
     /** @brief Require byte equality and report the first divergent byte. */
     template <typename T>
     void expectByteEqual(
-        const std::vector<T> &actual,
-        const std::vector<T> &expected,
+        const AlignedVector<T> &actual,
+        const AlignedVector<T> &expected,
         const std::string &label)
     {
         ASSERT_EQ(actual.size(), expected.size()) << label;
@@ -491,6 +566,8 @@ namespace
      * @param numerical_policy Independent native or GPU-aligned arithmetic contract.
      * @param gate_up_schedule Explicit gate/up candidate, or original Auto.
      * @param down_schedule Explicit down candidate, or original Auto.
+     * @param gate_up_ownership Independent ordinary-prefill gate/up ownership diagnostic.
+     * @param down_ownership Independent ordinary-prefill down ownership diagnostic.
      * @param purpose Typed grouped scheduling intent; serial oracles remain Decode.
      * @param warmup Untimed batches before measurements.
      * @param samples Number of independently timed batches.
@@ -509,6 +586,8 @@ namespace
         CPUProjectionNumericalPolicy numerical_policy,
         VerifierRowsPolicy gate_up_schedule,
         VerifierRowsPolicy down_schedule,
+        FusedOutputJobOwnership gate_up_ownership,
+        FusedOutputJobOwnership down_ownership,
         ProjectionRowsPurpose purpose,
         int warmup,
         int samples,
@@ -531,9 +610,9 @@ namespace
             d_model / static_cast<int>(Q8_1Block::BLOCK_SIZE);
         const int activation_blocks =
             intermediate / static_cast<int>(Q8_1Block::BLOCK_SIZE);
-        const std::vector<float> hidden =
+        const AlignedVector<float> hidden =
             makeHiddenRows(local_route_rows, d_model);
-        std::vector<Q8_1Block> router_q8(
+        AlignedVector<Q8_1Block> router_q8(
             static_cast<size_t>(local_route_rows) * hidden_blocks);
         quantize_activations_to_q8_1(
             hidden.data(),
@@ -543,19 +622,19 @@ namespace
             hidden_blocks,
             numerical_policy);
 
-        std::vector<float> grouped_gate(
+        AlignedVector<float> grouped_gate(
             static_cast<size_t>(local_route_rows) * intermediate);
-        std::vector<float> grouped_up(grouped_gate.size());
-        std::vector<Q8_1Block> grouped_activation(
+        AlignedVector<float> grouped_up(grouped_gate.size());
+        AlignedVector<Q8_1Block> grouped_activation(
             static_cast<size_t>(local_route_rows) * activation_blocks);
-        std::vector<float> grouped_down(
+        AlignedVector<float> grouped_down(
             static_cast<size_t>(local_route_rows) * d_model);
 
-        std::vector<float> serial_gate(grouped_gate.size());
-        std::vector<float> serial_up(grouped_up.size());
-        std::vector<float> serial_activated(grouped_gate.size());
-        std::vector<Q8_1Block> serial_activation(grouped_activation.size());
-        std::vector<float> serial_down(grouped_down.size());
+        AlignedVector<float> serial_gate(grouped_gate.size());
+        AlignedVector<float> serial_up(grouped_up.size());
+        AlignedVector<float> serial_activated(grouped_gate.size());
+        AlignedVector<Q8_1Block> serial_activation(grouped_activation.size());
+        AlignedVector<float> serial_down(grouped_down.size());
 
         using Descriptor =
             CPUNativeQuantisedGemmKernel::BatchedPrequantizedProjectionDesc;
@@ -604,6 +683,46 @@ namespace
             });
         }
 
+        // The production phase roots are64B aligned. Keep exact original
+        // tight strides: Q8 block rows need not themselves be cache-line aligned.
+        for(const auto& descriptor:gate_up_descriptors)
+            if(!alignedFFNFloatRows(descriptor.output,descriptor.ldc))
+                throw std::runtime_error("FFN gate/up descriptor lost its actual aligned root/row stride");
+        for(const auto& descriptor:down_descriptors)
+            if(!alignedFFNFloatRows(descriptor.output,descriptor.ldc))
+                throw std::runtime_error("FFN down descriptor lost its actual aligned root/row stride");
+        const auto publish_layout=[&]() {
+            const auto emit=[&]<class T>(const char* role,const AlignedVector<T>& values,size_t row_elements) {
+                const auto base=reinterpret_cast<std::uintptr_t>(values.data());
+                if(base%AlignedVector<T>::ALIGNMENT)
+                    throw std::runtime_error("FFN phase root lost its64B storage contract");
+                std::cout<<"CPU_FFN_LAYOUT,revision=aligned_phase_roots_v1,format="<<format.label
+                    <<",down_format="<<down_format.label
+                    <<",numerical_policy="<<(numerical_policy==CPUProjectionNumericalPolicy::GPUAlignedExpert?"GPUAlignedExpert":"BackendNative")
+                    <<",purpose="<<projectionRowsPurposeName(purpose)<<",buffer_role="<<role
+                    <<",base_mod64="<<base%64u<<",live_elements="<<values.size()
+                    <<",live_bytes="<<values.size()*sizeof(T)<<",row_elements="<<row_elements
+                    <<",row_stride_bytes="<<row_elements*sizeof(T)<<",expert_start_mod64=";
+                for(size_t expert=0;expert<experts.size();++expert) {
+                    if(expert)std::cout<<':';
+                    std::cout<<reinterpret_cast<std::uintptr_t>(values.data()+
+                        static_cast<size_t>(experts[expert].first_row)*row_elements)%64u;
+                }
+                std::cout<<",outside_timing=1,outside_profile=1\n";
+            };
+            emit("hidden_fp32",hidden,static_cast<size_t>(d_model));
+            emit("router_q8",router_q8,static_cast<size_t>(hidden_blocks));
+            emit("gate_fp32",grouped_gate,static_cast<size_t>(intermediate));
+            emit("up_fp32",grouped_up,static_cast<size_t>(intermediate));
+            emit("activation_q8",grouped_activation,static_cast<size_t>(activation_blocks));
+            emit("down_fp32",grouped_down,static_cast<size_t>(d_model));
+            emit("serial_oracle_gate_fp32",serial_gate,static_cast<size_t>(intermediate));
+            emit("serial_oracle_up_fp32",serial_up,static_cast<size_t>(intermediate));
+            emit("serial_oracle_activated_fp32",serial_activated,static_cast<size_t>(intermediate));
+            emit("serial_oracle_q8",serial_activation,static_cast<size_t>(activation_blocks));
+            emit("serial_oracle_down_fp32",serial_down,static_cast<size_t>(d_model));
+        };
+
         using PartialStorage = llaminar2::test::NativeQuantisedTestPartialStorage;
         PartialStorage grouped_partials(std::max(
             PartialStorage::bundleFloats(gate_up_descriptors.data(), gate_up_descriptors.size(), 1),
@@ -614,7 +733,7 @@ namespace
                     multiply_batched_preq_decode_equivalent(
                         gate_up_descriptors.data(),
                         static_cast<int>(gate_up_descriptors.size()),
-                        d_model, grouped_partials.span()))
+                        d_model, grouped_partials.span(), gate_up_ownership))
             {
                 throw std::runtime_error("Grouped CPU MoE gate/up failed");
             }
@@ -636,7 +755,7 @@ namespace
                     multiply_batched_preq_decode_equivalent(
                         down_descriptors.data(),
                         static_cast<int>(down_descriptors.size()),
-                        intermediate, grouped_partials.span()))
+                        intermediate, grouped_partials.span(), down_ownership))
             {
                 throw std::runtime_error("Grouped CPU MoE down failed");
             }
@@ -661,7 +780,8 @@ namespace
                         intermediate,
                         activation_blocks,
                         down_descriptors.data(),
-                        static_cast<int>(down_descriptors.size()), grouped_partials.span()))
+                        static_cast<int>(down_descriptors.size()), grouped_partials.span(),
+                        gate_up_ownership, down_ownership))
             {
                 throw std::runtime_error(
                     "Persistent-team grouped CPU MoE transaction failed");
@@ -771,6 +891,79 @@ namespace
             serial_down,
             std::string(format.label) + " persistent-team down projection");
 
+        const auto exact_profile_request = test::native_quantised_dispatch::profilerRequestId();
+        if (!exact_profile_request.empty())
+        {
+            if (::testing::Test::HasFailure())
+                throw std::runtime_error("FFN isolated profiling rejected a failed preparation byte oracle");
+            // Match CPUExecutionExactBatch's retained-team protocol. This call
+            // must originate outside an active team: perf control gathers the
+            // real persistent TIDs and concurrently arms/disarms those workers.
+            if (omp_in_parallel()) throw std::invalid_argument("FFN isolated profiling must enter from outside an active OpenMP team");
+            const auto selected_phase = [&]() {
+                if (profile_phase == "gate_up") grouped_gate_up();
+                else grouped_down_projection();
+            };
+            const auto launch = [&]() {
+#pragma omp parallel
+                { selected_phase(); }
+            };
+            for (int warmup = 0; warmup < 2; ++warmup) launch();
+            constexpr const char *route_family="kernel.cpu_native_quantised_fused_verifier_rows_projection_launch";
+            constexpr const char *ownership_family="kernel.cpu_native_quantised_fused_job_ownership";
+            const auto before_routes=PerfStatsCollector::snapshot({route_family});
+            const auto before_ownership=PerfStatsCollector::snapshot({ownership_family});
+            launch(); // Fresh actual proof is a separate, unprofiled call.
+            const auto fresh_count=[](const auto &records,const auto &before,auto emit) {
+                uint64_t count=0;
+                for(const auto &record:records) {
+                    const auto prior=std::find_if(before.begin(),before.end(),[&](const auto &entry){return entry.tags==record.tags;});
+                    const uint64_t old=prior==before.end()?0:prior->count;
+                    if(record.count<old)throw std::runtime_error("FFN profile proof epoch changed");
+                    const auto fresh=record.count-old;
+                    if(fresh){count+=fresh;emit(record.tags,fresh);}
+                }
+                return count;
+            };
+            const auto emit=[&](const char *kind,const auto &tags,uint64_t count) {
+                std::cout<<"CPU_FFN_PROFILE_PROOF,request="<<exact_profile_request<<",phase="<<profile_phase
+                    <<",kind="<<kind<<",fresh_count="<<count;
+                for(const auto &[name,value]:tags)std::cout<<','<<name<<'='<<value;
+                std::cout<<",outside_profile=1\n";
+            };
+            const auto expected_descriptors=static_cast<uint64_t>(active_experts)*(profile_phase=="gate_up"?2u:1u);
+            const auto routes=fresh_count(PerfStatsCollector::snapshot({route_family}),before_routes,
+                [&](const auto &tags,uint64_t count){emit("route",tags,count);});
+            const auto ownership=fresh_count(PerfStatsCollector::snapshot({ownership_family}),before_ownership,
+                [&](const auto &tags,uint64_t count){emit("ownership",tags,count);});
+            const auto requested_ownership=profile_phase=="gate_up"?gate_up_ownership:down_ownership;
+            if(routes!=expected_descriptors || ownership!=uint64_t(requested_ownership==FusedOutputJobOwnership::Contiguous))
+                throw std::runtime_error("FFN isolated profiling requires fresh actual selected-phase route/ownership proof");
+            const auto output=test::native_quantised_dispatch::profilerEnvironment(
+                test::native_quantised_dispatch::kPerfStatsPathEnvironment);
+            test::native_quantised_dispatch::LinuxPerfControl control(exact_profile_request,output);
+            test::native_quantised_dispatch::profileExactOpenMPRegion(control,exact_profile_request,output,launch);
+            // Counter read/publication and these byte oracles occur AFTER disarm.
+            expectByteEqual(grouped_gate,serial_gate,std::string(format.label)+" isolated profile gate");
+            expectByteEqual(grouped_up,serial_up,std::string(format.label)+" isolated profile up");
+            expectByteEqual(grouped_activation,serial_activation,std::string(format.label)+" isolated profile Q8");
+            expectByteEqual(grouped_down,serial_down,std::string(format.label)+" isolated profile down");
+            if (::testing::Test::HasFailure())
+                throw std::runtime_error("FFN isolated profile failed its post-launch byte oracle");
+            std::cout<<"CPU_FFN_PROFILE,request="<<exact_profile_request<<",output="<<output
+                <<",format="<<format.label<<",down_format="<<down_format.label<<",phase="<<profile_phase
+                <<",numerical_policy="<<(numerical_policy==CPUProjectionNumericalPolicy::GPUAlignedExpert?"GPUAlignedExpert":"BackendNative")
+                <<",purpose="<<projectionRowsPurposeName(purpose)<<",runtime_isa="<<isaLevelName(activeISALevel())
+                <<",workers="<<omp_get_max_threads()<<",team_lifetime=retained,profiled_calls=1,preconditioning_calls=2,proof_calls=1"
+                <<",d_model="<<d_model<<",intermediate="<<intermediate<<",active_experts="<<active_experts<<",route_rows="<<local_route_rows
+                <<",requested_gate_up_policy="<<cpu::native_quantised::verifierRowsPolicyName(gate_up_schedule)
+                <<",requested_down_policy="<<cpu::native_quantised::verifierRowsPolicyName(down_schedule)
+                <<",requested_gate_up_ownership="<<fusedOutputJobOwnershipName(gate_up_ownership)
+                <<",requested_down_ownership="<<fusedOutputJobOwnershipName(down_ownership)<<",bytes_pass=1\n";
+            publish_layout();
+            return {}; // Never enter legacy repeat loops or canonical timing clocks.
+        }
+
         if (profile_iterations > 0)
         {
             /*
@@ -815,11 +1008,15 @@ namespace
                 << " down_policy_n="
                 << cpuNativeQuantisedSerialEquivalentPolicyN(d_model)
                 << " gate_up_policy=" << cpu::native_quantised::verifierRowsPolicyName(gate_up_schedule)
-                << " down_policy=" << cpu::native_quantised::verifierRowsPolicyName(down_schedule)
-                << " iterations=" << profile_iterations
+                << " down_policy=" << cpu::native_quantised::verifierRowsPolicyName(down_schedule);
+            if (gate_up_ownership != FusedOutputJobOwnership::Current || down_ownership != FusedOutputJobOwnership::Current)
+                std::cerr << " gate_up_ownership=" << fusedOutputJobOwnershipName(gate_up_ownership)
+                    << " down_ownership=" << fusedOutputJobOwnershipName(down_ownership);
+            std::cerr << " iterations=" << profile_iterations
                 << " checksum=" << checksum << '\n';
             // Profiling and paired timing are disjoint executions. Returning
             // here also prevents later phases from polluting the hot samples.
+            publish_layout();
             return {};
         }
 
@@ -846,7 +1043,33 @@ namespace
         constexpr const char* route_counter="kernel.cpu_native_quantised_fused_verifier_rows_projection_launch";
         std::map<PerfStatsCollector::Tags,uint64_t> prior;
         for(const auto& record:PerfStatsCollector::snapshot({route_counter}))prior[record.tags]=record.count;
+        constexpr const char *ownership_counter="kernel.cpu_native_quantised_fused_job_ownership";
+        std::map<PerfStatsCollector::Tags,uint64_t> prior_ownership;
+        const bool ownership_diagnostic = gate_up_ownership != FusedOutputJobOwnership::Current ||
+            down_ownership != FusedOutputJobOwnership::Current;
+        if (ownership_diagnostic)
+            for (const auto &record : PerfStatsCollector::snapshot({ownership_counter}))
+                prior_ownership[record.tags] = record.count;
         grouped_complete_persistent();
+        if (ownership_diagnostic) {
+            uint64_t fresh_ownership = 0;
+            for (const auto &record : PerfStatsCollector::snapshot({ownership_counter})) {
+                const auto found = prior_ownership.find(record.tags);
+                const uint64_t before = found == prior_ownership.end() ? 0 : found->second;
+                if (record.count < before) throw std::runtime_error("FFN ownership epoch changed during fresh proof");
+                const auto count = record.count - before;
+                if (!count) continue;
+                fresh_ownership += count;
+                std::cout << "CPU_FFN_OWNERSHIP,format=" << format.label << ",down_format=" << down_format.label
+                    << ",fresh_bundles=" << count;
+                for (const auto &[name,value] : record.tags) std::cout << ',' << name << '=' << value;
+                std::cout << ",outside_timing=1\n";
+            }
+            const auto expected = uint64_t(gate_up_ownership == FusedOutputJobOwnership::Contiguous) +
+                uint64_t(down_ownership == FusedOutputJobOwnership::Contiguous);
+            if (fresh_ownership != expected)
+                throw std::runtime_error("Explicit FFN ownership requires its fresh outside-timing ownership PerfStats proof");
+        }
         uint64_t fresh_descriptors=0;bool saw_ordered_three=false;
         for(const auto& record:PerfStatsCollector::snapshot({route_counter})) {
             const auto found=prior.find(record.tags);
@@ -880,7 +1103,7 @@ namespace
         const auto original_precision=std::cout.precision();
         std::cout<<std::setprecision(std::numeric_limits<double>::max_digits10);
         for(size_t phase=0;phase<raw_samples.size();++phase)
-            for(size_t sample=0;sample<raw_samples[phase].size();++sample)
+            for(size_t sample=0;sample<raw_samples[phase].size();++sample) {
                 std::cout<<"CPU_FFN_SAMPLE,format="<<format.label<<",down_format="<<down_format.label
                     <<",numerical_policy="<<(numerical_policy==CPUProjectionNumericalPolicy::GPUAlignedExpert?"GPUAlignedExpert":"BackendNative")
                     <<",purpose="<<projectionRowsPurposeName(phase==5?ProjectionRowsPurpose::Decode:purpose)
@@ -893,10 +1116,19 @@ namespace
                     <<",down_policy_n="<<cpuNativeQuantisedSerialEquivalentPolicyN(d_model)
                     <<",d_model="<<d_model<<",intermediate="<<intermediate
                     <<",active_experts="<<active_experts<<",route_rows="<<local_route_rows
+                    <<",ffn_output_layout=aligned_phase_roots_v1"
                     <<",phase="<<phases[phase]<<",warmups="<<(phase==5?1:warmup)
                     <<",repeats="<<batch_iterations<<",sample="<<sample
-                    <<",us="<<raw_samples[phase][sample]<<",outside_timing=1\n";
+                    <<",us="<<raw_samples[phase][sample];
+                if (ownership_diagnostic)
+                    std::cout << ",requested_gate_up_ownership=" << fusedOutputJobOwnershipName(gate_up_ownership)
+                        << ",requested_down_ownership=" << fusedOutputJobOwnershipName(down_ownership)
+                        << ",ownership_scope=" << (phase == 5 ? "serial_oracle_unchanged" :
+                            phase == 1 ? "activation_unchanged" : "production_grouped");
+                std::cout << ",outside_timing=1\n";
+            }
         std::cout.precision(original_precision);
+        publish_layout();
         return timing;
     }
 } // namespace
@@ -923,11 +1155,51 @@ TEST(Perf_CPUMoEExpertVerifierRows, ExplicitRoleAndNumericalPolicyContract)
     EXPECT_EQ(parseVerifierPolicy("OrderedThreeRows"),VerifierRowsPolicy::OrderedThreeRows);
     EXPECT_THROW((void)parseVerifierPolicy("unknown"),std::invalid_argument);
     EXPECT_THROW((void)parseVerifierPolicy(""),std::invalid_argument);
+    EXPECT_EQ(parseJobOwnership("Current"),FusedOutputJobOwnership::Current);
+    EXPECT_EQ(parseJobOwnership("Contiguous"),FusedOutputJobOwnership::Contiguous);
+    EXPECT_THROW((void)parseJobOwnership(""),std::invalid_argument);
+    EXPECT_THROW((void)parseJobOwnership("Auto"),std::invalid_argument);
+    EXPECT_THROW((void)parseJobOwnership("contiguous"),std::invalid_argument);
+    // Pure validation: no weights, OpenMP team, perf_event_open or filesystem access.
+    for(const auto policy:{ProfilePolicy::Native,ProfilePolicy::Aligned}) {
+        for(const auto *phase:{"gate_up","down"})
+            EXPECT_NO_THROW(requireIsolatedFFNProfileOptions("request","output","",1,phase,1,false,policy));
+        EXPECT_NO_THROW(requireIsolatedFFNProfileOptions("","","",2000,"persistent",3,true,policy));
+    }
+    const auto invalid_profile=[](std::string_view request,std::string_view output,std::string_view batch,
+        int calls,std::string_view phase,size_t formats,bool all_formats,ProfilePolicy policy) {
+        EXPECT_THROW(requireIsolatedFFNProfileOptions(request,output,batch,calls,phase,formats,all_formats,policy),std::invalid_argument);
+    };
+    invalid_profile("request","","",1,"down",1,false,ProfilePolicy::Aligned);
+    invalid_profile("","output","",1,"down",1,false,ProfilePolicy::Aligned);
+    invalid_profile("request","output","batch",1,"down",1,false,ProfilePolicy::Aligned);
+    invalid_profile("","","batch",0,"down",1,false,ProfilePolicy::Aligned);
+    for(int calls:{0,2,2000})invalid_profile("request","output","",calls,"down",1,false,ProfilePolicy::Aligned);
+    for(const auto *phase:{"","swiglu_q8","complete","persistent"})
+        invalid_profile("request","output","",1,phase,1,false,ProfilePolicy::Aligned);
+    for(size_t formats:{size_t{0},size_t{2}})invalid_profile("request","output","",1,"down",formats,false,ProfilePolicy::Aligned);
+    invalid_profile("request","output","",1,"down",1,true,ProfilePolicy::Aligned);
+    invalid_profile("request","output","",1,"down",1,false,static_cast<ProfilePolicy>(99));
     EXPECT_EQ(parseMeasurementPolicy("both"),MeasurementPolicy::Both);
     EXPECT_EQ(parseMeasurementPolicy("native"),MeasurementPolicy::Native);
     EXPECT_EQ(parseMeasurementPolicy("aligned"),MeasurementPolicy::Aligned);
     EXPECT_THROW((void)parseMeasurementPolicy(""),std::invalid_argument);
     EXPECT_THROW((void)parseMeasurementPolicy("unknown"),std::invalid_argument);
+}
+
+/** @test Aligned phase roots retain tight FP32/Q8 extents and reject shifted output slices. */
+TEST(Perf_CPUMoEExpertVerifierRows, OutputLayoutContract)
+{
+    AlignedVector<float> fp32(3u*320u);
+    AlignedVector<Q8_1Block> q8(3u*10u);
+    EXPECT_TRUE(alignedFFNFloatRows(fp32.data(),320));
+    EXPECT_TRUE(alignedFFNFloatRows(fp32.data()+320,320));
+    EXPECT_FALSE(alignedFFNFloatRows(fp32.data()+1,320));
+    EXPECT_FALSE(alignedFFNFloatRows(fp32.data(),321));
+    EXPECT_FALSE(alignedFFNFloatRows(nullptr,320));
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(q8.data())%64u,0u);
+    EXPECT_EQ(q8.size(),30u);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(q8.data()+10)%64u,(10u*sizeof(Q8_1Block))%64u);
 }
 
 /** @test CPU phase warmup/sample calls emit zero records; fresh proof stays outside clocks. */
@@ -1004,17 +1276,21 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
     const VerifierRowsPolicy verifier_schedule = selectedVerifierPolicy("LLAMINAR_CPU_MOE_EXPERT_VERIFIER_POLICY");
     const VerifierRowsPolicy gate_up_schedule=selectedVerifierPolicy("LLAMINAR_CPU_MOE_EXPERT_GATE_UP_POLICY",verifier_schedule);
     const VerifierRowsPolicy down_schedule=selectedVerifierPolicy("LLAMINAR_CPU_MOE_EXPERT_DOWN_POLICY",verifier_schedule);
+    const auto gate_up_ownership=selectedJobOwnership("LLAMINAR_CPU_MOE_EXPERT_GATE_UP_OWNERSHIP");
+    const auto down_ownership=selectedJobOwnership("LLAMINAR_CPU_MOE_EXPERT_DOWN_OWNERSHIP");
+    const bool ownership_diagnostic=gate_up_ownership!=FusedOutputJobOwnership::Current ||
+        down_ownership!=FusedOutputJobOwnership::Current;
     const auto measurement_policy=selectedMeasurementPolicy();
     const bool include_native=measurement_policy!=MeasurementPolicy::Aligned;
     const bool include_aligned=measurement_policy!=MeasurementPolicy::Native;
     const ProjectionRowsPurpose purpose = selectedProjectionPurpose();
     const bool ordered_three=gate_up_schedule==VerifierRowsPolicy::OrderedThreeRows ||
         down_schedule==VerifierRowsPolicy::OrderedThreeRows;
-    if(ordered_three) {
+    if(ordered_three || ownership_diagnostic) {
         ASSERT_EQ(purpose,ProjectionRowsPurpose::Prefill);
         if(profile_iterations>0)ASSERT_EQ(profile_policy,ProfilePolicy::Aligned);
         else ASSERT_EQ(measurement_policy,MeasurementPolicy::Aligned)
-            << "OrderedThreeRows requires explicit aligned-only clocks, never a BackendNative substitution";
+            << "Explicit Prefill diagnostics require aligned-only clocks, never a BackendNative substitution";
     }
     // Batched descriptors have no original-output-slice binding. Query the
     // same serial-width authority used by the production fused planner; do
@@ -1032,6 +1308,15 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
 
     const std::set<std::string> requested = selectedFormats();
     const bool all_formats = requested.count("all") != 0u;
+    const auto exact_profile_request=test::native_quantised_dispatch::profilerRequestId();
+    const auto exact_profile_output=test::native_quantised_dispatch::profilerEnvironment(
+        test::native_quantised_dispatch::kPerfStatsPathEnvironment);
+    requireIsolatedFFNProfileOptions(exact_profile_request,exact_profile_output,
+        test::native_quantised_dispatch::profilerEnvironment(test::native_quantised_dispatch::kProfilerBatchPathEnvironment),
+        profile_iterations,profile_phase,requested.size(),all_formats,profile_policy);
+    if (!exact_profile_request.empty() && (std::ifstream(exact_profile_output).good() ||
+        std::ifstream(exact_profile_output+".partial").good()))
+        throw std::invalid_argument("FFN isolated profiler output already exists");
     const char *csv_path = std::getenv("LLAMINAR_CPU_MOE_EXPERT_POLICY_CSV");
     if (profile_iterations > 0)
     {
@@ -1053,7 +1338,9 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                "native_complete_us,native_persistent_us,"
                "aligned_gate_up_us,aligned_swiglu_q8_us,aligned_down_us,"
                "aligned_complete_us,aligned_persistent_us,"
-               "aligned_over_native_persistent,purpose,gate_up_policy_n,down_policy_n,requested_gate_up_policy,requested_down_policy,measured_numerics\n";
+               "aligned_over_native_persistent,purpose,gate_up_policy_n,down_policy_n,requested_gate_up_policy,requested_down_policy,measured_numerics";
+        if (ownership_diagnostic) csv << ",requested_gate_up_ownership,requested_down_ownership";
+        csv << ",ffn_output_layout\n";
     }
     int executed = 0;
     std::cout
@@ -1091,7 +1378,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 profile_policy == ProfilePolicy::Aligned
                     ? CPUProjectionNumericalPolicy::GPUAlignedExpert
                     : CPUProjectionNumericalPolicy::BackendNative,
-                gate_up_schedule, down_schedule, purpose, warmup, samples, batch_iterations,
+                gate_up_schedule, down_schedule, gate_up_ownership, down_ownership, purpose, warmup, samples, batch_iterations,
                 profile_iterations, profile_phase);
             ++executed;
             continue;
@@ -1110,7 +1397,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 d_model,
                 intermediate,
                 CPUProjectionNumericalPolicy::BackendNative,
-                gate_up_schedule, down_schedule,
+                gate_up_schedule, down_schedule, gate_up_ownership, down_ownership,
                 purpose,
                 warmup,
                 samples,
@@ -1130,7 +1417,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 d_model,
                 intermediate,
                 CPUProjectionNumericalPolicy::GPUAlignedExpert,
-                gate_up_schedule, down_schedule,
+                gate_up_schedule, down_schedule, gate_up_ownership, down_ownership,
                 purpose,
                 warmup,
                 samples,
@@ -1186,7 +1473,10 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 << gate_up_policy_n << ',' << down_policy_n << ','
                 << cpu::native_quantised::verifierRowsPolicyName(gate_up_schedule) << ','
                 << cpu::native_quantised::verifierRowsPolicyName(down_schedule) << ','
-                << (include_native?(include_aligned?"both":"native"):"aligned") << '\n';
+                << (include_native?(include_aligned?"both":"native"):"aligned");
+            if (ownership_diagnostic) csv << ',' << fusedOutputJobOwnershipName(gate_up_ownership)
+                << ',' << fusedOutputJobOwnershipName(down_ownership);
+            csv << ",aligned_phase_roots_v1" << '\n';
         }
         if(include_native)EXPECT_GT(native_speedup, 1.0)
             << format.label

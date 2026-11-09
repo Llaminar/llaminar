@@ -608,6 +608,11 @@ def adapt_cpu_verifier_row(
         raise ValueError(
             "CPU telemetry claimed a full-K verifier route in a K-partition domain"
         )
+    if candidate.config_json["policy"] == "OrderedThreeRows" and (
+            effective_runtime_isa != "AVX512" or m < 3 or k_tiles <= 1 or
+            "exact_key" not in raw or raw.get("purpose") != "prefill" or
+            raw.get("numerical_policy") != "GPUAlignedExpert"):
+        raise ValueError("OrderedThreeRows requires its typed fused nibble Prefill evidence")
     expected_n_block_chunks = candidate.config_json.get("n_block_chunks")
     if (
         expected_n_block_chunks is not None
@@ -666,7 +671,7 @@ def adapt_cpu_verifier_row(
         config_json=candidate.config_json,
         supported=forced_route_ok,
         graph_capture_ok=False,
-        generic_eligible=True,
+        generic_eligible=candidate.config_json["policy"]!="OrderedThreeRows",
         arithmetic_fingerprint=candidate.arithmetic_fingerprint,
         serial_m1_policy_id=CPU_SERIAL_POLICY_ID,
         serial_m1_policy_hash=context.serial_m1_policy_hash,

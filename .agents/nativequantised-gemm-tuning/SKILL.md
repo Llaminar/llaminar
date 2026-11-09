@@ -77,6 +77,12 @@ For a focused expert-only experiment, repeat `--expert-m M` to select actual
 row counts from the selected purposes' existing inventory. Declare this scope
 before collection and retain it on resume. The projection preserves mixed-row
 holdouts and does not change runtime dispatch or the default full inventory.
+`--expert-ordered-three` explicitly starts a fresh expert-Prefill choice-ABI2
+campaign and adds OrderedThreeRows only for applicable AVX512 canonical nibble
+cells. Legacy plans and Pairwise/WideRows records keep their original roster.
+Older explicit diagnostic records remain non-promotable; never relabel them as
+fresh choice2 evidence. Installation still uses the original mixed holdout,
+isolated profile and actual generated-Auto gates.
 
 Fresh model sweeps select Qwen3.5/3.6/3.8 and QFN geometry, retaining shared
 physical shapes under their original names. `--model-scope all-retained`

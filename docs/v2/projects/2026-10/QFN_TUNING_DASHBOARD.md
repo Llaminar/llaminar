@@ -22,20 +22,20 @@ explicit-none control. Full preflight, exact-feature GPU/model and OpenCode
 qualification remain open; previous broad-tree passes are not that certificate.
 
 **Current tuning:** modern scope retains105 geometries,315 completed M1 jobs
-and11 grouped cells. M1 is installed; paid evidence resumes unchanged.
-Four/two/one panel scheduling gives **1.62× CPU FFN over two-pair**. Live-plan
-initialization saves **2.3% MTP /2.5% prefill** in AVX512 components.
-M3 overlay: **11% component gain**, model flat.
+and11 grouped cells; no broad resweep. M3 overlay: **11% component gain**, model flat.
+CPU contiguous ownership passes all21 codebooks; aligned complete FFN saves
+**5–42%** across two repeated comparisons. Persistent timing bursts are retained.
+**Auto unchanged; mixed-row qualification next.**
+[All-format evidence](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md).
+CPU3-row saves **29–33%** gate/up on larger bundles; the small M64 exact contest
+keeps Pairwise. [Three-row candidate](../2026-11/QFN_CPU_ORDERED_THREE_PREFILL_20261109.md).
 Prepared-Q8 MT16: **9–25% component gain**, unpromoted. Root combine/weight
-worksharing: **~2× M64, 3–6% M448**. CPU3-row Prefill saves **29–33%** gate/up
-and **25–28%** FFN latency; bytes pass. **Auto unchanged**.
-[Candidate and correction](../2026-11/QFN_CPU_ORDERED_THREE_PREFILL_20261109.md).
-Shared gather: **~3× at16MiB**; sparse prefill remains unpromoted.
-[Exact-overlay scope and measurements](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md).
-[Launch omission, matched controls and timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md).
-[Root phase timing](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md).
-[Admission correction](../2026-11/QFN_SELECTED_ATTENTION_WORKSPACE_ADMISSION_20261108.md).
-[CPU assembly and measurements](../2026-11/QFN_CPU_NATIVEQUANTISED_SPILL_AUDIT_20261108.md).
+worksharing: **~2× M64, 3–6% M448**; shared gather **~3× at16MiB**.
+[Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
+[timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md),
+[root phases](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md),
+[admission](../2026-11/QFN_SELECTED_ATTENTION_WORKSPACE_ADMISSION_20261108.md),
+[CPU assembly](../2026-11/QFN_CPU_NATIVEQUANTISED_SPILL_AUDIT_20261108.md).
 
 Earlier ROCm TP4 Dynamic/OpenCode checkpoint: `2cf99995d`.
 [Contract and MTP table](QFN_MTP_TP4_TUNING.md). A1 controls below use MTP off.

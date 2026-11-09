@@ -85,6 +85,30 @@ class AdaptiveExpertScopeTest(unittest.TestCase):
         self.assertTrue({128,256,512,1024}.issubset(plan['expert_prefill_m']))
         self.assertIn('no interval',plan['prefill_publication'])
 
+    def test_new_choice_opt_in_preserves_historical_plan_and_scoped_native_requests(self):
+        old=target_plan(tournament='full')
+        self.assertNotIn('execution_exact_choice_abi',old)
+        self.assertFalse(any(r['candidate']=='OrderedThreeRows' for r in sweep.iter_requests(old)))
+        scope=dict(model_family='qwen4exp',tp_degree=2,layout='intermediate_shard',
+            isa=('AVX512','AVX512'),purposes=('prefill',))
+        fresh=target_plan(tournament='full',expert_scope=scope,expert_m=(64,),expert_ordered_three=True)
+        self.assertEqual(fresh['execution_exact_choice_abi'],2)
+        jobs=list(sweep.iter_jobs(fresh));self.assertEqual(len(jobs),2)
+        for job in jobs:
+            expected={'Pairwise','WideRows','OrderedThreeRows'} if job['role']=='gate_up' else {'Pairwise','WideRows'}
+            self.assertEqual({r['candidate'] for r in job['requests']},expected)
+            self.assertEqual({r['holdout'] for r in job['requests']},{False,True})
+        with self.assertRaises(ValueError):target_plan(expert_ordered_three=True,
+            expert_scope={**scope,'purposes':('mtp_verifier',)})
+        with tempfile.TemporaryDirectory() as directory:
+            directory=Path(directory)
+            args=SimpleNamespace(fused_avx512_bin=directory/'build/tests/v2/trainer')
+            sweep._command(args,fresh,jobs[0],directory)
+            native=json.loads((directory/'requests.json').read_text())
+            self.assertEqual(native['execution_exact_choice_abi'],2)
+            self.assertEqual(native['schema'],'cpu_execution_exact_batch_v1')
+        self.assertNotEqual(old['plan_digest'],fresh['plan_digest'])
+
     def test_actual_m_projection_keeps_native_train_and_mixed_holdouts(self):
         scope=dict(model_family='qwen4exp',tp_degree=2,layout='intermediate_shard',
             isa=('AVX512','AVX512'),purposes=('mtp_verifier',))
@@ -217,6 +241,43 @@ class AdaptiveExpertEvidenceTest(unittest.TestCase):
         receipt={'entries':[dict(key=rows[0].physical_launch_evidence['key'],candidate_id=rows[0].candidate_id)]}
         selected=sweep.expert_profile_observations(ObservationCorpus(rows),receipt)
         self.assertEqual([r.candidate_id for r in selected],[rows[0].candidate_id])
+
+    def test_new_declared_adaptive_roster_is_complete_and_old_two_choice_still_valid(self):
+        old=adaptive_payload()
+        validate_fused_tournament(old,minimum_samples=30)
+        fresh=deepcopy(old);fresh['execution_exact_choice_abi']=2
+        with self.assertRaisesRegex(ValueError,'roster'):validate_fused_tournament(fresh,minimum_samples=30)
+        fresh['tournament']['candidate_ids'].append('OrderedThreeRows')
+        decision=deepcopy(fresh['tournament']['candidates'][1]);decision['candidate_id']='OrderedThreeRows'
+        fresh['tournament']['candidates'].append(decision)
+        validate_fused_tournament(fresh,minimum_samples=30)
+        fresh.pop('execution_exact_choice_abi')
+        with self.assertRaisesRegex(ValueError,'roster'):validate_fused_tournament(fresh,minimum_samples=30)
+
+    def test_new_screened_choice_keeps_correctness_but_cannot_publish(self):
+        from native_quantised_dispatch.exact_oracle import candidate_is_eligible
+        p=adaptive_payload('WideRows',screened=True)
+        p.update(candidate='OrderedThreeRows',execution_exact_choice_abi=2,
+                 promotion_eligible=True,descriptor_policies=[2,2])
+        p['tournament']['candidate_ids'].append('OrderedThreeRows')
+        decision=deepcopy(p['tournament']['candidates'][1]);decision['candidate_id']='OrderedThreeRows'
+        p['tournament']['candidates'].append(decision)
+        p['counters']['route_records']=[dict(count=2,tags=dict(m='64',n='320',policy_n='320',
+            k='2560',codebook='5',k_tiles='16',purpose='prefill',isa='AVX512',
+            requested_verifier_policy='OrderedThreeRows',effective_verifier_policy='OrderedThreeRows',physical_row_tile='3'))]
+        observation=fixture.CPUExecutionNativeEvidenceTest().adapt(p)
+        self.assertTrue(observation.bitwise_equal)
+        self.assertFalse(is_promotion_grade(observation))
+        self.assertFalse(candidate_is_eligible(observation))
+
+    def test_fresh_full_choice_profiles_only_winner_and_actual_baseline(self):
+        rows=[fixture.observe(fixture.row(name,choice_abi=2))
+              for name in ('Pairwise','WideRows','OrderedThreeRows')]
+        rows=[replace(row,physical_launch_evidence={**row.physical_launch_evidence,'target_descriptor':0})
+              for row in rows]
+        receipt={'entries':[dict(key=rows[0].physical_launch_evidence['key'],candidate_id=rows[2].candidate_id)]}
+        profiles=sweep.expert_profile_observations(ObservationCorpus(rows),receipt)
+        self.assertEqual({row.candidate_id for row in profiles},{rows[0].candidate_id,rows[2].candidate_id})
 
     def test_old_native_v1_behavior_remains_unchanged(self):
         evidence=fixture.CPUExecutionNativeEvidenceTest()

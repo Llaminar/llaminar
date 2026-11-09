@@ -185,6 +185,54 @@ class CPUExecutionExactKey:
         return CPU_EXACT_SCHEMA + ":" + json.dumps(self.scalars(), separators=(",", ":"))
 
 
+CPU_EXECUTION_EXACT_CHOICE_NAMES = ("Pairwise", "WideRows", "OrderedThreeRows")
+CPU_EXECUTION_EXACT_CANDIDATE_IDS = (
+    "cpu.native_quantised.verifier.pairwise", "cpu.native_quantised.verifier.wide_rows",
+    "cpu.native_quantised.verifier.ordered_three_rows",
+)
+
+
+def execution_exact_choice_name(choice: int) -> str:
+    """Decode the append-only physical choice ABI; old0/1 keep their meaning."""
+    if type(choice) is not int or not 0 <= choice < len(CPU_EXECUTION_EXACT_CHOICE_NAMES):
+        raise ValueError("unknown CPU execution-exact physical choice")
+    return CPU_EXECUTION_EXACT_CHOICE_NAMES[choice]
+
+
+def execution_exact_choice_id(candidate: str) -> int:
+    """Resolve original native/canonical names without relabeling a physical mode."""
+    if candidate in CPU_EXECUTION_EXACT_CHOICE_NAMES:
+        return CPU_EXECUTION_EXACT_CHOICE_NAMES.index(candidate)
+    if candidate in CPU_EXECUTION_EXACT_CANDIDATE_IDS:
+        return CPU_EXECUTION_EXACT_CANDIDATE_IDS.index(candidate)
+    raise ValueError("unknown CPU execution-exact candidate")
+
+
+def ordered_three_execution_supported(key: CPUExecutionExactKey) -> bool:
+    """Mirror the canonical prepared nibble Prefill domain, never a learned rule.
+
+    Encoding0/4 are the existing CPU NibbleLUT/source-factor encodings. The
+    source registry supplies coefficient width and symmetry; native evidence
+    still proves the actual encoding, partition count, layout and worker class.
+    """
+    from .format_registry import FORMAT_SPECS
+    sources = [spec for spec in FORMAT_SPECS if
+               (spec.source_codebook_id, int(spec.source_is_superblock)) ==
+               (key.source_codebook, key.source_superblock)]
+    return (key.operation == 2 and key.numerical_policy == 1 and
+            key.build_isa == key.runtime_isa == 1 and key.rows >= 3 and key.k_tiles > 1 and
+            key.prepared_encoding in (0, 4) and len(sources) == 1 and
+            sources[0].payload_bytes == 16 and int(sources[0].is_asymmetric) == key.asymmetric)
+
+
+def execution_exact_candidate_names(key: CPUExecutionExactKey, choice_abi: int = 1) -> tuple[str, ...]:
+    """Keep historical rosters exact; only declared new applicable cells add choice2."""
+    if type(choice_abi) is not int or choice_abi not in (1, 2):
+        raise ValueError("unknown CPU execution-exact choice ABI")
+    names = ("Pairwise", "WideRows") if key.runtime_isa == 1 and key.rows >= 3 else ("Pairwise",)
+    return names + (("OrderedThreeRows",) if choice_abi == 2 and ordered_three_execution_supported(key) else ())
+
+
 def validate_filled_bundle(
     key: CPUExecutionExactKey,
     descriptors: Iterable[CPUExecutionExactKey],
@@ -216,8 +264,10 @@ def generate_execution_exact_include(entries: Mapping[CPUExecutionExactKey, int]
     """Emit the additive sorted full-key table; installed generics are untouched."""
     if any(key.rows < 2 for key in entries):
         raise ValueError("execution-exact row overlay requires grouped target rows")
-    if any(type(choice) is not int or choice not in (0, 1) for choice in entries.values()):
-        raise ValueError("execution-exact choice must be physical Pairwise or WideRows")
+    for key, choice in entries.items():
+        execution_exact_choice_name(choice)
+        if choice == 2 and not ordered_three_execution_supported(key):
+            raise ValueError("OrderedThreeRows exact choice is outside its canonical Prefill domain")
     ordered = sorted(entries.items())
     lines = [
         "/**", " * @file CPUNativeQuantisedExecutionExactGenerated.inc",
@@ -232,7 +282,7 @@ def generate_execution_exact_include(entries: Mapping[CPUExecutionExactKey, int]
     ]
     for key, choice in ordered:
         values = ", ".join(str(value) + "u" for value in key.scalars())
-        name = "Pairwise" if choice == 0 else "WideRows"
+        name = execution_exact_choice_name(choice)
         lines.append(f"    {{{{{values}}}, CPUExecutionExactChoice::{name}}},")
     lines += ["}};", "", "/** Resolve one immutable execution key without allocation or policy mutation. */",
               "inline bool selectCPUExecutionExactPolicy(",
@@ -297,8 +347,17 @@ def require_execution_exact_publication_timing(observation) -> None:
         if not is_execution_exact_batch_timing(payload):
             raise ValueError("nonbatch CPU exact timing remains diagnostic, not new winner publication evidence")
         require_execution_exact_batch_timing_collection_disabled(payload)
+        if payload.get("promotion_eligible") is False:
+            raise ValueError("CPU exact diagnostic evidence remains non-promotable")
+        if payload.get("execution_exact_choice_abi",1) != witness.get("execution_exact_choice_abi",1):
+            raise ValueError("CPU exact original choice ABI differs from its witness")
         if witness.get("native_timing_schema") != payload["schema"]:
             raise ValueError("CPU exact common/native timing schemas disagree")
+    if witness.get("promotion_eligible") is False:
+        raise ValueError("CPU exact diagnostic evidence remains non-promotable")
+    if observation.candidate_id == CPU_EXECUTION_EXACT_CANDIDATE_IDS[2] and (
+            witness.get("execution_exact_choice_abi") != 2 or witness.get("promotion_eligible") is not True):
+        raise ValueError("OrderedThreeRows publication requires fresh declared choice-ABI2 evidence")
     if (witness.get("native_timing_owner") != "CPUExecutionExactBatch" or
             witness.get("native_timing_schema") not in
                 {"cpu_execution_exact_native_v1", "cpu_execution_exact_native_v2"}):
@@ -394,9 +453,12 @@ def select_execution_exact_entries(corpus) -> tuple[dict[CPUExecutionExactKey, i
         vectors = {canonical_digest(row.physical_launch_evidence["descriptors"]) for row in rows}
         if len(vectors) != 1:
             raise ValueError("distinct training bundle vectors require separate exact-oracle surfaces")
-        required = {"cpu.native_quantised.verifier.pairwise"}
-        if key.runtime_isa == 1 and key.rows >= 3:
-            required.add("cpu.native_quantised.verifier.wide_rows")
+        # Old Pair/Wide observations retain their original finite roster. New
+        # applicability is declared by fresh ABI2 evidence, never inferred from
+        # the mere addition of a registered physical candidate.
+        choice_abi=max(row.physical_launch_evidence.get("execution_exact_choice_abi",1) for row in rows)
+        required={CPU_EXECUTION_EXACT_CANDIDATE_IDS[execution_exact_choice_id(name)]
+                  for name in execution_exact_candidate_names(key,choice_abi)}
         tournament_finalists = _execution_tournament_matrix(rows, required)
         valid = {row.candidate_id for row in rows
                  if candidate_is_eligible(row) and _execution_promotion_grade(row)}
@@ -410,7 +472,7 @@ def select_execution_exact_entries(corpus) -> tuple[dict[CPUExecutionExactKey, i
             raise ValueError("CPU exact key lacks complete byte-exact mixed-bundle holdout")
         winner = build_exact_winner([row for row in rows
             if candidate_is_eligible(row) and _execution_promotion_grade(row)])
-        choice = {"cpu.native_quantised.verifier.pairwise": 0, "cpu.native_quantised.verifier.wide_rows": 1}[winner.candidate_id]
+        choice = execution_exact_choice_id(winner.candidate_id)
         entries[key] = choice
         receipts.append({"key": key.scalars(), "choice": choice,
                          "candidate_id": winner.candidate_id,
@@ -432,7 +494,7 @@ def read_execution_exact_include(source: str) -> dict[CPUExecutionExactKey, int]
             return {}
         raise ValueError("unsupported prior CPU execution-exact generated program")
     rows = {}; body = table[2]
-    pattern = re.compile(r"\{\{([\d,u\s]+)\}, CPUExecutionExactChoice::(Pairwise|WideRows)\},")
+    pattern = re.compile(r"\{\{([\d,u\s]+)\}, CPUExecutionExactChoice::(Pairwise|WideRows|OrderedThreeRows)\},")
     ordered = []
     for match in pattern.finditer(body):
         literals = [value.strip() for value in match[1].split(',') if value.strip()]
@@ -441,7 +503,10 @@ def read_execution_exact_include(source: str) -> dict[CPUExecutionExactKey, int]
         key = CPUExecutionExactKey.from_scalars(int(value[:-1]) for value in literals)
         if key.rows < 2 or key in rows:
             raise ValueError("CPU execution-exact table has a foreign or duplicate key")
-        ordered.append(key); rows[key] = int(match[2] == "WideRows")
+        choice=execution_exact_choice_id(match[2])
+        if choice==2 and not ordered_three_execution_supported(key):
+            raise ValueError("OrderedThreeRows exact literal is outside its canonical Prefill domain")
+        ordered.append(key); rows[key] = choice
     if re.sub(r"\s", "", pattern.sub("", body)) or len(rows) != int(table[1]) or ordered != sorted(ordered):
         raise ValueError("CPU execution-exact literal inventory changed or is incomplete")
     return rows

@@ -52,6 +52,13 @@ bool exactTestInvalidChoice(const CPUExecutionExactKey &, CPUExecutionExactChoic
     return true;
 }
 
+/** @brief Authored table action for qualification of the appended choice. */
+bool exactTestOrderedThree(const CPUExecutionExactKey &, CPUExecutionExactChoice &choice)
+{
+    choice=CPUExecutionExactChoice::OrderedThreeRows;
+    return true;
+}
+
 /** @brief Metadata-only valid prepared geometry; no payload/kernel is used. */
 struct ExactPlanFixture
 {
@@ -195,6 +202,34 @@ TEST(CPUNativeQuantisedExecutionExactPolicy, SourceBlockShapeAdmissionDoesNotPad
                 EXPECT_NO_THROW(requireQuantizedVerifierSourceShape(format, 2560, k));
         }
     }
+}
+/** @test Appended exact choice reaches actual Auto planning only in its canonical domain. */
+TEST(CPUNativeQuantisedExecutionExactPolicy, OrderedThreeChoiceAutoDomainAndStorageContract)
+{
+    static_assert(static_cast<uint32_t>(CPUExecutionExactChoice::Pairwise)==0);
+    static_assert(static_cast<uint32_t>(CPUExecutionExactChoice::WideRows)==1);
+    static_assert(static_cast<uint32_t>(CPUExecutionExactChoice::OrderedThreeRows)==2);
+    ExactPlanFixture fixture;
+    for(auto& descriptor:fixture.descriptors)descriptor.purpose=ProjectionRowsPurpose::Prefill;
+#if LLAMINAR_COMPILED_WITH_AVX512
+    const auto plan=planNativeQuantisedFusedRows<exactTestOrderedThree>(fixture.descriptors,3,1,ISAPath::AVX512);
+    EXPECT_EQ(plan.partial_route,NativeQuantisedFusedPartialRoute::OutputTileLocal);
+    for(const auto& member:std::span(plan.projections).first(fixture.descriptors.size())) {
+        EXPECT_TRUE(member.execution_exact_hit);
+        EXPECT_EQ(member.requested_verifier_schedule,VerifierRowsPolicy::Auto);
+        EXPECT_EQ(member.effective_verifier_schedule,VerifierRowsPolicy::OrderedThreeRows);
+        EXPECT_EQ(member.verifier_resolution.physical_row_tile,3);
+    }
+    auto metadata=fixture.descriptors;
+    for(auto& descriptor:metadata)descriptor.output=nullptr;
+    const auto admitted=planNativeQuantisedFusedRows<exactTestOrderedThree>(metadata,3,1,ISAPath::AVX512);
+    EXPECT_EQ(admitted.partial_route,plan.partial_route);
+    EXPECT_EQ(admitted.sharedPartialFloats(),plan.sharedPartialFloats());
+    for(auto& descriptor:fixture.descriptors)descriptor.purpose=ProjectionRowsPurpose::MTPVerifier;
+    EXPECT_THROW((void)planNativeQuantisedFusedRows<exactTestOrderedThree>(fixture.descriptors,3,1,ISAPath::AVX512),std::invalid_argument);
+#endif
+    for(auto& descriptor:fixture.descriptors)descriptor.purpose=ProjectionRowsPurpose::Prefill;
+    EXPECT_THROW((void)planNativeQuantisedFusedRows<exactTestOrderedThree>(fixture.descriptors,3,1,ISAPath::AVX2),std::invalid_argument);
 }
 } // namespace
 } // namespace llaminar2::test

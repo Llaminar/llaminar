@@ -44,7 +44,7 @@ def _atomic(path: Path, value) -> None:
 def build_plan(threads: int, *, warmups: int = 5, samples: int = 30, repeats: int = 8, prefill_row_policy: str = "exact-points",
                expert_only: bool = False, expert_scope: dict | None = None, tournament: str = "full", model_scope: str = "all-retained",
                expert_role_formats: tuple[tuple[str,str],...] = (), exclude_expert_role_formats: tuple[tuple[str,str],...] = (),
-               expert_m: tuple[int,...] = ()) -> dict:
+               expert_m: tuple[int,...] = (), expert_ordered_three: bool = False) -> dict:
     """Project shared production geometry, source formats and actual M anchors."""
     if min(threads, warmups, samples, repeats) <= 0:
         raise ValueError("CPU exact collection requires positive team/timing settings")
@@ -144,6 +144,12 @@ def build_plan(threads: int, *, warmups: int = 5, samples: int = 30, repeats: in
                     geometry['k']%(256 if spec.source_is_superblock else 32)==0 for geometry in plan['expert_geometries']):
                 raise ValueError("explicit expert source format is not native-block admissible in this original slice")
         plan['expert_role_formats']=selected;plan['exclude_expert_role_formats']=excluded_formats
+    if type(expert_ordered_three) is not bool:
+        raise ValueError("expert OrderedThreeRows selection must be explicit")
+    if expert_ordered_three:
+        if not expert_only or 'prefill' not in expert_scope['purposes']:
+            raise ValueError("OrderedThreeRows collection requires explicit expert-only Prefill scope")
+        plan.update(schema='cpu-expert-only-exact-choice-v2',execution_exact_choice_abi=2)
     unsupported = []
     source_geometries = (("legacy", shapes), ("expert", plan["expert_geometries"]))
     for kind, geometries in source_geometries:
@@ -201,7 +207,13 @@ def iter_requests(plan):
                         count = max(2, math.ceil(plan['threads']/row_owners))
                         gate_up = geometry['role']=='gate_up'
                         experts = max(2, math.ceil(count/2)) if gate_up else count
-                        for candidate in (('Pairwise','WideRows') if runtime=='AVX512' and m>=3 else ('Pairwise',)):
+                        candidates=('Pairwise','WideRows') if runtime=='AVX512' and m>=3 else ('Pairwise',)
+                        # This is a source-format proposal only. The native
+                        # filled-class key proves actual prepared/K eligibility.
+                        if (plan.get('execution_exact_choice_abi')==2 and purpose=='prefill' and
+                                runtime=='AVX512' and m>=3 and spec.payload_bytes==16):
+                            candidates+=('OrderedThreeRows',)
+                        for candidate in candidates:
                             for holdout in (False,True):
                                 yield dict(kind='expert_rows', build_isa=build,runtime_isa=runtime,
                                     source_format=label,shape=geometry['shape'],n=geometry['n'],k=geometry['k'],
@@ -285,7 +297,9 @@ def _command(args, plan, job, directory):
             maximum_experts=max(maximum_experts,len(request['expert_rows']))
             maximum_rows=max(maximum_rows,max(request['expert_rows']))
         native_plan=directory/'requests.json'
-        _atomic(native_plan,dict(schema='cpu_execution_exact_batch_v2' if plan.get('tournament')=='adaptive_v1' and not job.get('installed_auto_validation',False) else 'cpu_execution_exact_batch_v1',requests=requests))
+        payload=dict(schema='cpu_execution_exact_batch_v2' if plan.get('tournament')=='adaptive_v1' and not job.get('installed_auto_validation',False) else 'cpu_execution_exact_batch_v1',requests=requests)
+        if plan.get('execution_exact_choice_abi')==2:payload['execution_exact_choice_abi']=2
+        _atomic(native_plan,payload)
         fields=dict(M=maximum_rows,N_A=job['n'],K=job['k'],POLICY_N=job['policy_n'],
             PROJECTIONS=maximum_experts*(2 if job['role']=='gate_up' else 1),
             NUMERICAL_POLICY='GPUAlignedExpert',TEAM_LIFETIME='retained',OUTPUT_ROLE=job['role'],
@@ -331,6 +345,8 @@ def main(argv=None):
     parser.add_argument('--expert-layout',choices=tuple(layout.value for layout in ExpertProjectionLayout))
     parser.add_argument('--expert-isa',choices=tuple(':'.join(pair) for pair in REGIMES))
     parser.add_argument('--expert-purpose',choices=('decode','mtp_verifier','prefill'),action='append')
+    parser.add_argument('--expert-ordered-three',action='store_true',
+        help='Fresh choice-ABI2 expert Prefill campaign; applicable native cells also compare OrderedThreeRows, old plans stay unchanged')
     parser.add_argument('--expert-m',type=int,action='append',default=[],metavar='M',
         help='Repeat to project expert-only collection onto actual M values admitted by every selected purpose; preserve on resume')
     parser.add_argument('--expert-role-format',action='append',default=[],metavar='ROLE:FORMAT',
@@ -366,13 +382,13 @@ def main(argv=None):
         expert_scope=dict(model_family=args.expert_model_family,tp_degree=args.expert_tp_degree,
             layout=args.expert_layout,isa=tuple(args.expert_isa.split(':')),
             purposes=tuple(args.expert_purpose or ('decode','mtp_verifier','prefill')))
-    elif args.expert_m or any(getattr(args,name) is not None for name in ('expert_model_family','expert_tp_degree','expert_layout','expert_isa','expert_purpose')):
+    elif args.expert_m or args.expert_ordered_three or any(getattr(args,name) is not None for name in ('expert_model_family','expert_tp_degree','expert_layout','expert_isa','expert_purpose')):
         parser.error('expert selection belongs to the expert-only transaction')
     try:
         plan=build_plan(args.threads,warmups=args.warmups,samples=args.samples,repeats=args.repeats, prefill_row_policy=args.prefill_row_policy,
             expert_only=args.stage=='expert-only',expert_scope=expert_scope,tournament=args.tournament,model_scope=args.model_scope,
             expert_role_formats=role_formats(args.expert_role_format),exclude_expert_role_formats=role_formats(args.exclude_expert_role_format),
-            expert_m=tuple(args.expert_m))
+            expert_m=tuple(args.expert_m),expert_ordered_three=args.expert_ordered_three)
         args.output_dir.mkdir(parents=True,exist_ok=True); target=args.output_dir/PLAN_NAME
         if target.exists():
             if json.loads(target.read_text()) != json.loads(json.dumps(plan)):
@@ -867,10 +883,16 @@ def expert_profile_observations(corpus, receipt):
         witness=row.physical_launch_evidence
         if witness['holdout']:continue
         key=tuple(witness['key']); tournament=witness.get('tournament')
-        if tournament is None:
+        if tournament is None and witness.get('execution_exact_choice_abi')!=2:
             output.append(row);continue
         if key not in selected:raise ValueError('profiler target lacks a selected exact key')
-        wanted={selected[key],tournament['baseline_candidate_id']}
+        if tournament is None:
+            from .cpu_exact_overlay import CPU_EXECUTION_EXACT_CANDIDATE_IDS
+            baseline=witness['baseline_descriptor_policies'][witness['target_descriptor']]
+            if type(baseline) is not int or not 0<=baseline<len(CPU_EXECUTION_EXACT_CANDIDATE_IDS):
+                raise ValueError('new exact profiler lacks an original physical baseline')
+            wanted={selected[key],CPU_EXECUTION_EXACT_CANDIDATE_IDS[baseline]}
+        else:wanted={selected[key],tournament['baseline_candidate_id']}
         if key in required and required[key]!=wanted:
             raise ValueError('profiler baseline changed within one exact contest')
         required[key]=wanted

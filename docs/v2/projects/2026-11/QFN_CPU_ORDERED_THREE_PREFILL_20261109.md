@@ -121,7 +121,9 @@ and compiled-owner receipts; profiler durations are not performance clocks.
 ## Contiguous ownership correction
 
 The explicit three-row bundle now receives contiguous static job chunks, using
-ceil(jobs / actual team width). Every legacy bundle retains cyclic chunk one.
+ceil(jobs / actual team width). With ownership `Current`, every legacy bundle
+retains cyclic chunk one. A separate explicit ownership control now permits
+comparing contiguous assignment without changing the arithmetic row policy.
 The flattened job order, panel mapping, arithmetic and output writers remain
 unchanged. This breaks the repeated short-tail assignment; it is not a claim
 of universally optimal weighted scheduling for arbitrary mixed bundles.
@@ -150,6 +152,13 @@ candidate, Auto). Gate/up falls from 5.013/4.981 ms to 3.808/3.793 ms. Persisten
 complete FFN falls from 9.734/10.092 ms to 7.280/7.281 ms, a 25–28% latency
 reduction. The Q5_1 down policy remains Auto; these authored mixed-row bundles
 are component evidence, not model throughput or recorded joint route vectors.
+
+**Qualification correction:** the full-FFN fixture used `std::vector` phase
+buffers and did not record their alignment. Production roots are 64-byte
+aligned. Those clocks remain diagnostics until both controls are rerun using
+the original aligned storage type and tight row strides. The earlier runs are
+not known to have been misaligned, but cannot establish matching layout. The
+exact-batch measurements above already use aligned roots and are unaffected.
 
 Five separate profiler observations per shape/policy corroborate improved
 execution efficiency, without contributing clocks to the timing comparisons:

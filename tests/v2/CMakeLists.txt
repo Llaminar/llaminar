@@ -18233,6 +18233,12 @@ foreach(V2_FUSED_COMPLETION_ISA AVX2 AVX512)
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedPairwiseContiguousOwnership_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+            --gtest_filter=CPUNativeQuantisedFusedCompletion.PairwiseContiguousOwnership*
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
     add_v2_test(V2_Integration_CPU_NativeQuantisedSamePanelPairRunReplay_${V2_FUSED_COMPLETION_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
             --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedPrefillSamePanelPairRunReplay
@@ -27300,7 +27306,7 @@ add_v2_test(V2_Perf_CPUMoEExpertVerifierRows
 # Device-free fixture controls share the original FFN owner; no weight preparation.
 add_v2_test(V2_Integration_CPUMoEExpertExplicitPolicyTimingContract
     COMMAND $<TARGET_FILE:v2_perf_cpu_moe_expert_verifier_rows>
-        --gtest_filter=Perf_CPUMoEExpertVerifierRows.ExplicitPurposeSelectionContract:Perf_CPUMoEExpertVerifierRows.ExplicitRoleAndNumericalPolicyContract:Perf_CPUMoEExpertVerifierRows.TimingCollectionScopeContract
+        --gtest_filter=Perf_CPUMoEExpertVerifierRows.ExplicitPurposeSelectionContract:Perf_CPUMoEExpertVerifierRows.ExplicitRoleAndNumericalPolicyContract:Perf_CPUMoEExpertVerifierRows.TimingCollectionScopeContract:Perf_CPUMoEExpertVerifierRows.OutputLayoutContract
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Prefill;Lifecycle;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
@@ -35031,6 +35037,7 @@ add_v2_test(V2_Integration_NativeQuantisedExactWorkflow
         NativeQuantisedDispatchRefreshTest.test_retired_training_command_has_no_executable_generic_path
         NativeQuantisedDispatchRefreshTest.test_retired_generic_flags_fail_before_discovery
         NativeQuantisedDispatchRefreshTest.test_missing_later_backend_arguments_fail_before_any_launch
+        NativeQuantisedDispatchRefreshTest.test_cpu_new_choice_is_explicit_and_forwarded_only_in_expert_scope
     LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;Dispatch;Trainer;DeviceFree;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedExactWorkflow)
@@ -36771,6 +36778,7 @@ if(NOT V2_PERF_TESTS_ONLY)
             V2_Integration_CPU_NativeQuantisedPrefillOrderedThreeTile_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedLivePlanFill_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedFusedLivePrefix_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeQuantisedPairwiseContiguousOwnership_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedSamePanelPairRunReplay_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_gate_${_cpu_checkpoint_isa}

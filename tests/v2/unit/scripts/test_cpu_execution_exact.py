@@ -21,7 +21,8 @@ sys.path.insert(0, str(ROOT / "tests/v2/performance/kernels"))
 from native_quantised_dispatch.cpu_exact_overlay import (
     CPUExecutionExactKey, RetainedCPUProgram, authenticate_retained_programs,
     file_digest, generate_execution_exact_include, merge_exact_entries,
-    select_execution_exact_entries, validate_filled_bundle,
+    select_execution_exact_entries, validate_filled_bundle, read_execution_exact_include,
+    execution_exact_choice_id, execution_exact_choice_name, ordered_three_execution_supported,
 )
 from native_quantised_dispatch.adapters.cpu_execution_exact import adapt_cpu_execution_exact_row, adapt_cpu_execution_exact_native
 from native_quantised_dispatch.adapters.cpu_verifier import CPUVerifierAdapterContext
@@ -35,7 +36,7 @@ def key(**changes):
     return replace(original, **changes)
 
 
-def row(choice="Pairwise", *, contract=None, members=None, holdout=False):
+def row(choice="Pairwise", *, contract=None, members=None, holdout=False, choice_abi=1):
     """Extend the existing strong-adapter fixture rather than invent an oracle."""
     contract = contract or key()
     members = members or [contract] * 2
@@ -51,8 +52,10 @@ def row(choice="Pairwise", *, contract=None, members=None, holdout=False):
                   exact_key_verified="1", numerical_policy="GPUAlignedExpert", purpose="prefill",
                   partial_route="OutputTileLocal", team_lifetime="retained",
                   output_layout="aligned_expert_major_v1", holdout=str(int(holdout)),
-                  descriptor_policies=json.dumps([int(choice == "WideRows") if member == contract else 0 for member in members]),
+                  descriptor_policies=json.dumps([execution_exact_choice_id(choice) if member == contract else 0 for member in members]),
                   baseline_descriptor_policies=json.dumps([0] * len(members)))
+    if choice_abi==2:result["execution_exact_choice_abi"]="2"
+    if choice=="OrderedThreeRows":result["promotion_eligible"]="1"
     return result
 
 
@@ -147,9 +150,51 @@ class CPUExecutionExactTest(unittest.TestCase):
         self.assertIn("return false;", text)
         self.assertNotIn("selectVerifierRowsPolicy", text)
         with self.assertRaises(ValueError):
-            generate_execution_exact_include({key(): 2})
+            generate_execution_exact_include({key(): 3})
         with self.assertRaises(ValueError):
             generate_execution_exact_include({key(rows=1): 0})
+
+    def test_third_choice_roundtrip_retains_old_literals_and_domain(self):
+        retained={key(rows=32):0,key(rows=64):1}
+        legacy=generate_execution_exact_include(retained)
+        self.assertEqual(read_execution_exact_include(legacy),retained)
+        combined={**retained,key(rows=128):2}
+        text=generate_execution_exact_include(combined)
+        self.assertEqual(read_execution_exact_include(text),combined)
+        self.assertIn("CPUExecutionExactChoice::OrderedThreeRows",text)
+        self.assertEqual(execution_exact_choice_name(2),"OrderedThreeRows")
+        from native_quantised_dispatch.adapters.cpu_verifier import adapt_cpu_verifier_row
+        self.assertFalse(adapt_cpu_verifier_row(row('OrderedThreeRows',choice_abi=2),
+            CPUVerifierAdapterContext.workflow_smoke(corpus_id='sha256:'+'2'*64)).generic_eligible)
+        for changes in ({'operation':1},{'rows':2},{'runtime_isa':0},
+                        {'source_codebook':7},{'prepared_encoding':1},{'asymmetric':0}):
+            with self.subTest(changes=changes),self.assertRaises(ValueError):
+                generate_execution_exact_include({key(**changes):2})
+        for label in ('Q4_0','Q4_1','Q4_K','IQ4_NL','IQ4_XS'):
+            from native_quantised_dispatch.format_registry import format_spec
+            spec=format_spec(label)
+            self.assertTrue(ordered_three_execution_supported(key(source_codebook=spec.source_codebook_id,
+                source_superblock=int(spec.source_is_superblock),asymmetric=int(spec.is_asymmetric),
+                prepared_encoding=4 if label=='IQ4_XS' else 0)))
+
+    def test_fresh_roster_adds_third_without_requiring_old_receipt_recollection(self):
+        members=[key(),key(rows=1)]
+        legacy=[observe(row(name,holdout=held,members=members if held else None))
+                for name in ('Pairwise','WideRows') for held in (False,True)]
+        self.assertEqual(set(select_execution_exact_entries(legacy)[0]),{key()})
+        fresh=[observe(row(name,choice_abi=2,holdout=held,members=members if held else None))
+               for name in ('Pairwise','WideRows','OrderedThreeRows') for held in (False,True)]
+        entries,_=select_execution_exact_entries(fresh)
+        self.assertEqual(set(entries),{key()})
+        with self.assertRaisesRegex(ValueError,'matrix'):
+            select_execution_exact_entries([value for value in fresh
+                if not value.candidate_id.endswith('ordered_three_rows')])
+        with self.assertRaisesRegex(ValueError,'declared choice'):
+            observe(row('OrderedThreeRows'))
+        # Compatible old physical choices may remain on their original record;
+        # only the fresh new choice declares the expanded finite roster.
+        third=[value for value in fresh if value.candidate_id.endswith('ordered_three_rows')]
+        self.assertEqual(set(select_execution_exact_entries(legacy+third)[0]),{key()})
 
     def test_retained_bases_require_both_authentic_programs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -205,6 +250,82 @@ class CPUExecutionNativeEvidenceTest(unittest.TestCase):
             path = Path(directory) / 'native.json'; path.write_text(json.dumps(payload))
             return adapt_cpu_execution_exact_native(path, CPUVerifierAdapterContext.workflow_smoke(
                 corpus_id='sha256:' + '2' * 64), holdout=False)
+
+    def test_fresh_third_choice_installed_auto_and_diagnostic_rejection(self):
+        from copy import deepcopy
+        payload=self.payload()
+        payload.update(candidate='OrderedThreeRows',execution_exact_choice_abi=2,
+            promotion_eligible=True,descriptor_policies=[2,2])
+        key_values=payload['exact_key']
+        tags=dict(m=str(key_values[9]),n=str(key_values[10]),policy_n=str(key_values[11]),
+            k=str(key_values[12]),codebook=str(key_values[2]),k_tiles=str(key_values[13]),
+            purpose='prefill',isa='AVX512',requested_verifier_policy='OrderedThreeRows',
+            effective_verifier_policy='OrderedThreeRows',physical_row_tile='3')
+        payload['counters']['route_records']=[dict(count=2,tags=tags)]
+        result=self.adapt(payload)
+        self.assertEqual(result.candidate_id,'cpu.native_quantised.verifier.ordered_three_rows')
+        self.assertEqual(result.physical_launch_evidence['execution_exact_choice_abi'],2)
+        for mutation in ('missing_abi','diagnostic','wrong_tile','wrong_effective'):
+            bad=deepcopy(payload)
+            if mutation=='missing_abi':bad.pop('execution_exact_choice_abi')
+            elif mutation=='diagnostic':bad.update(promotion_eligible=False,
+                explicit_candidate_scope='ordered_three_rows_prefill_contiguous_diagnostic_v1')
+            elif mutation=='wrong_tile':bad['counters']['route_records'][0]['tags']['physical_row_tile']='4'
+            else:bad['counters']['route_records'][0]['tags']['effective_verifier_policy']='WideRows'
+            with self.subTest(mutation=mutation),self.assertRaises(ValueError):self.adapt(bad)
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'auto.json'
+            payload['candidate']='Auto';payload.pop('promotion_eligible')
+            payload['counters']['execution_exact_hits']=2
+            payload['counters']['route_records'][0]['tags']['requested_verifier_policy']='Auto'
+            path.write_text(json.dumps(payload))
+            installed=adapt_cpu_execution_exact_native(path,CPUVerifierAdapterContext.workflow_smoke(
+                corpus_id='sha256:'+'2'*64),holdout=False,installed_choices={key():2})
+            self.assertEqual(installed.candidate_id,result.candidate_id)
+            payload['counters']['execution_exact_hits']=0;path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ValueError,'did not execute'):
+                adapt_cpu_execution_exact_native(path,CPUVerifierAdapterContext.workflow_smoke(
+                    corpus_id='sha256:'+'2'*64),holdout=False,installed_choices={key():2})
+
+    def test_new_choice_profile_batch_and_single_owner_keep_native_identity(self):
+        from native_quantised_dispatch.profiler_evidence import profiler_request_for_observation
+        from native_quantised_dispatch.profiler_collectors import (
+            CPUProfilerProcessBatch,CollectorOptions,_cpu_execution_exact_profile_fields,
+            _write_cpu_batch_plan,_validate_cpu_execution_exact_profile,_collect_cpu)
+        from native_quantised_dispatch.schema import Backend
+        payload=self.payload()
+        payload.update(candidate='OrderedThreeRows',execution_exact_choice_abi=2,
+            promotion_eligible=True,descriptor_policies=[2,2])
+        tags=dict(m='64',n='320',policy_n='320',k='2560',codebook='5',k_tiles='16',
+            ambient_n_block_chunks='1',purpose='prefill',isa='AVX512',
+            requested_verifier_policy='OrderedThreeRows',effective_verifier_policy='OrderedThreeRows',
+            physical_row_tile='3')
+        payload['counters']['route_records']=[dict(count=2,tags=tags)]
+        request=profiler_request_for_observation(self.adapt(payload))
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            fields=_cpu_execution_exact_profile_fields(request,root)
+            self.assertEqual(fields['LLAMINAR_CPU_FUSED_VERIFIER_POLICY'],'OrderedThreeRows')
+            path=root/'requests.json'
+            _write_cpu_batch_plan(path,CPUProfilerProcessBatch((request,)),{request.request_id:root})
+            plan=json.loads(path.read_text())
+            self.assertEqual(plan['execution_exact_choice_abi'],2)
+            self.assertEqual(plan['requests'][0]['candidate'],'OrderedThreeRows')
+            payload.update(schema='cpu_execution_exact_profile_v1',request_id=request.request_id,
+                profile_request_id=request.request_id,profiled_calls=1,preconditioning_calls=2,
+                activation_layout='aligned_tightly_packed_expert_rows_v1',activation_row_offsets=[0,64])
+            payload['counters'].update(projection_observations=2,expected_projection_observations=2)
+            (root/'native-profile.json').write_text(json.dumps(payload))
+            _validate_cpu_execution_exact_profile(request,root,require_route_counters=True)
+            options=CollectorOptions(backend=Backend.CPU,binary=root/'native-owner',
+                tool=Path('perf_event_open'),raw_directory=root,cpu_list='0-27')
+            def stopped_launch(command,environment,log,timeout):
+                manifest=json.loads(Path(environment['LLAMINAR_CPU_FUSED_VERIFIER_EXACT_REQUESTS_PATH']).read_text())
+                self.assertEqual(manifest['execution_exact_choice_abi'],2)
+                self.assertEqual(manifest['requests'][0]['profile_request_id'],request.request_id)
+                return SimpleNamespace(returncode=42)
+            with mock.patch('native_quantised_dispatch.profiler_collectors._run_command',side_effect=stopped_launch):
+                with self.assertRaisesRegex(RuntimeError,'42'):_collect_cpu(request,options,root)
 
     def test_batch_timing_requires_true_collection_disabled_and_exact_zero(self):
         from copy import deepcopy

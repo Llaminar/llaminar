@@ -652,7 +652,7 @@ def _build_gpu_process_batches(
 
 def _cpu_execution_exact_profile_fields(request: ProfilerRequest, raw_dir: Path) -> dict[str, str]:
     """Bind one original fused witness to the existing isolated CPU owner."""
-    from .cpu_exact_overlay import CPUExecutionExactKey, validate_filled_bundle
+    from .cpu_exact_overlay import CPUExecutionExactKey, validate_filled_bundle, execution_exact_choice_id, execution_exact_choice_name
     witness = request.execution_witness
     if witness.get("schema") != "cpu-execution-exact-witness-v1" or witness.get("timing_basis") != "whole_fused_bundle":
         raise ValueError("fused CPU profile requires its original full-bundle witness")
@@ -666,7 +666,7 @@ def _cpu_execution_exact_profile_fields(request: ProfilerRequest, raw_dir: Path)
         PROJECTIONS=len(members), PURPOSE=("decode", "mtp_verifier", "prefill")[key.operation],
         NUMERICAL_POLICY="GPUAlignedExpert", TEAM_LIFETIME="retained", OUTPUT_ROLE=role,
         EXPECTED_K_TILES=key.k_tiles, EXPECTED_CODEBOOK=key.source_codebook,
-        POLICY="Pairwise" if request.effective_candidate_id.endswith("pairwise") else "WideRows",
+        POLICY=execution_exact_choice_name(execution_exact_choice_id(request.effective_candidate_id)),
         EXPERT_ROWS=",".join(map(str, witness["expert_rows"])),
         EXACT_TARGET_DESCRIPTOR=witness["target_descriptor"],
         EXACT_EVIDENCE_PATH=str(raw_dir / "native-profile.json"), EXACT_SHAPE=request.shape_name,
@@ -698,12 +698,13 @@ def _cpu_process_batch_key(request: ProfilerRequest) -> tuple[object, ...]:
     if request.operation_kind == "CPUExecutionExactFusedBundle":
         from .cpu_exact_overlay import CPUExecutionExactKey
         key = CPUExecutionExactKey.from_scalars(request.execution_witness["key"])
-        return (request.architecture_class, request.build_id, request.compiler_id,
+        identity=(request.architecture_class, request.build_id, request.compiler_id,
             request.driver_runtime, request.threading_or_stream_mode,
             request.operation_kind, request.source_format, key.numerical_policy,
             key.prepared_encoding, key.asymmetric, key.physical_n, key.policy_n,
             key.k, key.k_tiles, key.ambient_n_block_chunks, key.layout,
             key.team_entry, key.bundle_class, request.execution_witness["output_role"])
+        return identity+(("execution_exact_choice_abi",2),) if request.execution_witness.get("execution_exact_choice_abi")==2 else identity
     return (
         request.architecture_class,
         request.build_id,
@@ -772,6 +773,7 @@ def _write_cpu_batch_plan(
     """Write the trainer's exact TSV plan and return its content digest."""
 
     if batch.requests[0].operation_kind == "CPUExecutionExactFusedBundle":
+        from .cpu_exact_overlay import execution_exact_choice_id, execution_exact_choice_name
         requests = []
         for request in batch.requests:
             witness = request.execution_witness
@@ -780,12 +782,14 @@ def _write_cpu_batch_plan(
             requests.append(dict(id=request.request_id, m=key[9],
                 purpose=("decode", "mtp_verifier", "prefill")[key[0]],
                 expert_rows=witness["expert_rows"], target_descriptor=witness["target_descriptor"],
-                candidate="Pairwise" if request.effective_candidate_id.endswith("pairwise") else "WideRows",
+                candidate=execution_exact_choice_name(execution_exact_choice_id(request.effective_candidate_id)),
                 evidence_path=str(directory / "native-profile.json"), holdout=False,
                 profile_request_id=request.request_id,
                 profile_output_path=str((directory / "perf-stat.csv").resolve())))
-        payload = json.dumps(dict(schema="cpu_execution_exact_batch_v1", shape=batch.requests[0].shape_name, requests=requests),
-                             sort_keys=True, separators=(",", ":"))
+        manifest=dict(schema="cpu_execution_exact_batch_v1",shape=batch.requests[0].shape_name,requests=requests)
+        if batch.requests[0].execution_witness.get("execution_exact_choice_abi")==2:
+            manifest["execution_exact_choice_abi"]=2
+        payload = json.dumps(manifest,sort_keys=True,separators=(",", ":"))
         path.write_text(payload, encoding="utf-8")
         return hashlib.sha256(payload.encode()).hexdigest()
     output = io.StringIO(newline="")
@@ -2031,6 +2035,10 @@ def _collect_cpu(
     environment["LLAMINAR_NATIVE_QUANTISED_PERF_STATS_PATH"] = str(
         raw_dir / "perf-stat.csv"
     )
+    if request.operation_kind=="CPUExecutionExactFusedBundle" and request.execution_witness.get("execution_exact_choice_abi")==2:
+        plan=raw_dir/"requests.json"
+        _write_cpu_batch_plan(plan,CPUProfilerProcessBatch((request,)),{request.request_id:raw_dir})
+        environment["LLAMINAR_CPU_FUSED_VERIFIER_EXACT_REQUESTS_PATH"]=str(plan)
     command = _cpu_owner_command(options, options.binary, request)
     completed = _run_command(
         command,
@@ -2084,7 +2092,7 @@ def _validate_cpu_execution_exact_profile(
 
     if request.operation_kind != "CPUExecutionExactFusedBundle":
         return
-    from .cpu_exact_overlay import CPUExecutionExactKey, validate_filled_bundle
+    from .cpu_exact_overlay import CPUExecutionExactKey, validate_filled_bundle, execution_exact_choice_id, execution_exact_choice_name
     witness = request.execution_witness
     if witness.get("schema") != "cpu-execution-exact-witness-v1":
         raise ValueError("fused CPU profile lacks its original execution witness")
@@ -2099,8 +2107,9 @@ def _validate_cpu_execution_exact_profile(
         purpose=("decode", "mtp_verifier", "prefill")[key.operation],
         output_layout="aligned_expert_major_v1", activation_layout="aligned_tightly_packed_expert_rows_v1",
         team_lifetime=witness["team_lifetime"],
-        candidate="Pairwise" if request.effective_candidate_id.endswith("pairwise") else "WideRows",
+        candidate=execution_exact_choice_name(execution_exact_choice_id(request.effective_candidate_id)),
         member_rows=[member.rows for member in members])
+    if witness.get("execution_exact_choice_abi")==2:expected["execution_exact_choice_abi"]=2
     if key != CPUExecutionExactKey.from_scalars(witness["key"]) or members != expected_members:
         raise ValueError("native CPU profile full key/descriptor vector differs from timing witness")
     if any(type(native.get(name)) is not type(value) or native.get(name) != value
@@ -2133,13 +2142,15 @@ def _validate_cpu_execution_exact_profile(
                 member.source_codebook, member.k_tiles, member.ambient_n_block_chunks,
                 ("AVX2", "AVX512")[member.runtime_isa],
                 ("decode", "mtp_verifier", "prefill")[member.operation],
-                ("Pairwise", "WideRows")[policy] if member.rows >= 2 else None)
+                execution_exact_choice_name(policy) if member.rows >= 2 else None)
         expected_routes = Counter(signature(member, policy) for member, policy in
                                   zip(members, native["descriptor_policies"]))
         observed_routes = Counter()
         for record in counters["route_records"]:
             tags = record["tags"]
             rows = int(tags["m"])
+            if tags.get("effective_verifier_policy")=="OrderedThreeRows" and tags.get("physical_row_tile")!="3":
+                raise ValueError("native CPU profile omitted its actual three-row physical tile")
             observed_routes[(rows, *(int(tags[name]) for name in
                 ("n", "policy_n", "k", "codebook", "k_tiles", "ambient_n_block_chunks")),
                 tags["isa"], tags["purpose"], tags["effective_verifier_policy"] if rows >= 2 else None)] += record["count"]

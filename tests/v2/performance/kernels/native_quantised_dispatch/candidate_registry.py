@@ -591,6 +591,18 @@ def cpu_native_quantised_verifier_registry() -> CandidateRegistry:
         ),
         _candidate(
             **common,
+            candidate_id="cpu.native_quantised.verifier.ordered_three_rows",
+            aliases=("OrderedThreeRows",),
+            family="cpu_ordered_three_prefill_rows",
+            config={
+                "policy": "OrderedThreeRows", "route": "decode_equivalent_kpart_rows",
+                "row_tile": 3, "k_tile_policy": "inherit_serial_m1",
+                "ownership": "ordered-three-contiguous-static-v1",
+            },
+            schedule="cpu-avx512-ordered-three-contiguous-prefill-v1",
+        ),
+        _candidate(
+            **common,
             candidate_id="cpu.native_quantised.verifier.full_k.row_chunk_grid",
             aliases=("FullKRowChunkGrid",),
             family="cpu_native_quantised_grouped_full_k_row_chunk_grid",

@@ -67,7 +67,7 @@ def validate_fused_tournament(payload: Mapping, *, minimum_samples: int) -> Nati
     the single recorded unforced Auto observation, not a supplied oracle label.
     The selected row cannot change grade/count independently of that receipt.
     """
-    from .cpu_exact_overlay import CPUExecutionExactKey, canonical_digest
+    from .cpu_exact_overlay import CPUExecutionExactKey, canonical_digest, execution_exact_candidate_names
     # Native adaptive v2 is always a full-floor tournament, even when a
     # diagnostic reader has a lower context sampling threshold.
     minimum_samples=max(30,minimum_samples)
@@ -106,7 +106,7 @@ def validate_fused_tournament(payload: Mapping, *, minimum_samples: int) -> Nati
                 raise ValueError('adaptive baseline is not the actual unforced native policy')
     if total!=len(payload['descriptor_keys']) or targets<=0:
         raise ValueError('adaptive baseline route records do not cover original live descriptors')
-    expected_roster={'Pairwise','WideRows'} if key.runtime_isa==1 and key.rows>=3 else {'Pairwise'}
+    expected_roster=set(execution_exact_candidate_names(key,payload.get('execution_exact_choice_abi',1)))
     if set(roster)!=expected_roster:
         raise ValueError('adaptive expert roster omitted or invented an original forceable candidate')
     decisions=receipt.get('candidates')

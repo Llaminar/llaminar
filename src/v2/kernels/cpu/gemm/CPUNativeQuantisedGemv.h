@@ -6945,6 +6945,31 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Invocation-local ownership of already formed fused output jobs.
+     *
+     * This is independent of row arithmetic and installed exact policy. Current
+     * preserves every existing schedule, including balanced OrderedThreeRows.
+     * Contiguous is an explicit ordinary-prefill Pairwise diagnostic only; it
+     * changes worker assignment without changing the job grid or its kernels.
+     */
+    enum class FusedOutputJobOwnership { Current, Contiguous };
+
+    /**
+     * @brief Name an invocation-local diagnostic without selecting arithmetic.
+     * @param ownership Complete typed choice; unknown enum values are rejected.
+     * @return Stable observation token.
+     * @throws std::invalid_argument For an unknown ownership value.
+     */
+    [[nodiscard]] constexpr const char *fusedOutputJobOwnershipName(FusedOutputJobOwnership ownership)
+    {
+        switch (ownership) {
+        case FusedOutputJobOwnership::Current: return "Current";
+        case FusedOutputJobOwnership::Contiguous: return "Contiguous";
+        }
+        throw std::invalid_argument("CPU fused output ownership has an unknown value");
+    }
+
+    /**
      * @brief Descriptor for one projection in a grouped verifier-row bundle.
      *
      * All descriptors share the same pre-quantized activation rows.  Each
@@ -7447,6 +7472,7 @@ namespace llaminar2::cpu::native_quantised
                         {
                         case CPUExecutionExactChoice::Pairwise: selected = VerifierRowsPolicy::Pairwise; break;
                         case CPUExecutionExactChoice::WideRows: selected = VerifierRowsPolicy::WideRows; break;
+                        case CPUExecutionExactChoice::OrderedThreeRows: selected = VerifierRowsPolicy::OrderedThreeRows; break;
                         default: throw std::runtime_error("CPU execution-exact artifact returned an unknown row policy");
                         }
                         plan.execution_exact_hit = true;
@@ -7652,6 +7678,39 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /**
+         * @brief Authenticate explicit ownership before any output or partial write.
+         * @param ownership Invocation-local diagnostic; Current adds no restrictions.
+         * @param descriptors Original immutable prepared members, not inferred aliases.
+         * @param plans Those members resolved by the original arithmetic planner.
+         * @param route Original admitted storage/ownership route.
+         * @throws std::invalid_argument Unless every explicit member is ordinary
+         *         GPU-aligned Pairwise Prefill in the original local-output route.
+         *
+         * Requiring the complete bundle prevents an explicit diagnostic from
+         * silently changing unrelated M=1, verifier, FullK or shared-bank work.
+         */
+        inline void requireFusedOutputJobOwnership(FusedOutputJobOwnership ownership,
+            std::span<const FusedVerifierRowsDesc> descriptors,
+            std::span<const FusedVerifierRowsPlan> plans,
+            NativeQuantisedFusedPartialRoute route)
+        {
+            (void)fusedOutputJobOwnershipName(ownership);
+            if (ownership == FusedOutputJobOwnership::Current) return;
+            if (descriptors.empty() || descriptors.size() != plans.size() ||
+                route != NativeQuantisedFusedPartialRoute::OutputTileLocal)
+                throw std::invalid_argument("CPU Contiguous ownership requires the original OutputTileLocal bundle");
+            for (size_t member = 0; member < descriptors.size(); ++member) {
+                const auto &descriptor = descriptors[member];
+                const auto &plan = plans[member];
+                if (!descriptor.packed || descriptor.purpose != ProjectionRowsPurpose::Prefill ||
+                    descriptor.packed->numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert ||
+                    plan.rows <= 1 || plan.effective_verifier_schedule != VerifierRowsPolicy::Pairwise ||
+                    plan.verifier_resolution.physical_row_tile != 2)
+                    throw std::invalid_argument("CPU Contiguous ownership requires every member's resolved GPU-aligned Pairwise ordinary Prefill");
+            }
+        }
+
+        /**
          * @brief Give an explicit three-row bundle contiguous independent job chunks.
          * @param has_ordered_three Whether an actual effective new three-row member executes.
          * @param jobs Original flattened local-tree job count after same-panel grouping.
@@ -7688,7 +7747,9 @@ namespace llaminar2::cpu::native_quantised
      * @param M Default row count for descriptors without an explicit count.
      * @param K_blocks Common activation/weight width in 32-element blocks.
      * @param isa_path Explicit or automatically resolved physical microkernel ISA.
+     * @param job_ownership Explicit independent output ownership; Current preserves old policy.
      * @return False for incomplete descriptors; true after every output is published.
+     * @throws std::invalid_argument Before writes for unsupported explicit ownership.
      * @throws std::runtime_error Before any output write if the declared bank is undersized.
      *
      * This is the projection-bundle analogue of
@@ -7711,7 +7772,8 @@ namespace llaminar2::cpu::native_quantised
         int num_descs,
         int M,
         int K_blocks,
-        ISAPath isa_path = ISAPath::AUTO)
+        ISAPath isa_path = ISAPath::AUTO,
+        FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Current)
     {
         constexpr int kMaxFusedVerifierProjections = NativeQuantisedFusedRowsPlan::capacity;
         if (!descs || num_descs <= 0 ||
@@ -7755,6 +7817,8 @@ namespace llaminar2::cpu::native_quantised
         const auto bundle = detail::fillNativeQuantisedFusedRowsPlans(
             live_plan.mutableProjections(),{descs,static_cast<size_t>(num_descs)},M,num_threads,isa_path);
         const auto plans = live_plan.projections();
+        detail::requireFusedOutputJobOwnership(job_ownership,
+            {descs, static_cast<size_t>(num_descs)}, plans, bundle.partial_route);
         const bool use_avx512 = bundle.use_avx512;
         const bool use_avx2 = bundle.use_avx2;
         const bool all_full_k = bundle.partial_route == NativeQuantisedFusedPartialRoute::FullK;
@@ -8716,10 +8780,22 @@ namespace llaminar2::cpu::native_quantised
                         local_tree_task_ends[static_cast<size_t>(projection)] = total_local_tree_tasks;
                     }
                 }
-                // Only a bundle executing the explicit new mechanism changes
-                // workshare grain. Every old policy keeps original cyclic IDs.
+                // Current retains balanced OrderedThreeRows and original cyclic
+                // Pairwise IDs. An independently validated diagnostic may assign
+                // these SAME jobs contiguously without altering any row policy.
                 const long long static_chunk = detail::selectOrderedThreeRowStaticChunk(
-                    has_ordered_three_rows, total_local_tree_tasks, num_threads);
+                    has_ordered_three_rows || job_ownership == FusedOutputJobOwnership::Contiguous,
+                    total_local_tree_tasks, num_threads);
+                if (job_ownership == FusedOutputJobOwnership::Contiguous &&
+                    (!omp_in_parallel() || omp_get_thread_num() == 0) &&
+                    PerfStatsCollector::isDomainEnabled("kernel"))
+                    PerfStatsCollector::addCounter("kernel", "cpu_native_quantised_fused_job_ownership",
+                        1.0, "gemm", "cpu", {{"requested_ownership", fusedOutputJobOwnershipName(job_ownership)},
+                        {"effective_ownership", "Contiguous"}, {"purpose", "prefill"},
+                        {"effective_verifier_policy", "Pairwise"}, {"physical_row_tile", "2"},
+                        {"jobs", std::to_string(total_local_tree_tasks)}, {"static_chunk", std::to_string(static_chunk)},
+                        {"workers", std::to_string(num_threads)}, {"descriptors", std::to_string(num_descs)},
+                        {"k", std::to_string(K_blocks * Q8_1Block::BLOCK_SIZE)}});
                 auto execute_layer_local_ordered_tree = [&]()
                 {
 #pragma omp for schedule(static, static_chunk) nowait
