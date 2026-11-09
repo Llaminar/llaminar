@@ -151,3 +151,21 @@ separate (shared) path with the same pattern but different owners.
   (incremental; Unit/preflight/focused incl. full MoEOverlay/MoEPipeline).
   Perf window (b): base = 302318f1e (confirmed) — IQ3_S/IQ4_XS gemv threads
   1/10/20, M=1+4/15, 3 shapes ABBA; 35B decode MTP off/dyn ABBA saved plan.
+
+## SOURCE111 P1 (2026-11-09, b645ca7d1) — cross-ISA contract mismatch
+
+- Seal accepts poisoned padding; production x86 consumers still REJECT it:
+  loadScales512/256 test every loaded IQ3/IQ4 lane (258/263, 283/288);
+  CPUNativeVNNIGemv.h checks all four 64-col chunk vectors (1535–1538/
+  2402–2405); IQ2 dispatch<16> :2329 defaults columns=64 + checks every
+  metadata vector (MultiScaleKernels 623–625). Accepted partial-N arrival can
+  throw inside x86 execution.
+- Direction (binding): COMMON CONTRACT — producer writes benign padding
+  (0x00, in-domain for all encodings) AT PUBLICATION in the same write that
+  places live columns (per-arrival; NO allocation/first-touch change).
+  Seal: live-only w/ producer guarantee, or belt-check padding==benign (lane
+  choice). x86 focused control (poisoned-padding partial-chunk arrival fails
+  BOTH admissions). NEON proof must exercise REAL mixed live/padding vectors
+  (N%4=1/2/3, chunk tails, grouped I8MM/SDOT/ASIMD, poisoned ADJACENT lanes
+  actually loaded, output guards) — N=8/Rows1 proof didn't load cols 8..63.
+  Old pre-seal checks were NOT strictly live-only for N%4!=0 (withdrawn).
