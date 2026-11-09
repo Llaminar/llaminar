@@ -381,3 +381,23 @@ the source policy). Dead persistent_state parameter removed.
 - Mac gate at dca2a3021: NEON_DOTPROD 289/289 + NEON 289/289 0 skips;
   preflight 226/226 ×20; RoPE source policy clean. Reviewer mechanical pass +
   WSL (5'') = dca2a3021 in flight; handover draft next.
+
+## 4 UNIT REGRESSIONS on x86 (WSL b199ccfa0 signal; 2026-11-09)
+
+- (1) ComputeStage ×3: RoPE runs without binding the admitted
+  cpu_rope_angles workspace (b5d9ebf9d) → 'requires its admitted workspace
+  binding' throw (RoPEPartialRotaryKeepsFullHeadStride,
+  KeyOnlyRoPEIsByteIdenticalToTheSameQueryRotation,
+  RoPEVerifierPrefillMatchesSerialDecodeRows); siblings GTEST_SKIP on other
+  message.
+- (2) WorkspaceMemoryEstimator: 180928 vs 177408 (:468); :2477/:2494
+  786944 vs 0 + 24640 vs 0 (angle-workspace bytes expected 0).
+- (3) MemoryPlanner.CPUOnly_AttentionWorkspaceUsesPhysicalWorkerBOM:
+  103859456 vs 102282496 (:2836/2842) — BOM/expectation angle-plane bytes.
+- (4) CUDABuilderProvisioning ×3: install-cuda.sh arch selection
+  (3dbfe04a0/a8198400c) via dpkg --print-architecture vs test shim printing
+  nothing → 'Unsupported architecture \'\''. Lane test code.
+- ALL deterministic device-free Unit; pre-commit gate would catch; Mac
+  dca2a3021 run = portability + preflight only (NOT V2_Unit_*). Production
+  contract stays; stale tests updated. Lane fixing; WSL (5'') held until the
+  fixed SHA. Rebase equivalence confirmed (0 lines, 45 files +2855/-1162).
