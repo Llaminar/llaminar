@@ -446,3 +446,20 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   completeness.
 - Precision: asm-label classifier heuristic (__extension__/generic-lambda
   `class T`) → narrow claim or close contexts.
+
+## SOURCE123 successor fba4e3cc2 (2026-11-09)
+
+- P1a typed input admission (per-arg types; depfile/debug-dir binding; real
+  option tables from 19 real jobs; driver blacklist retired; plan=authority;
+  extensive clang+GNU controls).
+- P1b one validated observation + logical program identity (driver-query
+  failures fatal; program: dirs + PATH lookup cross-checked vs
+  -print-prog-name; dirs/symlinks/resolved+sha recorded pre/post; retarget/
+  shadow/foreign controls).
+- P1c complete receipt (plan + one identity per program; verify revalidates +
+  replays lookups; removal/foreign/mismatch controls).
+- Precision: labels only at namespace/extern scope w/ syntax markers;
+  __extension__+generic-lambda fail; conservative approximation documented.
+- 75 tests; Mac E2E 3 configs; /usr/bin/c++ + Xcode clang bound.
+- GB10 census = FIRST real exercise of GNU lookup + typed admission
+  (requested; fix-back if rejection).
