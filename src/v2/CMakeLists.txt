@@ -398,7 +398,18 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard6.cu
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard7.cu
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
-        kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu  # custom native-quantised prefill GEMM family (Q4_0 first)
+        # NativeQuantised prefill is physically sharded by codebook pair, like
+        # decode: eight complete, deterministic modules behind one host-only
+        # dispatcher that owns the public ABI and the launch-policy state.
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillDispatch.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard0.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard1.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard2.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard3.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard4.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard5.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard6.cu
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillShard7.cu
         kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.cu   # device-planned byte-exact grouped MoE IMMA prefill
         kernels/cuda/moe/CUDAMoEGroupedIntermediateExchange.cu # lossless SwiGLU/scales exchange boundary
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
@@ -445,15 +456,7 @@ if(HAVE_CUDA)
         utils/CUDAKernelProfiler.cu                   # CUDA event-based kernel profiling
     )
 
-    # Prefill still owns hundreds of independent device-template instantiations
-    # in one TU, so ask nvcc to split its internal optimization work. Decode is
-    # physically sharded above: keeping compiler-internal split work there would
-    # oversubscribe eight already independent Ninja jobs.
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.3")
-        set_source_files_properties(
-            kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu
-            PROPERTIES COMPILE_OPTIONS "--split-compile=8"
-        )
         # Attention owns one arithmetic body specialized across native formats,
         # exact/partial widths, tile ownership and direct/context execution.
         # Parallelize optimization of that complete family instead of making a
