@@ -5,12 +5,12 @@ Reviewed against: `codex/qfn-ngram-continuation-arm64` @ `be6658c38`
 (rebase onto `feat/qfn-ngram-continuation` @ `2f01249c9` complete; 28 ARM
 commits replayed).
 
-**Current anchors (2026-11-09):** arm branch PR #43 = **`425002104`**
-(98 commits @ base `46c35f15b`; base renamed `NativeVNNI`->`NativeQuantised`
-in `a0fd16d04`; previous tip `5922cd1f5` is pre-rename). Lanes are being
-replayed under the rename token map (`/tmp/remap/vnni_map.py`): addon R1 =
-`ae090ec81` (pre-rename), ideas-7+25 = `989b7bada` (pre-rename) — new tips
-TBD; WSL gates + reviewing on the rebased tips.
+**Current anchors (2026-11-09):** arm branch PR #43 head = **`5d4e3716a`**
+(126 commits @ base `46c35f15b`; rename `NativeVNNI`->`NativeQuantised` in
+`a0fd16d04`; R1 fast-forwarded in: 425002104 -> 5d4e3716a; no rebase,
+reviewed tip exact; PR body updated). R2 + CUDA spill commits stack on
+`5d4e3716a`. Ideas-7+25 = `b199ccfa0` (on 425002104) — rebasing onto
+`5d4e3716a` in progress.
 
 Scope: performance and memory improvement ideas gathered during the review of
 PR #32 (`feat(cpu): add native ARM64 inference kernels`) and PR #35
