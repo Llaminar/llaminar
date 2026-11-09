@@ -110,57 +110,6 @@ namespace llaminar2::cpu::native_quantised
         int previous_serial_; ///< Existing two-int predecessor policy.
     };
 
-#if defined(__aarch64__) && defined(__ARM_NEON)
-    /**
-     * @brief Publish the native NEON schedule each fused member executed.
-     *
-     * The NEON launcher is core-free and records nothing itself, so every
-     * kernel call site publishes the same `fused_verifier_rows_projection_launch`
-     * counter as the x86 launcher. Multi-row members report a `grouped_neon_*`
-     * route (the shared-row tile, two or four rows, over full K); M=1 members
-     * report `decode_neon_full_k_row`. The plan is the same pure geometry
-     * resolution the launcher used, so the tags describe what actually ran.
-     * @param descriptors Complete fused members already executed.
-     * @param count Positive member count.
-     * @param rows Default physical M for members without an explicit row count.
-     */
-    inline void recordNEONFusedRowsLaunches(const FusedVerifierRowsDesc *descriptors, int count, int rows)
-    {
-        if (!PerfStatsCollector::isDomainEnabled("kernel") || (omp_in_parallel() && omp_get_thread_num() != 0))
-            return;
-        const auto executed = planNativeQuantisedFusedRows(
-            std::span<const FusedVerifierRowsDesc>(descriptors, std::size_t(count)), rows,
-            nativeQuantisedInvocationWorkerCount(), ISAPath::AUTO);
-        for (int member = 0; member < executed.count; ++member)
-        {
-            const auto &d = descriptors[member];
-            const int member_rows = executed.rows[member];
-            const int tile_rows = member_rows == 1 ? 1
-                : (executed.tiles[member] == NEONProjectionRowTile::Pair ? 2 : 4);
-            const int chunks = d.packed->N_padded / 64;
-            const int n_block = executed.chunks[member];
-            const auto producer_tasks = std::int64_t((member_rows + tile_rows - 1) / tile_rows) *
-                ((chunks + n_block - 1) / n_block);
-            const char *route = member_rows == 1 ? "decode_neon_full_k_row"
-                : (tile_rows == 2 ? "grouped_neon_full_k_pair_rows" : "grouped_neon_full_k_four_rows");
-            PerfStatsCollector::addCounter(
-                "kernel", "cpu_native_quantised_fused_verifier_rows_projection_launch", 1.0, "gemm", "cpu",
-                PerfStatsCollector::Tags{
-                    {"m", std::to_string(member_rows)},
-                    {"n", std::to_string(d.N)},
-                    {"k", std::to_string(d.packed->K)},
-                    {"projection", std::to_string(member)},
-                    {"purpose", d.purpose == ProjectionRowsPurpose::Prefill ? "prefill" : "decode"},
-                    {"route", route},
-                    {"task_grid", "row_tile_n_block"},
-                    {"physical_row_tile", std::to_string(tile_rows)},
-                    {"n_block_chunks", std::to_string(n_block)},
-                    {"bundle_scheduler", "layer_global_full_k"},
-                    {"producer_tasks", std::to_string(producer_tasks)},
-                    {"reduction_tasks", "0"}});
-        }
-    }
-#endif
 
     /** @brief Prepared quantized weights with participant-owned invocation scratch. */
     class CPUNativeQuantisedGemmKernel : public ITensorGemm, public CPUInvocationWorkspaceConsumer
@@ -1180,9 +1129,6 @@ namespace llaminar2::cpu::native_quantised
                         /*n=*/0,
                         k,
                         static_cast<int>(projections.size()));
-#if defined(__aarch64__) && defined(__ARM_NEON)
-                    recordNEONFusedRowsLaunches(fused_descs.data(), int(projections.size()), live_rows);
-#endif
                     if (PerfStatsCollector::isDomainEnabled("kernel"))
                     {
                         PerfStatsCollector::addCounter(
@@ -1400,9 +1346,6 @@ namespace llaminar2::cpu::native_quantised
             {
                 return false;
             }
-#if defined(__aarch64__) && defined(__ARM_NEON)
-            recordNEONFusedRowsLaunches(fused_descriptors.data(), descriptor_count, 1);
-#endif
 
             // Guard before constructing strings/maps: addCounter's own guard
             // cannot prevent allocations while evaluating its arguments.
@@ -1728,9 +1671,6 @@ namespace llaminar2::cpu::native_quantised
                               "kernel rejected an advertised NativeQuantised contract");
                     return false;
                 }
-#if defined(__aarch64__) && defined(__ARM_NEON)
-                recordNEONFusedRowsLaunches(descriptors.data(), static_cast<int>(projections.size()), m);
-#endif
             }
 
             recordVerifierTiming(
