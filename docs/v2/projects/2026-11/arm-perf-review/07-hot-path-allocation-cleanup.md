@@ -292,3 +292,11 @@ the source policy). Dead persistent_state parameter removed.
   (remaining source read + orphan-deletion check); will review exact fix
   SHA. Lane implementing; WSL (5') continues as unfixed-tip signal (final
   gate will be at fixed tip).
+
+- 8ba25fc28 FINAL: HOLD on lane-owned RoPE P2 ONLY; no additional P1;
+  Q11/sweep/owner-key/inv_freq/workspace/wire-v7/GGUF/host-timer/Docker all
+  affirmed. Qualifications (nonblocking): >8192 decoded-row reject intended;
+  generic partial-profile Unit + preflight focused geometry; host-timer
+  restore lambda not RAII across ASSERT (optional fold). Nothing
+  authenticated/promoted to this tip. Reviewer next: 407347f6c deletion
+  delta; then fix SHA.
