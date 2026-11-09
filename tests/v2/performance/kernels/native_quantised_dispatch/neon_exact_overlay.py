@@ -8,7 +8,8 @@ policy is ``Four``/``nbc=1`` for every geometry; this generator emits an exact
 entry only where a measured candidate beats it.
 
 Input rows come from ``Perf__CPUNativeNEONExactOverlay`` (schema
-``neon-exact-overlay-v1``). For each runtime key (execution codebook, source
+``neon-exact-overlay-v2``, which records the compiled build envelope and the
+resolved leaf instruction separately). For each runtime key (execution codebook, source
 superblock layout, N, K, physical M, workers) every measured source alias must
 provide the complete candidate set with byte-exact output. Every ``--csv`` is
 one independent replica (a separate collector process), usually of one source
@@ -24,8 +25,9 @@ policy. An entry is emitted only when:
   ``--min-improvement``, and
 - it is not slower than the total policy for any alias in any replica.
 
-Missing candidates, non-exact bytes, duplicate measurements or mixed ISA
-identities fail closed. Unmeasured keys stay on the total policy; nothing is
+Missing candidates, non-exact bytes, duplicate measurements or mixed
+build-envelope/instruction identities fail closed: one NEON_I8MM binary can
+time SMMLA, SDOT or ASIMD leaves, and those regimes never pool. Unmeasured keys stay on the total policy; nothing is
 interpolated or fitted. The receipt records every input digest and decision.
 """
 
@@ -40,12 +42,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-SCHEMA = "neon-exact-overlay-v1"
+SCHEMA = "neon-exact-overlay-v2"
 TOTAL_POLICY = ("Four", 1)
 TILES = ("Pair", "Four")
 CHUNKS = (1, 2, 4, 8)
 FIELDS = (
-    "schema", "isa", "codebook", "superblock", "source_format", "shape", "n", "k",
+    "schema", "build_isa", "instruction", "codebook", "superblock", "source_format", "shape", "n", "k",
     "m", "workers", "tile", "nbc", "samples", "median_us", "p10_us", "p90_us",
     "byte_exact",
 )
@@ -109,6 +111,9 @@ def read_rows(paths: Sequence[Path]) -> tuple[list[tuple[int, dict[str, str]]], 
 def collect(rows: Iterable[tuple[int, Mapping[str, str]]], min_replicas: int):
     """Group authenticated rows by runtime key, (alias, replica) and candidate."""
 
+    # The build envelope and the resolved leaf instruction are distinct: one
+    # NEON_I8MM binary can time SMMLA (automatic), SDOT or ASIMD (forced by
+    # LLAMINAR_ISA_LEVEL). Replicas pool only within one exact pair.
     isas = set()
     grouped: dict[OverlayKey, dict[tuple[str, int], dict[tuple[str, int], float]]] = {}
     for replica, row in rows:
@@ -116,7 +121,9 @@ def collect(rows: Iterable[tuple[int, Mapping[str, str]]], min_replicas: int):
             raise OverlayError(f"unsupported schema {row['schema']!r}")
         if row["byte_exact"] != "1":
             raise OverlayError(f"non-exact candidate output: {row}")
-        isas.add(row["isa"])
+        if not row["build_isa"] or not row["instruction"]:
+            raise OverlayError(f"incomplete build/instruction identity: {row}")
+        isas.add(f"{row['build_isa']}/{row['instruction']}")
         key = OverlayKey(int(row["codebook"]), row["superblock"] == "1", int(row["n"]),
                          int(row["k"]), int(row["m"]), int(row["workers"]))
         if min(key.n, key.k, key.m, key.workers) <= 0:
@@ -133,7 +140,7 @@ def collect(rows: Iterable[tuple[int, Mapping[str, str]]], min_replicas: int):
             raise OverlayError(f"duplicate measurement for {key} {row['source_format']} {candidate}")
         candidates[candidate] = median
     if len(isas) != 1:
-        raise OverlayError(f"overlay inputs mix ISA identities {sorted(isas)}")
+        raise OverlayError(f"overlay inputs mix build/instruction identities {sorted(isas)}")
     for key, sources in grouped.items():
         for alias in {source for source, _ in sources}:
             present = sorted(replica for source, replica in sources if source == alias)
@@ -217,7 +224,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     rendered = render(entries, isa)
     args.output.write_text(rendered, encoding="utf-8")
     receipt = {
-        "schema": "neon-exact-overlay-receipt-v1",
+        "schema": "neon-exact-overlay-receipt-v2",
         "isa": isa,
         "inputs": digests,
         "min_improvement": args.min_improvement,
