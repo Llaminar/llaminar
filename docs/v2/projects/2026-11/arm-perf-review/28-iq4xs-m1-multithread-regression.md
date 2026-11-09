@@ -215,3 +215,24 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - Owner evidence set: Mac AppleClang E2E; .80 GNU-14 E2E; census 9 GNU + 9
   AppleClang assemblies, zero structural errors; 27 adversarial tests.
 - R1: complete from the lane (SOURCE116 under review; WSL x86 gate pending).
+
+## SOURCE116 FINAL (2026-11-09) — tooling HOLD; successor scope (SOURCE117)
+
+- P1a interprocedural: no return/arg/stack-memory summaries + caller-frame
+  ownership (x0–x18 cleared on call; x8 indirect-result + caller-stack args
+  omitted; callee-visible memory effects absent) → summaries or structural
+  rejection; outside budgets.
+- P1b operand semantics: BFI/MOVK partial defs (implicit inputs); partial-load
+  SP reconstitution (byte/bit ranges or reject); SIMD lane-aware ABI proof
+  (LD1 d[1] high-lane writes; LD1R/LD2 don't inherit LDR semantics) → proven
+  opcode/lane/layout only.
+- P1c grammar: retain global-label statements; explicit admitted
+  instruction/directive grammar (`.byte`/`.incbin` code-generating forms);
+  compute() fail-closed admission.
+- P1d dependency normalization: filesystem-lookup semantics BEFORE hashing
+  (normpath after symlink resolution; decoy `/p/h.h` vs real `/q/h.h`
+  control).
+- P2a abort property: nonreturning ≠ abort — require the declared abort
+  property or reject unproved cycles (no-abort + mixed loop/abort controls).
+- Positives kept; never change production allocation for the checker;
+  owner-evidence framing stands.
