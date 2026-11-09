@@ -51,3 +51,17 @@ during one invocation. This is both economy and collective safety:
 
 ARM NEON tile only; the x86 `CPUNativeVNNIMultiScaleKernels.h` checks are a
 separate (shared) path with the same pattern but different owners.
+
+## Addon implementation (2026-11-09) — f058a2953 part of R1 09cba9963
+
+- Native weight bytes behind CPUNativeVNNIPublishedBytes generation counter;
+  CPUNativeVNNIMetadataSeal validates metadata once per publication; the
+  per-encoding coverage table (== old in-loop rules, padding included) is in
+  the commit body; all 6 producers seal; overlay slot acquisition withdraws
+  admission until the arrival reseals; NEON run path noexcept (static_asserts);
+  writer-policy sanitizer (narrow named allowlist) + negative controls pass.
+- M1 core-free (preliminary, not authoritative): MetadataSeal 6/6,
+  WeightView 4/4, PreparedProjection 8/8, ProjectionBatch 10/10, NEONExecution
+  10/10, NumericalContract 5/5, writer negatives 5/5; run<> 44045→37434
+  instructions. Syntax-only: gcc-16 ARM + clang x86_64-AVX512. Pending:
+  core-linked tests (.80) + WSL x86 gate. x86 loadScales checks untouched.
