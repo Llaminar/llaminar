@@ -81,3 +81,29 @@ idea 10).
 - Commit order: 7d → 7b → 7a → 7c → 25a → 25b (25c tracker-only). Reviewer at
   clean checkpoint → handover to Main. Dead-code flag (apply_with_residual_add
   no production callers) + RMSNorm-no-workspace sent to Main.
+
+## Ideas 7+25 lane progress (2026-11-09, branch rebased onto 302318f1e, local)
+
+- 06b205ccd fix(cpu) 7d: Q8_1 pure-integer gamma keyed by owner identity
+  (weak_from_this + address + width; quantisation split into own primitive;
+  empty/expired owners requantise per call, never cached). Core-free
+  regression + negative control (address-only key fails the 3 cases) in
+  ProductionTestPreflight; AVX512 syntax probe on Mac; real AVX512 exec = WSL.
+- a588345ac perf(cpu) 7b: inv_freq hits lock-free via 8-entry per-thread memo
+  of published node addresses (map never erased; values/storage unchanged);
+  regression 12 geometries × 6 threads → single address + bit-exact values.
+- c93a2d1a8 build(docker) 25b: install-cuda.sh arch-aware (22.04|24.04 ×
+  amd64→x86_64 | arm64→sbsa; else fail closed; x86 unchanged); MODE=profilers
+  (CUPTI + nsight-compute + nsight-systems); validate-cuda-profilers.sh
+  (identity + cuda,nvtx trace must contain kernels + cudaGraphLaunch);
+  mapping test in preflight image-contract suite. uma4 (FROM uma3 +
+  MODE=profilers) + runbook → arm-sparks builds/validates.
+- Mac: portability NEON_DOTPROD Release 261/261 after 7d; RoPE subset 20/20
+  after 7b.
+- Decisions folded: 7c does NOT touch apply_with_residual_add; >8192 → FAIL
+  FAST (fatal naming width+bound) — declared cpu_rmsnorm_rows workspace =
+  tracked follow-up; 7a/7a2 via RoPEStage IWorkspaceConsumer, sizing from
+  admitted max rows (incl. grouped verifier rows), bind before capture/replay,
+  lifecycle reset/replay test, no thread_local cos/sin left in RoPE TU.
+- Process: local --no-verify OK (macOS can't configure full engine); WSL x86
+  gate = real prerequisite; branch stays local until gate + handover.
