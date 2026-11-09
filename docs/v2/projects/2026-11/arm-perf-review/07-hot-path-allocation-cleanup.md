@@ -440,3 +440,14 @@ the source policy). Dead persistent_state parameter removed.
   MECHANISM intact. Required: ASSERT_TRUE(execute()), exceptions FAIL, norm
   assertions unconditional. Lane pushing test-only follow-up; WSL (5'') held
   for the final SHA. Not a production defect.
+
+## 912d0107 (2026-11-09) — hidden-skip mechanism removed (test-only)
+
+- ComputeStages norm-preservation: ASSERT_TRUE(execute); catch-all→skip
+  removed; unconditional norm assertions. Same mechanism found in all four
+  CPU RoPE cases (ComputeStage: RoPEBasic, RoPEPositionOffset,
+  RoPEExplicitPositionIds_BatchedParity, position_ids-override) — converted;
+  no RoPE skip path remains (grep empty). Removing it exposed the
+  position_ids-override 3 stages UNBOUND (regex missed digit names — lane's
+  error, acknowledged) — bound. Correct re-sweep: 33 RoPEStage constructions,
+  all accounted. Mac gcc-16 -Wall 0 diagnostics; WSL (5'') = first execution.
