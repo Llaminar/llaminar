@@ -288,6 +288,23 @@ v2_add_core_free_test(V2_Integration_CPUWorkshareTimingRetainedRelease
 v2_add_core_free_test(V2_Integration_CPUWorkshareTimingLifecycle
     COMMAND $<TARGET_FILE:v2_test_cpu_workshare_timing> --gtest_filter=*PublicationStateRejectsRepeatedOperations
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Profiling Ownership Regression)
+add_executable(v2_test_cpu_openmp_workshare
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__OpenMPWorkshare.cpp")
+target_compile_features(v2_test_cpu_openmp_workshare PRIVATE cxx_std_23)
+target_include_directories(v2_test_cpu_openmp_workshare PRIVATE
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
+target_link_libraries(v2_test_cpu_openmp_workshare PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+v2_add_core_free_test(V2_Unit_OpenMPWorkshareLexicalRetained
+    COMMAND $<TARGET_FILE:v2_test_cpu_openmp_workshare>
+    LABELS V2 Unit CPU DeviceFree OpenMP Workshare Ownership Regression)
+v2_add_core_free_test(V2_Integration_OpenMPWorkshareLexicalRetained
+    COMMAND $<TARGET_FILE:v2_test_cpu_openmp_workshare>
+        --gtest_filter=OpenMPWorkshare.RetainedSerializedTeamReusesExactTeam:OpenMPWorkshare.RetainedInactiveTeamReusesExactTeam:OpenMPWorkshare.RegionIfRetainedVariantsStayDirect:OpenMPWorkshare.BeginWorkshareEmptySemantics
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree OpenMP Workshare Ownership Regression)
+v2_add_core_free_test(V2_Integration_OpenMPWorkshareRetainedDepth
+    COMMAND $<TARGET_FILE:v2_test_cpu_openmp_workshare>
+        --gtest_filter=OpenMPWorkshare.StandalonePolicyIsUnchanged:OpenMPWorkshare.RetainedActiveTeamReusesExactTeam:OpenMPWorkshare.NestedSerializedTeamDepthIsStable:OpenMPWorkshare.CollapseFormsReuseRetainedTeam:OpenMPWorkshare.RepeatedRetainedCallsKeepConstantDepth:OpenMPWorkshare.ImmediateAfterReturnBeforeOuterJoin:OpenMPWorkshare.RetainedSingleExecutesExactlyOnce:OpenMPWorkshare.SingleNoWaitHasNoForcedBarrier:OpenMPWorkshare.RegionSyncAddsExplicitBarrierAfterNowaitWork:OpenMPWorkshare.LayerParallelReusesRetainedTeam:OpenMPWorkshare.CanonicalPlacementAuthority
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree OpenMP Workshare Ownership Regression)
 add_executable(v2_test_cpu_rmsnorm_numeric_fatal
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPURMSNormNumericFatal.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RMSNormPrimitives.cpp")

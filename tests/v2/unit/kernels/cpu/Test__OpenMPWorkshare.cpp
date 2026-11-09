@@ -1,0 +1,575 @@
+/**
+ * @file Test__OpenMPWorkshare.cpp
+ * @brief Device-free lexical retained-team semantics for the shared workshare helpers.
+ *
+ * The shared OpenMP helper family must reuse the exact enclosing team whenever a
+ * participant is inside any parallel region -- active, serialized
+ * (num_threads(1)) or inactive (if(false)) -- instead of forking an unwanted
+ * inner team based on the active-only omp_in_parallel() predicate. Every test
+ * observes the predicates from INSIDE the work function: omp_get_level(),
+ * omp_in_parallel(), omp_get_num_threads() and the canonical
+ * llaminar::v2::teamPlacement()/inLexicalWorkshare() authority. The Active
+ * label carries the exact OpenMP meaning (enclosed by an active region; an
+ * active ancestor makes a nested-serialized one-thread team report active) and
+ * never claims current team width > 1. Standalone policy (condition-true full
+ * team, condition-false 1-thread region, empty calls without a team/barrier)
+ * is unchanged. This target is device-free and does not certify factories,
+ * model inference or economy.
+ */
+#include "utils/OpenMPUtils.h"
+#include <gtest/gtest.h>
+#include <omp.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <thread>
+
+namespace llaminar2::test
+{
+namespace
+{
+using llaminar::v2::TeamPlacement;
+using llaminar::v2::beginWorkshare;
+using llaminar::v2::inActiveParallelRegion;
+using llaminar::v2::inLexicalWorkshare;
+using llaminar::v2::isInParallelRegion;
+using llaminar::v2::teamPlacement;
+
+/** @brief Keep requested retained teams exact without leaking caller policy. */
+class TeamPolicy final
+{
+public:
+    TeamPolicy() : threads_(omp_get_max_threads()), dynamic_(omp_get_dynamic()) { omp_set_dynamic(0); }
+    ~TeamPolicy() { omp_set_num_threads(threads_); omp_set_dynamic(dynamic_); }
+private:
+    int threads_, dynamic_;
+};
+/** @brief Keep a requested thread-count ICV while a fixture runs. */
+class NumThreadsGuard final
+{
+public:
+    explicit NumThreadsGuard(int threads) : previous_(omp_get_max_threads()) { omp_set_num_threads(threads); }
+    ~NumThreadsGuard() { omp_set_num_threads(previous_); }
+private:
+    int previous_;
+};
+} // namespace
+
+/** @test Standalone conditional-true uses the exact admitted width; false one thread. */
+TEST(OpenMPWorkshare, StandalonePolicyIsUnchanged)
+{
+    const TeamPolicy policy;
+    const NumThreadsGuard admitted(3);
+    std::atomic<int> iterations{0}, wrong{0};
+    auto full = [&]() {
+#pragma omp for schedule(static)
+        for (int i = 0; i < 8; ++i)
+        {
+            // The fork must use the exact admitted team width (3), not merely >1.
+            if (omp_get_level() != 1 || omp_get_num_threads() != 3)
+                wrong.fetch_add(1, std::memory_order_relaxed);
+            iterations.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    OMP_WORKSHARE_REGION_IF(full, true);
+    EXPECT_EQ(iterations.load(), 8);
+    auto single = [&]() {
+#pragma omp for schedule(static)
+        for (int i = 0; i < 8; ++i)
+        {
+            if (omp_get_level() != 1 || omp_get_num_threads() != 1)
+                wrong.fetch_add(1, std::memory_order_relaxed);
+            iterations.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    OMP_WORKSHARE_REGION_IF(single, false);
+    EXPECT_EQ(iterations.load(), 16);
+    EXPECT_EQ(wrong.load(), 0);
+}
+
+/** @test Retained active team: the work function reuses the exact 3-thread team. */
+TEST(OpenMPWorkshare, RetainedActiveTeamReusesExactTeam)
+{
+    const TeamPolicy policy;
+    std::atomic<int> iterations{0}, badDepth{0};
+    auto work = [&]() {
+#pragma omp for schedule(static)
+        for (int i = 0; i < 9; ++i)
+        {
+            // No nested region: the work body sees the outer team directly.
+            EXPECT_EQ(omp_get_num_threads(), 3);
+            EXPECT_EQ(omp_get_level(), 1);
+            EXPECT_EQ(omp_in_parallel(), 1);
+            if (omp_get_level() != 1) badDepth.fetch_add(1, std::memory_order_relaxed);
+            iterations.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    int outerTeam = 0;
+#pragma omp parallel num_threads(3)
+    {
+        if (omp_get_thread_num() == 0) outerTeam = omp_get_num_threads();
+        OMP_WORKSHARE_REGION(work);
+    }
+    EXPECT_EQ(outerTeam, 3);
+    EXPECT_EQ(iterations.load(), 9);
+    EXPECT_EQ(badDepth.load(), 0);
+}
+
+/** @test Retained one-thread team (no active ancestor) never forks an inner region. */
+TEST(OpenMPWorkshare, RetainedSerializedTeamReusesExactTeam)
+{
+    const TeamPolicy policy;
+    std::atomic<int> iterations{0}, wrong{0};
+    auto work = [&]() {
+#pragma omp for schedule(static)
+        for (int i = 0; i < 3; ++i)
+        {
+            // Old active-only predicate forked a new region at a deeper level.
+            if (omp_get_level() != 1 || omp_get_num_threads() != 1)
+                wrong.fetch_add(1, std::memory_order_relaxed);
+            EXPECT_FALSE(inActiveParallelRegion());
+            EXPECT_TRUE(teamPlacement() == TeamPlacement::Retained);
+            EXPECT_TRUE(inLexicalWorkshare());
+            iterations.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+#pragma omp parallel num_threads(1)
+    {
+        // Absent an active ancestor, a top-level one-thread region is inactive.
+        EXPECT_EQ(omp_get_level(), 1);
+        EXPECT_FALSE(omp_in_parallel());
+        EXPECT_TRUE(teamPlacement() == TeamPlacement::Retained);
+        EXPECT_FALSE(inActiveParallelRegion());
+        OMP_WORKSHARE_REGION(work);
+    }
+    EXPECT_EQ(iterations.load(), 3);
+    EXPECT_EQ(wrong.load(), 0);
+}
+
+/** @test Retained inactive (if(false)) team never forks an inner region. */
+TEST(OpenMPWorkshare, RetainedInactiveTeamReusesExactTeam)
+{
+    const TeamPolicy policy;
+    std::atomic<int> iterations{0}, wrong{0};
+    auto work = [&]() {
+#pragma omp for schedule(static)
+        for (int i = 0; i < 3; ++i)
+        {
+            if (omp_get_level() != 1 || omp_get_num_threads() != 1)
+                wrong.fetch_add(1, std::memory_order_relaxed);
+            iterations.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+#pragma omp parallel if(false)
+    {
+        EXPECT_EQ(omp_get_level(), 1);
+        EXPECT_FALSE(omp_in_parallel());
+        EXPECT_TRUE(teamPlacement() == TeamPlacement::Retained);
+        OMP_WORKSHARE_REGION(work);
+    }
+    EXPECT_EQ(iterations.load(), 3);
+    EXPECT_EQ(wrong.load(), 0);
+}
+
+/** @test REGION_IF retained variants: active3, inactive and nested stay direct. */
+TEST(OpenMPWorkshare, RegionIfRetainedVariantsStayDirect)
+{
+    const TeamPolicy policy;
+    std::atomic<int> iterations{0}, wrong{0};
+    int expectedLevel = 1;
+    auto work = [&]() {
+#pragma omp for schedule(static)
+        for (int i = 0; i < 6; ++i)
+        {
+            if (omp_get_level() != expectedLevel) wrong.fetch_add(1, std::memory_order_relaxed);
+            iterations.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+#pragma omp parallel num_threads(3)
+    {
+        OMP_WORKSHARE_REGION_IF(work, true);
+        OMP_WORKSHARE_REGION_IF(work, false);
+    }
+    EXPECT_EQ(iterations.load(), 12);
+    EXPECT_EQ(wrong.load(), 0);
+    iterations.store(0);
+#pragma omp parallel if(false)
+    {
+        OMP_WORKSHARE_REGION_IF(work, true);
+        OMP_WORKSHARE_REGION_IF(work, false);
+    }
+    EXPECT_EQ(iterations.load(), 12);
+    EXPECT_EQ(wrong.load(), 0);
+    iterations.store(0);
+    expectedLevel = 2;
+#pragma omp parallel num_threads(2)
+    {
+        if (omp_get_num_threads() != 2) wrong.fetch_add(1000, std::memory_order_relaxed);
+#pragma omp parallel num_threads(1)
+        {
+            OMP_WORKSHARE_REGION_IF(work, true);
+            OMP_WORKSHARE_REGION_IF(work, false);
+        }
+    }
+    // Two outer threads each create a serialized inner team, and each inner
+    // team runs both 6-iteration workshares: 2 * (6 + 6) = 24.
+    EXPECT_EQ(iterations.load(), 24);
+    EXPECT_EQ(wrong.load(), 0);
+}
+
+/** @test Nested serialized retained team authenticates both widths and placement helpers. */
+TEST(OpenMPWorkshare, NestedSerializedTeamDepthIsStable)
+{
+    const TeamPolicy policy;
+    std::atomic<int> wrong{0};
+    auto work = [&]() {
+#pragma omp for schedule(static)
+        for (int i = 0; i < 2; ++i)
+            // Outer active (1) + inner serialized (2): no third fork.
+            if (omp_get_level() != 2) wrong.fetch_add(1, std::memory_order_relaxed);
+    };
+#pragma omp parallel num_threads(2)
+    {
+        int team = omp_get_num_threads();
+        if (team != 2) wrong.fetch_add(1000, std::memory_order_relaxed);
+#pragma omp parallel num_threads(1)
+        {
+            int innerWidth = omp_get_num_threads();
+            if (innerWidth != 1) wrong.fetch_add(2000, std::memory_order_relaxed);
+            // Exact OpenMP meaning: an active ancestor exists, so the Active
+            // label applies even though the current team has one thread.
+            if (!(teamPlacement() == TeamPlacement::Active)) wrong.fetch_add(3000, std::memory_order_relaxed);
+            if (!inLexicalWorkshare()) wrong.fetch_add(4000, std::memory_order_relaxed);
+            if (!isInParallelRegion()) wrong.fetch_add(5000, std::memory_order_relaxed);
+            if (!inActiveParallelRegion()) wrong.fetch_add(6000, std::memory_order_relaxed);
+            OMP_WORKSHARE_REGION(work);
+        }
+    }
+    EXPECT_EQ(wrong.load(), 0);
+}
+
+/** @test COLLAPSE2/3 forms reuse the retained team and condition false stays direct. */
+TEST(OpenMPWorkshare, CollapseFormsReuseRetainedTeam)
+{
+    const TeamPolicy policy;
+    std::atomic<int> iterations{0}, wrong{0};
+    auto work2 = [&]() {
+#pragma omp for collapse(2) schedule(static)
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 3; ++j)
+            {
+                if (omp_get_num_threads() != 3 || omp_get_level() != 1) wrong.fetch_add(1, std::memory_order_relaxed);
+                iterations.fetch_add(1, std::memory_order_relaxed);
+            }
+    };
+    auto work3 = [&]() {
+#pragma omp for collapse(3) schedule(static)
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 3; ++j)
+                for (int k = 0; k < 2; ++k)
+                {
+                    if (omp_get_num_threads() != 3 || omp_get_level() != 1) wrong.fetch_add(1, std::memory_order_relaxed);
+                    iterations.fetch_add(1, std::memory_order_relaxed);
+                }
+    };
+#pragma omp parallel num_threads(3)
+    {
+        OMP_WORKSHARE_COLLAPSE2_IF(work2, true);
+        OMP_WORKSHARE_COLLAPSE3_IF(work3, false);
+    }
+    EXPECT_EQ(iterations.load(), 12 + 12);
+    EXPECT_EQ(wrong.load(), 0);
+}
+
+/** @test beginWorkshare: standalone empty returns; retained empty rendezvous before outer join. */
+TEST(OpenMPWorkshare, BeginWorkshareEmptySemantics)
+{
+    const TeamPolicy policy;
+    // Standalone empty: no team, no barrier, plain return.
+    EXPECT_FALSE(beginWorkshare(false));
+    // Retained active3 entry witness: every member reaches the empty boundary
+    // before any member may return (entry rendezvous); this does not by itself
+    // prove post-work completion of a later barrier.
+    std::atomic<int> arrived{0}, early{0};
+#pragma omp parallel num_threads(3)
+    {
+        if (omp_get_thread_num() == 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        arrived.fetch_add(1, std::memory_order_release);
+        EXPECT_FALSE(beginWorkshare(false));
+        if (arrived.load(std::memory_order_acquire) != 3) early.fetch_add(1, std::memory_order_relaxed);
+    }
+    EXPECT_EQ(arrived.load(), 3);
+    EXPECT_EQ(early.load(), 0);
+    // Retained serialized/inactive empty boundaries are valid no-ops.
+#pragma omp parallel num_threads(1)
+    { EXPECT_FALSE(beginWorkshare(false)); EXPECT_EQ(omp_get_level(), 1); }
+#pragma omp parallel if(false)
+    { EXPECT_FALSE(beginWorkshare(false)); EXPECT_EQ(omp_get_level(), 1); }
+}
+
+/** @test Repeated retained calls keep one inner depth and no per-call fork. */
+TEST(OpenMPWorkshare, RepeatedRetainedCallsKeepConstantDepth)
+{
+    const TeamPolicy policy;
+    std::atomic<int> iterations{0}, wrong{0};
+    auto work = [&]() {
+#pragma omp for schedule(static)
+        for (int i = 0; i < 6; ++i)
+        {
+            if (omp_get_num_threads() != 3 || omp_get_level() != 1)
+                wrong.fetch_add(1, std::memory_order_relaxed);
+            iterations.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+#pragma omp parallel num_threads(3)
+    {
+        for (int repeat = 0; repeat < 10; ++repeat) OMP_WORKSHARE_REGION(work);
+    }
+    EXPECT_EQ(iterations.load(), 60);
+    EXPECT_EQ(wrong.load(), 0);
+}
+
+/** @test Cross-member completion is verified by every member before the outer join. */
+TEST(OpenMPWorkshare, ImmediateAfterReturnBeforeOuterJoin)
+{
+    const TeamPolicy policy;
+    constexpr std::size_t kSlots = 12, kGuard = 16;
+    std::array<std::atomic<std::uint64_t>, kGuard> shared;
+    std::array<std::atomic<int>, kGuard> owner;
+    for (std::size_t i = 0; i < kGuard; ++i)
+    {
+        shared[i].store(0xfeedfacecafebeefull, std::memory_order_relaxed);
+        owner[i].store(-1, std::memory_order_relaxed);
+    }
+    std::atomic<int> recordedTeam{0}, missing{0}, corrupted{0}, mastered{0}, skewFailed{0};
+    auto work = [&]() {
+        const int team = omp_get_num_threads();
+        recordedTeam.store(team, std::memory_order_relaxed);
+        const int tid = omp_get_thread_num();
+#pragma omp for schedule(static)
+        for (std::size_t i = 0; i < kSlots; ++i)
+        {
+            // Condition-based skew: the member owning the last (static, default
+            // chunk = ceil(N/team)) chunk waits until every other member has
+            // written its own slots (50us polling, ~200ms hard cap with a fail
+            // flag), then a fixed 2ms before writing. Oversubscribed cores do
+            // not turn this into a long spin.
+            if (i == kSlots - 4)
+            {
+                bool othersDone = false;
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+                do {
+                    othersDone = true;
+                    for (std::size_t j = 0; j < kSlots - 4; ++j)
+                        if (owner[j].load(std::memory_order_acquire) < 0) { othersDone = false; break; }
+                    if (!othersDone) std::this_thread::sleep_for(std::chrono::microseconds(50));
+                } while (!othersDone && std::chrono::steady_clock::now() < deadline);
+                if (!othersDone) skewFailed.fetch_add(1, std::memory_order_relaxed);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            owner[i].store(tid, std::memory_order_release);
+            shared[i].store(std::uint64_t(0xc0ffee0000000000ull | i), std::memory_order_release);
+        }
+    };
+#pragma omp parallel num_threads(3)
+    {
+        OMP_WORKSHARE_REGION(work);
+        // Immediately after return, before the outer join and with NO masking
+        // barrier, EVERY member verifies ALL 12 slots (written by the
+        // distributed static schedule, each slot owned by one member), the
+        // delayed last chunk's non-master ownership, and the guard region.
+        int localMissing = 0;
+        bool corrupt = false;
+        for (std::size_t i = 0; i < kGuard; ++i)
+        {
+            const auto value = shared[i].load(std::memory_order_acquire);
+            const auto who = owner[i].load(std::memory_order_acquire);
+            if (i < kSlots)
+            {
+                if (value != std::uint64_t(0xc0ffee0000000000ull | i) || who < 0) ++localMissing;
+                if (i >= kSlots - 4 && who == 0) mastered.fetch_add(1, std::memory_order_relaxed);
+            }
+            else if (value != 0xfeedfacecafebeefull) corrupt = true;
+        }
+        if (corrupt) corrupted.fetch_add(1, std::memory_order_relaxed);
+        if (localMissing) missing.fetch_add(1, std::memory_order_relaxed);
+    }
+    EXPECT_EQ(recordedTeam.load(), 3);
+    EXPECT_EQ(corrupted.load(), 0);
+    EXPECT_EQ(missing.load(), 0);
+    EXPECT_EQ(mastered.load(), 0);
+    EXPECT_EQ(skewFailed.load(), 0);
+}
+
+/** @test OMP_SINGLE executes exactly once in a retained active team. */
+TEST(OpenMPWorkshare, RetainedSingleExecutesExactlyOnce)
+{
+    const TeamPolicy policy;
+    std::atomic<int> singles{0};
+    int outerTeam = 0;
+    auto once = [&]() { singles.fetch_add(1, std::memory_order_relaxed); };
+#pragma omp parallel num_threads(3)
+    {
+        if (omp_get_thread_num() == 0) outerTeam = omp_get_num_threads();
+        OMP_SINGLE(once);
+    }
+    EXPECT_EQ(outerTeam, 3);
+    EXPECT_EQ(singles.load(), 1);
+}
+
+/** @test OMP_SINGLE_NOWAIT keeps its no-forced-barrier semantics (bounded scheduling). */
+TEST(OpenMPWorkshare, SingleNoWaitHasNoForcedBarrier)
+{
+    const TeamPolicy policy;
+    std::atomic<int> returned{0};
+    std::atomic<bool> failed{false};
+    int outerTeam = 0;
+#pragma omp parallel num_threads(3)
+    {
+        if (omp_get_thread_num() == 0) outerTeam = omp_get_num_threads();
+        OMP_SINGLE_NOWAIT([&]() {
+            // Bounded ORDERED scheduling handshake: wait until the two
+            // non-single threads have returned from the nowait macro using
+            // 50us sleep-based polling with a generous ~200ms hard cap. A
+            // forced barrier after the single would keep them blocked here, so
+            // the cap trips and the failure flag is set. This is a bounded
+            // scheduling witness, not a timing-free proof.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+            while (std::chrono::steady_clock::now() < deadline &&
+                   returned.load(std::memory_order_acquire) < 2)
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (returned.load(std::memory_order_acquire) < 2)
+                failed.store(true, std::memory_order_relaxed);
+        });
+        returned.fetch_add(1, std::memory_order_release);
+    }
+    EXPECT_EQ(outerTeam, 3);
+    EXPECT_EQ(returned.load(), 3);
+    EXPECT_FALSE(failed.load());
+}
+
+/** @test REGION_SYNC's explicit barrier is observable after skewed nowait work. */
+TEST(OpenMPWorkshare, RegionSyncAddsExplicitBarrierAfterNowaitWork)
+{
+    const TeamPolicy policy;
+    constexpr std::size_t kSlots = 12, kGuard = 16;
+    std::array<std::atomic<std::uint64_t>, kGuard> shared;
+    std::array<std::atomic<int>, kGuard> owner;
+    for (std::size_t i = 0; i < kGuard; ++i)
+    {
+        shared[i].store(0xfeedfacecafebeefull, std::memory_order_relaxed);
+        owner[i].store(-1, std::memory_order_relaxed);
+    }
+    std::atomic<int> recordedTeam{0}, missing{0}, corrupted{0}, mastered{0}, skewFailed{0};
+    auto work = [&]() {
+        const int team = omp_get_num_threads();
+        recordedTeam.store(team, std::memory_order_relaxed);
+        const int tid = omp_get_thread_num();
+#pragma omp for schedule(static) nowait
+        for (std::size_t i = 0; i < kSlots; ++i)
+        {
+            // Condition-based skew on the last chunk: wait until every other
+            // member's slots are written (50us polling, ~200ms hard cap with a
+            // fail flag), then a fixed 2ms before writing. Without the explicit
+            // SYNC barrier a fast member could observe incomplete slots
+            // (skew-assisted positive check; barrier-removal negative is the
+            // tester's separate SYNC mutant, not the old-predicate control).
+            if (i == kSlots - 4)
+            {
+                bool othersDone = false;
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+                do {
+                    othersDone = true;
+                    for (std::size_t j = 0; j < kSlots - 4; ++j)
+                        if (owner[j].load(std::memory_order_acquire) < 0) { othersDone = false; break; }
+                    if (!othersDone) std::this_thread::sleep_for(std::chrono::microseconds(50));
+                } while (!othersDone && std::chrono::steady_clock::now() < deadline);
+                if (!othersDone) skewFailed.fetch_add(1, std::memory_order_relaxed);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            owner[i].store(tid, std::memory_order_release);
+            shared[i].store(std::uint64_t(0xc0ffee0000000000ull | i), std::memory_order_release);
+        }
+    };
+#pragma omp parallel num_threads(3)
+    {
+        OMP_WORKSHARE_REGION_SYNC(work);
+        int localMissing = 0;
+        bool corrupt = false;
+        for (std::size_t i = 0; i < kGuard; ++i)
+        {
+            const auto value = shared[i].load(std::memory_order_acquire);
+            const auto who = owner[i].load(std::memory_order_acquire);
+            if (i < kSlots)
+            {
+                if (value != std::uint64_t(0xc0ffee0000000000ull | i) || who < 0) ++localMissing;
+                if (i >= kSlots - 4 && who == 0) mastered.fetch_add(1, std::memory_order_relaxed);
+            }
+            else if (value != 0xfeedfacecafebeefull) corrupt = true;
+        }
+        if (corrupt) corrupted.fetch_add(1, std::memory_order_relaxed);
+        if (localMissing) missing.fetch_add(1, std::memory_order_relaxed);
+    }
+    EXPECT_EQ(recordedTeam.load(), 3);
+    EXPECT_EQ(corrupted.load(), 0);
+    EXPECT_EQ(missing.load(), 0);
+    EXPECT_EQ(mastered.load(), 0);
+    EXPECT_EQ(skewFailed.load(), 0);
+}
+
+/** @test OMP_LAYER_PARALLEL forks standalone and reuses the retained team. */
+TEST(OpenMPWorkshare, LayerParallelReusesRetainedTeam)
+{
+    const TeamPolicy policy;
+    std::atomic<int> wrong{0};
+    OMP_LAYER_PARALLEL({
+        if (omp_get_level() != 1) wrong.fetch_add(1, std::memory_order_relaxed);
+    });
+    EXPECT_EQ(wrong.load(), 0);
+#pragma omp parallel num_threads(3)
+    {
+        OMP_LAYER_PARALLEL({
+            if (omp_get_num_threads() != 3 || omp_get_level() != 1)
+                wrong.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    EXPECT_EQ(wrong.load(), 0);
+}
+
+/** @test The canonical placement authority classifies standalone, retained and active. */
+TEST(OpenMPWorkshare, CanonicalPlacementAuthority)
+{
+    const TeamPolicy policy;
+    EXPECT_TRUE(teamPlacement() == TeamPlacement::Standalone);
+    EXPECT_FALSE(inLexicalWorkshare());
+    EXPECT_FALSE(isInParallelRegion());
+#pragma omp parallel num_threads(1)
+    {
+        // Absent an active ancestor, a one-thread region is inactive.
+        EXPECT_TRUE(teamPlacement() == TeamPlacement::Retained);
+        EXPECT_TRUE(inLexicalWorkshare());
+        EXPECT_FALSE(inActiveParallelRegion());
+        EXPECT_FALSE(isInParallelRegion());
+    }
+#pragma omp parallel if(false)
+    {
+        EXPECT_TRUE(teamPlacement() == TeamPlacement::Retained);
+        EXPECT_TRUE(inLexicalWorkshare());
+        EXPECT_FALSE(inActiveParallelRegion());
+        EXPECT_FALSE(isInParallelRegion());
+    }
+#pragma omp parallel num_threads(3)
+    {
+        EXPECT_TRUE(teamPlacement() == TeamPlacement::Active);
+        EXPECT_TRUE(inLexicalWorkshare());
+        EXPECT_TRUE(inActiveParallelRegion());
+        EXPECT_TRUE(isInParallelRegion());
+    }
+    EXPECT_FALSE(isInParallelRegion());
+    EXPECT_FALSE(inLexicalWorkshare());
+}
+} // namespace llaminar2::test
