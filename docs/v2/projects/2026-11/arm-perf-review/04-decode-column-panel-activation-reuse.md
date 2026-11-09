@@ -126,3 +126,19 @@ in the plan. Any NibbleMap touch points must remain seam-based.
 - Reviewer note (for R2 checkpoint): S=2 ≤1 padding strip per final chunk,
   compute-only, never stored; panel-width/tail tests prove no store past N.
 - arm-sparks resume (a) gate → (b) tournament → (c) A1 at f3b28a120.
+
+## R2 (a)+PCH clean; (b)/(c) re-booked (2026-11-09)
+
+- f3b28a120: CFG=0 BUILD=0 CENSUS=0 (12/12); Unit 13 + Preflight 12 =
+  EXACT R1 base sets; PCHBUILD=0 9/9 rerun (ParityFixture incl.). Cells
+  2/199: GroupedSealedPlan (known base) + V2_Perf_CPUFlashAttentionTile
+  Tournament TIMEOUT 600s (ran --parallel 20; UNCLASSIFIED; needs solo
+  base-vs-R2).
+- LANE SCRIPT BUG: build-release.sh pre-rename target
+  (v2_perf_cpu_native_vnni_thread_scaling) → unknown target; binaries never
+  built; scripts echoed EXIT/rc=0 after redirect → (b)/(c) logs read DONE
+  but NO measurements. FIXED: renamed target, fail-closed, binary checks,
+  real rc, r2rel.sh. arm-sparks warned: DO NOT report void numbers.
+- RE-BOOK: r2rel.sh (REL_BASE=0 REL_R2=0 + 3 binaries) → window-panel.sh
+  f3b28a120 → window-r2e.sh 5d4e3716a f3b28a120 → optional solo FA
+  tournament A/B (else WSL/x86 classification).
