@@ -308,3 +308,19 @@ failures GONE at this base. RE-GATE GO to arm-sparks.
 - i8mm lane RETIRED (already); .80 back to arm-sparks; Mac qual evidence stays
   until the gcc-14 objdump confirm (arm-sparks, pending) — if a non-SMMLA
   codegen difference shows, a follow-up commit + revalidation.
+
+## gcc-14 objdump (post-merge, sealed K14-I8MM-OBJDUMP-GCC14-20261109)
+
+- fndiff.py STRICT=1, objdump --no-addresses, ea5402a54 vs 79c1f62ab,
+  DOTPROD, g++-14: same=92, diff=4, only=0 for run<> leaves (96 matched).
+- The 4 DIFFs = Tile<1..4>::run<Ops<DotProd>, Policy0, Encoding0,
+  NibbleMap1, true> — IDENTICAL instruction counts (286/391/488/572),
+  differing normalized streams only under STRICT (immediates/register moves).
+- All other 92 leaves identical (every ASIMD + all other DotProd encodings/
+  policies/nibblemaps); execute<> wrappers differ (expected admission change);
+  no leaf added/removed.
+- gcc-16 Mac was 96/96 → gcc-14-specific scheduling/codegen, NOT source;
+  AppleClang/gcc-16 byte-identity evidence does NOT transfer to gcc-14.
+- DECISION PENDING Main: accept as gcc-14 scheduling noise (byte-identity
+  claim = same-compiler-only) or investigate the 4 leaves (readable diff
+  available) → possible follow-up commit on PR #43.
