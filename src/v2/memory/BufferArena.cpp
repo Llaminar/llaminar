@@ -638,12 +638,14 @@ namespace llaminar2
             }
             catch (const std::exception &error)
             {
-                // Name the exact graph buffer: a physical admission failure
-                // must identify which declared owner exceeded its BOM.
-                throw std::logic_error(std::string(error.what()) + " [BufferArena buffer '" +
-                    bufferIdName(bid) + "' rows=" + std::to_string(b.rows) + " cols=" +
-                    std::to_string(b.cols) + " dtype=" + (b.dtype ? b.dtype : "?") +
-                    " device=" + b.home_device.toString() + "]");
+                // Name the exact graph buffer whose materialization failed (a
+                // physical admission failure must identify which declared
+                // owner exceeded its BOM), then rethrow the original exception
+                // unchanged so callers still observe its exact type.
+                LOG_ERROR("[BufferArena] Materializing buffer '" << bufferIdName(bid) << "' rows=" << b.rows
+                          << " cols=" << b.cols << " dtype=" << (b.dtype ? b.dtype : "?")
+                          << " device=" << b.home_device.toString() << " failed: " << error.what());
+                throw;
             }
             if (!tensor)
             {
