@@ -25,11 +25,11 @@ add_executable(v2_integration_cpu_attention_key_q8
 target_compile_features(v2_integration_cpu_attention_key_q8 PRIVATE cxx_std_20)
 target_include_directories(v2_integration_cpu_attention_key_q8 PRIVATE "${V2_CPU_AQ8_ROOT}/src/v2" "${V2_CPU_AQ8_ROOT}/tests/v2")
 target_link_libraries(v2_integration_cpu_attention_key_q8 PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
-v2_add_core_free_test(V2_Unit_CPUAttentionKeyQ8
+v2_add_core_free_test(V2_Unit_CPUAttentionKeyQ8 WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=-*AllWidthsISAsAndWorkerCountsMatchScalarBytes
     LABELS V2 Unit CPU DeviceFree Attention KVCache Q8 AllHeadDims ByteExact)
-v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8
+v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8 WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 AllHeadDims ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUQ8AttentionValueProgram
