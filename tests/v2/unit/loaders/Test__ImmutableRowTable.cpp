@@ -7,6 +7,7 @@
  * crossing mapping boundaries, eviction and concurrent clients. Mutation and
  * malformed admission fail before a destination can become partially valid.
  */
+#include "../../utils/HostNUMANodes.h"
 #include "loaders/ImmutableRowTable.h"
 #include "loaders/ModelContext.h"
 #include "planning/ImmutableRowTablePlacementPlanner.h"
@@ -535,9 +536,10 @@ TEST(ImmutableRowTable, ExplicitNumaPlacementPreservesCanonicalPhysicalOwnership
         const auto planned = ImmutableRowTable::physicalBytes(src, policy);
         auto memory = authority(planned, DeviceId::cpu());
         {
-            ImmutableRowTable table(src, policy, DeviceId::cpu(), memory,ImmutableRowTableHostPlacement::onNode(1));
+            const int node = llaminar2::test::hostLastNUMANode();
+            ImmutableRowTable table(src, policy, DeviceId::cpu(), memory,ImmutableRowTableHostPlacement::onNode(node));
             EXPECT_EQ(table.hostDevice(), DeviceId::cpu());
-            EXPECT_EQ(table.hostPlacement(), ImmutableRowTableHostPlacement::onNode(1));
+            EXPECT_EQ(table.hostPlacement(), ImmutableRowTableHostPlacement::onNode(node));
             EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ImmutableTableStorage,
                 PhysicalMemoryMaterializationKind::NewAllocation), planned);
             const std::array<std::int64_t, 2> ids{2, 0};

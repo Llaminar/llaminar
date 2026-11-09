@@ -548,7 +548,7 @@ namespace llaminar2
             for (int b = 0; b < blocks_per_row; ++b)
             {
                 const Q8_1Block &block = blocks[r * blocks_per_row + b];
-                float scale = bf16_to_fp32(block.d);
+                float scale = fp16_to_fp32(block.d);
                 for (int i = 0; i < 32; ++i)
                 {
                     float prob = static_cast<float>(block.qs[i]) * scale;
