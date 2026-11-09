@@ -334,6 +334,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 FROM toolchain AS builder
 
+# An admitted OCI toolchain is an external image, so build arguments must be
+# declared here rather than relying on inheritance from an in-file stage.
+ARG LLAMINAR_BUILD_TYPE
+ARG LLAMINAR_CPU_ISA
+ARG LLAMINAR_CUDA_ARCHS
+ARG LLAMINAR_ENABLE_CUDA
+ARG LLAMINAR_ENABLE_ROCM
+ARG LLAMINAR_BUILD_RCCL_FROM_SOURCE
+
 # Runtime-only cloud builds omit Integration without invalidating the shared
 # compiler/SDK dependency layers. Test companions always compile Integration.
 ARG LLAMINAR_SKIP_INTEGRATION

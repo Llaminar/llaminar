@@ -42,8 +42,11 @@ mounts. Each job calls `run_develop_image_gate.py --cpu-isa <matrix ISA>` withou
 `--build-only` or `--publish`, on the 16-core GitHub-hosted runner through the protected
 `develop-pr-tests.yml@develop` reusable workflow. PRs import public registry cache
 layers without credentials or registry cache export. Before source compilation,
-both cloud workflows checkpoint `gpu-sdk` and the ISA-specific `toolchain` in
-GitHub Actions cache. Later build/test failures retain completed dependencies;
+both cloud workflows restore complete ISA-specific OCI toolchain images from
+GitHub Actions cache, keyed by the committed dependency context. A cold build
+also checkpoints `gpu-sdk` layers. OCI labels and digests authenticate restored
+toolchains, and source builds consume the pinned OCI context directly.
+Later build/test failures retain completed dependencies;
 PR caches remain scoped to their merge ref. Cache capacity is configured in
 GitHub Actions settings. Separate PRs run concurrently;
 new commits cancel older checks on the same PR. The cloud pool admits up to

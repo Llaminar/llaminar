@@ -34,10 +34,13 @@ jobs:
           persist-credentials: false
       - uses: docker/setup-buildx-action@v4
         with:
-          # The cloud VM is ephemeral. Registry layer caches retain compiler
-          # and SDK layers; the job's worker shares ccache across both ISAs.
+          version: v0.38.1
+          # Complete OCI toolchains survive the ephemeral VM; registry layer
+          # caches accelerate the remaining build. Ccache is shared per job.
           driver: docker-container
-          driver-opts: network=host
+          driver-opts: |
+            network=host
+            image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
           cache-binary: false
       - uses: docker/login-action@v4
         with:
@@ -68,6 +71,7 @@ jobs:
           # hundreds of MiB of tracked diagnostic CSVs which Docker itself
           # excludes. Upload build/publication logs and identity receipts only.
           path: |
+            ${{ runner.temp }}/llaminar-toolchains/*-toolchain.json
             parity-results/develop-image-gate/develop-image-gate.json
             parity-results/develop-image-gate/**/build-*.log
             parity-results/develop-image-gate/**/build-timeline.jsonl

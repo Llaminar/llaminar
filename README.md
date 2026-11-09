@@ -1197,9 +1197,9 @@ PRs into `develop` build AVX512 and AVX2 test images in parallel on separate
 and the host lane of production preflight; both checks and owner approval
 are required. CUDA, ROCm and exclusive preflight lanes remain production checks.
 After merge, the same runner size builds and publishes the AVX512 and AVX2
-Release development images without running tests. Both workflows cache completed
-GPU SDK and ISA toolchain stages before source compilation, so later failures
-retain those dependency layers. Production validation and
+Release development images without running tests. Both workflows restore complete
+toolchain images keyed by dependency inputs and ISA. They save newly built
+toolchains before source compilation, so later failures retain them. Production validation and
 release certification remain separate. Different PRs can run concurrently; a
 new develop merge cancels any older image build. See [the CI workflow](docs/production-ci.md).
 

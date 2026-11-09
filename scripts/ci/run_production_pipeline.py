@@ -40,6 +40,7 @@ import time
 import uuid
 
 import docker_paths
+import toolchain_cache
 from azure_cross_host_resources import DEFAULT_TUNNEL_SUBNET
 from model_parity_inventory import InventoryScope, cross_host_scenarios
 from generation_corpus import ApprovedGenerationCorpus
@@ -405,6 +406,7 @@ def build(args, source: dict, directory: Path, *,
     if (not roles or len(set(roles)) != len(roles)
             or any(not isinstance(role, ImageRole) for role in roles)):
         raise ValueError("image build requires distinct typed image roles")
+    toolchain_arguments = toolchain_cache.build_context_arguments(args.cpu_isa, source["tree"])
     context = directory / "source"
     if not context.exists():
         snapshot(source["tree"], context)
@@ -428,6 +430,7 @@ def build(args, source: dict, directory: Path, *,
                    "--build-arg", f"LLAMINAR_TEST_UID={os.getuid()}",
                    "--build-arg", f"LLAMINAR_TEST_GID={os.getgid()}",
                    "--build-arg", f"LLAMINAR_CPU_ISA={args.cpu_isa}",
+                   *toolchain_arguments,
                    *persistent_build_cache_arguments(args.cpu_isa, role,
                                                      external_cache_owner), str(context)]
         started = time.monotonic()
