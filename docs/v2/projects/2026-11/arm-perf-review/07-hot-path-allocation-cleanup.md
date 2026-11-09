@@ -192,3 +192,9 @@ the source policy). Dead persistent_state parameter removed.
   783d07efc). APPROVED (b): force-push rebased tip; WSL x86 gate + Mac
   portability re-run + reviewer handover all on the rebased tip; A/B economy
   stands (deletions = unused code, no codegen impact — noted in handover).
+
+- FORCE-PUSHED: tip **989b7bada** (origin/codex/hotpath-cleanup-prefill, 7
+  commits, base 5922cd1f5); tree differs from 94d7cbe2f only by Main's
+  deletions (getOrCreateRoPE + 2 dead test sources; unused → no codegen
+  impact, A/B stands). Handed to WSL arm-qual for the x86 gate (after addon
+  R1 x86); Mac portability re-run on 989b7bada in progress (lane).
