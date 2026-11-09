@@ -383,6 +383,17 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         COMMAND $<TARGET_FILE:v2_test_neon_rmsnorm_reduction>
             --gtest_filter=*IntegerOriginalRowsRetainFullWidthAndSerialBytes
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NEON RMSNorm ByteExact Regression)
+    add_executable(v2_test_neon_gdn_normalization
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__NEONGDNNormalization.cpp")
+    target_compile_features(v2_test_neon_gdn_normalization PRIVATE cxx_std_20)
+    target_include_directories(v2_test_neon_gdn_normalization PRIVATE "${V2_CPU_ARCHITECTURE_ROOT}/src/v2")
+    target_link_libraries(v2_test_neon_gdn_normalization PRIVATE GTest::gtest_main)
+    v2_add_core_free_test(V2_Unit_NEONGDNNormalization
+        COMMAND $<TARGET_FILE:v2_test_neon_gdn_normalization>
+        LABELS V2 Unit CPU DeviceFree NEON GDN ByteExact)
+    v2_add_core_free_test(V2_Integration_NEONGDNNormalization
+        COMMAND $<TARGET_FILE:v2_test_neon_gdn_normalization>
+        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NEON GDN ByteExact Regression)
     add_executable(v2_test_neon_attention_math
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__NEONAttentionMath.cpp"
         "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/VectorPrimitives.cpp")
