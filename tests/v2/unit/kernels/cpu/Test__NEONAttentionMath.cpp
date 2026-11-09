@@ -12,6 +12,10 @@
 #include "utils/CPUExplicitRoundingOracle.h"
 #include "utils/CPUFeatures.h"
 #include <gtest/gtest.h>
+#include <sys/mman.h>
+#include <csignal>
+#include <cstdio>
+#include <exception>
 #include <bit>
 #include <cstring>
 #include <vector>
@@ -254,16 +258,6 @@ TEST_F(NEONAttentionMath, OriginalStorageAndDomainAdmission)
     values.fill(std::span(value).first(4));std::array<float,4> aliased_weights{1,2,3,4};
     EXPECT_THROW((native::accumulate<Storage::FP32,4>(aliased_weights,values,aliased_weights)),std::invalid_argument);
     EXPECT_EQ(output,original);EXPECT_EQ(aliased_weights,weights);
-    // A nonfinite weight is fatal before any numerator write: a throw here
-    // would strand the rest of the worker team at its barrier.
-    values.fill(value);
-    for(const float bad:{std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity(),-std::numeric_limits<float>::infinity()})
-        for(int row=0;row<4;++row)
-        {
-            auto invalid=weights;invalid[row]=bad;
-            EXPECT_DEATH((native::accumulate<Storage::FP32,4>(output,values,invalid)),"nonfinite attention weight");
-        }
-    EXPECT_EQ(output,original);
     std::array<std::int16_t,8> destination;destination.fill(0x5151);const auto initial=destination;
     EXPECT_THROW(native::quantizeQuery(query,destination,0),std::invalid_argument);
     EXPECT_THROW(native::quantizeQuery(query,std::span(destination).first(7),127),std::invalid_argument);
@@ -273,5 +267,55 @@ TEST_F(NEONAttentionMath, OriginalStorageAndDomainAdmission)
         EXPECT_THROW(native::quantizeQuery(invalid,destination,127),std::domain_error);EXPECT_EQ(destination,initial);
     }
 }
+/**
+ * @brief Prove one nonfinite-weight rejection: SIGABRT from the diagnostic, not an
+ * escaped exception or terminate, with no byte of the child-visible numerator written.
+ * @tparam Rows One/two/four-row program. @param numerator Shared (MAP_SHARED) numerator.
+ */
+template<std::size_t Rows>void nonfiniteIsFatalBeforeWrites(std::span<float>numerator)
+{
+    std::array<float,8> value{1,2,3,4,5,6,7,8};
+    std::array<std::span<const float>,Rows> values;values.fill(value);
+    std::vector<float> before(numerator.begin(),numerator.end());
+    for(const float bad:{std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity(),-std::numeric_limits<float>::infinity()})
+        for(std::size_t row=0;row<Rows;++row)
+        {
+            std::array<float,Rows> weights;weights.fill(0.5f);weights[row]=bad;
+            EXPECT_EXIT(({
+                // An escaped exception or terminate would exit 77, not SIGABRT.
+                std::set_terminate([]{std::fputs("escaped exception or terminate\n",stderr);std::_Exit(77);});
+                native::accumulate<Storage::FP32,Rows>(numerator,values,weights);
+                std::_Exit(0);
+            }),::testing::KilledBySignal(SIGABRT),"consumed invalid nonfinite attention weight") << "rows=" << Rows << " row=" << row;
+            EXPECT_EQ(std::memcmp(numerator.data(),before.data(),before.size()*sizeof(float)),0) << "rows=" << Rows << " row=" << row;
+        }
+}
 } // namespace
+
+/**
+ * @test A nonfinite weight is fatal before any numerator write, for every row
+ * program. The numerator is shared with the death-test child, and a
+ * write-before-reject negative control proves the witness sees child writes.
+ */
+TEST_F(NEONAttentionMath, NonfiniteWeightIsFatalBeforeAnySharedNumeratorWrite)
+{
+    GTEST_FLAG_SET(death_test_style,"fast"); // The child must inherit the shared mapping.
+    void*mapping=mmap(nullptr,4096,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    ASSERT_NE(mapping,MAP_FAILED);
+    std::span<float> numerator(static_cast<float*>(mapping),8);
+    for(std::size_t i=0;i<numerator.size();++i)numerator[i]=float(i)*0.25f-1.0f;
+    const std::vector<float> original(numerator.begin(),numerator.end());
+
+    // Negative control: a child that writes first and then rejects is detected.
+    EXPECT_EXIT(({numerator[3]=99.0f;native::rejectAttentionData("nonfinite attention weight");}),
+        ::testing::KilledBySignal(SIGABRT),"consumed invalid nonfinite attention weight");
+    EXPECT_EQ(numerator[3],99.0f);
+    numerator[3]=original[3];
+
+    nonfiniteIsFatalBeforeWrites<1>(numerator);
+    nonfiniteIsFatalBeforeWrites<2>(numerator);
+    nonfiniteIsFatalBeforeWrites<4>(numerator);
+    EXPECT_EQ(std::memcmp(numerator.data(),original.data(),original.size()*sizeof(float)),0);
+    munmap(mapping,4096);
+}
 } // namespace llaminar2::test

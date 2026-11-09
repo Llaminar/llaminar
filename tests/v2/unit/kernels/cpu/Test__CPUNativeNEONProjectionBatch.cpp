@@ -33,8 +33,25 @@ using Dot = multi_scale::NEONByteDot;
 // Collective safety: once bind() admitted a publication, nothing a worker runs
 // inside the team can throw, for every row tile and admitted family.
 static_assert(noexcept(std::declval<const CPUNativeNEONProjectionBatch &>().runTask<Dot::ASIMD>(0)));
-static_assert(noexcept(std::declval<const CPUNativeNEONProjectionTile<1> &>().executeAdmitted<Dot::ASIMD>()));
-static_assert(noexcept(std::declval<const CPUNativeNEONProjectionTile<4> &>().executeAdmitted<Dot::ASIMD>()));
+// Unchecked tiles are confined to the batch binding: nobody else can skip
+// requireExecutable, geometry or CPU-feature admission.
+template <class Tile> concept CanBuildUncheckedTile = requires(CPUNativeQuantisedWeightView weights,
+    std::array<std::span<const Q8_1Block>, 1> input, std::array<std::span<float>, 1> output) {
+    Tile::admitted(weights, input, output, 0);
+};
+template <class Tile> concept CanRunUncheckedTile = requires(const Tile &tile) {
+    tile.template executeAdmitted<Dot::ASIMD>();
+};
+struct PublicTileControl
+{
+    static PublicTileControl admitted(CPUNativeQuantisedWeightView, std::array<std::span<const Q8_1Block>, 1>,
+        std::array<std::span<float>, 1>, int);
+    template <Dot> void executeAdmitted() const;
+};
+static_assert(CanBuildUncheckedTile<PublicTileControl> && CanRunUncheckedTile<PublicTileControl>,
+    "positive control: the concepts detect public unchecked entries");
+static_assert(!CanBuildUncheckedTile<CPUNativeNEONProjectionTile<1>>);
+static_assert(!CanRunUncheckedTile<CPUNativeNEONProjectionTile<1>>);
 #if defined(__ARM_FEATURE_DOTPROD)
 static_assert(noexcept(std::declval<const CPUNativeNEONProjectionBatch &>().runTask<Dot::DotProd>(0)));
 #endif

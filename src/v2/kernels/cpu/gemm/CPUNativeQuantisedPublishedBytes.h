@@ -39,9 +39,8 @@ namespace llaminar2::cpu::native_quantised
      */
     [[noreturn]] inline void rejectUnsealedNativeQuantisedPublication(const char *reason) noexcept
     {
-        std::fputs("ERROR: native CPU weight publication is not admitted: ", stderr);
-        std::fputs(reason, stderr);
-        std::fputc('\n', stderr);
+        // One stdio call, so concurrent diagnostics cannot interleave.
+        std::fprintf(stderr, "ERROR: native CPU weight publication is not admitted: %s\n", reason);
         std::abort();
     }
 

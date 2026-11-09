@@ -28,6 +28,15 @@ using namespace llaminar2::cpu::native_quantised;
 
 namespace
 {
+/// Whether arbitrary code can move a seal onto other bytes (it must not).
+template <class Seal> concept CanRebindSeal = requires(const Seal &seal, std::span<const std::uint8_t> bytes) {
+    seal.rebound(bytes);
+};
+struct PublicRebindControl { PublicRebindControl rebound(std::span<const std::uint8_t>) const; };
+static_assert(CanRebindSeal<PublicRebindControl>, "positive control: the concept detects a public rebind");
+static_assert(!CanRebindSeal<CPUNativeQuantisedMetadataSeal>,
+    "only CPUNativeQuantisedPublishedBytes may rebind a seal, while deep-copying bytes it owns");
+
 /** @return Byte offset of a unit's secondary metadata word for one column. */
 std::size_t secondaryOffset(const CPUNativeQuantisedWeightView &view, int chunk, int block, int column)
 {

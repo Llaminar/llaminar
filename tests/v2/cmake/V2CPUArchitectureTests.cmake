@@ -441,7 +441,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*OriginalQueryQuantizationProgram
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention ByteExact)
     v2_add_core_free_test(V2_Integration_NEONAttentionStorageAdmission
-        COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*OriginalStorageAndDomainAdmission
+        COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*OriginalStorageAndDomainAdmission:*NonfiniteWeightIsFatalBeforeAnySharedNumeratorWrite
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention Regression)
 endif()
 add_executable(v2_unit_cpu_isa_profile
