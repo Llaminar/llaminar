@@ -293,6 +293,11 @@ namespace llaminar2
                                 size_t count);
         static void reduce_avx512(float *out, const float *a, const float *b,
                                   size_t count);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        /// Four-lane NEON add; byte-identical to reduce_scalar (one rounding per element).
+        static void reduce_neon(float *out, const float *a, const float *b,
+                                size_t count);
+#endif
 
         /// FP16 reduce: convert to FP32, add, convert back
         static void reduce_fp16(uint16_t *out, const uint16_t *a,
