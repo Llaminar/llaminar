@@ -6,7 +6,10 @@
  *
  * Tests the Q16_1 RMSNorm kernel that reads Q16_1 quantized input,
  * dequantizes on-the-fly during normalization, and outputs FP32.
- * This is part of the typed residual stream optimization (Phase 4).
+ * ISA-neutral cases execute the actual public native dispatch. The named
+ * AVX512 entry separately proves its available body or precise rejection;
+ * unsupported ISA stubs must never turn these tests into scalar substitutes.
+ * Decoded Q16 FP32-square and unquantized FP64-square references stay distinct.
  */
 
 #include <gtest/gtest.h>
@@ -16,6 +19,11 @@
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <stdexcept>
 
 using namespace llaminar2;
 using namespace llaminar2::primitives;
@@ -23,9 +31,14 @@ using namespace llaminar2::primitives;
 class Q16_1RMSNormTest : public ::testing::Test
 {
 protected:
+    /** @brief Explicit independent square programs; input storage alone does not choose arithmetic. */
+    enum class SquareProgram { DecodedFP32, UnquantizedFP64 };
     std::mt19937 rng_{42};
 
-    // Helper: Quantize FP32 to Q16_1 blocks
+    /** @brief Quantize finite fixture rows into original Q16 storage.
+     * @param fp32 Original fixture values; @param blocks Writable complete blocks.
+     * @param count Complete32-value geometry, supplied by these fixtures.
+     */
     void quantize_fp32_to_q16_1(const float *fp32, Q16_1Block *blocks, size_t count)
     {
         size_t n_blocks = count / 32;
@@ -58,7 +71,10 @@ protected:
         }
     }
 
-    // Helper: Dequantize Q16_1 to FP32
+    /** @brief Decode original blocks for an independent accuracy reference.
+     * @param blocks Original Q16 storage; @param fp32 Writable scalar fixture bank.
+     * @param count Complete logical geometry; no production decoder is reused.
+     */
     void dequantize_q16_1_to_fp32(const Q16_1Block *blocks, float *fp32, size_t count)
     {
         size_t n_blocks = count / 32;
@@ -75,19 +91,29 @@ protected:
         }
     }
 
-    // Reference FP32 RMSNorm
+    /** @brief Independent FP32-input accuracy reference with an explicit square program.
+     * @param input Decoded Q16 values by default, or original unquantized FP32 fixtures.
+     * @param gamma Original weights; @param output Writable reference values.
+     * @param cols Complete logical width; @param eps Original epsilon.
+     * @param program Declared FP32-before-widen Q16 program or FP64 mathematical baseline.
+     */
     void reference_rmsnorm_fp32(
         const float *input,
         const float *gamma,
         float *output,
         size_t cols,
-        float eps)
+        float eps,
+        SquareProgram program=SquareProgram::DecodedFP32)
     {
-        // Compute sum of squares
         double sum_sq = 0.0;
         for (size_t i = 0; i < cols; ++i)
         {
-            sum_sq += static_cast<double>(input[i]) * input[i];
+            if(program==SquareProgram::DecodedFP32)
+            {
+                volatile float square=input[i]*input[i];
+                sum_sq+=double(square);
+            }
+            else sum_sq+=static_cast<double>(input[i])*input[i];
         }
 
         // Compute RMS
@@ -101,7 +127,7 @@ protected:
         }
     }
 
-    // Compute accuracy metrics
+    /** @brief Accuracy observations, not a replacement for the separate byte/metadata gates. */
     struct AccuracyMetrics
     {
         double max_diff;
@@ -110,6 +136,10 @@ protected:
         double cosine_similarity;
     };
 
+    /** @brief Compare complete scalar fixture outputs without changing thresholds.
+     * @param a First bank; @param b Second bank; @param count Original element count.
+     * @return Absolute/relative and directional accuracy observations.
+     */
     AccuracyMetrics compute_metrics(const float *a, const float *b, size_t count)
     {
         AccuracyMetrics m{};
@@ -171,8 +201,6 @@ TEST_F(Q16_1RMSNormTest, ScalarBasic)
 
     // Run Q16_1 RMSNorm (scalar)
     std::vector<float> output_q16(cols);
-    RMSNormExecOptions opts;
-    opts.force_scalar = true;
     rmsnorm_q16_1_fp32_row_scalar(input_q16.data(), gamma.data(), output_q16.data(), cols, eps);
 
     // Run FP32 reference (using dequantized input for fair comparison)
@@ -188,7 +216,8 @@ TEST_F(Q16_1RMSNormTest, ScalarBasic)
     EXPECT_GT(metrics.cosine_similarity, 0.999999) << "Cosine similarity too low: " << metrics.cosine_similarity;
 }
 
-TEST_F(Q16_1RMSNormTest, AVX512Basic)
+/** @test ISA-neutral basic accuracy exercises the real native public program. */
+TEST_F(Q16_1RMSNormTest, NativeBasic)
 {
     const size_t cols = 64; // 2 blocks
     const float eps = 1e-5f;
@@ -213,9 +242,9 @@ TEST_F(Q16_1RMSNormTest, AVX512Basic)
     std::vector<Q16_1Block> input_q16(cols / 32);
     quantize_fp32_to_q16_1(input_fp32.data(), input_q16.data(), cols);
 
-    // Run Q16_1 RMSNorm (AVX512)
+    // Run the available native public program, not a named unavailable ISA.
     std::vector<float> output_q16(cols);
-    rmsnorm_q16_1_fp32_row_avx512(input_q16.data(), gamma.data(), output_q16.data(), cols, eps);
+    rmsnorm_q16_1_fp32_fused(input_q16.data(), gamma.data(), output_q16.data(), 1, cols, eps);
 
     // Run FP32 reference (using dequantized input for fair comparison)
     std::vector<float> dequant_fp32(cols);
@@ -230,7 +259,8 @@ TEST_F(Q16_1RMSNormTest, AVX512Basic)
     EXPECT_GT(metrics.cosine_similarity, 0.999999) << "Cosine similarity too low: " << metrics.cosine_similarity;
 }
 
-TEST_F(Q16_1RMSNormTest, ScalarVsAVX512Parity)
+/** @test Diagnostic scalar and native arithmetic retain the existing accuracy bound. */
+TEST_F(Q16_1RMSNormTest, ScalarVsNativeAccuracy)
 {
     const size_t cols = 896; // Qwen 0.5B hidden dim
     const float eps = 1e-5f;
@@ -259,15 +289,40 @@ TEST_F(Q16_1RMSNormTest, ScalarVsAVX512Parity)
     std::vector<float> output_scalar(cols);
     rmsnorm_q16_1_fp32_row_scalar(input_q16.data(), gamma.data(), output_scalar.data(), cols, eps);
 
-    // Run AVX512
-    std::vector<float> output_avx512(cols);
-    rmsnorm_q16_1_fp32_row_avx512(input_q16.data(), gamma.data(), output_avx512.data(), cols, eps);
+    // Native dispatch has its own fixed reduction program. Separate grouped
+    // tests require actual M1 bytes; this cross-program check is accuracy only.
+    std::vector<float> output_native(cols);
+    rmsnorm_q16_1_fp32_fused(input_q16.data(), gamma.data(), output_native.data(), 1, cols, eps);
+    auto metrics = compute_metrics(output_scalar.data(), output_native.data(), cols);
 
-    // Compare: should be bitwise identical or very close
-    auto metrics = compute_metrics(output_scalar.data(), output_avx512.data(), cols);
+    EXPECT_LT(metrics.max_diff, 1e-6) << "Scalar vs native max diff: " << metrics.max_diff;
+    EXPECT_GT(metrics.cosine_similarity, 0.9999999) << "Scalar vs native cosine: " << metrics.cosine_similarity;
+}
 
-    EXPECT_LT(metrics.max_diff, 1e-6) << "Scalar vs AVX512 max diff: " << metrics.max_diff;
-    EXPECT_GT(metrics.cosine_similarity, 0.9999999) << "Scalar vs AVX512 cosine: " << metrics.cosine_similarity;
+/** @test Named AVX512 coverage never silently substitutes another ISA body. */
+TEST_F(Q16_1RMSNormTest, NamedAVX512EntryMatchesCompilerEnvelope)
+{
+    constexpr std::size_t columns=64;
+    std::vector<float> source(columns),gamma(columns,1.0f),output(columns,-3.0f);
+    for(std::size_t i=0;i<columns;++i)source[i]=float(int(i)-17)*0.125f;
+    std::vector<Q16_1Block> blocks(columns/32);
+    quantize_fp32_to_q16_1(source.data(),blocks.data(),columns);
+#if defined(__AVX512F__)
+    EXPECT_NO_THROW(rmsnorm_q16_1_fp32_row_avx512(blocks.data(),gamma.data(),output.data(),columns,1e-5f));
+    std::vector<float> decoded(columns),expected(columns);
+    dequantize_q16_1_to_fp32(blocks.data(),decoded.data(),columns);
+    reference_rmsnorm_fp32(decoded.data(),gamma.data(),expected.data(),columns,1e-5f);
+    for(std::size_t column=0;column<columns;++column)
+    {
+        ASSERT_TRUE(std::isfinite(output[column]))<<"column="<<column;
+        ASSERT_TRUE(std::isfinite(expected[column]))<<"column="<<column;
+        EXPECT_LT(std::abs(output[column]-expected[column]),1e-5)<<"column="<<column;
+    }
+#else
+    const auto before=output;
+    EXPECT_THROW(rmsnorm_q16_1_fp32_row_avx512(blocks.data(),gamma.data(),output.data(),columns,1e-5f),std::runtime_error);
+    EXPECT_EQ(output,before);
+#endif
 }
 
 // =============================================================================
@@ -354,13 +409,14 @@ TEST_F(Q16_1RMSNormTest, Q16_1_vs_FP32_RMSNorm_Accuracy)
 
     // Pure FP32 reference
     std::vector<float> output_fp32_ref(cols);
-    reference_rmsnorm_fp32(input_fp32.data(), gamma.data(), output_fp32_ref.data(), cols, eps);
+    reference_rmsnorm_fp32(input_fp32.data(), gamma.data(), output_fp32_ref.data(), cols, eps,
+                          SquareProgram::UnquantizedFP64);
 
     // Quantize input to Q16_1 and run Q16_1 RMSNorm
     std::vector<Q16_1Block> input_q16(cols / 32);
     quantize_fp32_to_q16_1(input_fp32.data(), input_q16.data(), cols);
     std::vector<float> output_q16(cols);
-    rmsnorm_q16_1_fp32_row_avx512(input_q16.data(), gamma.data(), output_q16.data(), cols, eps);
+    rmsnorm_q16_1_fp32_fused(input_q16.data(), gamma.data(), output_q16.data(), 1, cols, eps);
 
     // Compare
     auto metrics = compute_metrics(output_q16.data(), output_fp32_ref.data(), cols);
@@ -398,7 +454,7 @@ TEST_F(Q16_1RMSNormTest, ZeroInput)
 
     // Run RMSNorm
     std::vector<float> output(cols);
-    rmsnorm_q16_1_fp32_row_avx512(input_q16.data(), gamma.data(), output.data(), cols, eps);
+    rmsnorm_q16_1_fp32_fused(input_q16.data(), gamma.data(), output.data(), 1, cols, eps);
 
     // Output should be all zeros (or very close due to epsilon)
     for (size_t i = 0; i < cols; ++i)
@@ -423,7 +479,7 @@ TEST_F(Q16_1RMSNormTest, ConstantInput)
 
     // Run RMSNorm
     std::vector<float> output(cols);
-    rmsnorm_q16_1_fp32_row_avx512(input_q16.data(), gamma.data(), output.data(), cols, eps);
+    rmsnorm_q16_1_fp32_fused(input_q16.data(), gamma.data(), output.data(), 1, cols, eps);
 
     // With gamma=1, constant input should normalize to ~1.0 (or close)
     // RMS of constant = constant, so normalized = constant / constant = 1.0
@@ -458,9 +514,9 @@ TEST_F(Q16_1RMSNormTest, LargeHiddenDim)
     std::vector<Q16_1Block> input_q16(cols / 32);
     quantize_fp32_to_q16_1(input_fp32.data(), input_q16.data(), cols);
 
-    // Run
+    // Run the actual supported native program.
     std::vector<float> output_q16(cols);
-    rmsnorm_q16_1_fp32_row_avx512(input_q16.data(), gamma.data(), output_q16.data(), cols, eps);
+    rmsnorm_q16_1_fp32_fused(input_q16.data(), gamma.data(), output_q16.data(), 1, cols, eps);
 
     // Reference
     std::vector<float> dequant_fp32(cols);
