@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """Build and authenticate a register-allocation witness for the native NEON projection tiles.
 
-Build phase: compile CPUNativeNEONTileRegisterProbe.cpp with the real target's
-ordered compile command at -O3 and audit the assembly.
+Build phase: compile CPUNativeNEONTileRegisterProbe.cpp into an object with the
+real target's ordered compile command at -O3, disassemble that object with the
+configured objdump and audit the instructions actually assembled.
 
+- Object: the format (ELF64 AArch64 or Mach-O arm64) is read from the object
+  itself and must match the disassembly's format line. The disassembler prints
+  generic AArch64 syntax (GNU objdump, or llvm-objdump --triple=aarch64, not
+  Apple's abbreviated printer), so every operand is visible; assembler-level
+  controls (macros, conditionals, directives) cannot change or hide audited
+  instructions, because only the assembled bytes are read.
 - Inventory: the expected tile K-loop programs (row tile x integer family x
   policy x encoding/map/minimum) derive from the admitted ISA envelope; the
-  probe's inventory string must agree. Every expected program must be emitted
+  inventory string embedded in the object, the object's function symbol table
+  and its disassembly must all agree. Every expected program must appear
   exactly once with real instructions; any other tile program symbol fails.
-- Admitted forms: function bodies keep every statement, including one on a
-  global label's line, and start in the section actually in force at the label.
-  The dialect (ELF or Mach-O) is bound to the compiler identity and must match
-  the witness's own format declarations. Every instruction must be an admitted
-  (mnemonic, operand signature) form: the forms qualified on the GNU-14 and
-  AppleClang-21 witnesses plus the explicitly modelled merge definitions. This
-  is an inventory of supported forms, not a complete AArch64 grammar; any other
-  form fails. Executable sections admit only metadata directives and alignment
-  without a fill value (NOP padding); data directives belong to data sections,
-  which control may not reach or fall into; unknown section control fails.
+- Disassembly contract: every line is a format, section, symbol, instruction or
+  relocation line; relocations attach to their instruction; branches inside the
+  function become local labels, relocated branches name their symbol, page and
+  low-12 data relocations become symbolic operands. Skipped zero runs, unknown
+  relocations, branch addends, unrelocated address operands and data words in
+  code fail.
+- Admitted forms: every instruction must be an admitted (mnemonic, operand
+  signature) form: the forms qualified on the GNU-14 and AppleClang-21 witness
+  objects plus the explicitly modelled merge definitions. This is an inventory
+  of supported forms, not a complete AArch64 grammar; any other form fails.
 - Calls: the only admitted call is to the exact fatal-diagnostic symbol, whose
   body must consist of admitted forms, call only the trusted fwrite/fputs, be
   acyclic and end every path in a call to abort(). Every other call boundary,
@@ -47,7 +55,7 @@ ordered compile command at -O3 and audit the assembly.
   identity is derived from the compiler's own version output and must equal the
   configured one; unknown identities/envelopes fail closed.
 - Dependencies: the dependency closure is the one the compiler reports for this
-  exact compilation (-MD on the -S run), cross-checked against a preprocessing
+  exact compilation (-MD on the -c run), cross-checked against a preprocessing
   pass with the same flags; every input is hashed before and after compiling and
   bound with its logical path, its resolved path (component-wise, as the kernel
   resolves symlinks and "..") and the symlinks followed. The Ninja depfile names
@@ -55,9 +63,11 @@ ordered compile command at -O3 and audit the assembly.
 
 Verify phase (Unit/preflight): no compiler is invoked, but every recorded input
 (including absolute system/SDK headers named by the compiler) must be present
-and unchanged, so verification is tied to the build host's toolchain; it is not
-an SDK-independent or installed-runner qualification. The actual target command
-must match and the retained assembly must re-audit to the recorded counts.
+and unchanged, and the bound object is re-disassembled by the bound disassembler
+(hashed) and must reproduce the retained disassembly; verification is therefore
+tied to the build host's toolchain and binutils, not an SDK-independent or
+installed-runner qualification. The actual target command must match and the
+object must re-audit to the recorded counts. Probe paths must be absolute.
 """
 from __future__ import annotations
 
@@ -110,14 +120,14 @@ ld1 list,mem,imm|ld1 list[],mem|ld1 list[],mem,imm|ld1r list,mem|ld1r list,mem,i
 ld2r list,mem|ldp d,d,mem|ldp d,d,mem,imm|ldp q,q,mem|ldp q,q,mem,imm|ldp s,s,mem|ldp w,w,mem|ldp x,x,mem
 ldp x,x,mem,imm|ldpsw x,x,mem|ldr b,mem|ldr d,mem|ldr d,mem,imm|ldr h,mem|ldr q,mem|ldr q,mem,imm|ldr s,mem
 ldr w,mem|ldr x,mem|ldrb w,mem|ldrh w,mem|ldrsh w,mem|ldrsw x,mem|ldur d,mem|ldur q,mem|lsl w,w,imm|lsl x,x,imm
-lsr x,x,imm|lsr x,x,x|madd x,x,x,x|mov v,v|mov v[],v[]|mov w,imm|mov w,w|mov x,imm|mov x,x|movi d,imm|movi v,imm
-movi v,imm,shift|movk x,imm,shift|mul w,w,w|mul x,x,x|mvni v,imm|mvni v,imm,shift|orr v,imm|orr v,v,v|orr w,w,imm
+lsr x,x,imm|lsr x,x,x|madd x,x,x,x|mov d,v[]|mov v,v|mov v[],v[]|mov w,imm|mov w,w|mov x,imm|mov x,x|movi d,imm|movi v,imm
+movi v,imm,shift|movk x,imm,shift|mul w,w,w|mul x,x,x|mvni v,imm|mvni v,imm,shift|nop|orr v,imm|orr v,v,v|orr w,w,imm
 orr w,w,w|orr w,w,w,shift|orr x,x,imm|orr x,x,x,shift|ret|saddlp v,v|sbfiz x,x,imm,imm|scvtf s,w|scvtf v,v
 sdot v,v,v|shl v,v,imm|smaddl x,w,w,x|smmla v,v,v|smull v,v,v|smull x,w,w|smull2 v,v,v|sshll v,v,imm|sshr v,v,imm
 st1 list,mem|st1 list,mem,imm|st1 list[],mem|stp d,d,mem|stp q,q,mem|stp w,w,mem|stp x,x,mem|str b,mem|str d,mem|str d,mem,imm|str q,mem,imm
 str h,mem|str q,mem|str s,mem|str w,mem|str x,mem|stur d,mem|stur q,mem|sub v,v,v|sub w,w,imm|sub w,w,w
 sub x,x,imm|sub x,x,imm,shift|sub x,x,x|sxtw x,w|tbl v,list,v|tbnz w,imm,sym|tbnz x,imm,sym|tbz w,imm,sym
-uaddw v,v,v|ubfiz w,w,imm,imm|ubfx w,w,imm,imm|ucvtf v,v|umaddl x,w,w,x|umull x,w,w|ushll v,v,imm|ushr v,v,imm
+uaddw v,v,v|ubfiz w,w,imm,imm|ubfx w,w,imm,imm|ubfx x,x,imm,imm|ucvtf v,v|umaddl x,w,w,x|umull x,w,w|ushll v,v,imm|ushr v,v,imm
 usra v,v,imm|uxtw x,w|zip1 v,v,v|zip2 v,v,v
 """.replace("\n", "|").split("|") if line.strip())
 # Admitted instruction grammar. Anything else is a structural failure.
@@ -135,22 +145,6 @@ CONDITIONAL_SELECTS = frozenset({"csel"})  # csinc/csinv/csneg transform one alt
 STRUCTURE_ACCESSES = re.compile(r"^(ld|st)([1-4])(r?)$")
 # Trusted calls of the fatal diagnostic body (they return; the path must still reach abort()).
 DIAGNOSTIC_CALLS = frozenset({"fwrite", "fputs"})
-
-# Directives admitted inside executable sections, with validated operands: none emits instruction bytes.
-# Alignment is admitted only without an explicit fill value, so the assembler pads code with NOPs.
-CODE_DIRECTIVES = {
-    ".p2align": re.compile(r"^\d+(?:\s*,\s*,\s*\d+)?$"),
-    ".align": re.compile(r"^\d+$"),
-}
-METADATA_DIRECTIVES = re.compile(r"^\.(?:cfi_[a-z_]+|loc|file|type|size|globl|global|weak|hidden|private_extern|"
-                                 r"weak_def_can_be_hidden|weak_definition|loh|ident|addrsig|addrsig_sym|"
-                                 r"subsections_via_symbols|build_version)$")
-SECTION_CONTROL = frozenset({".section", ".text", ".data", ".bss"})
-UNSUPPORTED_SECTION_CONTROL = frozenset({".pushsection", ".popsection", ".previous", ".subsection"})
-ELF_DATA_SECTIONS = (".rodata", ".data", ".bss", ".gcc_except_table", ".note", ".comment", ".debug", ".eh_frame",
-                     ".init_array", ".fini_array", ".tdata", ".tbss")
-MACHO_DATA_SECTIONS = ("__gcc_except_tab", "__const", "__cstring", "__literal4", "__literal8", "__literal16",
-                       "__eh_frame", "__compact_unwind")
 
 GP64 = re.compile(r"^(?:x([12]?[0-9]|30)|sp|fp|lr|xzr)$")
 GP32 = re.compile(r"^(?:w([12]?[0-9]|30)|wsp|wzr)$")
@@ -170,89 +164,173 @@ WIDEN_AFTER = 4
 
 
 class Dialect:
-    """Assembler syntax of one witness: Mach-O (Apple) or ELF (GNU)."""
-
-    def __init__(self, macho: bool) -> None:
-        self.macho = macho
-
-    @staticmethod
-    def for_identity(identity: str) -> "Dialect":
-        """The object format is bound to the compiler identity, never guessed from the text."""
-        if identity.startswith("AppleClang-"):
-            return Dialect(True)
-        if identity.startswith(("GNU-", "Clang-")):
-            return Dialect(False)
-        raise ValueError(f"no assembly dialect for compiler identity {identity}")
-
-    def require_format(self, assembly: str) -> None:
-        """The witness must declare exactly the object format of its dialect (directive lines, not text)."""
-        declared = any(line.strip().startswith((".build_version", ".subsections_via_symbols", ".section\t__TEXT,",
-                                                ".section __TEXT,")) for line in assembly.splitlines())
-        if declared != self.macho:
-            raise ValueError("assembly object format does not match the compiler identity")
+    """Syntax of the normalised disassembly the analysis reads (generic AArch64 syntax, ELF-style labels)."""
 
     def local(self, label: str) -> bool:
-        """Assembler-local labels stay inside the enclosing function."""
-        return label[:1] in ("L", "l") if self.macho else label.startswith(".L")
+        """Local labels (branch targets inside one function) stay inside the enclosing function."""
+        return label.startswith(".L")
 
     def symbol(self, name: str) -> str:
-        """Source-level symbol name (Mach-O prefixes C symbols with an underscore)."""
-        return name[1:] if self.macho and name.startswith("_") else name
+        return name
 
     def statements(self, line: str) -> list[str]:
-        """Strip comments and split one source line into statements."""
-        if self.macho:
-            return [line.split(";", 1)[0].split("//", 1)[0]]
-        line = line.split("//", 1)[0]
-        if line.lstrip().startswith("#"):
-            return []
-        return line.split(";")
-
-    def section(self, directive: str, arguments: str) -> tuple[str, bool | None]:
-        """(section identity, executable) for a section directive; executable None = unsupported section."""
-        if directive != ".section":
-            return directive, directive == ".text"
-        fields = [field.strip().strip('"') for field in arguments.split(",")]
-        if self.macho:
-            if len(fields) < 2 or fields[0] not in ("__TEXT", "__DATA", "__DATA_CONST", "__DWARF"):
-                return arguments, None
-            if fields[0] == "__TEXT" and fields[1] == "__text":
-                return arguments, True
-            return arguments, False if fields[0] != "__TEXT" or fields[1] in MACHO_DATA_SECTIONS else None
-        name = fields[0]
-        flags = re.search(r',\s*"([^"]*)"', arguments)
-        if name.startswith(".text"):
-            return name, True if not flags or "x" in flags.group(1) else None
-        if flags:
-            return name, "x" in flags.group(1)
-        return name, False if name.startswith(ELF_DATA_SECTIONS) else None
+        return [line]
 
 
-def functions(assembly: str, dialect: Dialect) -> dict[str, list[str]]:
-    """Split compiler -S output into global function bodies; local labels and same-line statements stay inside.
+GENERIC = Dialect()
+ENTRY_SECTION = re.compile(r'^\t\.section \.text\.\S+,"ax"$')
 
-    Each body starts with the section directive actually in force at its label (the assembler's default .text if
-    none), so the analysis knows the real section of the function entry.
+# Disassembly front end. The witness analyses the instructions actually assembled into the probe object, as
+# printed by the configured disassembler in generic AArch64 syntax (GNU objdump, or llvm-objdump with
+# --triple=aarch64, which does not use Apple's abbreviated printer). Assembler-level controls (macros,
+# conditionals, directives) therefore cannot change or hide the audited instructions.
+FORMAT_LINE = re.compile(r"^\S.*:\s+file format (\S.*?)\s*$")
+SECTION_LINE = re.compile(r"^Disassembly of section (\S+):$")
+SYMBOL_LINE = re.compile(r"^([0-9a-f]+) <(\S+)>:$")
+RELOCATION_LINE = re.compile(r"^\s+([0-9a-f]+):\s+((?:R_AARCH64|ARM64_RELOC)_\w+)\s+(\S+)\s*$")
+INSTRUCTION_LINE = re.compile(r"^\s+([0-9a-f]+):\s+(\S.*?)\s*$")
+ADDRESS_OPERAND = re.compile(r"^(?:0x)?([0-9a-f]+)\s+<(\S+)>$")
+BRANCH_RELOCATIONS = frozenset({"R_AARCH64_CALL26", "R_AARCH64_JUMP26", "ARM64_RELOC_BRANCH26"})
+PAGE_RELOCATIONS = frozenset({"R_AARCH64_ADR_PREL_PG_HI21", "R_AARCH64_ADR_GOT_PAGE", "ARM64_RELOC_PAGE21",
+                              "ARM64_RELOC_GOT_LOAD_PAGE21"})
+LOW12_RELOCATIONS = frozenset({"R_AARCH64_ADD_ABS_LO12_NC", "R_AARCH64_LDST8_ABS_LO12_NC",
+                               "R_AARCH64_LDST16_ABS_LO12_NC", "R_AARCH64_LDST32_ABS_LO12_NC",
+                               "R_AARCH64_LDST64_ABS_LO12_NC", "R_AARCH64_LDST128_ABS_LO12_NC",
+                               "R_AARCH64_LD64_GOT_LO12_NC", "ARM64_RELOC_PAGEOFF12", "ARM64_RELOC_GOT_LOAD_PAGEOFF12"})
+OBJECT_FORMATS = {"elf64-littleaarch64": False, "mach-o arm64": True}
+
+
+def object_format(data: bytes) -> bool:
+    """True for a Mach-O arm64 object, False for an ELF64 AArch64 object; anything else fails."""
+    if data[:4] == b"\x7fELF" and data[4] == 2 and data[5] == 1 and int.from_bytes(data[18:20], "little") == 183:
+        return False
+    if data[:4] == bytes.fromhex("cffaedfe") and int.from_bytes(data[4:8], "little") == 0x0100000C:
+        return True
+    raise ValueError("witness object is neither an ELF64 AArch64 nor a Mach-O arm64 object")
+
+
+def object_inventory(data: bytes) -> list[str]:
+    """The probe's instantiation inventory strings embedded in the object."""
+    marker = b"llaminar-native-neon-tile-probe:"
+    found, start = [], data.find(marker)
+    while start >= 0:
+        end = data.find(b"\0", start)
+        found.append(data[start:end if end >= 0 else len(data)].decode("ascii", "replace"))
+        start = data.find(marker, start + 1)
+    return [entry[len(marker.decode()):] for entry in found]
+
+
+def normalize_disassembly(disassembly: str, macho: bool) -> dict[str, list[str]]:
+    """Translate disassembler output into one normalised body per symbol.
+
+    Branch targets inside the function become local labels; relocated branches name their relocation symbol;
+    page/low-12 relocations become symbolic operands. Any line, relocation or operand outside this contract
+    fails. Mach-O symbol names lose their leading underscore.
     """
+    def symbol(name: str) -> str:
+        return name[1:] if macho and name.startswith("_") else name
+
+    lines = disassembly.splitlines()
+    formats = [FORMAT_LINE.match(line).group(1) for line in lines if FORMAT_LINE.match(line)]
+    if len(formats) != 1 or OBJECT_FORMATS.get(formats[0]) != macho:
+        raise ValueError(f"disassembly object format {formats} does not match the witness object")
+    functions: list[dict] = []
+    section = None
+    for line in lines:
+        if not line.strip() or FORMAT_LINE.match(line):
+            continue
+        if SECTION_LINE.match(line):
+            section = SECTION_LINE.match(line).group(1)
+            continue
+        if SYMBOL_LINE.match(line):
+            if section is None:
+                raise ValueError(f"disassembly symbol outside a section: {line}")
+            address, name = SYMBOL_LINE.match(line).groups()
+            functions.append({"name": symbol(name), "section": section, "start": int(address, 16), "code": []})
+            continue
+        relocation = RELOCATION_LINE.match(line)
+        if relocation:
+            if not functions or not functions[-1]["code"] or functions[-1]["code"][-1][0] != int(relocation.group(1), 16):
+                raise ValueError(f"relocation does not follow its instruction: {line.strip()}")
+            if functions[-1]["code"][-1][2] is not None:
+                raise ValueError(f"instruction carries two relocations: {line.strip()}")
+            functions[-1]["code"][-1][2] = (relocation.group(2), symbol(relocation.group(3)))
+            continue
+        instruction = INSTRUCTION_LINE.match(line)
+        if instruction and functions:
+            text = instruction.group(2).split("//", 1)[0].strip()
+            functions[-1]["code"].append([int(instruction.group(1), 16), text, None])
+            continue
+        raise ValueError(f"unparseable disassembly line: {line.strip()}")
+    names = [function["name"] for function in functions]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"symbol defined twice in the witness: {duplicates[0]}")
     bodies: dict[str, list[str]] = {}
-    current, section = None, "\t.text"
-    for line in assembly.splitlines():
-        label = LABEL.match(line)
-        if label and not dialect.local(label.group(1)):
-            current = label.group(1)
-            if current in bodies:
-                raise ValueError(f"symbol defined twice in the witness: {current}")
-            bodies[current] = [section] + ([label.group(2)] if label.group(2).strip() else [])
-            line = label.group(2)
-        elif current is not None:
-            bodies[current].append(line)
-        for statement in dialect.statements(LABEL.match(line).group(2) if LABEL.match(line) else line):
-            directive = statement.strip().split(None, 1)[0] if statement.strip() else ""
-            if directive in SECTION_CONTROL:
-                section = "\t" + statement.strip()
-            elif directive in UNSUPPORTED_SECTION_CONTROL:
-                section = "\t" + statement.strip()  # Rejected by the analysis wherever it governs a function.
+    starts = {(function["section"], function["start"]): function["name"] for function in functions}
+    for index, function in enumerate(functions):
+        following = [other["start"] for other in functions[index + 1:] if other["section"] == function["section"]]
+        end = following[0] if following else (function["code"][-1][0] + 4 if function["code"] else function["start"])
+        rewritten, targets = [], set()
+        for address, text, relocation in function["code"]:
+            if not function["start"] <= address < end:
+                raise ValueError(f"instruction outside its function: {function['name']}+{address:#x}")
+            rewritten.append((address, rewrite(text, relocation, function, end, starts, targets)))
+        body = [f'\t.section .text.{function["section"].replace(",", ".")},"ax"']
+        for address, text in rewritten:
+            if address in targets:
+                body.append(f".L{address:x}:")
+            body.append(f"\t{text}")
+        bodies[function["name"]] = body
     return bodies
+
+
+def rewrite(text: str, relocation: tuple[str, str] | None, function: dict, end: int,
+            starts: dict[tuple[str, int], str], targets: set[int]) -> str:
+    """One disassembled instruction in normalised form (symbolic branch targets and relocations)."""
+    parts = text.split(None, 1)
+    mnemonic, operands = parts[0], (split_operands(parts[1]) if len(parts) > 1 else [])
+    branch = mnemonic in ("b", "bl", "cbz", "cbnz", "tbz", "tbnz") or CONDITIONAL_BRANCH.match(mnemonic)
+    kind = relocation[0] if relocation else None
+    name = relocation[1] if relocation else None
+    if relocation and re.search(r"[+-]0x[0-9a-f]+$", name):
+        if kind in BRANCH_RELOCATIONS:
+            raise ValueError(f"branch relocation with an addend is not supported: {text} {name}")
+        name = re.sub(r"[+-]0x[0-9a-f]+$", "", name)  # A data address offset; never a stack address.
+    if branch:
+        target = ADDRESS_OPERAND.match(operands[-1]) if operands else None
+        if not target:
+            raise ValueError(f"unparseable branch target: {text}")
+        if relocation:
+            if kind not in BRANCH_RELOCATIONS or mnemonic not in ("b", "bl"):
+                raise ValueError(f"unsupported branch relocation: {text} {kind}")
+            operands[-1] = name
+        else:
+            address = int(target.group(1), 16)
+            if function["start"] <= address < end:
+                targets.add(address)
+                operands[-1] = f".L{address:x}"
+            else:
+                operands[-1] = starts.get((function["section"], address), f".Loutside{address:x}")
+    elif relocation and kind in PAGE_RELOCATIONS and mnemonic == "adrp" and len(operands) == 2 \
+            and ADDRESS_OPERAND.match(operands[1]):
+        operands[1] = name
+    elif relocation and kind in LOW12_RELOCATIONS:
+        memory = next((index for index, operand in enumerate(operands) if operand.startswith("[")), None)
+        if memory is not None:
+            inner = MEMORY.match(operands[memory])
+            if not inner or (inner.group(2) and immediate(inner.group(2)) != 0) or inner.group(3):
+                raise ValueError(f"unsupported relocated addressing: {text}")
+            operands[memory] = f"[{inner.group(1)}, :lo12:{name}]"
+        elif mnemonic == "add" and len(operands) == 3 and immediate(operands[2]) == 0:
+            operands[2] = f":lo12:{name}"
+        else:
+            raise ValueError(f"unsupported low-12 relocation: {text}")
+    elif relocation:
+        raise ValueError(f"unsupported relocation {kind} on {text}")
+    elif any(ADDRESS_OPERAND.match(operand) for operand in operands):
+        raise ValueError(f"unrelocated address operand: {text}")
+    return f"{mnemonic}\t{', '.join(operands)}" if operands else mnemonic
 
 
 def split_operands(text: str) -> list[str]:
@@ -380,13 +458,7 @@ class Instruction:
         parts = self.text.split(None, 1)
         mnemonic = parts[0].lower()
         self.operands = split_operands(parts[1]) if len(parts) > 1 else []
-        self.arrangement = None
-        if CONDITIONAL_BRANCH.match(mnemonic):
-            self.base = "b.cond"
-        elif dialect.macho and "." in mnemonic:
-            self.base, self.arrangement = mnemonic.split(".", 1)  # Apple: ld1.d, st1.s, ld1r.4s, add.16b ...
-        else:
-            self.base = mnemonic
+        self.base = "b.cond" if CONDITIONAL_BRANCH.match(mnemonic) else mnemonic
         self.memory = next((index for index, operand in enumerate(self.operands) if operand.startswith("[")), None)
         kinds = [operand_kind(operand) for operand in self.operands]
         self.form = None if None in kinds else f"{self.base} {','.join(kinds)}".strip()
@@ -414,7 +486,7 @@ def footprint(instruction: Instruction, operand: str) -> int | None:
     shapes = {re.sub(r"^v\d+", "", element) for element in registers}
     if len(shapes) != 1:
         return None
-    shape = shapes.pop().lstrip(".") or (instruction.arrangement or "")
+    shape = shapes.pop().lstrip(".")
     arrangement = re.match(r"^(\d*)([bhsd])$", shape)
     if not arrangement:
         return None
@@ -429,58 +501,37 @@ def footprint(instruction: Instruction, operand: str) -> int | None:
 
 
 class Block:
-    def __init__(self, section: str, executable: bool | None) -> None:
+    def __init__(self) -> None:
         self.labels: list[str] = []
         self.instructions: list[Instruction] = []
         self.successors: list[int] = []
-        self.section, self.executable = section, executable
+        self.falls = True
 
 
 def build_cfg(body: list[str], dialect: Dialect) -> tuple[list[Block], list[str]]:
-    """Basic blocks of one function body; only admitted directives may appear in executable sections."""
-    # A body without its entry section directive (functions() always supplies one) is not code.
-    section, executable = "<no section>", False
-    blocks, errors = [Block(section, executable)], []
-
-    def start(new_section: str, new_executable: bool | None) -> None:
-        if blocks[-1].instructions or blocks[-1].labels:
-            blocks.append(Block(new_section, new_executable))
-        else:
-            blocks[-1].section, blocks[-1].executable = new_section, new_executable
-
-    for line in body:
+    """Basic blocks of one normalised function body; data words or directives inside code fail."""
+    blocks: list[Block] = [Block()]
+    if not body or not ENTRY_SECTION.match(body[0]):
+        return blocks, ["function body has no executable entry section"]
+    errors: list[str] = []
+    for line in body[1:]:
         label = LABEL.match(line)
-        statements = dialect.statements(label.group(2) if label else line)
         if label:
             if blocks[-1].instructions:
-                blocks.append(Block(section, executable))
+                blocks.append(Block())
             blocks[-1].labels.append(label.group(1))
-        for statement in statements:
+            line = label.group(2)
+        for statement in dialect.statements(line):
             statement = statement.strip()
             if not statement:
                 continue
             if statement.startswith("."):
-                directive, _, arguments = statement.partition(" ")
-                directive = directive.split("\t", 1)[0]
-                arguments = statement[len(directive):].strip()
-                if directive in UNSUPPORTED_SECTION_CONTROL:
-                    errors.append(f"unsupported section control: {statement}")
-                elif directive in SECTION_CONTROL:
-                    section, executable = dialect.section(directive, arguments)
-                    if executable is None:
-                        errors.append(f"unclassifiable section: {statement}")
-                    start(section, executable)
-                elif executable and not METADATA_DIRECTIVES.match(directive) and not (
-                        directive in CODE_DIRECTIVES and CODE_DIRECTIVES[directive].match(arguments)):
-                    errors.append(f"directive may emit code bytes: {statement}")
-                continue
-            if not executable:
-                errors.append(f"instruction outside an executable section: {statement}")
+                errors.append(f"data or directive inside code: {statement}")
                 continue
             instruction = Instruction(statement, dialect)
             blocks[-1].instructions.append(instruction)
             if instruction.base in BRANCHES or INDIRECT.match(instruction.base) or RETURN.match(instruction.base):
-                blocks.append(Block(section, executable))  # Every branch ends its block.
+                blocks.append(Block())  # Every branch ends its block.
     return blocks, errors
 
 
@@ -590,7 +641,7 @@ class Analysis:
         if not SYMBOL.match(target):
             return "indirect", None
         if target in self.labels:
-            if base == "bl" or not self.blocks[self.labels[target]].executable:
+            if base == "bl":
                 return "invalid", target
             return ("jump" if base == "b" else "branch"), target
         if self.dialect.local(target):
@@ -631,18 +682,12 @@ class Analysis:
         self.report = True
         for index, block in enumerate(self.blocks):
             if index not in states:
-                if block.instructions:
+                # Alignment padding after the last return is never executed; anything else is unclassifiable.
+                if block.instructions and not all(instruction.base == "nop" for instruction in block.instructions):
                     self.errors.append(f"unreachable instructions cannot be classified: '{block.instructions[0].text}'")
                 continue
-            if self.transfer(index, states[index].copy()) is None or not block.falls or not block.executable:
-                continue
-            following = index + 1
-            if following >= len(self.blocks):
+            if self.transfer(index, states[index].copy()) is not None and block.falls and index + 1 >= len(self.blocks):
                 self.errors.append("control falls off the end of the function")
-            elif not self.blocks[following].executable:
-                self.errors.append("control falls into a data section")
-            elif self.blocks[following].section != block.section:
-                self.errors.append("control falls through a section switch")
 
     def transfer(self, index: int, state: State) -> State | None:
         for instruction in self.blocks[index].instructions:
@@ -921,7 +966,7 @@ def proven_noreturn(symbol: str, bodies: dict[str, list[str]], dialect: Dialect)
     if body is None:
         return False
     blocks, errors = build_cfg(body, dialect)
-    if errors or not blocks[0].executable:
+    if errors:
         return False
     labels = {label: index for index, block in enumerate(blocks) for label in block.labels}
     successors: dict[int, list[int] | None] = {}
@@ -944,7 +989,7 @@ def proven_noreturn(symbol: str, bodies: dict[str, list[str]], dialect: Dialect)
                     break
                 continue
             if instruction.base in ("b", "b.cond", "cbz", "cbnz", "tbz", "tbnz"):
-                if target not in labels or not blocks[labels[target]].executable:
+                if target not in labels:
                     valid = False
                     break
                 edges.append(labels[target])
@@ -958,7 +1003,7 @@ def proven_noreturn(symbol: str, bodies: dict[str, list[str]], dialect: Dialect)
             successors[index] = None
             continue
         if not ends:
-            if index + 1 >= len(blocks) or blocks[index + 1].section != block.section:
+            if index + 1 >= len(blocks):
                 successors[index] = None
                 continue
             edges.append(index + 1)
@@ -1013,15 +1058,32 @@ ENVELOPE_PROGRAMS = {
 TILE_RUN = re.compile(r"27CPUNativeNEONProjectionTileILm\d+EE3run")
 
 
-def audit(assembly: str, mode: str, dialect: Dialect) -> dict[str, int]:
-    """Per-program FP/SIMD spill counts over the probe's complete inventory and call closure.
+SYMBOL_TABLE_LINE = re.compile(r"^[0-9a-f]{8,16} (.{7}) (\S+)\s+(?:[0-9a-f]{8,16}\s+)?(\S+)$")
 
-    Structural failures (missing/duplicate/empty programs, unauditable callees, indirect branches, ambiguous or
-    unclassifiable stack addressing, unproven ABI saves) are fatal and never paid from a spill budget.
+
+def function_symbols(table: str, macho: bool) -> set[str]:
+    """Names of the function symbols in the object's symbol table (objdump -t)."""
+    names = set()
+    for line in table.splitlines():
+        match = SYMBOL_TABLE_LINE.match(line)
+        if match and "F" in match.group(1):
+            name = match.group(3)
+            names.add(name[1:] if macho and name.startswith("_") else name)
+    return names
+
+
+def audit(data: bytes, disassembly: str, symbols: str, mode: str) -> dict[str, int]:
+    """Per-program FP/SIMD spill counts of the tile programs actually assembled into the witness object.
+
+    The expected programs derive from the admitted envelope; the object's embedded inventory, its symbol table
+    and its disassembly must all agree with it. Structural failures (missing/duplicate/unexpected/empty
+    programs, unsupported calls, indirect branches, unclassifiable forms, ambiguous or unclassifiable stack
+    addressing, unproven ABI saves) are fatal and never paid from a spill budget.
     """
     if mode not in ENVELOPE_PROGRAMS:
         raise ValueError(f"no tile program inventory for ISA envelope {mode}")
-    inventory = INVENTORY.findall(assembly)
+    macho = object_format(data)
+    inventory = object_inventory(data)
     if inventory != [",".join(ENVELOPE_PROGRAMS[mode])]:
         raise ValueError(f"probe instantiation inventory {inventory} does not match the {mode} envelope")
     expected = set()
@@ -1031,23 +1093,24 @@ def audit(assembly: str, mode: str, dialect: Dialect) -> dict[str, int]:
         for policy in (0, 1):
             for encoding, nibble_map, minimum in DISPATCH:
                 expected.add((int(rows), leaf, policy, encoding, nibble_map, minimum))
-    if not expected:
-        raise ValueError("register witness inventory names no tile instantiation")
-    dialect.require_format(assembly)
-    bodies = functions(assembly, dialect)
-    noreturn = noreturn_symbols(bodies, dialect)
+    bodies = normalize_disassembly(disassembly, macho)
+    table = {name for name in function_symbols(symbols, macho) if TILE_RUN.search(name)}
+    disassembled = {name for name in bodies if TILE_RUN.search(name)}
+    if table != disassembled:
+        raise ValueError(f"symbol table and disassembly disagree on tile programs: "
+                         f"{sorted(table ^ disassembled)[:3]}")
+    noreturn = noreturn_symbols(bodies, GENERIC)
     found: dict[tuple, str] = {}
-    for name in bodies:
+    for name in sorted(disassembled):
         match = PROGRAM.search(name)
-        if match:
-            key = tuple(int(group) for group in match.groups())
-            if key in found:
-                raise ValueError(f"tile program appears twice: {name}")
-            if key not in expected:
-                raise ValueError(f"tile program outside the {mode} inventory: {name}")
-            found[key] = name
-        elif TILE_RUN.search(name):
+        if not match:
             raise ValueError(f"unrecognized tile program symbol: {name}")
+        key = tuple(int(group) for group in match.groups())
+        if key in found:
+            raise ValueError(f"tile program appears twice: {name}")
+        if key not in expected:
+            raise ValueError(f"tile program outside the {mode} inventory: {name}")
+        found[key] = name
     missing = expected - found.keys()
     if missing:
         raise ValueError(f"register witness is missing {len(missing)} expected tile programs, e.g. {sorted(missing)[:3]}")
@@ -1055,7 +1118,7 @@ def audit(assembly: str, mode: str, dialect: Dialect) -> dict[str, int]:
     structural: list[str] = []
     for key in sorted(expected):
         program = found[key]
-        result[program], errors = analyse_function(program, bodies, dialect, noreturn)
+        result[program], errors = analyse_function(program, bodies, GENERIC, noreturn)
         structural.extend(f"{program_key(program)}: {error}" for error in errors)
     if structural:
         raise ValueError(f"native NEON tile witness is structurally unprovable ({len(structural)}): "
@@ -1155,18 +1218,46 @@ def bind_inputs(paths: list[str]) -> dict[str, dict]:
     return {path: input_identity(path) for path in paths}
 
 
-def executed_command(command: list[str], source: str, assembly: Path, dependencies: Path) -> list[str]:
-    return command + WITNESS_FLAGS + ["-S", source, "-o", str(assembly), "-MD", "-MF", str(dependencies),
-                                      "-MT", "probe"]
+def executed_command(command: list[str], source: str, obj: Path, dependencies: Path) -> list[str]:
+    return command + WITNESS_FLAGS + ["-c", source, "-o", str(obj), "-MD", "-MF", str(dependencies), "-MT", "probe"]
+
+
+def require_absolute_source(source: str) -> None:
+    """The probe path is passed to the compiler as given; relative spellings depend on the cwd and are rejected."""
+    if not os.path.isabs(source):
+        raise ValueError(f"the witness probe path must be absolute: {source}")
+
+
+def disassembler_commands(tool: str, obj: Path) -> tuple[list[str], list[str], str]:
+    """Disassembly and symbol-table commands for the configured objdump, and its version text."""
+    version = subprocess.check_output([tool, "--version"], text=True)
+    if "GNU objdump" in version:
+        options = ["-d", "-r", "-z", "--no-show-raw-insn"]
+    elif "LLVM" in version:
+        options = ["-d", "-r", "-z", "--no-show-raw-insn", "--triple=aarch64"]  # Generic, not Apple, printer.
+    else:
+        raise ValueError(f"unsupported disassembler: {version.splitlines()[0] if version else tool}")
+    return [tool] + options + [str(obj)], [tool, "-t", str(obj)], version
+
+
+def disassemble(tool: str, obj: Path) -> tuple[str, str, list[str], list[str], str]:
+    disassembly_command, symbol_command, version = disassembler_commands(tool, obj)
+    disassembly = subprocess.check_output(disassembly_command, text=True)
+    symbols = subprocess.check_output(symbol_command, text=True)
+    return disassembly, symbols, disassembly_command, symbol_command, version
 
 
 def build(args: argparse.Namespace) -> None:
-    """Compile the probe with the target command; publish the depfile, then the proof last and atomically."""
+    """Compile the probe object with the target command, disassemble it, audit it, publish the proof last."""
+    require_absolute_source(args.source)
     output = Path(args.proof)
     output.parent.mkdir(parents=True, exist_ok=True)
-    assembly, dependencies = output.with_suffix(".s"), output.with_suffix(".deps")
+    obj, dependencies = output.with_suffix(".o"), output.with_suffix(".deps")
+    disassembly_path, symbols_path = output.with_suffix(".dis"), output.with_suffix(".sym")
     preprocessed, depfile, temporary = output.with_suffix(".pre.deps"), output.with_suffix(".d"), output.with_suffix(".tmp")
-    for stale in (output, temporary, assembly, dependencies, preprocessed, depfile):
+    # proof.s: the retired assembly-text witness of earlier schemas.
+    for stale in (output, temporary, obj, dependencies, preprocessed, depfile, disassembly_path, symbols_path,
+                  output.with_suffix(".s")):
         stale.unlink(missing_ok=True)
     command, directory = envelope.target_command(args)
     version = subprocess.check_output([command[0], "--version"], cwd=directory, text=True)
@@ -1176,7 +1267,7 @@ def build(args: argparse.Namespace) -> None:
     subprocess.run(command + WITNESS_FLAGS + ["-M", "-MF", str(preprocessed), "-MT", "probe", args.source],
                    cwd=directory, check=True, stdout=subprocess.DEVNULL)
     before = bind_inputs(read_depfile(preprocessed, directory))
-    executed = executed_command(command, args.source, assembly, dependencies)
+    executed = executed_command(command, args.source, obj, dependencies)
     subprocess.run(executed, cwd=directory, check=True)
     closure = read_depfile(dependencies, directory)
     if closure != sorted(before):
@@ -1185,10 +1276,13 @@ def build(args: argparse.Namespace) -> None:
     if after != before:
         changed = sorted(path for path in closure if before[path] != after[path])
         raise ValueError(f"inputs changed while the witness compiled: {changed[:3]}")
-    counts = audit(assembly.read_text(), args.mode, Dialect.for_identity(args.identity))
+    disassembly, symbols, disassembly_command, symbol_command, tool_version = disassemble(args.disassembler, obj)
+    disassembly_path.write_text(disassembly)
+    symbols_path.write_text(symbols)
+    counts = audit(obj.read_bytes(), disassembly, symbols, args.mode)
     require_registers(counts, args.identity, args.mode)
     result = {
-        "schema": 4, "signature": args.signature, "identity": identity, "mode": args.mode,
+        "schema": 5, "signature": args.signature, "identity": identity, "mode": args.mode,
         "checker_sha256": envelope.digest(Path(__file__)),
         "envelope_sha256": envelope.digest(_ENVELOPE),
         "budget_sha256": envelope.digest(BUDGET_PATH),
@@ -1196,12 +1290,15 @@ def build(args: argparse.Namespace) -> None:
         "executed_command": executed, "executed_directory": directory,
         "target_command_sha256": envelope.command_digest(command, directory),
         "inputs": after,
-        "assembly_file": assembly.name, "assembly_sha256": envelope.digest(assembly),
+        "object_file": obj.name, "object_sha256": envelope.digest(obj),
+        "disassembler": args.disassembler, "disassembler_version": tool_version,
+        "disassembler_sha256": envelope.digest(Path(os.path.realpath(args.disassembler))),
+        "disassembly_command": disassembly_command, "symbol_command": symbol_command,
+        "disassembly_sha256": envelope.digest(disassembly_path), "symbols_sha256": envelope.digest(symbols_path),
         "program_violations": counts,
     }
-    # Ninja depfile: any input of the closure re-runs the witness. Written before the proof, which is published last.
+    # Ninja depfile: resolved paths (Ninja canonicalises ".." lexically, which would name another file).
     target = args.depfile_target or str(output)
-    # Resolved paths: Ninja canonicalises ".." lexically, which would name a different file behind a symlink.
     resolved = sorted({identity["resolved"] for identity in after.values()})
     depfile.write_text(f"{target}: " + " ".join(path.replace(" ", "\\ ") for path in resolved) + "\n")
     temporary.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
@@ -1209,10 +1306,11 @@ def build(args: argparse.Namespace) -> None:
 
 
 def verify(args: argparse.Namespace) -> None:
-    """Validate the retained proof without invoking a compiler."""
+    """Validate the retained proof: inputs, command, the bound object, and its re-disassembly by the bound tool."""
+    require_absolute_source(args.source)
     proof_path = Path(args.proof)
     proof = json.loads(proof_path.read_text())
-    if (proof.get("schema") != 4 or proof.get("signature") != args.signature or
+    if (proof.get("schema") != 5 or proof.get("signature") != args.signature or
             proof.get("identity") != args.identity or proof.get("mode") != args.mode):
         raise ValueError("tile register proof has a foreign schema/configuration")
     if compiler_identity(str(proof.get("compiler_version", ""))) != args.identity:
@@ -1222,8 +1320,7 @@ def verify(args: argparse.Namespace) -> None:
         if proof.get(key) != envelope.digest(path):
             raise ValueError(f"stale tile register tool: {path}")
     inputs = proof.get("inputs")
-    # The probe path keeps its spelling: lexical normalisation would collapse a symlink followed by "..".
-    source = resolve(args.source if os.path.isabs(args.source) else os.path.join(os.getcwd(), args.source))[0]
+    source = resolve(args.source)[0]
     if not isinstance(inputs, dict) or not any(isinstance(identity, dict) and identity.get("resolved") == source
                                                for identity in inputs.values()):
         raise ValueError("tile register proof does not bind the probe's dependency closure")
@@ -1233,18 +1330,24 @@ def verify(args: argparse.Namespace) -> None:
     command, directory = envelope.target_command(args)
     if proof.get("target_command_sha256") != envelope.command_digest(command, directory):
         raise ValueError("actual target compile command changed after the register witness")
-    executed = proof.get("executed_command")
-    name = proof.get("assembly_file")
-    if not isinstance(name, str) or Path(name).name != name:
-        raise ValueError("tile register proof must name one retained local assembly artifact")
-    assembly = proof_path.parent / name
-    expected_command = executed_command(command, args.source, assembly, proof_path.with_suffix(".deps"))
-    if (not isinstance(executed, list) or proof.get("executed_directory") != directory or
-            executed != expected_command or executed[0] != command[0]):
+    obj = proof_path.with_suffix(".o")
+    if proof.get("object_file") != obj.name or proof.get("executed_directory") != directory or \
+            proof.get("executed_command") != executed_command(command, args.source, obj, proof_path.with_suffix(".deps")):
         raise ValueError("recorded witness invocation is not the target command over the probe")
-    if not assembly.is_file() or proof.get("assembly_sha256") != envelope.digest(assembly):
-        raise ValueError("tile register assembly is missing or changed")
-    counts = audit(assembly.read_text(), args.mode, Dialect.for_identity(args.identity))
+    if not obj.is_file() or proof.get("object_sha256") != envelope.digest(obj):
+        raise ValueError("tile register object is missing or changed")
+    if proof.get("disassembler") != args.disassembler or \
+            proof.get("disassembler_sha256") != envelope.digest(Path(os.path.realpath(args.disassembler))):
+        raise ValueError("configured disassembler changed after the register witness")
+    disassembly, symbols, disassembly_command, symbol_command, tool_version = disassemble(args.disassembler, obj)
+    if (disassembly_command != proof.get("disassembly_command") or symbol_command != proof.get("symbol_command")
+            or tool_version != proof.get("disassembler_version")):
+        raise ValueError("disassembler invocation changed after the register witness")
+    for path, text, key in ((proof_path.with_suffix(".dis"), disassembly, "disassembly_sha256"),
+                            (proof_path.with_suffix(".sym"), symbols, "symbols_sha256")):
+        if not path.is_file() or path.read_text() != text or proof.get(key) != envelope.digest(path):
+            raise ValueError(f"retained disassembly does not match the bound object: {path.name}")
+    counts = audit(obj.read_bytes(), disassembly, symbols, args.mode)
     if proof.get("program_violations") != counts:
         raise ValueError("tile register evidence changed")
     require_registers(counts, args.identity, args.mode)
@@ -1252,12 +1355,14 @@ def verify(args: argparse.Namespace) -> None:
 
 def census(args: argparse.Namespace) -> None:
     """Maintainer tool: print the per-program spill census for qualifying a budget (no budget applied)."""
+    require_absolute_source(args.source)
     command, directory = envelope.target_command(args)
     version = subprocess.check_output([command[0], "--version"], cwd=directory, text=True)
-    assembly = Path(args.proof).with_suffix(".census.s")
-    assembly.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(command + WITNESS_FLAGS + ["-S", args.source, "-o", str(assembly)], cwd=directory, check=True)
-    counts = audit(assembly.read_text(), args.mode, Dialect.for_identity(compiler_identity(version)))
+    obj = Path(args.proof).with_suffix(".census.o")
+    obj.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(command + WITNESS_FLAGS + ["-c", args.source, "-o", str(obj)], cwd=directory, check=True)
+    disassembly, symbols, *_ = disassemble(args.disassembler, obj)
+    counts = audit(obj.read_bytes(), disassembly, symbols, args.mode)
     print(json.dumps({"identity": compiler_identity(version), "mode": args.mode,
                       "programs": {program_key(name): count for name, count in counts.items()}},
                      indent=1, sort_keys=True))
@@ -1275,6 +1380,7 @@ def main() -> None:
     parser.add_argument("--target-source", required=True)
     parser.add_argument("--identity", required=True, help="compiler id and major version, e.g. GNU-14")
     parser.add_argument("--mode", required=True, help="native ISA envelope, e.g. NEON_I8MM")
+    parser.add_argument("--disassembler", required=True, help="objdump (GNU binutils or LLVM) for the target")
     parser.add_argument("--depfile-target", help="depfile output path as the generator names it")
     args = parser.parse_args()
     if args.action == "census":
