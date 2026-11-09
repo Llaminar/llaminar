@@ -100,3 +100,14 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   partial/inline/outlined/empty-body negatives; never change production
   allocation to fit the scanner.
 - Owner evidence (scheduling/0-176/M1 bytes/.80/3-arm) remains owner evidence.
+
+## Update (2026-11-09, widened detector) — grouped confirmed; M=1 OPEN
+
+- GROUPED regression confirmed + fixed: R3 SDOT 52→463→52 (base→R1→fix);
+  R4 SDOT 70→666→~70; R2 30→24→30 (ASIMD); Rows=1 = 0 in all three on Linux
+  gcc-14. The fix is justified by the grouped-tile spill regression.
+- M=1 ATTRIBUTION NOT CONFIRMED on Linux gcc-14 (earlier spill = Darwin gcc
+  output). IQ4_XS M=1 −4% cause OPEN: 3-arm run decides whether the fix
+  changes M=1; else investigate separately (bind/admission per call, code
+  alignment). Ratchet gate approved (idea 29): Rows=1 zero; Rows2–4 per-program
+  budgets keyed by compiler id+major + envelope; unknown → fail closed.
