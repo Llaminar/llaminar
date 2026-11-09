@@ -8,6 +8,9 @@
 #if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
+#if LLAMINAR_COMPILED_WITH_NEON
+#include <arm_neon.h>
+#endif
 
 namespace llaminar2::cpu_sampling
 {
@@ -220,6 +223,66 @@ namespace llaminar2::cpu_sampling
         int *out_ids)
     {
         return select_topk_avx2(logits, vocab_size, top_k, out_logits, out_ids);
+    }
+#endif
+
+#if LLAMINAR_COMPILED_WITH_NEON
+    int select_topk_neon(
+        const float *logits,
+        int vocab_size,
+        int top_k,
+        float *out_logits,
+        int *out_ids)
+    {
+        top_k = sanitize_topk(vocab_size, top_k);
+        if (!logits || !out_logits || !out_ids || top_k == 0)
+        {
+            return 0;
+        }
+
+        initialize_outputs(out_logits, out_ids, top_k);
+
+        alignas(16) float lane_values[4];
+        int count = 0;
+        int i = 0;
+        const int vec_end = vocab_size & ~3;
+        for (; i < vec_end; i += 4)
+        {
+            const float threshold =
+                count == top_k ? out_logits[top_k - 1] : -std::numeric_limits<float>::infinity();
+            const float32x4_t values = vld1q_f32(logits + i);
+            uint32_t mask = 0xFu;
+            if (count == top_k)
+            {
+                const float32x4_t limit = vdupq_n_f32(threshold);
+                // Ordered greater-than: NaN lanes are excluded, matching the
+                // scalar/AVX strict insertion rule at the same phase boundary.
+                const uint32x4_t gt = vcgtq_f32(values, limit);
+                mask = vgetq_lane_u32(gt, 0)
+                     | (vgetq_lane_u32(gt, 1) << 1)
+                     | (vgetq_lane_u32(gt, 2) << 2)
+                     | (vgetq_lane_u32(gt, 3) << 3);
+                if (mask == 0)
+                {
+                    continue;
+                }
+            }
+
+            vst1q_f32(lane_values, values);
+            for (int lane = 0; lane < 4; ++lane)
+            {
+                if (mask & (1u << lane))
+                {
+                    insert_candidate(lane_values[lane], i + lane, out_logits, out_ids, count, top_k);
+                }
+            }
+        }
+
+        for (; i < vocab_size; ++i)
+        {
+            insert_candidate(logits[i], i, out_logits, out_ids, count, top_k);
+        }
+        return count;
     }
 #endif
 
