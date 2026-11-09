@@ -4641,6 +4641,7 @@ class NativeQuantisedCommonDispatchPolicyTest(unittest.TestCase):
                 policy_accelerators=(),
                 fit_cache=PolicyFitCache(Path(directory)),
                 profiler_feature_catalog=catalog,
+                profiler_surrogate_devices=("cpu",),
             )
 
         self.assertEqual(len(policy.cross_validation), 1)
