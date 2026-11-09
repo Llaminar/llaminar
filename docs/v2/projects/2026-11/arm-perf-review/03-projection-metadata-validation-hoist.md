@@ -300,3 +300,18 @@ separate (shared) path with the same pattern but different owners.
   only, no re-review).
 - R1 CLOSE = the remaining evidence gates: .80 rerun @035d1d948, WSL x86,
   window (b) economy; then R2 (rebased on successor + C2c).
+
+## R1 evidence progress (2026-11-09) — green modulo base
+
+- IQ2 precision item (035d1d948 → **d1f1e8e34**, test-only): each IQ2_S K block
+  poisoned alone; dispatch<8> AND dispatch<16> must each reject it. WSL target.
+- .80 owner evidence @661fc9284 (Integration NEON_I8MM, gcc-14, base
+  302318f1e): Build BUILD=0; Unit 961/963 (MoEForbiddenDependencyScan +
+  TestTargetSelection, known base); Preflight 2308/2311 (Release/Pooled/
+  Qwen4Exp target-selection, known base); Focused 207/207 (incl.
+  TailPaddingContract, full MoEOverlay/MoEPipeline, slot reuse, seal, padding,
+  writer policy; the three fabric/pipeline cells that failed at 46c9ffc58
+  now PASS). Owner runs, not authoritative.
+- Rerun at d1f1e8e34 in progress (build/r1c.status); Release builds for window
+  (b) (302318f1e + 035d1d948; kernel identical to d1f1e8e34) chained after;
+  (b) announced when done.
