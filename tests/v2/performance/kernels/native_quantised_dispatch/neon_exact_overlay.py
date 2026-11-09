@@ -27,7 +27,7 @@ policy. An entry is emitted only when:
 
 Missing candidates, non-exact bytes, duplicate measurements or mixed
 build-envelope/instruction identities fail closed: one NEON_I8MM binary can
-time SMMLA, SDOT or ASIMD leaves, and those regimes never pool. Unmeasured keys stay on the total policy; nothing is
+time its I8MM family or forced ASIMD, and those regimes never pool. Unmeasured keys stay on the total policy; nothing is
 interpolated or fitted. The receipt records every input digest and decision.
 """
 
@@ -111,9 +111,9 @@ def read_rows(paths: Sequence[Path]) -> tuple[list[tuple[int, dict[str, str]]], 
 def collect(rows: Iterable[tuple[int, Mapping[str, str]]], min_replicas: int):
     """Group authenticated rows by runtime key, (alias, replica) and candidate."""
 
-    # The build envelope and the resolved leaf instruction are distinct: one
-    # NEON_I8MM binary can time SMMLA (automatic), SDOT or ASIMD (forced by
-    # LLAMINAR_ISA_LEVEL). Replicas pool only within one exact pair.
+    # The build envelope and the resolved instruction family are distinct: one
+    # NEON_I8MM binary resolves AUTO to the I8MM family, or to ASIMD under
+    # LLAMINAR_ISA_LEVEL=neon. Replicas pool only within one exact pair.
     isas = set()
     grouped: dict[OverlayKey, dict[tuple[str, int], dict[tuple[str, int], float]]] = {}
     for replica, row in rows:
