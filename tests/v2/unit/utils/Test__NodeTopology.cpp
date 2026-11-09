@@ -384,3 +384,18 @@ TEST(Test__NodeTopology, DetectionIsIdempotent)
     EXPECT_EQ(topology1.numNUMANodes(), topology2.numNUMANodes());
     EXPECT_EQ(topology1.numCPUs(), topology2.numCPUs());
 }
+
+/** @test Firmware package numbering (GB10 reports 36) maps to dense socket indices. */
+TEST(Test__NodeTopology, SparsePackageIdsBecomeDenseSocketIndices)
+{
+    std::vector<llaminar2::NUMANode> nodes{
+        {.node_id = 0, .cpu_ids = {0, 1}, .memory_bytes = 1, .socket_id = 36},
+        {.node_id = 1, .cpu_ids = {2, 3}, .memory_bytes = 1, .socket_id = 7},
+        {.node_id = 2, .cpu_ids = {4, 5}, .memory_bytes = 1, .socket_id = 36}};
+    llaminar2::NodeTopology::densifySocketIds(nodes);
+    EXPECT_EQ(nodes[0].socket_id, 1);
+    EXPECT_EQ(nodes[1].socket_id, 0);
+    EXPECT_EQ(nodes[2].socket_id, 1);
+    EXPECT_EQ(nodes[0].physical_package_id, 36);
+    EXPECT_EQ(nodes[1].physical_package_id, 7);
+}
