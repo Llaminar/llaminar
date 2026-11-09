@@ -13,6 +13,7 @@
 #include "utils/NativeQuantisedPreparedByteFixture.h"
 #include "utils/CPUExplicitRoundingOracle.h"
 #include <gtest/gtest.h>
+#include <utility>
 #include <array>
 #include <cstring>
 #include <chrono>
@@ -28,6 +29,18 @@ namespace
 {
 using namespace cpu::native_quantised;
 using Dot = multi_scale::NEONByteDot;
+
+// Collective safety: once bind() admitted a publication, nothing a worker runs
+// inside the team can throw, for every row tile and admitted family.
+static_assert(noexcept(std::declval<const CPUNativeNEONProjectionBatch &>().runTask<Dot::ASIMD>(0)));
+static_assert(noexcept(std::declval<const CPUNativeNEONProjectionTile<1> &>().executeAdmitted<Dot::ASIMD>()));
+static_assert(noexcept(std::declval<const CPUNativeNEONProjectionTile<4> &>().executeAdmitted<Dot::ASIMD>()));
+#if defined(__ARM_FEATURE_DOTPROD)
+static_assert(noexcept(std::declval<const CPUNativeNEONProjectionBatch &>().runTask<Dot::DotProd>(0)));
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+static_assert(noexcept(std::declval<const CPUNativeNEONProjectionBatch &>().runTask<Dot::I8MM>(0)));
+#endif
 
 /** @brief Restore the caller's OpenMP budget and dynamic-team policy after each test. */
 class TeamBudget final

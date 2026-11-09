@@ -1244,10 +1244,10 @@ namespace llaminar2
                 result.encoding=cpu_host_.encoding;result.data_stride=cpu_host_.data_stride;
                 result.interleaved_block_stride=cpu_host_.interleaved_block_stride;
                 result.native_interleaved.resize_uninitialized(demotion_layout_.cpuStorageBytes());
-                std::fill(result.native_interleaved.begin(),result.native_interleaved.end(),0xa5);
+                const auto written=result.native_interleaved.beginRewrite();
+                std::fill(written.begin(),written.end(),0xa5);
                 auto layout=demotion_layout_;layout.maximum_units_per_chunk=layout.unit_count;
-                if(!scatterExpertTierCPUWeightChunk(layout,wire_oracle_,0,layout.unit_count,
-                    std::span<uint8_t>(result.native_interleaved.data(),result.native_interleaved.size())))
+                if(!scatterExpertTierCPUWeightChunk(layout,wire_oracle_,0,layout.unit_count,written))
                     throw std::runtime_error("Original CPU rectangle root cannot receive exact oracle planes");
                 return result;
             }
