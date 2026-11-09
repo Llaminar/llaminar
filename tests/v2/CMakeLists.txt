@@ -19387,6 +19387,16 @@ add_v2_test(V2_Unit_NativeNEONExactOverlayGenerator
         ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_neon_exact_overlay.py
     LABELS "V2;Unit;NativeQuantised;CPU;ARM;DeviceFree;Dispatch;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+# One NEON_I8MM binary times SMMLA, SDOT or ASIMD leaves; evidence from different
+# resolved instructions must never pool into one installed winner.
+add_v2_test(V2_Integration_NativeNEONExactOverlayInstructionIdentity
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_neon_exact_overlay.py
+        NeonExactOverlayTest.test_replica_of_another_instruction_regime_is_rejected
+        NeonExactOverlayTest.test_incomplete_nonexact_duplicate_or_mixed_evidence_fails
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;CPU;ARM;DeviceFree;Dispatch;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeNEONExactOverlayInstructionIdentity)
 
 # Native ARM exact-overlay candidate collection: the two numerically neutral
 # NEON schedule dimensions over the canonical exact-overlay shapes. Its rows feed

@@ -188,6 +188,10 @@ class CPUCodegenEnvelopeEvidenceTest(unittest.TestCase):
             CHECKER.require_envelope("NEON", CHECKER.instruction_counts("\tsmmla v0.4s,v1.16b,v2.16b\n"))
         with self.assertRaises(ValueError):
             CHECKER.require_envelope("NEON_SVE", CHECKER.instruction_counts(gnu))
+        # Unsigned UDOT cannot stand in for the signed SDOT single-row leaf.
+        with self.assertRaises(ValueError):
+            CHECKER.require_envelope("NEON_I8MM", CHECKER.instruction_counts(
+                "\tudot v0.4s,v1.16b,v2.16b\n\tsmmla v0.4s,v1.16b,v2.16b\n"))
 
 
 if __name__ == "__main__":

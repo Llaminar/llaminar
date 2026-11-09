@@ -242,9 +242,11 @@ TEST(Perf__CPUNativeNEONExactOverlay, CollectAuthenticatedCandidates)
                 {
                     auto sorted = samples[index];
                     std::sort(sorted.begin(), sorted.end());
-                    // Record the build envelope and the leaf instruction the AUTO
-                    // launches resolved (LLAMINAR_ISA_LEVEL may force SDOT/ASIMD in a
-                    // NEON_I8MM binary); the generator never pools across them.
+                    // Record the build envelope and the instruction family the AUTO
+                    // launches resolved: in a NEON_I8MM binary AUTO selects the I8MM
+                    // family (SMMLA row pairs, SDOT for lone rows) unless
+                    // LLAMINAR_ISA_LEVEL=neon forces ASIMD. The generator never pools
+                    // evidence across build/instruction pairs.
                     output << "neon-exact-overlay-v2," << compiledNativeQuantisedBuildISAName() << ','
                            << multi_scale::neonByteDotName(neon_execution::instruction(ISAPath::AUTO)) << ','
                            << static_cast<int>(packed.codebook_id) << ',' << (packed.is_superblock ? 1 : 0) << ','
