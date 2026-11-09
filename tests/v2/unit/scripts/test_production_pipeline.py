@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Device-free adversarial tests for benchmark and image certification policy.
+"""@file test_production_pipeline.py
+@brief Device-free adversarial tests for benchmark and image certification policy.
 
 Mocked processes prove orchestration decisions, not inference performance.
 Prefix-state obligations come from typed model declarations; exact output
@@ -3504,7 +3505,11 @@ class CrossHostRunnerTests(unittest.TestCase):
                     artifacts.write_json(directory / "runtime-import.json", {"source_image": image})
                     return {host["public_ip"]: "sha256:remote-fixture" for host in hosts}
 
-                with patch.object(remote_e2e, "AzureCLI", return_value=cli), \
+                # This device-free fixture owns its staging bytes too. Never
+                # write temporary containers into the real checkout, which may
+                # be read-only in an installed runner or shared by other work.
+                with patch.object(remote_e2e, "CROSS_HOST_CONTAINER_SCRATCH", root / "container-scratch"), \
+                     patch.object(remote_e2e, "AzureCLI", return_value=cli), \
                      patch.object(remote_e2e, "validate_local_network"), \
                      patch.object(remote_e2e, "private_mpi_connection", side_effect=connection), \
                      patch.object(remote_e2e, "image_identity", return_value=remote_runtime_identity()), \
@@ -4343,9 +4348,19 @@ class ImageIdentityTests(unittest.TestCase):
         # generator. Keep exactly that small fixture closure; importing the
         # builder would conceal a missing dependency and turn the test image
         # back into a compiler image.
-        for package in ("build-essential", "cmake", "git", "jq"):
+        for package in ("build-essential", "git", "jq"):
             with self.subTest(package=package):
                 self.assertIn(package, test_runner)
+        # The distro CTest lacks ownership metadata. Reuse the exact selected
+        # builder entrypoints and their package/native data below instead of
+        # independently selecting an apt CMake family in the installed runner.
+        self.assertIn(
+            "COPY --from=toolchain /usr/local/bin/cmake /usr/local/bin/ctest /usr/local/bin/cpack /usr/local/bin/",
+            test_runner,
+        )
+        apt_install = test_runner.split("apt-get install -y --no-install-recommends", 1)[1].split(
+            "&& rm -rf /var/lib/apt/lists/*", 1)[0]
+        self.assertNotIn("cmake", apt_install)
         self.assertIn(
             "COPY --from=toolchain /usr/local/bin/ninja /usr/local/bin/ninja",
             test_runner,
@@ -4689,7 +4704,9 @@ class ImageIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "source").mkdir()
-            cache_root = root / "cache"
+            # The production owner canonicalizes the user-supplied root; on
+            # Darwin /var and /private/var can name the same owned directory.
+            cache_root = (root / "cache").resolve()
             cache_root.mkdir()
             source = {"revision": "revision", "tree": "tree", "dirty": False}
             args = argparse.Namespace(cpu_isa="AVX512")
