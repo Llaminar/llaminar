@@ -142,3 +142,23 @@ in the plan. Any NibbleMap touch points must remain seam-based.
 - RE-BOOK: r2rel.sh (REL_BASE=0 REL_R2=0 + 3 binaries) → window-panel.sh
   f3b28a120 → window-r2e.sh 5d4e3716a f3b28a120 → optional solo FA
   tournament A/B (else WSL/x86 classification).
+
+## R2 (a) fix — f9f190059 (2026-11-09)
+
+- DECISION (a) implemented: panel tournament + smoke move out of
+  V2CPUArchitectureTests.cmake (early return UNCHANGED — base convention
+  untouched) into tests/v2/CMakeLists.txt next to
+  v2_perf_cpu_native_quantised_thread_scaling under an arm64 guard; Release
+  perf-only selection admits every v2_perf_* target (V2TestTargetSelection)
+  → Release produces the timed binary; same sources/flags/OpenMP/smoke
+  (add_v2_test NO_MPI NO_MODELS TIMEOUT 120); reason in the commit body.
+  Rebased onto #43 **7d1a94479**; r2wip; supersedes fda883839.
+- Verified .80: Release + Integration CFG=0 vs 7d1a94479 guards; panel +
+  FA tournament present in BOTH configs; Release target build TOURBUILD=0
+  (2.4 MB); INT registrations present; smoke ran (0.08 s — pass line is
+  r2gate2's evidence).
+- CORRECTION: r2fa had NO gap — the FA tournament already lives in the main
+  perf section (21 refs in Release); only the panel tournament was hidden.
+- SINGLE-TIP sequence (relayed): r2gate2 7d1a94479 f9f190059 → window-panel
+  f9f190059 → window-r2e 7d1a94479 f9f190059 (real exit codes; plan
+  regen guard) → r2fa 7d1a94479 f9f190059 → push → reviewer → WSL.
