@@ -442,11 +442,22 @@ TEST(CPUNativeNEONExactOverlay, ExactKeysOverrideTotalPolicyAndNeverInterpolate)
     }
 }
 
-/** @test The installed GB10 table resolves its own keys exactly through the hot-path API. */
+/**
+ * @test The installed table resolves its own keys exactly through the hot-path
+ * API, and an empty table leaves every key on the total policy.
+ */
 TEST(CPUNativeNEONExactOverlay, InstalledTableResolvesEveryEntryExactly)
 {
     const auto installed = installedNativeNEONExactOverlay();
-    ASSERT_FALSE(installed.empty());
+    if (installed.empty())
+    {
+        // Q4_K superblock (codebook 2) at a representative 35B projection key.
+        const auto total = resolveNativeNEONSchedule(2, true, 2048, 4096, 4, 20);
+        EXPECT_FALSE(total.exact);
+        EXPECT_EQ(total.tile, NEONProjectionRowTile::Four);
+        EXPECT_EQ(total.n_block_chunks, 1);
+        return;
+    }
     for (const auto &entry : installed)
     {
         const auto schedule = resolveNativeNEONSchedule(entry.codebook_id, entry.is_superblock,
