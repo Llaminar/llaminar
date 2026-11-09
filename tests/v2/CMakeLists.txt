@@ -146,6 +146,10 @@ else()
     set(V2_CPU_NATIVE_ISA_CELLS NEON)
     if(LLAMINAR_CPU_ISA_UPPER STREQUAL "NEON_DOTPROD")
         list(APPEND V2_CPU_NATIVE_ISA_CELLS NEON_DOTPROD)
+    elseif(LLAMINAR_CPU_ISA_UPPER STREQUAL "NEON_I8MM")
+        # I8MM shares the DotProd arithmetic level; its automatic projection
+        # leaf is the row-pair SMMLA family, so this cell replaces the SDOT one.
+        list(APPEND V2_CPU_NATIVE_ISA_CELLS NEON_I8MM)
     endif()
 endif()
 list(GET V2_CPU_NATIVE_ISA_CELLS 0 V2_CPU_BASELINE_ISA_CELL)
@@ -155,7 +159,7 @@ v2_cpu_native_isa_runtime(<cell> <output>)
   Map a native ISA cell name to its LLAMINAR_ISA_LEVEL value.
 #]]
 function(v2_cpu_native_isa_runtime cell output)
-    if(cell STREQUAL "NEON_DOTPROD")
+    if(cell STREQUAL "NEON_DOTPROD" OR cell STREQUAL "NEON_I8MM")
         set(value "neon-dotprod")
     else()
         string(TOLOWER "${cell}" value)

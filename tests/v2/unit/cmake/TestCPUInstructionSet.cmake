@@ -19,15 +19,27 @@ foreach(processor IN ITEMS arm64 aarch64 ARM64 AARCH64)
        NOT "LLAMINAR_COMPILED_WITH_NEON=1" IN_LIST definitions OR
        NOT "LLAMINAR_COMPILED_WITH_AVX2=0" IN_LIST definitions OR
        NOT "LLAMINAR_COMPILED_WITH_AVX512=0" IN_LIST definitions OR
-       NOT "LLAMINAR_COMPILED_WITH_NEON_DOTPROD=0" IN_LIST definitions)
+       NOT "LLAMINAR_COMPILED_WITH_NEON_DOTPROD=0" IN_LIST definitions OR
+       NOT "LLAMINAR_COMPILED_WITH_NEON_I8MM=0" IN_LIST definitions)
         message(FATAL_ERROR "AArch64 policy is not native NEON: '${flags}' '${definitions}'")
     endif()
     llaminar_cpu_instruction_set("${processor}" neon_dotprod flags definitions)
     if(NOT flags STREQUAL "-mcpu=generic -march=armv8-a+simd+dotprod" OR
        NOT "LLAMINAR_COMPILED_WITH_NEON=1" IN_LIST definitions OR
        NOT "LLAMINAR_COMPILED_WITH_NEON_DOTPROD=1" IN_LIST definitions OR
+       NOT "LLAMINAR_COMPILED_WITH_NEON_I8MM=0" IN_LIST definitions OR
        NOT "LLAMINAR_COMPILED_WITH_AVX2=0" IN_LIST definitions)
         message(FATAL_ERROR "DotProd policy has the wrong native compiler envelope")
+    endif()
+    # I8MM is the DotProd envelope plus exactly one extension on the ARMv8.0
+    # base; an ARMv8.2+ base would implicitly add unadmitted LSE/RDMA/CRC.
+    llaminar_cpu_instruction_set("${processor}" Neon_I8mm flags definitions)
+    if(NOT flags STREQUAL "-mcpu=generic -march=armv8-a+simd+dotprod+i8mm" OR
+       NOT "LLAMINAR_COMPILED_WITH_NEON=1" IN_LIST definitions OR
+       NOT "LLAMINAR_COMPILED_WITH_NEON_DOTPROD=1" IN_LIST definitions OR
+       NOT "LLAMINAR_COMPILED_WITH_NEON_I8MM=1" IN_LIST definitions OR
+       NOT "LLAMINAR_COMPILED_WITH_AVX2=0" IN_LIST definitions)
+        message(FATAL_ERROR "I8MM policy has the wrong native compiler envelope: '${flags}' '${definitions}'")
     endif()
 endforeach()
 
@@ -41,7 +53,8 @@ foreach(processor IN ITEMS x86_64 AMD64 amd64 x64)
         if(NOT flags MATCHES "-mavx2" OR flags MATCHES "-march=" OR
            NOT "LLAMINAR_COMPILED_WITH_AVX2=1" IN_LIST definitions OR
            NOT "LLAMINAR_COMPILED_WITH_NEON=0" IN_LIST definitions OR
-           NOT "LLAMINAR_COMPILED_WITH_NEON_DOTPROD=0" IN_LIST definitions)
+           NOT "LLAMINAR_COMPILED_WITH_NEON_DOTPROD=0" IN_LIST definitions OR
+           NOT "LLAMINAR_COMPILED_WITH_NEON_I8MM=0" IN_LIST definitions)
             message(FATAL_ERROR "x86 compiler envelope changed: '${flags}' '${definitions}'")
         endif()
         if(isa STREQUAL "AVX2")
@@ -68,6 +81,8 @@ expect_rejection(arm64 AVX512 "incompatible with AArch64")
 expect_rejection(aarch64 AVX2 "incompatible with AArch64")
 expect_rejection(x86_64 NEON "incompatible with x86-64")
 expect_rejection(x86_64 NEON_DOTPROD "incompatible with x86-64")
+expect_rejection(x86_64 NEON_I8MM "incompatible with x86-64")
+expect_rejection(arm64 NEON_I8MM_SVE "incompatible with AArch64")
 expect_rejection(arm64 scalar "incompatible with AArch64")
 expect_rejection(x86_64 native "incompatible with x86-64")
 expect_rejection(riscv64 NEON "Unsupported CPU target")
