@@ -432,3 +432,17 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   9/9 cells single=0 grouped=budget 0 mismatches. NO driver-authority
   rejection — the REAL GNU-14 cc1plus+as jobs + -H PCH validation accepted
   (nothing real to fix back). Reviewer SOURCE122 (source) pending.
+
+## SOURCE122 FINAL (2026-11-09) — successor scope (SOURCE123)
+
+- P1a typed compiler-input admission: reject remap-file/VFS overlays,
+  profile-instr-use (codegen inputs) precisely, or bind the actual
+  backing-file/codegen authority; real/decoy/backing-input mutation controls.
+- P1b one validated driver-plan observation (jobs + routing); fail on
+  expansion errors; retain logical selection + symlink identity + pre/post
+  stability; symlink-retarget/search-shadow controls.
+- P1c complete per-job program binding: plan validation in verify; missing/
+  malformed/foreign/mismatched controls; 'all remaining hashes match' ≠
+  completeness.
+- Precision: asm-label classifier heuristic (__extension__/generic-lambda
+  `class T`) → narrow claim or close contexts.
