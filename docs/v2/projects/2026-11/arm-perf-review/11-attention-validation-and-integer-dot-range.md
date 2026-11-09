@@ -65,3 +65,16 @@ Proposed options (only with proof):
   (debug asserts). Structure: R1 = C1(03) + C2a(11b) + C2b(fatal finite
   check); R2 = C2c(FA admission) + C3/C4(04). R2 shared code validated via
   WSL x86 gate + Mac portability + GB10 attention parity/engine.
+
+## Reviewer P1 (2026-11-09, R1 @ 09cba9963) — tail overflow before validation
+
+- integerDot validates query magnitude only AFTER the scalar tail
+  `result[row] += int32_t(q[c])*k[row][c]`; invalid input can overflow INT32
+  before rejectAttentionData. Repro: T=n=65, bound.limit=1008, first 64
+  q=-1008/k=-32768, last q=-32768 → vector fold 2,113,929,216 + tail
+  1,073,741,824 > INT32_MAX.
+- REQUIRED FIX: reject invalid query magnitude BEFORE any bound-dependent
+  scalar op (tail included); retain the valid-input INT32 program; add a
+  tail-bearing adversarial regression (current n64 fixture only exercises
+  vector lanes with key=1). Amended R1 SHA → reviewer re-check (reviewer
+  pins to exact SHAs; in-flight R2 kept out of the reviewed tree).
