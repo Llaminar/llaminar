@@ -188,3 +188,18 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   real GNU-14 counts unchanged; AppleClang −14/envelope (old checker
   double-counted callee-saved reloads) → RE-CENSUS + update budget JSON when
   the tooling lands.
+
+## RESOLVED (2026-11-09) — b01d285dc; idea 29 stays open
+
+- 3-arm window (5 interleaved reps, Release NEON_I8MM gcc-14, .80):
+  17408×5120 M=1: 10t base 1014.5 (1011–1020) / R1 1060.2 (+4.5%) / fix
+  1009.7 (−0.5%); 20t 536.8 / 558.5 (+4.0%) / 543.9 (+1.3%) — R1 spreads
+  tight, non-overlapping; fix overlaps/touches base. 2048×4096 M=1 earlier
+  −4% did NOT reproduce (R1 0.966/0.955 of base; fix inside noise) → noise.
+  Other cells base-level or faster.
+- MECHANISM (honest): Rows=1 ZERO spills in all three on gcc-14 → M=1
+  recovery NOT explained by spills; likely the throw-path codegen
+  (scheduling/layout) in the decode loop removed by the cold noreturn fatal —
+  evidence = timing recovery + zero-spill census only.
+- STATUS: idea 28 RESOLVED with b01d285dc; idea 29 open (pre-existing grouped
+  spills). SOURCE116 tooling successor submitted (f6be6b510).
