@@ -4,8 +4,10 @@
  *
  * Each socket computes its own prepared fragment and contributes only live
  * unweighted records. The original root gathers once and combines fragments
- * in immutable source-cohort order. Original router weighting/return remains a
- * later graph edge; this stage never executes another participant's compute.
+ * in immutable source-cohort order. Its original root ticket may store the
+ * separately rounded router-weighted copy immediately after each final-add tile; the raw
+ * combined bank and later top-k order remain unchanged. This stage never
+ * executes another participant's compute.
  */
 #pragma once
 #include "../IComputeStage.h"
@@ -25,7 +27,9 @@ class MoEOverlayCanonicalRouteReturnTicketStorage;
 class MoECPUExpertShardRouteStage final : public IComputeStage {
 public:
     /** @brief Completed root-only host intervals; gather includes peer readiness/transport wait.
-     * @note Combine includes complete input validation and fixed participant-order FP32 addition.
+     * @note A fused root ticket reports only fused_combine_preweight_publication_ns;
+     * the separate children remain absent, so aggregate projection cannot double-count.
+     * Combine includes complete input validation and fixed participant-order FP32 addition.
      * Preweight includes destination validation, weighting and metadata; the ticket path additionally
      * includes its original release publication. Mapped joint-return signaling remains a later edge.
      * Absent components were not executed; an observed zero is retained without a synthetic 1ns.
@@ -33,6 +37,7 @@ public:
     struct RootTimingSample {
         ExpertHistogramSource source=ExpertHistogramSource::DecodeToken;
         std::optional<std::uint64_t> gather_ns, combine_ns, preweight_publication_ns;
+        std::optional<std::uint64_t> fused_combine_preweight_publication_ns; ///< One indivisible root ticket operation; never also reported as separate children.
     };
     /** @brief Stack-owned, nonmoving observation borrowed only for one serialized stage scope.
      * @note This carries no execution/publication authority. The worker owns it until its existing

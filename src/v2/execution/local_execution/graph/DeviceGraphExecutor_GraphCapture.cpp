@@ -442,8 +442,8 @@ namespace llaminar2
             bool collect_timing = false;
             std::uint64_t service_elapsed_ns = 0u;
             // Worker writes stack scalars; original await retires it before caller publication.
-            std::array<std::array<std::uint64_t,3>,kExpertHistogramProductionSourceCount> root_ns{};
-            std::array<std::array<std::uint64_t,3>,kExpertHistogramProductionSourceCount> root_calls{};
+            std::array<std::array<std::uint64_t,4>,kExpertHistogramProductionSourceCount> root_ns{};
+            std::array<std::array<std::uint64_t,4>,kExpertHistogramProductionSourceCount> root_calls{};
         } invocation{
             .executor = this,
             .graph = &graph,
@@ -484,7 +484,7 @@ namespace llaminar2
                                     const auto phase=expertHistogramProductionSourceIndex(sample->source);
                                     if(phase==kExpertHistogramProductionSourceCount)
                                         throw std::logic_error("CPU root timing has no production phase");
-                                    const std::array components{sample->gather_ns,sample->combine_ns,sample->preweight_publication_ns};
+                                    const std::array components{sample->gather_ns,sample->combine_ns,sample->preweight_publication_ns,sample->fused_combine_preweight_publication_ns};
                                     for(size_t component=0;component<components.size();++component)if(components[component]) {
                                         auto& ns=job.root_ns[phase][component];
                                         auto& calls=job.root_calls[phase][component];
@@ -600,8 +600,8 @@ namespace llaminar2
                 static_assert(expertHistogramProductionSourceIndex(ExpertHistogramSource::DecodeToken)==0u);
                 static_assert(expertHistogramProductionSourceIndex(ExpertHistogramSource::PrefillChunk)==1u);
                 static_assert(expertHistogramProductionSourceIndex(ExpertHistogramSource::GroupedVerifier)==2u);
-                constexpr std::array names{"cpu_root_gather","cpu_root_validated_fixed_order_combine","cpu_root_preweight_publication"};
-                constexpr std::array counters{"cpu_root_gather_calls","cpu_root_validated_fixed_order_combine_calls","cpu_root_preweight_publication_calls"};
+                constexpr std::array names{"cpu_root_gather","cpu_root_validated_fixed_order_combine","cpu_root_preweight_publication","cpu_root_fused_combine_preweight_publication"};
+                constexpr std::array counters{"cpu_root_gather_calls","cpu_root_validated_fixed_order_combine_calls","cpu_root_preweight_publication_calls","cpu_root_fused_combine_preweight_publication_calls"};
                 for(size_t phase=0;phase<phases.size();++phase)for(size_t component=0;component<names.size();++component) {
                     if(!invocation.root_calls[phase][component])continue;
                     PerfStatsCollector::recordTimingNs("retained_parent_transaction",names[component],

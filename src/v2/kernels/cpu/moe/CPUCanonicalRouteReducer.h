@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace llaminar2::cpu::moe
@@ -124,6 +125,21 @@ namespace llaminar2::cpu::moe
         int columns = 0;
     };
 
+    /**
+     * @brief Borrowed compact weighted copy of the SAME original route sums.
+     * The caller retains its publication lease and allocation authority. Sorted
+     * original slots name exactly the live sums; weights use that same order.
+     * Destination slots are independently sorted compact top-k coordinates,
+     * including holes; their complete extent is validated before either store.
+     * This view does not publish or own data and never replaces raw outputs.
+     */
+    struct CanonicalRoutePreweightedOutput {
+        std::span<float> values;
+        std::span<const int32_t> original_slots;
+        std::span<const int32_t> destination_slots; ///< Actual compact top-k coordinates, including inactive holes.
+        std::span<const float> weights;
+    };
+
     /** @brief Unweighted fixed-order combine, before any original top-k weighting. */
     struct CanonicalRouteDownPartialCombineArgs {
         std::span<const CanonicalRouteDownPartialRows> ordered_participants;
@@ -132,6 +148,7 @@ namespace llaminar2::cpu::moe
         int rows = 0;
         int top_k = 0;
         int columns = 0;
+        std::optional<CanonicalRoutePreweightedOutput> preweighted_output; ///< The same worker weights each completed column tile before advancing.
     };
     /**
      * @brief Combine original cohort partials in FP32 participant order only.

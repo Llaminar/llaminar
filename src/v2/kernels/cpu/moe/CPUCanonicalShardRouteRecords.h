@@ -6,7 +6,8 @@
  * its completed per-participant ranges and original router inputs, reconstructs
  * only selected CPU route mappings in admitted scratch, then invokes the same
  * fixed-order reducer used by dense expert-shard replay. It neither allocates
- * nor decides placement, and does not apply router weights.
+ * nor decides placement, and applies router weights only for an explicit borrowed compact output.
+ * Its ordinary combine-only interface retains its original behavior.
  */
 #pragma once
 #include "CPUCanonicalRouteReducer.h"
@@ -35,6 +36,7 @@ struct CanonicalShardRouteRecordArgs {
     int top_k=0;
     int columns=0;
     std::optional<CanonicalShardSparseRouteView> sparse_routes; ///< Mutually exclusive with dense router inputs.
+    std::optional<CanonicalRoutePreweightedOutput> preweighted_output; ///< Disjoint compact copy; slots/factor bytes must match the original router. Raw rows remain mandatory.
 };
 /**
  * @brief Validate all original members and route records before publishing combined rows.

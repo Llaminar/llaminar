@@ -6,6 +6,7 @@
 #include "../../../execution/moe/CanonicalMoERouteRecord.h"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <limits>
 namespace llaminar2::cpu::moe {
@@ -39,18 +40,37 @@ bool combineCanonicalShardRouteRecords(const CanonicalShardRouteRecordArgs &a) {
             yb>std::numeric_limits<uintptr_t>::max()-v) return true;
         return u<v+yb && v<u+xb;
     };
+    if(a.preweighted_output && (a.records.size()>maximum/sizeof(float) ||
+        a.source_ranges.size()>maximum/sizeof(RootedFloatRecordRange) ||
+        a.route_indices.size()>maximum/sizeof(float) || a.route_weights.size()>maximum/sizeof(float) ||
+        a.selected_expert_ids.size()>maximum/sizeof(int) ||
+        a.participant_route_maps.size()>maximum/sizeof(int32_t) ||
+        a.required_route_weights.size()>maximum/sizeof(float) ||
+        a.combined_route_rows.size()>maximum/sizeof(float) ||
+        a.preweighted_output->values.size()>maximum/sizeof(float) ||
+        a.preweighted_output->original_slots.size()>maximum/sizeof(int32_t) ||
+        a.preweighted_output->destination_slots.size()>maximum/sizeof(int32_t) ||
+        a.preweighted_output->weights.size()>maximum/sizeof(float)))return false;
     const auto sparse=a.sparse_routes.value_or(CanonicalShardSparseRouteView{});
-    const std::array<std::pair<const void*,size_t>,8> inputs{{
+    const std::array<std::pair<const void*,size_t>,11> inputs{{
         {a.records.data(),a.records.size_bytes()}, {a.source_ranges.data(),a.source_ranges.size_bytes()},
         {a.route_indices.data(),a.route_indices.size_bytes()}, {a.route_weights.data(),a.route_weights.size_bytes()},
         {a.selected_expert_ids.data(),a.selected_expert_ids.size_bytes()},
         {sparse.original_slots.data(),sparse.original_slots.size_bytes()},
         {sparse.expert_ids.data(),sparse.expert_ids.size_bytes()},
-        {sparse.weights.data(),sparse.weights.size_bytes()}}};
-    const std::array<std::pair<const void*,size_t>,3> outputs{{
+        {sparse.weights.data(),sparse.weights.size_bytes()},
+        {a.preweighted_output?a.preweighted_output->original_slots.data():nullptr,
+         a.preweighted_output?a.preweighted_output->original_slots.size_bytes():0},
+        {a.preweighted_output?a.preweighted_output->weights.data():nullptr,
+         a.preweighted_output?a.preweighted_output->weights.size_bytes():0},
+        {a.preweighted_output?a.preweighted_output->destination_slots.data():nullptr,
+         a.preweighted_output?a.preweighted_output->destination_slots.size_bytes():0}}};
+    const std::array<std::pair<const void*,size_t>,4> outputs{{
         {a.participant_route_maps.data(),slots*population*sizeof(int32_t)},
         {a.required_route_weights.data(),slots*sizeof(float)},
-        {a.combined_route_rows.data(),slots*h*sizeof(float)}}};
+        {a.combined_route_rows.data(),slots*h*sizeof(float)},
+        {a.preweighted_output?a.preweighted_output->values.data():nullptr,
+         a.preweighted_output?a.preweighted_output->values.size_bytes():0}}};
     for (size_t i=0;i<outputs.size();++i) {
         if (outputs[i].second && !outputs[i].first) return false;
         for (const auto &input:inputs)
@@ -71,6 +91,41 @@ bool combineCanonicalShardRouteRecords(const CanonicalShardRouteRecordArgs &a) {
                !std::isfinite(sparse.weights[entry]) || sparse.weights[entry]==0.0f ||
                !std::binary_search(a.selected_expert_ids.begin(),a.selected_expert_ids.end(),expert))return false;
             prior=slot;
+        }
+    }
+    auto preweighted_output=a.preweighted_output;
+    if(preweighted_output) {
+        auto &sink=*preweighted_output;
+        const size_t count=sink.original_slots.size();
+        if(count>slots || sink.weights.size()!=count ||
+           (count && (!sink.original_slots.data() || !sink.weights.data())))return false;
+        // The router is the sole multiplier/selection authority. A borrowed
+        // sink may repeat its immutable metadata, but cannot supply a second
+        // finite factor or a different set of original slots. Authenticate the
+        // complete contract before changing even the scratch route maps.
+        const auto same_factor=[](float left,float right) {
+            return std::bit_cast<uint32_t>(left)==std::bit_cast<uint32_t>(right);
+        };
+        if(a.sparse_routes) {
+            if(count!=sparse.original_slots.size())return false;
+            for(size_t entry=0;entry<count;++entry)
+                if(sink.original_slots[entry]!=sparse.original_slots[entry] ||
+                   !same_factor(sink.weights[entry],sparse.weights[entry]))return false;
+            // Pass the original router views onwards after authenticating any
+            // equivalent borrowed view; no independent weighting bank is read.
+            sink.original_slots=sparse.original_slots;
+            sink.weights=sparse.weights;
+        } else {
+            size_t entry=0;
+            for(size_t slot=0;slot<slots;++slot) {
+                if(a.route_weights[slot]==0.0f ||
+                   !std::binary_search(a.selected_expert_ids.begin(),a.selected_expert_ids.end(),
+                                       static_cast<int>(a.route_indices[slot])))continue;
+                if(entry>=count || static_cast<size_t>(sink.original_slots[entry])!=slot ||
+                   !same_factor(sink.weights[entry],a.route_weights[slot]))return false;
+                ++entry;
+            }
+            if(entry!=count)return false;
         }
     }
     std::fill_n(a.participant_route_maps.data(),slots*population,int32_t{-1});
@@ -98,6 +153,6 @@ bool combineCanonicalShardRouteRecords(const CanonicalShardRouteRecordArgs &a) {
     }
     if (slots==0) return true;
     return combineCanonicalRouteDownPartialsOrdered({std::span(banks).first(population),
-        a.combined_route_rows,a.required_route_weights.data(),a.rows,a.top_k,a.columns});
+        a.combined_route_rows,a.required_route_weights.data(),a.rows,a.top_k,a.columns,preweighted_output});
 }
 } // namespace llaminar2::cpu::moe

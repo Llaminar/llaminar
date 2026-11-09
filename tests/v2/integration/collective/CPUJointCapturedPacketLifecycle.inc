@@ -28,6 +28,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/moe/CanonicalMoERouteRecord.h"
+#include "kernels/cpu/moe/CPUCanonicalShardRouteRecords.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEGraphOwnerProjection.h"
 #include "execution/moe/MoEOverlayActivationEpochProtocol.h"
@@ -1324,6 +1325,21 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
         returned.residency_lease_terminal = MoEOverlayHostDispatchLeaseTerminal::Release;
         local_return = std::make_unique<MoESparseReturnReduceStage>(returned);
     }
+    if(is_root) {
+        // Exercise the actual bound lease before any captured consumer is
+        // launched. Rejection keeps ownership armed; scope exit cancels it
+        // without publishing/incrementing a sequence or touching payload.
+        auto lease=canonical->arm(1);
+        requireOriginal(bool(lease),"original pristine canonical publication lease");
+        EXPECT_TRUE(lease.authorizes(*canonical,1));
+        EXPECT_FALSE(lease.authorizes(*canonical,0));
+        EXPECT_FALSE(lease.authorizes(*canonical,2));
+        MoEOverlayCanonicalRouteReturnTicketStorage foreign_ticket;
+        EXPECT_FALSE(lease.authorizes(foreign_ticket,1));
+        auto foreign_epoch=input;foreign_epoch.residency_epoch=2;
+        EXPECT_FALSE(combineAndPublishMoEOverlayCanonicalShardRouteRows(*canonical,lease,foreign_epoch,{}));
+        EXPECT_TRUE(lease.authorizes(*canonical,1));
+    }
     for (uint64_t generation = 1; generation <= invocation_count; ++generation)
     {
         const auto& recorded = trace[(generation - 1) % trace.size()];
@@ -1445,9 +1461,12 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
         EXPECT_EQ(root_sample.has_value(),is_root);
         if(root_sample){
             EXPECT_EQ(root_sample->source,recorded.histogram_source);
-            EXPECT_TRUE(root_sample->gather_ns);EXPECT_TRUE(root_sample->combine_ns);
-            // Even an empty live prefix executes the original ticket metadata/release edge.
-            EXPECT_TRUE(root_sample->preweight_publication_ns);
+            EXPECT_TRUE(root_sample->gather_ns);
+            // Even an empty prefix executes one complete fused ticket edge.
+            // Separate children would falsely double-count the same operation.
+            EXPECT_TRUE(root_sample->fused_combine_preweight_publication_ns);
+            EXPECT_FALSE(root_sample->combine_ns);
+            EXPECT_FALSE(root_sample->preweight_publication_ns);
         }
         const size_t gathered_prefix = size_t(live * top_k) * (is_root ? members.size() : 1);
         EXPECT_TRUE(std::all_of(packed.data() + gathered_prefix * (hidden + 1),

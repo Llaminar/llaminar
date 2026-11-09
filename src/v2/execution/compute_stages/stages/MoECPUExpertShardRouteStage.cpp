@@ -279,24 +279,25 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
         {sparse->expert_ids_host,sparse->live_entry_count},
         {sparse->route_weights_host,sparse->live_entry_count}};
     const auto combine_begin=timing_observation_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-    if(!cpu::moe::combineCanonicalShardRouteRecords({
+    const cpu::moe::CanonicalShardRouteRecordArgs combine_args{
         {records,gathered*canonical_moe_route_record::recordWidth(p.columns)},p.source_ranges,
         {p.route_indices?p.route_indices->data():nullptr,p.route_indices?slots:0},
         {p.route_weights?p.route_weights->data():nullptr,p.route_weights?slots:0},
         invocation_bank?std::span<const int>(invocation_bank->layerForModelLayer(p.original_source->layer()).cpu_fragment_expert_ids):p.original_source->expertIds(),
         p.participant_route_maps,p.required_route_weights,
         {p.combined_routes->mutable_data(),slots*static_cast<size_t>(p.columns)},
-        p.original_source->ownership().geometry().experts,p.rows,p.top_k,p.columns,sparse_view})) return reject("canonical_fixed_order_combine");
-    if(timing_observation_)timing_observation_->sample_.combine_ns=rootTimingElapsed(combine_begin);
+        p.original_source->ownership().geometry().experts,p.rows,p.top_k,p.columns,sparse_view};
     if(publication) {
-        const auto publication_begin=timing_observation_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-        if(!publishMoEOverlayCanonicalRouteRows(*p.original_canonical_ticket,*publication,*sparse,
-            {p.combined_routes->data(),p.combined_routes->numel()},MoEOverlayCanonicalRouteSourceLayout::originalSlots()))return reject("canonical_live_ticket_publication");
+        if(!combineAndPublishMoEOverlayCanonicalShardRouteRows(*p.original_canonical_ticket,
+            *publication,*sparse,combine_args))return reject("canonical_fused_combine_ticket_publication");
+        if(timing_observation_)timing_observation_->sample_.fused_combine_preweight_publication_ns=rootTimingElapsed(combine_begin);
         // The mapped ticket owns these values. This protocol return carries
         // only completion metadata, never a duplicate weighted route payload.
         p.original_return_rows->live_row_count=0u;
         p.original_return_rows->layout=MoEOverlayReturnLayout::CanonicalExpertRoutes;
-        if(timing_observation_)timing_observation_->sample_.preweight_publication_ns=rootTimingElapsed(publication_begin);
+    } else {
+        if(!cpu::moe::combineCanonicalShardRouteRecords(combine_args))return reject("canonical_fixed_order_combine");
+        if(timing_observation_)timing_observation_->sample_.combine_ns=rootTimingElapsed(combine_begin);
     }
     publish();
     return finish();

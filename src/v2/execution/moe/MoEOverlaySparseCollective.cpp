@@ -13,6 +13,7 @@
 #include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
 
+#include "kernels/cpu/moe/CPUCanonicalShardRouteRecords.h"
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
 #include "collective/CollectiveTimeoutPolicy.h"
@@ -791,6 +792,20 @@ namespace llaminar2
         return *this;
     }
 
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::Publication::authorizes(
+        const MoEOverlayCanonicalRouteReturnTicketStorage& storage,
+        uint64_t residency_epoch) const noexcept
+    {
+        if(owner_ != &storage || sequence_ == 0u || residency_epoch == 0u ||
+            !storage.hasValidBoundIdentity() ||
+            storage.producer_lifecycle_ != ProducerLifecycle::Armed ||
+            storage.armed_sequence_ != sequence_ ||
+            storage.control_host_->residency_epoch != residency_epoch)return false;
+        const auto published=std::atomic_ref<uint64_t>(storage.control_host_->published_sequence).load(std::memory_order_acquire);
+        const auto consumed=std::atomic_ref<uint64_t>(storage.control_host_->consumed_sequence).load(std::memory_order_acquire);
+        return published==consumed && published!=std::numeric_limits<uint64_t>::max() && sequence_==published+1u;
+    }
+
     bool MoEOverlayCanonicalRouteReturnTicketStorage::Publication::publish(
         size_t live_entry_count) noexcept
     {
@@ -1078,6 +1093,89 @@ namespace llaminar2
             ticket.compactRouteSlotsHost()[entry]=input.compact_route_slots_host[entry];
         }
         return publication.publish(input.live_entry_count);
+    }
+
+    bool combineAndPublishMoEOverlayCanonicalShardRouteRows(
+        MoEOverlayCanonicalRouteReturnTicketStorage& ticket,
+        MoEOverlayCanonicalRouteReturnTicketStorage::Publication& publication,
+        const MoEOverlaySparseRows& input,
+        const cpu::moe::CanonicalShardRouteRecordArgs& original) noexcept
+    {
+        if (!publication.authorizes(ticket,input.residency_epoch) ||
+            input.key.layer_idx!=ticket.layerIndex() || input.d_model!=ticket.dModel() ||
+            input.top_k<=0 || input.live_row_count>input.row_capacity ||
+            input.live_entry_count>input.entry_capacity ||
+            input.live_entry_count>ticket.routeCapacity() ||
+            (input.live_entry_count && !input.live_row_count) ||
+            original.columns!=input.d_model || original.top_k!=input.top_k ||
+            !original.sparse_routes || original.preweighted_output ||
+            !ticket.originalRouteSlotsHost() || !ticket.compactRouteSlotsHost() ||
+            !ticket.contributionRowsHost()) return false;
+        const auto &sparse=*original.sparse_routes;
+        const size_t count=input.live_entry_count,width=static_cast<size_t>(input.d_model);
+        const auto maximum=std::numeric_limits<size_t>::max();
+        if(ticket.routeCapacity()>maximum/width || ticket.routeCapacity()*width>maximum/sizeof(float) ||
+           count>maximum/sizeof(int32_t) ||
+           sparse.original_slots.size()!=count || sparse.expert_ids.size()!=count || sparse.weights.size()!=count ||
+           sparse.original_slots.data()!=input.original_route_slots_host ||
+           sparse.expert_ids.data()!=input.expert_ids_host || sparse.weights.data()!=input.route_weights_host ||
+           (count && !input.compact_route_slots_host))return false;
+        if(original.records.size()>maximum/sizeof(float) ||
+           original.source_ranges.size()>maximum/sizeof(RootedFloatRecordRange) ||
+           original.selected_expert_ids.size()>maximum/sizeof(int) ||
+           original.participant_route_maps.size()>maximum/sizeof(int32_t) ||
+           original.required_route_weights.size()>maximum/sizeof(float) ||
+           original.combined_route_rows.size()>maximum/sizeof(float))return false;
+        int32_t previous_original=-1,previous_compact=-1;
+        for(size_t entry=0;entry<count;++entry) {
+            const auto slot=input.original_route_slots_host[entry],compact=input.compact_route_slots_host[entry];
+            if(slot<=previous_original || static_cast<size_t>(slot)>=ticket.routeCapacity() ||
+               compact<=previous_compact)return false;
+            previous_original=slot;previous_compact=compact;
+        }
+        // Ticket metadata and payload are all outputs. Validate their complete
+        // roots against each other and the original borrowed sources/scratch
+        // before the fused kernel writes either raw or weighted FP32 output.
+        const auto overlaps=[](const void* a,size_t an,const void* b,size_t bn) {
+            if(!an || !bn)return false;
+            const auto x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);
+            return !a || !b || an>std::numeric_limits<uintptr_t>::max()-x ||
+                bn>std::numeric_limits<uintptr_t>::max()-y || (x<y+bn && y<x+an);
+        };
+        const std::array<std::pair<const void*,size_t>,3> outputs{{
+            {ticket.contributionRowsHost(),ticket.routeCapacity()*width*sizeof(float)},
+            {ticket.originalRouteSlotsHost(),ticket.routeCapacity()*sizeof(int32_t)},
+            {ticket.compactRouteSlotsHost(),ticket.routeCapacity()*sizeof(int32_t)}}};
+        const std::array<std::pair<const void*,size_t>,10> inputs{{
+            {original.records.data(),original.records.size_bytes()},
+            {original.source_ranges.data(),original.source_ranges.size_bytes()},
+            {original.selected_expert_ids.data(),original.selected_expert_ids.size_bytes()},
+            {original.participant_route_maps.data(),original.participant_route_maps.size_bytes()},
+            {original.required_route_weights.data(),original.required_route_weights.size_bytes()},
+            {original.combined_route_rows.data(),original.combined_route_rows.size_bytes()},
+            {input.original_route_slots_host,count*sizeof(int32_t)},
+            {input.compact_route_slots_host,count*sizeof(int32_t)},
+            {input.expert_ids_host,count*sizeof(int32_t)},
+            {input.route_weights_host,count*sizeof(float)}}};
+        for(size_t i=0;i<outputs.size();++i) {
+            for(const auto &in:inputs)if(overlaps(outputs[i].first,outputs[i].second,in.first,in.second))return false;
+            for(size_t j=0;j<i;++j)if(overlaps(outputs[i].first,outputs[i].second,outputs[j].first,outputs[j].second))return false;
+        }
+        auto args=original;
+        args.preweighted_output=cpu::moe::CanonicalRoutePreweightedOutput{
+            {ticket.contributionRowsHost(),ticket.routeCapacity()*width},sparse.original_slots,
+            {input.compact_route_slots_host,count},sparse.weights};
+        if(!cpu::moe::combineCanonicalShardRouteRecords(args))return false;
+        // Retain the existing diagnostic: NaN validation is outside normal
+        // serving and must still reject before releasing an invalid ticket.
+        if(debugEnv().validation.fail_on_nan)
+            for(size_t entry=0;entry<count;++entry)for(size_t column=0;column<width;++column)
+                if(!std::isfinite(ticket.contributionRowsHost()[static_cast<size_t>(input.compact_route_slots_host[entry])*width+column]))return false;
+        for(size_t entry=0;entry<count;++entry) {
+            ticket.originalRouteSlotsHost()[entry]=input.original_route_slots_host[entry];
+            ticket.compactRouteSlotsHost()[entry]=input.compact_route_slots_host[entry];
+        }
+        return publication.publish(count);
     }
 
     bool MoEOverlayCanonicalRouteReturnTicketStorage::payloadReadyFor(

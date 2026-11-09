@@ -1116,3 +1116,60 @@ raw A/C/A samples, ISA and isolated counters),
 `/tmp/qfn-canonical-ingress-model-r1124/` (matched model, resource and retirement
 receipts). The 500/40 target remains open. Full preflight remains explicitly
 outside this focused iteration.
+
+
+### CPU root combine/preweight: live-entry worksharing
+
+The original root still validates and combines every required participant in
+its existing FP32 order, keeps the complete original raw output, and publishes
+the same compact weighted ticket. One worker now weights each completed column
+tile immediately after the unchanged `vec_add` call. The validated live-slot
+list drives the task grid directly; inactive routes and per-tile binary searches
+are omitted. This removes the separate whole-bank traversal/workshare, not the
+raw read itself. Column partitions, multiplier authority, allocations, transfer
+extents, graph edges and publication sequence remain unchanged. Borrowed sink
+metadata, factor bytes, aliases and armed publication are checked before writes.
+A single fused timing child prevents counting the same operation twice.
+
+An initial dual-output arithmetic primitive was rejected: its compiled scalar
+and vector tails selected different NaN payloads. It is removed completely.
+Final code calls the original addition primitive, then separately multiplies
+by the original finite router factor. The final linked ISA has no FMA or hot
+vector spills. Same-worker reuse is intentional; arbitrary-width L1 residency
+is not guaranteed. Runtime scalar/AVX2/AVX512 tests use the AVX512 build and do
+not claim independent pure-AVX2 compilation.
+
+Eight original CPU registrations pass, including 2–8 participant orders,
+distinct signed quiet/signaling NaNs, subnormals, zero/Inf/cancellation, tails,
+aliases, bad factor/slot metadata, held/foreign publication and repeated dirty
+large→small→empty use. The original captured fixture passes prefill, decode and
+verifier cases on CUDA, MI50 and 7900 XTX: nine registrations, twenty generations
+each. Focused regressions are explicitly registered in production preflight;
+the complete preflight was not run during this iteration.
+
+The existing ready-record performance owner retains 4480 slots but uses the
+correct logical extent: M64/640 slots with453 live routes, or M448/4480 with3208.
+These are authored sparse controls, not captured model route vectors. At28
+workers on one actual socket, two AVX512 lifetimes measure **122.760→60.791** and
+**118.838→58.822 μs** for M64 (about2.02×); M448 measures **1887.430→1830.245** and
+**1879.650→1777.090 μs** (3.1–5.8%). Runtime AVX2 gives1.93×/1.04× respectively.
+All30 small-case pairs favor the candidate; large cases have substantial
+first/second-arm variation and only15–16 paired wins. Earlier small-case data
+that mistakenly used logical M448 is retained as diagnostic, not the M64 result.
+
+The matched passive Release model measures **286.040438 prefill /39.074346
+decode** tok/s versus280.307100 /38.534730: **+2.05% /+1.40%** in this comparison.
+All768 generated IDs, MTP work, normalized configuration and initial placement
+match. Controls remain512 input/256 generated, one warmup/three measurements,
+two MI50 continuation cards and two physical CPU socket ranks, context262144,
+dynamic MTP/balancing, RAM ngrams and16/32GiB prefix budgets. This is a modest
+measured model gain; the500/40 target is still open.
+
+All processes retire;206 driver snapshots report zero findings. The220 passive
+resource samples show maximum individual RSS82.863GB and per-client VRAM
+32.455/32.279GB, comparable to the previous run; aliases are never summed and
+this is not a long-duration leak certificate. Metadata-only cleanup removes18
+retired run-owned prefix files (727,912,509 bytes), without payload reads/hashes.
+Evidence: `/tmp/qfn-cpu-root-combine-preweight-r1125/` (focused/native/ISA and raw
+paired economy) and `/tmp/qfn-cpu-root-fusion-model-r1125/` (matched model,
+configuration, resources, driver observation and retirement).

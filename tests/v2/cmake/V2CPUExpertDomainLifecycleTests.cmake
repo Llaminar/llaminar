@@ -5,10 +5,11 @@ The canonical lscpu-derived V2_TEST_SOCKETS owns launch eligibility. Missing
 populations remain unqualified; no oversubscribed process control substitutes
 for physical sockets. Device-free membership and 1–8 production math remain.
 ]]
-# Release deliberately owns only performance targets. Keep functional target
-# creation, source/property mutations and registration under the same policy.
-# Integration still executes every declaration and rejects missing owners.
-if(V2_PERF_TESTS_ONLY)
+# Explicit Release qualification uses these original owners and core ABI.
+# Ordinary Release selection still omits them through the shared selector.
+v2_test_target_selected(v2_integration_cpu_expert_domain_lifecycle cpu_domain_owner_selected)
+v2_test_target_selected(v2_unit_cpu_expert_socket_membership cpu_membership_owner_selected)
+if(NOT cpu_domain_owner_selected AND NOT cpu_membership_owner_selected)
     return()
 endif()
 

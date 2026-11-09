@@ -6,6 +6,7 @@
 #include "kernels/cpu/moe/CPUCanonicalShardRouteRecords.h"
 #include "execution/moe/CanonicalMoERouteRecord.h"
 #include "kernels/cpu/primitives/VectorPrimitives.h"
+#include "execution/moe/MoEOverlaySparseCollective.h"
 #include "utils/CPUFeatures.h"
 #include <cstring>
 #include <omp.h>
@@ -266,4 +267,170 @@ TEST(CPUShardRouteCollective, FirstPairDirectAddMatchesOriginalBytesAndLiveExten
             }
         }
     }
+}
+
+/**
+ * @test Authored compact shard records preserve both original outputs when the
+ * worker preweights each completed final-add tile. This is numerical/lifecycle contract
+ * coverage, not a recorded route trace, NUMA or captured-consumer certificate.
+ */
+TEST(CPUShardRouteCollective, FusedFinalAddPreservesRawAndWeightedBytes) {
+    const int saved=omp_get_max_threads();
+    struct Restore {int value;~Restore(){omp_set_num_threads(value);}} restore{saved};
+    // Same source bit corpus as the first-pair control, now reaching the NEW
+    // fused workshare and its scalar tails. Explicit participant-varying
+    // NaN lanes make operand reversal visible even in a one-column route.
+    constexpr std::array<uint32_t,16> patterns{
+        0x00000000u,0x80000000u,0x3f800000u,0xbf800000u,
+        0x7f800000u,0xff800000u,0x7fc12345u,0xffc54321u,
+        0x7f812345u,0x00000001u,0x80000001u,0x00800000u,
+        0x60ad78ecu,0xe0ad78ecu,0x33800000u,0x3f800001u};
+    for(const int threads:{1,3})for(const int columns:{1,7,16,17,31,32,33,65,2560})
+    for(size_t degree=2;degree<=8;++degree) {
+        SCOPED_TRACE("workers="+std::to_string(threads)+" columns="+std::to_string(columns)+
+            " degree="+std::to_string(degree));
+        omp_set_num_threads(threads);
+        constexpr int rows=3,top_k=3,slots=rows*top_k;
+        std::array<int32_t,5> original_slots{0,2,3,5,8},compact_slots{0,1,3,5,7};
+        const std::array<int32_t,5> experts{1,1,1,1,1};
+        const std::array<int,1> selected{1};
+        std::array<float,5> weights{.3f,-.75f,.5f,0x1.000002p-1f,-0x1p-120f};
+        std::vector<float> records;
+        std::vector<RootedFloatRecordRange> ranges(degree);
+        for(size_t arrival=0;arrival<degree;++arrival) {
+            const size_t participant=degree-1-arrival,first=records.size()/size_t(columns+1);
+            for(const auto slot:original_slots) {
+                const auto begin=records.size();records.resize(begin+size_t(columns+1));
+                for(int column=0;column<columns;++column) {
+                    const size_t lane=(size_t(column)+size_t(slot)*3u)%patterns.size();
+                    uint32_t bits=patterns[(lane+participant*5u)%patterns.size()];
+                    const uint32_t sign=participant%2u?0x80000000u:0u;
+                    if(lane==6)bits=sign|uint32_t(0x7fc12345u+participant); // Distinct quiet NaNs.
+                    if(lane==8)bits=sign|uint32_t(0x7f812345u+participant); // Distinct signaling NaNs.
+                    if(lane==9)bits=uint32_t(1u+participant); // Actual positive subnormals.
+                    if(lane==10)bits=0x80000000u|uint32_t(1u+participant); // Negative subnormals.
+                    float value=std::bit_cast<float>(bits);
+                    if(lane==0)value=participant==0?1e20f:participant==1?-1e20f:float(participant+3);
+                    if(lane==1)value=participant==0?-0.0f:0.0f;
+                    records[begin+size_t(column)]=value;
+                }
+                ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(records.data()+begin,columns,size_t(slot)));
+            }
+            ranges[participant]={int(participant),first,original_slots.size()};
+        }
+        std::vector<int32_t> maps(degree*slots);
+        std::vector<float> required(slots),raw(size_t(slots)*columns,-991.0f),weighted(raw.size(),-993.0f);
+        CanonicalShardRouteRecordArgs args{records,ranges,{},{},selected,maps,required,raw,512,rows,top_k,columns,
+            CanonicalShardSparseRouteView{original_slots,experts,weights}};
+        MoEOverlaySparseRows input;
+        input.row_capacity=rows;input.entry_capacity=slots;input.live_row_count=rows;
+        input.live_entry_count=original_slots.size();input.d_model=columns;input.top_k=top_k;
+        input.original_route_slots_host=original_slots.data();input.compact_route_slots_host=compact_slots.data();
+        input.route_weights_host=weights.data();
+        ASSERT_TRUE(combineCanonicalShardRouteRecords(args));
+        ASSERT_TRUE(preweightMoEOverlayCanonicalRouteRows(input,raw,
+            MoEOverlayCanonicalRouteSourceLayout::originalSlots(),weighted,
+            MoEOverlayCanonicalRouteSourceIndex::CompactRouteSlot));
+        const auto expected_raw=raw,expected_weighted=weighted;
+        for(int replay=0;replay<3;++replay) {
+            std::fill(raw.begin(),raw.end(),-991.0f);std::fill(weighted.begin(),weighted.end(),-993.0f);
+            args.preweighted_output=CanonicalRoutePreweightedOutput{weighted,original_slots,compact_slots,weights};
+            ASSERT_TRUE(combineCanonicalShardRouteRecords(args));
+            EXPECT_EQ(std::memcmp(raw.data(),expected_raw.data(),raw.size()*sizeof(float)),0);
+            EXPECT_EQ(std::memcmp(weighted.data(),expected_weighted.data(),weighted.size()*sizeof(float)),0);
+        }
+        // An existing-team call consumes already-validated immutable maps. The
+        // record validator itself remains a single caller, matching serving.
+        std::array<CanonicalRouteDownPartialRows,8> banks;
+        for(size_t p=0;p<degree;++p)banks[p]={
+            std::span<const float>(records).subspan(ranges[p].first_record*size_t(columns+1),
+                ranges[p].record_count*size_t(columns+1)),std::span<const int32_t>(maps).subspan(p*slots,slots)};
+        std::fill(raw.begin(),raw.end(),-991.0f);std::fill(weighted.begin(),weighted.end(),-993.0f);
+        int failures=0;
+#pragma omp parallel reduction(+:failures)
+        {
+            if(!combineCanonicalRouteDownPartialsOrdered({std::span(banks).first(degree),raw,
+                required.data(),rows,top_k,columns,args.preweighted_output}))++failures;
+        }
+        EXPECT_EQ(failures,0);
+        EXPECT_EQ(std::memcmp(raw.data(),expected_raw.data(),raw.size()*sizeof(float)),0);
+        EXPECT_EQ(std::memcmp(weighted.data(),expected_weighted.data(),weighted.size()*sizeof(float)),0);
+    }
+}
+
+/** @test Malformed weighted sinks fail before either payload changes; empty/reset work preserves holes. */
+TEST(CPUShardRouteCollective, FusedFinalAddRejectsIncompleteSinksAndResetsLiveExtent) {
+    Replay a;
+    const std::array<int32_t,4> slots{0,2,3,4},destinations{0,1,3,6},experts{64,511,64,511};
+    const std::array<float,4> weights{.25f,.75f,.5f,.25f};
+    std::array<float,Replay::M*Replay::K*Replay::H> weighted;
+    auto args=a.args();
+    for(const bool sparse_input:{false,true}) {
+      args=a.args();
+      if(sparse_input) {
+        args.route_indices={};args.route_weights={};
+        args.sparse_routes=CanonicalShardSparseRouteView{slots,experts,weights};
+      }
+      for(int mutation=0;mutation<14;++mutation) {
+        auto original=slots,compact=destinations;auto factors=weights;
+        a.combined.fill(-991);weighted.fill(-993);
+        auto sink=CanonicalRoutePreweightedOutput{weighted,original,compact,factors};
+        if(mutation==0)sink.values=sink.values.first(3);
+        if(mutation==1)sink.values=a.combined;
+        if(mutation==2)sink.values=std::span(a.records).first(weighted.size());
+        if(mutation==3)sink.original_slots=sink.original_slots.first(3);
+        if(mutation==4)sink.weights=sink.weights.first(3);
+        if(mutation==5)original[1]=original[0];
+        if(mutation==6)original[3]=99;
+        if(mutation==7)compact[1]=compact[0];
+        if(mutation==8)compact[3]=99;
+        if(mutation==9)factors[2]=NAN;
+        if(mutation==10)factors[2]=0.0f;
+        if(mutation==11)sink.destination_slots=sink.destination_slots.first(3);
+        if(mutation==12)original[2]=1; // Does not name a required original route.
+        if(mutation==13)factors[2]=.375f; // Finite but NOT the original router multiplier.
+        args.preweighted_output=sink;
+        EXPECT_FALSE(combineCanonicalShardRouteRecords(args))<<mutation;
+        EXPECT_TRUE(std::all_of(a.combined.begin(),a.combined.end(),[](float x){return x==-991;}));
+        EXPECT_TRUE(std::all_of(weighted.begin(),weighted.end(),[](float x){return x==-993;}));
+      }
+      // Both original dense and sparse router views admit the exact factors.
+      args.preweighted_output=CanonicalRoutePreweightedOutput{weighted,slots,destinations,weights};
+      ASSERT_TRUE(combineCanonicalShardRouteRecords(args));
+    }
+    args.preweighted_output=CanonicalRoutePreweightedOutput{weighted,slots,destinations,weights};
+    ASSERT_TRUE(combineCanonicalShardRouteRecords(args));
+    // Reuse the same capacity for one live record and then empty work. Neither
+    // operation may clear or communicate the now-inactive payload capacity.
+    for(size_t p=0;p<2;++p)a.ranges[p].record_count=1;
+    args.sparse_routes=CanonicalShardSparseRouteView{std::span(slots).first(1),std::span(experts).first(1),std::span(weights).first(1)};
+    args.preweighted_output=CanonicalRoutePreweightedOutput{weighted,std::span(slots).first(1),std::span(destinations).first(1),std::span(weights).first(1)};
+    a.combined.fill(-991);weighted.fill(-993);
+    // The ready record bank retains its original ranges; a one-record prefix
+    // is not a new gather and must still form a complete nonoverlapping range.
+    a.records.resize(2*(Replay::H+1));
+    for(size_t p=0;p<2;++p) {
+        a.ranges[p]={int(p),p,1};
+        ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(a.records.data()+p*(Replay::H+1),Replay::H,0));
+    }
+    args.records=a.records;args.source_ranges=a.ranges;
+    ASSERT_TRUE(combineCanonicalShardRouteRecords(args));
+    EXPECT_TRUE(std::all_of(a.combined.begin()+Replay::H,a.combined.end(),[](float x){return x==-991;}));
+    EXPECT_TRUE(std::all_of(weighted.begin()+Replay::H,weighted.end(),[](float x){return x==-993;}));
+    a.records.clear();a.ranges={RootedFloatRecordRange{0,0,0},RootedFloatRecordRange{1,0,0}};
+    args.records={};args.source_ranges=a.ranges;args.sparse_routes=CanonicalShardSparseRouteView{};
+    args.preweighted_output=CanonicalRoutePreweightedOutput{weighted,{},{},{}};
+    const auto prior_raw=a.combined,prior_weighted=weighted;
+    ASSERT_TRUE(combineCanonicalShardRouteRecords(args));
+    EXPECT_EQ(a.combined,prior_raw);EXPECT_EQ(weighted,prior_weighted);
+}
+
+/** @test An unarmed/foreign-epoch publication cannot touch either root payload. */
+TEST(CPUShardRouteCollective, FusedTicketRejectsUnarmedLeaseBeforePayloadWrites) {
+    Replay a;MoEOverlaySparseRows input;
+    MoEOverlayCanonicalRouteReturnTicketStorage ticket;
+    MoEOverlayCanonicalRouteReturnTicketStorage::Publication unarmed;
+    EXPECT_FALSE(unarmed.authorizes(ticket,1));
+    EXPECT_FALSE(combineAndPublishMoEOverlayCanonicalShardRouteRows(ticket,unarmed,input,a.args()));
+    EXPECT_TRUE(std::all_of(a.combined.begin(),a.combined.end(),[](float x){return x==-991;}));
 }

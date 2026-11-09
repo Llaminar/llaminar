@@ -374,6 +374,7 @@ TEST(CPUJointServingMetadata, RootTimingLifecycle) {
                 ASSERT_TRUE(sample->gather_ns);ASSERT_TRUE(sample->combine_ns);
                 // Standalone dense records have no original sparse publication edge.
                 EXPECT_FALSE(sample->preweight_publication_ns);
+                EXPECT_FALSE(sample->fused_combine_preweight_publication_ns);
                 ++gather_observations;++combine_observations;
                 EXPECT_TRUE(std::all_of(combined.data(),combined.data()+combined.numel(),
                     [live](float value){return value==(live?3.0f:-991.0f);}));

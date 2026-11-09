@@ -7,8 +7,8 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Release 512/256: **280.307 P /38.535 D with passive counters**.
-Versus279.868/38.707: effectively flat; all768 output IDs/MTP work match.
+Release 512/256: **286.040 P /39.074 D with passive counters**.
+Root combine/preweight: **+2.05% P /+1.40% D**; all768 IDs/MTP match.
 Short-prefill indexer elision saves **36 kernels/chunk/GPU**; its matched
 control showed **+7.09% P**, with unchanged output IDs/MTP.
 Paired retained graphs cost eight GPU expert slots: **8066 total, 4033/card**.
@@ -27,8 +27,9 @@ Four/two/one panel scheduling gives **1.62× CPU FFN over two-pair**. Live-plan
 initialization saves **2.3% MTP /2.5% prefill** in AVX512 components.
 Installed M3 overlay: mixed Auto gate/up **11% faster**, model flat.
 Prepared-Q8 N64/MT16 passes MI50/XTX byte gates; **9–25% faster than N64/MT32**,
-unpromoted. HIP two-read ingress improves small ready cases **8–12%**, bulk/model
-flat. Shared gather gives **~3× at16MiB**; sparse prefill remains unpromoted.
+unpromoted. HIP ingress: **8–12% small-case gain**, bulk/model flat. Root combine/weight
+worksharing: **~2× M64, 3–6% M448** component gain; model result above.
+Shared gather: **~3× at16MiB**; sparse prefill remains unpromoted.
 [Exact-overlay scope and measurements](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md).
 [Launch omission, matched controls and timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md).
 [Root phase timing](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md).

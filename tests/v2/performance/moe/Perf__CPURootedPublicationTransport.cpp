@@ -19,6 +19,9 @@
  * entry from an existing OpenMP region without changing the production selector.
  * The original admitted backend also replays absorbing abort publication and
  * local-abort precedence without a callback, host hook, race or timing assumption.
+ * RootCombinePreweightReadyRecordEconomy separately measures the exact CPU
+ * arithmetic on PMA/NUMA cached outputs. It is an authored mechanism control,
+ * not a mapped-ticket, gather, topology or full-model speed certificate.
  */
 
 #include <gtest/gtest.h>
@@ -30,6 +33,9 @@
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "memory/CPUStorageRoot.h"
 #include "backends/HostMemoryCapacity.h"
+#include "kernels/cpu/moe/CPUCanonicalShardRouteRecords.h"
+#include "execution/moe/MoEOverlaySparseCollective.h"
+#include "execution/moe/CanonicalMoERouteRecord.h"
 #include "utils/MPIContext.h"
 #include "utils/NUMATopology.h"
 #include "utils/NodeTopology.h"
@@ -793,5 +799,125 @@ namespace llaminar2::test
 
         shmem.shutdown();
         MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    /**
+     * @test Cached-output mechanism control for original combine+preweight.
+     * Inputs are authored ready records at observed live-row scales, not a
+     * recorded route/gather replay. All large banks use the existing PMA/NUMA
+     * authority. Native mapped-ticket/model qualification remains separate.
+     */
+    TEST(Perf__CPURootedPublicationTransport, RootCombinePreweightReadyRecordEconomy)
+    {
+        ASSERT_EQ(worldSize(),1)<<"One original session worker on one physical socket is required";
+        constexpr int maximum_rows=448,top_k=10,columns=2560;
+        constexpr size_t slots=size_t(maximum_rows)*top_k,live_max=3208,record_width=columns+1;
+        const int workers=omp_get_max_threads();
+        ASSERT_GT(workers,0);
+        const auto affinity=NUMATopology::detectLocalNUMANode();
+        ASSERT_TRUE(affinity.detection_succeeded);
+        const auto observed=observeSystemMemoryCapacity();
+        ASSERT_TRUE(observed.valid());
+        const PhysicalMemoryResource cpu{0,DeviceId::cpu(),observed.total_bytes,observed.admission_available_bytes};
+        const auto placement=CPUStoragePlacement::onNode(affinity.local_numa_node);
+        const CPUStorageRoot<float> records_root(2*live_max*record_width,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu(),placement);
+        const CPUStorageRoot<float> raw0_root(slots*columns,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu(),placement);
+        const CPUStorageRoot<float> raw1_root(slots*columns,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu(),placement);
+        const CPUStorageRoot<float> weighted0_root(slots*columns,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu(),placement);
+        const CPUStorageRoot<float> weighted1_root(slots*columns,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu(),placement);
+        PhysicalMemoryPlanBuilder bill;
+        bill.add(cpu,PhysicalMemoryOwner::ActivationArena,records_root.physicalBytes()+raw0_root.physicalBytes()+
+            raw1_root.physicalBytes()+weighted0_root.physicalBytes()+weighted1_root.physicalBytes());
+        auto memory=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(bill.build()),0);
+        auto records=records_root.allocate(memory),raw0=raw0_root.allocate(memory),raw1=raw1_root.allocate(memory),
+            weighted0=weighted0_root.allocate(memory),weighted1=weighted1_root.allocate(memory);
+        // First-touch large banks on the workers that consume them.
+        int actual_workers=0;
+#pragma omp parallel
+        {
+#pragma omp single
+            actual_workers=omp_get_num_threads();
+#pragma omp for schedule(static)
+            for(long long i=0;i<static_cast<long long>(records.size());++i)records.data()[i]=float(i%31)*.03125f;
+#pragma omp for schedule(static)
+            for(long long i=0;i<static_cast<long long>(raw0.size());++i) {
+                raw0.data()[i]=raw1.data()[i]=-991.0f;
+                weighted0.data()[i]=weighted1.data()[i]=-993.0f;
+            }
+        }
+        ASSERT_EQ(actual_workers,workers)<<"Dynamic/narrowed team is not the requested measurement";
+        RecordProperty("actual_omp_workers",actual_workers);
+        std::vector<int32_t> original(live_max),compact(live_max),experts(live_max,1),maps(2*slots);
+        std::vector<float> weights(live_max,.3f),required(slots);
+        const std::array<int,1> selected{1};
+        std::array<RootedFloatRecordRange,2> ranges;
+        constexpr int warmups=16,samples=30,repeats=8;
+        RecordProperty("output_storage","cached_PMA_root_mechanism_control");
+        RecordProperty("route_provenance","authored_ready_records_not_route_replay");
+        RecordProperty("workers",workers);RecordProperty("numa_node",affinity.local_numa_node);
+        for(const size_t live:{size_t{453},live_max}) {
+            // Retained maximum storage is not the logical incoming chunk.
+            // These live-count scales correspond to M64 and M448 respectively.
+            const int rows=live==453?64:maximum_rows;
+            const size_t live_slot_extent=static_cast<size_t>(rows)*top_k;
+            for(size_t entry=0;entry<live;++entry) {
+                // A sparse prefix at this scale has real holes in both output
+                // coordinate systems. Neither capacity nor padding is work.
+                original[entry]=static_cast<int32_t>(entry+entry/16);
+                compact[entry]=static_cast<int32_t>(entry+entry/16);
+                ASSERT_LT(original[entry],int32_t(live_slot_extent));
+                for(size_t participant=0;participant<2;++participant)
+                    ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(
+                        records.data()+(participant*live+entry)*record_width,columns,size_t(original[entry])));
+            }
+            ranges={RootedFloatRecordRange{0,0,live},RootedFloatRecordRange{1,live,live}};
+            const auto os=std::span<const int32_t>(original).first(live);
+            const auto cs=std::span<const int32_t>(compact).first(live);
+            const auto es=std::span<const int32_t>(experts).first(live);
+            const auto ws=std::span<const float>(weights).first(live);
+            cpu::moe::CanonicalShardRouteRecordArgs baseline{{records.data(),2*live*record_width},ranges,{},{},selected,
+                maps,required,{raw0.data(),raw0.size()},512,rows,top_k,columns,
+                cpu::moe::CanonicalShardSparseRouteView{os,es,ws}};
+            auto fused=baseline;fused.combined_route_rows={raw1.data(),raw1.size()};
+            fused.preweighted_output=cpu::moe::CanonicalRoutePreweightedOutput{
+                {weighted1.data(),weighted1.size()},os,cs,ws};
+            MoEOverlaySparseRows input;
+            input.row_capacity=rows;input.entry_capacity=live_slot_extent;input.live_row_count=rows;
+            input.live_entry_count=live;input.d_model=columns;input.top_k=top_k;
+            input.original_route_slots_host=original.data();input.compact_route_slots_host=compact.data();input.route_weights_host=weights.data();
+            const auto run=[&](int candidate) {
+                if(candidate==1)return cpu::moe::combineCanonicalShardRouteRecords(fused);
+                return cpu::moe::combineCanonicalShardRouteRecords(baseline) &&
+                    preweightMoEOverlayCanonicalRouteRows(input,{raw0.data(),raw0.size()},
+                        MoEOverlayCanonicalRouteSourceLayout::originalSlots(),{weighted0.data(),weighted0.size()},
+                        MoEOverlayCanonicalRouteSourceIndex::CompactRouteSlot);
+            };
+            ASSERT_TRUE(run(0));ASSERT_TRUE(run(1));
+            ASSERT_EQ(std::memcmp(raw0.data(),raw1.data(),raw0.size()*sizeof(float)),0);
+            ASSERT_EQ(std::memcmp(weighted0.data(),weighted1.data(),weighted0.size()*sizeof(float)),0);
+            for(int warm=0;warm<warmups;++warm){ASSERT_TRUE(run(warm%2));}
+            std::array<std::array<double,samples>,2> timings{};
+            for(int sample=0;sample<samples;++sample)for(int offset=0;offset<2;++offset) {
+                const int candidate=(sample+offset)%2;
+                const auto begin=std::chrono::steady_clock::now();
+                bool ok=true;for(int repeat=0;repeat<repeats;++repeat)ok=run(candidate)&&ok;
+                const auto end=std::chrono::steady_clock::now();
+                ASSERT_TRUE(ok);
+                timings[candidate][sample]=std::chrono::duration<double,std::micro>(end-begin).count()/repeats;
+            }
+            ASSERT_EQ(std::memcmp(raw0.data(),raw1.data(),raw0.size()*sizeof(float)),0);
+            ASSERT_EQ(std::memcmp(weighted0.data(),weighted1.data(),weighted0.size()*sizeof(float)),0);
+            for(int candidate=0;candidate<2;++candidate) {
+                auto sorted=timings[candidate];std::sort(sorted.begin(),sorted.end());
+                std::cout<<"ROOT_COMBINE_PREWEIGHT,cached_output_mechanism_control,authored_ready_records"
+                    <<",candidate="<<(candidate?"fused":"original_two_pass")<<",live="<<live<<",H="<<columns
+                    <<",M="<<rows<<",live_slot_extent="<<live_slot_extent<<",storage_slots="<<slots
+                    <<",workers="<<workers<<",median_us="<<(sorted[14]+sorted[15])*.5
+                    <<",p10_us="<<sorted[3]<<",p90_us="<<sorted[27]<<",raw_us=";
+                for(const double value:timings[candidate])std::cout<<value<<';';
+                std::cout<<",both_outputs_byte_exact=1\n";
+            }
+        }
     }
 } // namespace llaminar2::test

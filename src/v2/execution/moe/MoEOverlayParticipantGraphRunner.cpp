@@ -6959,7 +6959,8 @@ namespace llaminar2
                     for(const auto& [name,ns]:std::array{
                         std::pair{"mapped_cpu_layer_root_gather",sample.joint_root->gather_ns},
                         std::pair{"mapped_cpu_layer_root_validated_fixed_order_combine",sample.joint_root->combine_ns},
-                        std::pair{"mapped_cpu_layer_root_preweight_publication",sample.joint_root->preweight_publication_ns}})
+                        std::pair{"mapped_cpu_layer_root_preweight_publication",sample.joint_root->preweight_publication_ns},
+                        std::pair{"mapped_cpu_layer_root_fused_combine_preweight_publication",sample.joint_root->fused_combine_preweight_publication_ns}})
                         if(ns)PerfStatsCollector::recordTimingNs("moe_overlay_participant_graph",name,*ns,
                             transaction_phase,"CPU",child_tags);
                     child_tags.erase("gather_semantics");

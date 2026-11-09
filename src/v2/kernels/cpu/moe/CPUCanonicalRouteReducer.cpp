@@ -7,6 +7,9 @@
  * existing canonical top-k FMA fold. Callers own every input/scratch/output
  * allocation through the ordinary PMA; this kernel neither prices nor places
  * experts and never allocates or changes worker-team width.
+ * A borrowed weighted sink is filled by the same worker immediately after the
+ * original addition routine finishes a column tile. This retains that routine's
+ * exact arithmetic while avoiding a second traversal of the complete raw bank.
  */
 
 #include "CPUCanonicalRouteReducer.h"
@@ -16,6 +19,7 @@
 #include "../../../utils/OpenMPUtils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <limits>
 #include <omp.h>
@@ -271,18 +275,68 @@ namespace llaminar2::cpu::moe
                  overlap(bank.record_for_route_slot.data(),bank.record_for_route_slot.size_bytes(),
                          args.route_weights,weightBytes))) return false;
         }
+        // Validate the complete second output before either output is touched.
+        // The compact index is derived from immutable original slots, never a
+        // second route/ownership ledger or an inferred active capacity.
+        if (args.preweighted_output) {
+            const auto &w=*args.preweighted_output;
+            const auto count=w.original_slots.size();
+            if (slots>static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+                count!=w.weights.size() || count!=w.destination_slots.size() || count>slots || count>maximum/columns ||
+                w.values.size()>maximum/sizeof(float) || w.values.size()%columns ||
+                w.values.size()<count*columns || (count && (!w.values.data() ||
+                !w.original_slots.data() || !w.destination_slots.data() || !w.weights.data()))) return false;
+            const auto sinkBytes=w.values.size_bytes();
+            if (overlap(w.values.data(),sinkBytes,args.combined_route_rows.data(),bytes) ||
+                overlap(w.values.data(),sinkBytes,args.route_weights,weightBytes) ||
+                overlap(w.values.data(),sinkBytes,w.original_slots.data(),w.original_slots.size_bytes()) ||
+                overlap(w.values.data(),sinkBytes,w.weights.data(),w.weights.size_bytes()) ||
+                overlap(w.values.data(),sinkBytes,w.destination_slots.data(),w.destination_slots.size_bytes()) ||
+                overlap(args.combined_route_rows.data(),bytes,w.original_slots.data(),w.original_slots.size_bytes()) ||
+                overlap(args.combined_route_rows.data(),bytes,w.destination_slots.data(),w.destination_slots.size_bytes()) ||
+                overlap(args.combined_route_rows.data(),bytes,w.weights.data(),w.weights.size_bytes())) return false;
+            for (const auto &bank:args.ordered_participants) {
+                if (overlap(w.values.data(),sinkBytes,bank.values.data(),
+                    bank.record_for_route_slot.empty()?bytes:bank.values.size_bytes()) ||
+                    overlap(w.values.data(),sinkBytes,bank.record_for_route_slot.data(),
+                            bank.record_for_route_slot.size_bytes())) return false;
+            }
+            int32_t previous=-1,previous_destination=-1;
+            for(size_t entry=0;entry<count;++entry) {
+                const auto slot=w.original_slots[entry],destination=w.destination_slots[entry];
+                if(slot<=previous || static_cast<size_t>(slot)>=slots ||
+                   destination<=previous_destination || static_cast<size_t>(destination)>=w.values.size()/columns ||
+                   args.route_weights[slot]==0.0f || !std::isfinite(w.weights[entry]) ||
+                   w.weights[entry]==0.0f) return false;
+                previous=slot;previous_destination=destination;
+            }
+            size_t live=0;
+            for(size_t slot=0;slot<slots;++slot)live+=args.route_weights[slot]!=0.0f;
+            if(live!=count)return false;
+        }
         const auto partialRow=[&](size_t participant,size_t slot,size_t first) {
             const auto &bank=args.ordered_participants[participant];
             const auto offset=bank.record_for_route_slot.empty()?slot*columns:
                 static_cast<size_t>(bank.record_for_route_slot[slot])*(columns+1);
             return bank.values.data()+offset+first;
         };
+        // The optional sink already names every required original route once
+        // in order. Schedule that live list directly instead of rediscovering
+        // each route by binary search in every column tile. Retain the original
+        // column partition so the called addition's arithmetic boundaries do
+        // not change. Unweighted callers retain their existing row/task grid.
+        const size_t task_count=args.preweighted_output?
+            args.preweighted_output->original_slots.size()*static_cast<size_t>(plan.column_tiles_per_row):
+            plan.parallel_tasks;
         const auto combine = [&](size_t task) {
             const auto row=task/static_cast<size_t>(plan.column_tiles_per_row);
             const auto first=static_cast<int>(task%static_cast<size_t>(plan.column_tiles_per_row))*plan.column_tile;
             const auto count=std::min(plan.column_tile,args.columns-first);
-            for (size_t route=0;route<top_k;++route) {
-                const auto slot=row*top_k+route;
+            const auto first_slot=args.preweighted_output?
+                static_cast<size_t>(args.preweighted_output->original_slots[row]):row*top_k;
+            const auto route_count=args.preweighted_output?size_t{1}:top_k;
+            for (size_t route=0;route<route_count;++route) {
+                const auto slot=first_slot+route;
                 if (args.route_weights[slot]==0.0f) continue;
                 const auto offset=slot*columns+static_cast<size_t>(first);
                 float *const destination=args.combined_route_rows.data()+offset;
@@ -291,21 +345,47 @@ namespace llaminar2::cpu::moe
                 // first would write and reread the same live columns before
                 // this identical vec_add. Both operand order and its FP32
                 // rounding point are unchanged, including scalar tails.
-                primitives::vec_add(destination,
-                    partialRow(0,slot,static_cast<size_t>(first)),
-                    partialRow(1,slot,static_cast<size_t>(first)),count);
-                // Later participants retain their original ordered additions.
-                for (size_t participant=2;participant<args.ordered_participants.size();++participant)
-                    primitives::vec_add(destination,destination,
-                        partialRow(participant,slot,static_cast<size_t>(first)),count);
+                const auto last=args.ordered_participants.size()-1;
+                if (!args.preweighted_output) {
+                    primitives::vec_add(destination,
+                        partialRow(0,slot,static_cast<size_t>(first)),
+                        partialRow(1,slot,static_cast<size_t>(first)),count);
+                    for (size_t participant=2;participant<=last;++participant)
+                        primitives::vec_add(destination,destination,
+                            partialRow(participant,slot,static_cast<size_t>(first)),count);
+                } else {
+                    const auto &w=*args.preweighted_output;
+                    const auto entry=row;
+                    // Keep the actual original add routine, including its
+                    // compiled NaN operand selection and scalar-tail behavior.
+                    // Consume its completed column tile immediately on this
+                    // worker, before another task displaces the useful data.
+                    // This fuses ownership/worksharing rather than arithmetic:
+                    // there is no second full-bank pass or parallel region.
+                    if(last>1) {
+                        primitives::vec_add(destination,partialRow(0,slot,static_cast<size_t>(first)),
+                            partialRow(1,slot,static_cast<size_t>(first)),count);
+                        for(size_t participant=2;participant<last;++participant)
+                            primitives::vec_add(destination,destination,
+                                partialRow(participant,slot,static_cast<size_t>(first)),count);
+                    }
+                    primitives::vec_add(destination,
+                        last==1?partialRow(0,slot,static_cast<size_t>(first)):destination,
+                        partialRow(last,slot,static_cast<size_t>(first)),count);
+                    float *const weighted=w.values.data()+
+                        static_cast<size_t>(w.destination_slots[entry])*columns+static_cast<size_t>(first);
+                    const float factor=w.weights[entry];
+                    for(int column=0;column<count;++column)
+                        weighted[column]=destination[column]*factor;
+                }
             }
         };
         if (plan.executor==CanonicalRouteFoldExecutor::CallerThread) {
-            for (size_t task=0;task<plan.parallel_tasks;++task) combine(task);
+            for (size_t task=0;task<task_count;++task) combine(task);
         } else {
             auto work=[&]() {
 #pragma omp for schedule(static)
-                for (long long task=0;task<static_cast<long long>(plan.parallel_tasks);++task)
+                for (long long task=0;task<static_cast<long long>(task_count);++task)
                     combine(static_cast<size_t>(task));
             };
             OMP_WORKSHARE_REGION(work);

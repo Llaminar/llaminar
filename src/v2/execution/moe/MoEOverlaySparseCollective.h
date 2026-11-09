@@ -29,6 +29,7 @@
 
 namespace llaminar2
 {
+    namespace cpu::moe { struct CanonicalShardRouteRecordArgs; }
     enum class ForwardGraphSubmissionIntent : uint8_t;
     class IBackend;
     class IDeviceContext;
@@ -358,6 +359,15 @@ namespace llaminar2
              */
             bool publish(size_t live_entry_count) noexcept;
 
+            /**
+             * @brief Authenticate this exact armed sequence and residency epoch before payload writes.
+             * @param storage Original bound ticket owner.
+             * @param residency_epoch Consumed sparse packet's immutable epoch.
+             * @return True only for this still-armed producer and exact nonzero epoch.
+             */
+            [[nodiscard]] bool authorizes(const MoEOverlayCanonicalRouteReturnTicketStorage& storage,
+                                          uint64_t residency_epoch) const noexcept;
+
             /** @return Whether this lease belongs to @p storage. */
             [[nodiscard]] bool belongsTo(
                 const MoEOverlayCanonicalRouteReturnTicketStorage &storage)
@@ -634,6 +644,24 @@ namespace llaminar2
         MoEOverlayCanonicalRouteReturnTicketStorage::Publication& publication,
         const MoEOverlaySparseRows& original,std::span<const float> unweighted_rows,
         MoEOverlayCanonicalRouteSourceLayout source_layout) noexcept;
+
+    /**
+     * @brief Combine original CPU fragments and preweight the original ticket in one workshare.
+     * @param ticket Existing mapped continuation ticket, never rebound here.
+     * @param publication Its exact armed epoch/sequence producer lease.
+     * @param original Complete authenticated consumed sparse packet.
+     * @param records Original completed gather and persistent raw combined output.
+     * @return False before payload mutation for invalid lease, geometry, aliases or records.
+     * @note Ascending participant FP32 addition finishes before one separate multiplication.
+     * Both original raw output and compact weighted ticket remain populated.
+     * The existing finite-value diagnostic can reject after computation, but
+     * never releases that failed payload to a captured consumer.
+     */
+    bool combineAndPublishMoEOverlayCanonicalShardRouteRows(
+        MoEOverlayCanonicalRouteReturnTicketStorage& ticket,
+        MoEOverlayCanonicalRouteReturnTicketStorage::Publication& publication,
+        const MoEOverlaySparseRows& original,
+        const cpu::moe::CanonicalShardRouteRecordArgs& records) noexcept;
 
     enum class MoEOverlayCollectiveDirection : uint8_t
     {

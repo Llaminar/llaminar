@@ -27599,12 +27599,23 @@ target_link_libraries(v2_perf_cpu_rooted_publication_transport
 )
 add_v2_test(V2_Perf_CPURootedPublicationTransport
     COMMAND $<TARGET_FILE:v2_perf_cpu_rooted_publication_transport>
+        --gtest_filter=-Perf__CPURootedPublicationTransport.RootCombinePreweightReadyRecordEconomy
     LABELS "V2;Perf;CPU;Collective;ShmemSpin;MoE"
     MPI_PROCS 2
     NO_MODELS
     TIMEOUT 120
     RESOURCE_LOCK "ShmemSpin"
 )
+
+# The CPU operation control owns one socket's worker team. It is deliberately
+# separate from the same executable's original two-rank transport measurements.
+add_v2_test(V2_Perf_CPURootCombinePreweightReadyRecord
+    COMMAND $<TARGET_FILE:v2_perf_cpu_rooted_publication_transport>
+        --gtest_filter=Perf__CPURootedPublicationTransport.RootCombinePreweightReadyRecordEconomy
+    LABELS "V2;Performance;CPU;MoE;ComponentTiming"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+        "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_DYNAMIC=false")
 
 # Exact original owner replay for the large-copy mechanism. Native CPU/NUMA
 # integration is separate from Unit and never initializes an accelerator.

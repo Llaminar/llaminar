@@ -4,10 +4,11 @@
 The two-rank case proves the real original MPI/shared-memory lifecycle. Neither
 it nor device-free recorded partials certify full NUMA model serving or economy.
 ]]
-# Release deliberately owns only performance targets. Keep functional target
-# creation, source/property mutations and registration under the same policy.
-# Integration still executes every declaration and rejects missing owners.
-if(V2_PERF_TESTS_ONLY)
+# Keep this original owner selectable for Release arithmetic qualification.
+# The shared selector retains ordinary performance-only Release defaults and
+# rejects undeclared explicit owners; no alternate core ABI is introduced.
+v2_test_target_selected(v2_test_cpu_shard_route_collective cpu_shard_route_owner_selected)
+if(NOT cpu_shard_route_owner_selected)
     return()
 endif()
 
@@ -122,4 +123,18 @@ foreach(cpu_first_pair_isa IN ITEMS scalar avx2 avx512)
             "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1"
             "LLAMINAR_ISA_LEVEL=${cpu_first_pair_isa}")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${cpu_first_pair_name})
+endforeach()
+
+# The authored controls use the same-worker combine/preweight implementation.
+foreach(cpu_fused_isa IN ITEMS scalar avx2 avx512)
+    set(cpu_fused_name "V2_Integration_CPUShardFusedFinalAddPreweight_${cpu_fused_isa}")
+    add_v2_test(${cpu_fused_name}
+        COMMAND $<TARGET_FILE:v2_test_cpu_shard_route_collective>
+            --gtest_filter=CPUShardRouteCollective.FusedFinalAdd*:CPUShardRouteCollective.FusedTicketRejectsUnarmedLeaseBeforePayloadWrites
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Shard;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+            "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1"
+            "LLAMINAR_ISA_LEVEL=${cpu_fused_isa}")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${cpu_fused_name})
 endforeach()
