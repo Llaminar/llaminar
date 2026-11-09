@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Compiler-free adversarial tests of the native NEON tile register-allocation witness.
 
-Fixtures are real ELF64 AArch64 and Mach-O arm64 objects (sections, symbol
-tables with raw linker names, relocation tables) with a matching
-llvm-objdump-style disassembly built from one shared layout; analysis tests
-run the production front end over them. Covered: the control-flow/provenance
+Fixtures are synthetic ELF64 AArch64 (ET_REL) and Mach-O arm64 (MH_OBJECT)
+objects - sections, symbol tables with raw linker names and relocation tables,
+with zero-filled code bytes - paired with an llvm-objdump-style disassembly
+rendered from the same layout; they are not native compiler/disassembler pairs.
+Native object re-audits are separate owner evidence. Analysis tests run the
+production front end over the pairs. Covered: the control-flow/provenance
 analysis, the ABI save proof, admitted forms, call-boundary rejection, the
 never-returning diagnostic and its trusted imports (binding and exact ABI
-spelling), complete and aligned coverage, object-bound relocations, the
-embedded inventory, the envelope-derived program inventory, the
-single-row/ratchet policy, compiler identity, the tokenized inline-assembly
-guard, and proof binding through scripted stand-in tools (dependency closure,
-symlinks, inputs changing during the build, executed command, object,
+spelling), complete and aligned coverage, object-bound relocations and their
+native field admission, object types, the embedded inventory, the
+envelope-derived program inventory, the single-row/ratchet policy, compiler
+identity, the tokenized inline-assembly guard (nested asm, label context,
+opaque directives), and proof binding through scripted stand-in tools
+(dependency closure, symlinks, inputs changing during the build, executed
+command, driver jobs and their programs, precompiled headers, object,
 disassembler, budget, translation unit). Expected program keys are written out
 here, never derived from checker tables.
 """
@@ -199,8 +203,10 @@ def _elf(layout: Layout, records: list[tuple], data: bytes, sizes: dict[str, int
         offsets.append(64 + len(body))
         body += content
     header = bytearray(64)
-    header[0:6] = b"\x7fELF\x02\x01"
-    header[18:20] = (183).to_bytes(2, "little")
+    header[0:7] = b"\x7fELF\x02\x01\x01"
+    header[16:18] = (1).to_bytes(2, "little")  # ET_REL
+    header[18:20] = (183).to_bytes(2, "little")  # EM_AARCH64
+    header[20:24] = (1).to_bytes(4, "little")  # EV_CURRENT
     header[0x28:0x30] = (64 + len(body)).to_bytes(8, "little")
     header[0x3A:0x3C] = (64).to_bytes(2, "little")
     header[0x3C:0x3E] = len(names).to_bytes(2, "little")
@@ -257,8 +263,8 @@ def _macho(layout: Layout, records: list[tuple], data: bytes) -> bytes:
     segment += section(b"__const", text_size, len(data), const_offset, 0, (0, 0))
     symtab = (0x2).to_bytes(4, "little") + (24).to_bytes(4, "little") + symoff.to_bytes(4, "little") + \
         len(records).to_bytes(4, "little") + stroff.to_bytes(4, "little") + len(strtab).to_bytes(4, "little")
-    header = bytes.fromhex("cffaedfe") + (0x0100000C).to_bytes(4, "little") + bytes(8) + \
-        (2).to_bytes(4, "little") + commands.to_bytes(4, "little") + bytes(8)
+    header = bytes.fromhex("cffaedfe") + (0x0100000C).to_bytes(4, "little") + bytes(4) + \
+        (1).to_bytes(4, "little") + (2).to_bytes(4, "little") + commands.to_bytes(4, "little") + bytes(8)  # MH_OBJECT
     return header + segment + symtab + bytes(text_size) + data + bytes(relocations) + bytes(nlist) + bytes(strtab)
 
 
@@ -298,6 +304,24 @@ def abi_options(options: dict, macho: bool) -> dict:
         if key in options:
             mapped[key] = {abi(name, True): value for name, value in options[key].items()}
     return mapped
+
+
+def elf_header_offset(data: bytes, wanted: str) -> int:
+    """File offset of the ELF section header named wanted."""
+    shoff, count, names = (int.from_bytes(data[0x28:0x30], "little"), int.from_bytes(data[0x3C:0x3E], "little"),
+                           int.from_bytes(data[0x3E:0x40], "little"))
+    strings = shoff + names * 64
+    table = int.from_bytes(data[strings + 24:strings + 32], "little")
+    for index in range(count):
+        base = shoff + index * 64
+        start = table + int.from_bytes(data[base:base + 4], "little")
+        if data[start:data.index(b"\0", start)].decode() == wanted:
+            return base
+    raise KeyError(wanted)
+
+
+def patched(data: bytes, offset: int, value: int, size: int) -> bytes:
+    return data[:offset] + value.to_bytes(size, "little") + data[offset + size:]
 
 
 def image(functions: list[tuple[str, str]], macho: bool = False, **options) -> CHECKER.ObjectImage:
@@ -789,9 +813,32 @@ class AssemblerInputTest(unittest.TestCase):
                        'auto r = R"x(a")x"; asm(".incbin \\"y\\"");',
                        "char c = '\"'; asm(\".incbin x\");",
                        'asm(R"(.macro external suffix\n.inc\\suffix "extra.s"\n.endm\nexternal lude)");',
-                       'asm(".irpc c,lude\\n.inc\\\\c x\\n.endr");', 'asm(".p2align 2");', 'asm("nop; nop");'):
+                       'asm(".irpc c,lude\\n.inc\\\\c x\\n.endr");', 'asm(".p2align 2");', 'asm("nop; nop");',
+                       'asm("nop");'):
             with self.subTest(source=source):
                 self.assertTrue(CHECKER.inline_assembly_violations(source))
+
+    def test_every_asm_is_visited_and_labels_need_declaration_context(self) -> None:
+        for source in ('void f() { asm volatile("" : : "r"([] { asm volatile(".include \\"extra.s\\""); '
+                       'return 0; }())); }',
+                       'void f() { asm("nop"); }', 'asm("nop");', 'void f(int x) { if (x) asm("nop"); }',
+                       'void f() { extern int g __asm("h"); }', 'int f() __asm__ volatile("g");',
+                       'int f() __asm__("g" : );', 'auto l = [] { int v __asm("w"); };'):
+            with self.subTest(source=source):
+                self.assertTrue(CHECKER.inline_assembly_violations(source))
+        for source in ('extern "C" { int fputs(const char *, void *) __asm("_" "fputs"); }',
+                       'namespace a { inline namespace b { long tz __asm("_timezone"); } }',
+                       'struct S { static int x __asm("y"); };', 'int a[2] __asm("b");'):
+            with self.subTest(source=source):
+                self.assertEqual(CHECKER.inline_assembly_violations(source), [])
+
+    def test_opaque_preprocessor_input_fails(self) -> None:
+        for source in ('#pragma GCC pch_preprocess "probe.h.gch"\nint a;', '#pragma clang module import x\nint a;',
+                       '#include "x.h"\nint a;', '# include_next <x>\n', '#embed "blob"\n', "}"):
+            with self.subTest(source=source):
+                with self.assertRaises(ValueError):
+                    CHECKER.inline_assembly_violations(source)
+        self.assertEqual(CHECKER.inline_assembly_violations('# 1 "x.h" 1\n#pragma GCC diagnostic push\nint a;'), [])
 
     def test_ordinary_asm_and_labels_are_accepted_and_malformed_asm_fails(self) -> None:
         for source in ('int f() __asm__("g");', 'void h(float v) { asm volatile("" : "+w"(v)); }',
@@ -861,6 +908,59 @@ class RelocationTest(unittest.TestCase):
             CHECKER.normalize_disassembly(disassembly(functions), image(functions, sizes={"f": 4}))
         plain = [("f", "\tret\n\tnop\n")]
         self.assertIn("f", CHECKER.normalize_disassembly(disassembly(plain), image(plain, sizes={"f": 4})))
+
+
+class NativeRecordTest(unittest.TestCase):
+    """Relocation and object-type records are admitted by their native fields, not by their rendering."""
+
+    def relocated(self, macho: bool) -> tuple[list[tuple[str, str]], bytes]:
+        functions = [("f", f"\tbl {abi('helper', macho)}\n\tret\n")]
+        return functions, witness_object(functions, macho=macho)
+
+    def test_macho_relocation_field_combinations(self) -> None:
+        functions, data = self.relocated(True)
+        reloff = int.from_bytes(data[32 + 72 + 56:32 + 72 + 60], "little")
+        info = int.from_bytes(data[reloff + 4:reloff + 8], "little")
+        self.assertIn("f", CHECKER.normalize_disassembly(disassembly(functions, True), CHECKER.read_object(data)))
+        for label, value in (("pcrel cleared", info & ~(1 << 24)), ("length 8 bytes", info | (3 << 25)),
+                             ("length 1 byte", info & ~(3 << 25)), ("UNSIGNED type", info & 0x0FFFFFFF),
+                             ("ADDEND type", (info & 0x0FFFFFFF) | (10 << 28)), ("not extern", info & ~(1 << 27))):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "relocation"):
+                    CHECKER.read_object(patched(data, reloff + 4, value, 4))
+        for label, address in (("unaligned", 2), ("past the section", 64)):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "not an instruction"):
+                    CHECKER.read_object(patched(data, reloff, address, 4))
+
+    def test_elf_relocation_records(self) -> None:
+        functions, data = self.relocated(False)
+        header = elf_header_offset(data, ".rela.text.f")
+        size, offset = (int.from_bytes(data[header + 32:header + 40], "little"),
+                        int.from_bytes(data[header + 24:header + 32], "little"))
+        CHECKER.read_object(data)
+        for label, mutated in (("remainder", patched(data, header + 32, size + 8, 8)),
+                               ("truncated", patched(data, header + 24, len(data) - 8, 8)),
+                               ("invalid link", patched(data, header + 40, 999, 4)),
+                               ("invalid info", patched(data, header + 44, 999, 4)),
+                               ("REL table", patched(data, header + 4, 9, 4)),
+                               ("data type in code", patched(data, offset + 8, (int.from_bytes(
+                                   data[offset + 8:offset + 16], "little") & ~0xFFFFFFFF) | 257, 8)),
+                               ("offset past the section", patched(data, offset, 64, 8)),
+                               ("unaligned offset", patched(data, offset, 2, 8))):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    CHECKER.read_object(mutated)
+
+    def test_object_types(self) -> None:
+        _, elf = self.relocated(False)
+        _, macho = self.relocated(True)
+        for label, mutated in (("ET_EXEC", patched(elf, 16, 2, 2)), ("ET_DYN", patched(elf, 16, 3, 2)),
+                               ("e_version 0", patched(elf, 20, 0, 4)), ("MH_EXECUTE", patched(macho, 12, 2, 4)),
+                               ("MH_DYLIB", patched(macho, 12, 6, 4))):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "relocatable"):
+                    CHECKER.read_object(mutated)
 
 
 class AlignmentTest(unittest.TestCase):
@@ -981,9 +1081,15 @@ here = pathlib.Path(__file__).parent
 args = sys.argv[1:]
 if args == ["--version"]:
     sys.stdout.write((here / "version.txt").read_text()); sys.exit(0)
-(here / "invocations.txt").open("a").write(" ".join(args) + "\\n")
 def value(flag):
     return args[args.index(flag) + 1]
+if "-###" in args:
+    jobs = (here / "jobs.txt").read_text() if (here / "jobs.txt").exists() else (
+        " {{here}}/cc1plus -quiet {{source}} -o /tmp/ccTEST.s\\n as -EL -march=armv8-a -o {{obj}} /tmp/ccTEST.s\\n")
+    sys.stderr.write("Using built-in specs.\\nCOMPILER_PATH={{here}}\\n".format(here=here) + jobs.format(
+        here=here, source=args[args.index("-c") + 1] if "-c" in args else "", obj=value("-o") if "-o" in args else ""))
+    sys.exit(0)
+(here / "invocations.txt").open("a").write(" ".join(args) + "\\n")
 if "-E" in args:
     unit = here / "preprocessed.txt"
     pathlib.Path(value("-o")).write_text(unit.read_text() if unit.exists() else "int probe;\\n"); sys.exit(0)
@@ -995,6 +1101,8 @@ if compiling:
         target = pathlib.Path(mutate.read_text().strip())
         target.write_text(target.read_text() + "// changed during the build\\n")
     shutil.copy(here / "witness.o", value("-o"))
+    if (here / "headers.txt").exists():
+        sys.stderr.write((here / "headers.txt").read_text())
 pathlib.Path(value("-MF")).write_text(value("-MT") + ": " + " ".join(deps) + "\\n")
 """
 FAKE_DISASSEMBLER = """#!{python}
@@ -1023,6 +1131,9 @@ class ProofBindingTest(unittest.TestCase):
         self.disassembler.write_text(FAKE_DISASSEMBLER.format(python=sys.executable))
         self.disassembler.chmod(self.disassembler.stat().st_mode | stat.S_IEXEC)
         (self.tool / "objdump-version.txt").write_text("GNU objdump (Fixture) 2.42\n")
+        for program in ("cc1plus", "as"):
+            (self.tool / program).write_text("#!/bin/sh\n")
+            (self.tool / program).chmod(0o755)
         self.witness(programs())
         self.source, self.header, self.real = root / "probe.cpp", root / "view.h", root / "real" / "view.h"
         self.real.parent.mkdir()
@@ -1159,13 +1270,60 @@ class ProofBindingTest(unittest.TestCase):
                 self.assertFalse(Path(self.args.proof).exists())
                 self.assertNotIn(" -c ", (self.tool / "invocations.txt").read_text())
 
+    def test_nested_asm_build_publishes_no_receipt(self) -> None:
+        (self.tool / "preprocessed.txt").write_text(
+            'void f() { asm volatile("" : : "r"([] { asm volatile(".include \\"extra.s\\""); return 0; }())); }\n')
+        with self.assertRaisesRegex(ValueError, "inline assembly"):
+            CHECKER.build(self.args)
+        self.assertFalse(Path(self.args.proof).exists())
+        self.assertNotIn(" -c ", (self.tool / "invocations.txt").read_text() if
+                         (self.tool / "invocations.txt").exists() else "")
+
+    def test_opaque_routes_are_rejected_before_or_by_the_compile(self) -> None:
+        here = self.tool
+        default_jobs = f" {here}/cc1plus -quiet {{source}} -o /tmp/ccTEST.s\n as -EL -o {{obj}} /tmp/ccTEST.s\n"
+        cases = {
+            "PCH marker in the translation unit": ("preprocessed.txt", '#pragma GCC pch_preprocess "p.h.gch"\nint a;\n'),
+            "PCH used by the compile": ("headers.txt", ". /usr/include/stdio.h\n! /work/probe.h.gch\n"),
+            "invalid PCH tried": ("headers.txt", "..x /work/x.h.gch\n"),
+            "specs file read": ("jobs.txt", "Reading specs from /tmp/extra.specs\n" + default_jobs),
+            "extra assembler input (renamed asm spec)": (
+                "jobs.txt", f" {here}/cc1plus -quiet {{source}} -o /tmp/ccTEST.s\n"
+                            f" as -EL -o {{obj}} /tmp/ccTEST.s /abs/extra.s\n"),
+            "assembler include path option": (
+                "jobs.txt", f" {here}/cc1plus -quiet {{source}} -o /tmp/ccTEST.s\n as --defsym x=1 -o {{obj}} /tmp/ccTEST.s\n"),
+            "PCH in a compiler job": (
+                "jobs.txt", f" {here}/cc1plus -quiet -include-pch p.pch {{source}} -o /tmp/ccTEST.s\n"
+                            f" as -EL -o {{obj}} /tmp/ccTEST.s\n"),
+            "third job": ("jobs.txt", default_jobs + f" {here}/cc1plus -quiet x.cpp -o /tmp/other.s\n"),
+        }
+        for label, (name, content) in cases.items():
+            with self.subTest(label=label):
+                (self.tool / name).write_text(content)
+                with self.assertRaises(ValueError):
+                    CHECKER.build(self.args)
+                self.assertFalse(Path(self.args.proof).exists())
+                (self.tool / name).unlink()
+        CHECKER.build(self.args)
+        self.assertEqual(len(self.proof()["driver_jobs"]), 2)
+
+    def test_job_programs_are_bound(self) -> None:
+        CHECKER.build(self.args)
+        CHECKER.verify(self.args)
+        (self.tool / "as").write_text("#!/bin/sh\n# replaced assembler\n")
+        with self.assertRaisesRegex(ValueError, "program"):
+            CHECKER.verify(self.args)
+
     def test_assembler_options_in_the_compile_command_fail(self) -> None:
-        for option in ("-Wa,-I/tmp", "-Xassembler", "-save-temps"):
+        for option in ("-Wa,-I/tmp", "-Xassembler", "-save-temps", "-specs=/tmp/extra.specs", "--specs=x",
+                       "-B/tmp/tools", "-include-pch", "-fpch-preprocess", "-fmodules", "-fplugin=x.so", "@args.rsp",
+                       "-no-integrated-as", "--config=x.cfg"):
+            (self.root / "args.rsp").write_text("-Wa,-I/tmp\n")  # Response files are expanded first.
             with self.subTest(option=option):
                 database = json.loads(Path(self.args.compile_database).read_text())
                 database[0]["arguments"] = [str(self.compiler), option, "-c", str(self.source), "-o", "x.o"]
                 Path(self.args.compile_database).write_text(json.dumps(database))
-                with self.assertRaisesRegex(ValueError, "assembler options"):
+                with self.assertRaisesRegex(ValueError, "routes inputs outside"):
                     CHECKER.build(self.args)
 
     def test_inline_assembly_file_input_is_rejected_before_compiling(self) -> None:
