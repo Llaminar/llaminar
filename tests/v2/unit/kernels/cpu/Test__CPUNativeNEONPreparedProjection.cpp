@@ -268,11 +268,12 @@ template <typename Ops> void verifyAllPrepared()
 /**
  * @brief Prove the padding contract at a partial final chunk for one source/geometry/family.
  * @tparam Ops Admitted family (ASIMD, DotProd, or I8MM row pairs).
- * @details For coefficient-ruled encodings every padding word a vector of the
- * last strip or its neighbour loads is poisoned in turn: admission must reject
- * it before any tile exists and every output guard must stay untouched. With
- * the producer's benign padding, every row tile 1..4 on both policies must
- * equal serial bytes and the independent numerical program (verifyPrepared).
+ * @details Two complementary proofs on separate fixtures. Poison rejection: for
+ * coefficient-ruled encodings every padding word a vector of the last strip or
+ * its neighbour loads is poisoned in turn, and admission must reject it before
+ * any tile exists. Positive execution: with the producer's benign padding,
+ * every row tile 1..4 on both policies must equal serial bytes, the
+ * independent numerical program and the output guards (verifyPrepared).
  */
 template <typename Ops> void verifyTailPadding(const NativeQuantisedFormatInfo &source, int n, int blocks)
 {
@@ -302,12 +303,16 @@ template <typename Ops> void verifyTailPadding(const NativeQuantisedFormatInfo &
                 }
         }
     }
+    // Row tiles 1..4 under both policies (contiguous backend-native and
+    // ordered expert partitions), on a fixture separate from the poison checks.
     verifyPrepared<1, Ops, ms::Reduction::Contiguous>(source, n, blocks);
     verifyPrepared<2, Ops, ms::Reduction::Contiguous>(source, n, blocks);
+    verifyPrepared<3, Ops, ms::Reduction::Contiguous>(source, n, blocks);
+    verifyPrepared<4, Ops, ms::Reduction::Contiguous>(source, n, blocks);
+    verifyPrepared<1, Ops, ms::Reduction::OrderedPartitions>(source, n, blocks);
+    verifyPrepared<2, Ops, ms::Reduction::OrderedPartitions>(source, n, blocks);
     verifyPrepared<3, Ops, ms::Reduction::OrderedPartitions>(source, n, blocks);
     verifyPrepared<4, Ops, ms::Reduction::OrderedPartitions>(source, n, blocks);
-    verifyPrepared<2, Ops, ms::Reduction::OrderedPartitions>(source, n, blocks);
-    verifyPrepared<1, Ops, ms::Reduction::OrderedPartitions>(source, n, blocks);
 }
 
 /** @brief Every source family at N mod 4 = 1/2/3, inside and across chunk tails. */

@@ -204,6 +204,18 @@ namespace llaminar2::cpu::native_quantised
         std::size_t extent_ = 0;                 ///< Exact sealed extent.
     };
 
+    /** @brief Canonical checked geometry of one stored publication; no readable view. */
+    struct CPUNativeQuantisedPublishedGeometry
+    {
+        int columns = 0;                  ///< Live output columns N.
+        int padded_columns = 0;           ///< Canonical 64-column capacity.
+        int blocks_per_row = 0;           ///< ceil(K / 32).
+        int data_stride = 0;              ///< Payload bytes before inline metadata.
+        int interleaved_block_stride = 0; ///< Total bytes per 64-column/K-block unit.
+        int secondary_offset = 0;         ///< Unit offset of the secondary metadata words.
+        bool has_secondary = false;       ///< Whether the encoding stores secondary words.
+    };
+
     /** @brief Validated immutable layout and borrowed storage for native CPU readers. */
     class CPUNativeQuantisedWeightView final
     {
@@ -241,6 +253,31 @@ namespace llaminar2::cpu::native_quantised
             if (!seal.admits(descriptor, bytes))
                 throw std::invalid_argument("Native CPU weight view requires a metadata seal of exactly these bytes");
             return admitStructure(descriptor, bytes);
+        }
+
+        /**
+         * @brief Admit structure and return canonical geometry without exposing a view.
+         * @param descriptor Shape/source/encoding publication.
+         * @param bytes Exact stored stream.
+         * @return Checked geometry; nothing readable or executable is created.
+         * @throws std::invalid_argument For an unknown source/encoding, inconsistent
+         *         metadata or a stream that is not the exact canonical extent.
+         * @throws std::overflow_error For padded geometry/extent overflow.
+         * @details For producers that must write descriptor-owned planes (for
+         * example padding normalization) before the publication is sealed.
+         */
+        [[nodiscard]] static CPUNativeQuantisedPublishedGeometry publishedGeometry(
+            const CPUNativeQuantisedWeightDescriptor &descriptor, std::span<const std::uint8_t> bytes)
+        {
+            const auto view = admitStructure(descriptor, bytes);
+            const bool secondary = view.is_asymmetric || view.usesNibbleLUTSourceScale() ||
+                view.usesIQ3SExpandedSourceScale() || view.usesQ6KNativeDualScale() || view.usesCompactMultiScale();
+            return {
+                .columns = view.N, .padded_columns = view.N_padded, .blocks_per_row = view.blocks_per_row,
+                .data_stride = view.data_stride, .interleaved_block_stride = view.interleaved_block_stride,
+                .secondary_offset = view.data_stride + (view.usesInlineCompensation() ? 256 : 128),
+                .has_secondary = secondary,
+            };
         }
 
         /** @return Whether a four-bit payload is retained in the stream. */

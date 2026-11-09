@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -165,21 +166,52 @@ TEST(CPUNativeQuantisedMetadataSeal, PaddingNormalizationSeparatesRawFromNormali
         }
 }
 
-/** @test Normalization trusts only descriptor-owned geometry, never a raw byte size. */
-TEST(CPUNativeQuantisedMetadataSeal, PaddingNormalizationRejectsForeignGeometry)
+/**
+ * @test Normalization admits canonical structure (source, encoding, positive
+ * checked geometry, exact stored extent, owner fields) before any mutable span
+ * exists; every malformed owner is rejected with every stored byte unchanged.
+ */
+TEST(CPUNativeQuantisedMetadataSeal, PaddingNormalizationRejectsMalformedOwnersWithoutMutation)
 {
     NativeQuantisedPreparedByteFixture fixture(native_quantised_formats::IQ3_S, 33, 64);
     fixture.seedPayloadAndMetadata();
-    auto packed = owner(fixture);
-    (void)packed.native_interleaved.beginRewrite();
-    auto foreign = packed.blocks_per_row;
-    packed.blocks_per_row = foreign + 1;
-    EXPECT_THROW(packed.normalizePaddingMetadata(), std::logic_error);
-    packed.blocks_per_row = foreign;
-    packed.N_padded += 64;
-    EXPECT_THROW(packed.normalizePaddingMetadata(), std::logic_error);
-    packed.N_padded -= 64;
-    EXPECT_NO_THROW(packed.normalizePaddingMetadata());
+    const auto rejects = [](CPUNativeQuantisedPackedWeights packed, const char *trace) {
+        SCOPED_TRACE(trace);
+        if (!packed.native_interleaved.empty())
+        {
+            const auto written = packed.native_interleaved.beginRewrite();
+            for (std::size_t byte = 0; byte < written.size(); ++byte)
+                written[byte] = static_cast<std::uint8_t>(0xa5u ^ byte);
+        }
+        const std::vector<std::uint8_t> before(packed.native_interleaved.begin(), packed.native_interleaved.end());
+        EXPECT_ANY_THROW(packed.normalizePaddingMetadata());
+        const std::vector<std::uint8_t> after(packed.native_interleaved.begin(), packed.native_interleaved.end());
+        EXPECT_EQ(after, before);
+    };
+    const auto malformed = [&](const char *trace, auto &&mutate) {
+        auto packed = owner(fixture);
+        mutate(packed);
+        rejects(std::move(packed), trace);
+    };
+    malformed("N = INT_MAX", [](auto &p) { p.N = std::numeric_limits<int>::max(); });
+    malformed("N = 0", [](auto &p) { p.N = 0; });
+    malformed("K alone changed", [](auto &p) { p.K = 32; }); // blocks_per_row no longer ceil(K / 32).
+    malformed("negative K", [](auto &p) { p.K = -1; });
+    malformed("unknown source", [](auto &p) { p.codebook_id = 255; });
+    malformed("unknown encoding", [](auto &p) { p.encoding = static_cast<CPUNativeQuantisedEncoding>(250); });
+    malformed("foreign blocks_per_row", [](auto &p) { p.blocks_per_row += 1; });
+    malformed("foreign N_padded", [](auto &p) { p.N_padded += 64; });
+    malformed("short storage", [](auto &p) { p.native_interleaved.resize(p.native_interleaved.size() - 1); });
+
+    // The reviewer's exact case: unknown encoding, asymmetric, N = 1, zero
+    // strides and empty storage must be rejected before any pointer arithmetic.
+    CPUNativeQuantisedPackedWeights empty;
+    empty.encoding = static_cast<CPUNativeQuantisedEncoding>(250);
+    empty.is_asymmetric = true;
+    empty.N = 1; empty.K = 32; empty.N_padded = 64; empty.blocks_per_row = 1;
+    empty.data_stride = 0; empty.interleaved_block_stride = 0;
+    empty.codebook_id = native_quantised_formats::Q4_1.codebook_id;
+    rejects(std::move(empty), "unknown encoding with empty storage");
 }
 
 /** @test A view needs a seal of exactly its bytes and interpretation; arithmetic policy is not part of it. */
