@@ -1,9 +1,9 @@
 # Idea 15: known-failure classification on NUMA-less and 64K-page ARM hosts
 
-Status: classification record. Report only, no production change. Gap tickets go through arm-perf.
-Source anchors refer to `39c24d8b4` (the gated tree). The tracker declares `7d1a94479` and
-`a27c7ed4f` content-equivalent for CPU-only code. Every count below is reproduced by
-`classify.py` from the raw logs listed in §6.
+Status: classification record, revision 2 (reviewer #144). Report only, no production change. Gap
+tickets go through arm-perf. Source anchors refer to `39c24d8b4` (the gated tree). The tracker
+declares `7d1a94479` and `a27c7ed4f` content-equivalent for CPU-only code. Every count below is
+produced by `classify_v2.py` from the raw logs listed in §6.
 
 ## 1. Host records
 
@@ -56,64 +56,104 @@ are not comparable as-is.
 
 **WSL x86**
 
-AVX512, GCC 14, same SHA. It serves as the base reference: a failure that also occurs on x86 at
-the same SHA is not attributable to the ARM host.
+AVX512, GCC 14, at 39c24d8b4. These logs were captured **without `--output-on-failure`**. They
+record which tests failed, but not why. An x86 failure of the same test name is therefore kept as a
+separate baseline observation (§2) and is never used as the cause of an ARM failure.
 
-## 2. Classes and verdicts
+## 2. Method: three independent fields per failing test
 
-| Class | Meaning | Verdict |
+Each failing test of each ARM run gets three fields:
+
+| Field | Meaning |
+|---|---|
+| `x86_same_name` | The same test name also failed on WSL x86 at 39c24d8b4. This is a baseline observation only; the x86 cause is unobservable (see above). |
+| `tags` | Every cause rule whose evidence line occurs in the ARM failure output. Tags **overlap**. They are matched over the whole ctest output of that test, which includes passing gtest siblings; this is why G8 was withdrawn. |
+| `primary` | The first matching tag in the priority order below, or **UNRESOLVED**. Exactly one per test, so the primary counts of a run are a **disjoint partition** of its tests. |
+
+Tags in priority order:
+
+| Tag | Evidence | Verdict |
 |---|---|---|
-| B0 | Also fails on x86 WSL at 39c24d8b4, or is the `_neon`/`_neon_i8mm` twin of a failing base `_scalar` cell | BASE |
-| S1 | Container seccomp: `mbind`/`set_mempolicy`/`get_mempolicy` EPERM, Open MPI hwloc "failed to bind memory" | ENVIRONMENT (launch) |
-| T1 | Tests pass `ImmutableRowTableStoragePolicy::forStorage(…, 4096, …)` mmap windows. The production default is 64 KiB (`kImmutableRowDefaultWindowBytes`) and the validator's fail-fast is correct. | TEST ASSUMPTION |
-| T2 | 4K-host byte literals or caps (4491052224, 8392704, `recordedFragmentBytes`, exact 49×4096 slices, `< 31` ngram boundary, staging cap 8192). Production rounds through the sysconf page in one authority, and its own actual==estimate checks pass. | TEST ASSUMPTION |
-| M1 | Test iterates every NUMA node, including CPU-less ones. The production rejection "Topology exposes no CPU on requested NUMA node" is correct. | TEST ASSUMPTION |
-| E1 | oneDNN origin-probe git behaviour in the devcontainer | ENVIRONMENT (container git) |
-| G1–G7 | See §4 | PRODUCT GAP |
+| X1 | Target missing: unguarded AVX2 `.inc` from `cc502b95a` | BUILD BREAK |
+| S1 | `mbind`/`set_mempolicy`/`get_mempolicy` EPERM, Open MPI "failed to bind memory" | ENVIRONMENT (container launch) |
+| G1, G2, G3, G6 | See §4 | PRODUCT GAP |
+| N2 | Multi-rank inventory or rank-local backend requires exact NUMA affinity (the G5/G7 detection path) | PRODUCT GAP |
+| N1 | NUMA binding or policy required on a NUMA-less kernel (incl. `get_mempolicy: Function not implemented`) | PRODUCT GAP (WP J) |
+| N3 | "Streaming CPU measurement requires observed aggregate cache coverage" | PRODUCT GAP (WP J) |
+| M1 | Test targets a CPU-less node ("Topology exposes no CPU on requested NUMA node") | TEST ASSUMPTION |
+| T1 | Test passes a 4096-byte mmap window; production default is 64 KiB | TEST ASSUMPTION |
+| T2 | 4K-host byte literal or cap (4491052224, 8392704, `recordedFragmentBytes`, 49×4096, `< 31`, staging cap) | TEST ASSUMPTION |
+| E1 | oneDNN origin-probe git behaviour in the devcontainer | ENVIRONMENT |
+| E2 | `docker` CLI absent in the container | ENVIRONMENT |
+| E3 | Nested CMake configure fails inside the test ("Configuring incomplete") | UNRESOLVED-ENV: the configure error itself was not extracted |
+| F1 | ROCm trainer fixtures absent from the tree | FIXTURE MISSING |
+| V1, V2 | Mac timeouts: pass standalone, or the 34 s suite against its 30 s budget | ENVIRONMENT (VM) |
 
-## 3. Results
+**UNRESOLVED** means no rule matched. These rows are listed by name; they are not attributed to the
+base merely because x86 also failed them.
 
-**DGX canonical run** (default seccomp), NEON at 39c24d8b4. 130 DGX failures (Unit 29 + preflight
-101), plus WSL-only rows for completeness, give 134 rows. None are unclassified.
+## 3. Results (disjoint primary partition; x86 same-name overlap shown per row)
 
-| Class | Rows |
-|---|---|
-| B0 base | 32 (all 14 WSL Unit + 16 WSL preflight + `_neon` twin + `_scalar`) |
-| S1 seccomp | 41 |
-| T1 mmap window | 40 |
-| T2 4K literal | 17 |
-| E1 git | 2 |
-| G1 / G3 (primary) | 1 / 1 |
+**DGX canonical run** (39c24d8b4, NEON, default seccomp): 130 failing tests, of which 27 have
+`x86_same_name`.
 
-Two WSL-only rows need explaining:
+| Primary | Tests | …of which x86_same_name |
+|---|---|---|
+| S1 seccomp EPERM | 47 | 5 |
+| T1 mmap window | 40 | 0 |
+| T2 4K literal | 17 | 0 |
+| E3 nested configure | 9 | 9 |
+| UNRESOLVED | 8 | 7 |
+| F1 fixtures | 4 | 4 |
+| E2 docker | 2 | 2 |
+| E1 git | 2 | 0 |
+| G3 | 1 | 0 |
+| **Total** | **130** | **27** |
 
-- `ParityFixtureShardOwnership` is the stale-ccache artifact recorded in ideas07-25.
-- `MoEOwnedSharedBackingNativeStartup` fails on WSL and passes on DGX.
+- Overlapping tag occurrences: S1 47, T1 47, T2 22, E3 9, F1 4, E1 2, E2 2, G1 1, G3 1, N2 1.
+- UNRESOLVED: MoEForbiddenDependencyScan, ProductionParityCampaigns, CPUNativeQuantisedGroupedSealedPlan,
+  CPUShardRouteCollective, NativeQuantisedCommonDispatchPolicy, DevelopPRGateContract,
+  CPUShardFusedFinalAddPreweight_scalar, CPUShardFusedFinalAddPreweight_neon. All except the `_neon`
+  cell also fail by name on x86.
+- WSL-only failures, recorded separately: ParityFixtureShardOwnership (the ideas07-25 stale-ccache
+  artifact) and MoEOwnedSharedBackingNativeStartup (passes on DGX). The `_avx2`/`_avx512` cells are not
+  registered on ARM.
 
-**DGX unmasked rerun**
+**DGX unmasked rerun** of 52 tests (`--cap-add SYS_NICE --security-opt seccomp=unconfined`, same image
+and build, default 64 MiB shm). The sets are disjoint exact test sets.
 
-The rerun covers the S1+P1 set: 52 tests, `--cap-add SYS_NICE --security-opt seccomp=unconfined`,
-same image and build, default 64 MiB shm. Result: 16 PASS, 36 FAIL.
+PASS, 16 tests: these failed only because of the seccomp mask.
 
-- The 16 that pass were seccomp-masked only. They are 9 `CPUJoint*`, 2 `CPUFragment*`, 1
-  `CPUJointBufferedSourceEconomy`, 6 `FrontendAutomaticSelection*_MPI` and `Qwen35MoEGraph`.
-- The 36 that still fail, by primary class:
+- 7 `CPUJoint*`: BufferedSourceEconomy, ColdGraphAdmissionLifecycle, ColocatedSerialArenaLifecycle,
+  InitialBankPrepassContract, LateGraphSourceLifecycle, ReusableRegistryBinding,
+  SerialSourceGeometryLifecycle.
+- 2 `CPUFragment*`: EpochBankContract, PayloadContract.
+- 6 `FrontendAutomaticSelection*_MPI`.
+- `Qwen35MoEGraph`.
 
-| Class | Rows |
-|---|---|
-| B0 base | 4 |
-| T1 | 9 |
-| T2 | 9 |
-| M1 | 2 |
-| **G2** | **9** |
-| **G6** | **4** |
-| G1 | 1 |
-| G3 | 1 |
-| G7 | 1 |
+`CPUJointBufferedSourceEconomy` also fails by name on x86, yet passes here. This shows concretely why
+same-name overlap is not causal attribution.
 
-Each row's deciding line is in `classification-39c24d8b4.csv` (columns `unmasked`,
-`unmasked_classes`). The seccomp mask hid most product gaps: in the canonical run EPERM fired before
-the 64K-page `madvise`/`mbind` was reached.
+FAIL, 36 tests, by primary cause:
+
+| Primary | Tests | …of which x86_same_name |
+|---|---|---|
+| G2 CPUBackend 4K mbind | 9 | 0 |
+| T1 mmap window | 9 | 0 |
+| T2 4K literal | 7 | 1 |
+| G6 expert estimate | 4 | 0 |
+| UNRESOLVED | 3 | 3 |
+| G1 | 1 | 0 |
+| G3 | 1 | 0 |
+| N2 (ClusterInventoryBootstrap) | 1 | 0 |
+| M1 | 1 | 0 |
+| **Total** | **36** | **4** |
+
+- Overlapping tag occurrences: G2 9, T1 9, T2 9, G6 4, M1 2, G1 1, G3 1, N2 1. ExpertGemmRegistry
+  carries G6+T2, MemoryPlanner T1+T2, NUMAAllocator G1+M1.
+- UNRESOLVED: CPUStartupAffinity (no failure line in its output), CPURootedGatherParallelCopyReplay
+  (`validCPUExpertSocketMembership(endpoints,2)` false; a memory-only-node topology effect is plausible
+  but unproven), CPUShardRouteCollective (the preweight assertion).
 
 **DGX NEON_I8MM run**
 
@@ -122,15 +162,9 @@ the 64K-page `madvise`/`mbind` was reached.
 | I8MM | 29/985 | 102/2373 |
 | NEON | 29/984 | 101/2344 |
 
-The failure set is identical to NEON. The only extra entry is `CPUShardFusedFinalAddPreweight_neon_i8mm`,
-the I8MM twin of the base NaN-corpus defect. There are **no I8MM-specific failures on Grace**, and all
+The failing-name set is identical to NEON, except for `CPUShardFusedFinalAddPreweight_neon_i8mm`, the
+I8MM twin of the UNRESOLVED preweight cells. There are no I8MM-specific failures on Grace, and all
 newly registered I8MM cells pass.
-
-**Mac Docker VM at a27c7ed4f**
-
-Run with the kernel-truth launch: SYS_NICE, seccomp unconfined, 16 GiB shm, NEON_DOTPROD,
-Integration, `SHARED_CORE=ON`, private ccache. Results: Unit 957/984 and preflight 2296/2374. All
-105 failures are classified; see §5.
 
 ## 4. Product gaps (ticket candidates, filed through arm-perf)
 
@@ -155,51 +189,51 @@ Integration, `SHARED_CORE=ON`, private ccache. Results: Unit 957/984 and preflig
 **Withdrawn:** G8 (activation arena). The ERROR line comes from the passing deliberate rejection test
 `CPUGraphArenaDeclarations.SmallActualSchemaMaterializesExactlyAndRejectsShortOwnerBudget`.
 
+
 ## 5. Mac record (a27c7ed4f, NUMA-less kernel, 4K pages, no published cache sizes)
 
-Classified by `classify_mac.py` into `classification-mac-a27c7ed4f.csv`: 105 failures (Unit 27 +
-preflight 78), none unclassified.
+Run with the kernel-truth launch (SYS_NICE, seccomp unconfined, 16 GiB shm), NEON_DOTPROD envelope,
+Integration build, private ccache. Unit 957/984, preflight 2296/2374: 105 failing tests, of which 28
+have `x86_same_name`.
 
-| Class | Rows | Verdict |
+| Primary | Tests | …of which x86_same_name |
 |---|---|---|
-| B0: name fails on x86 WSL at 39c24d8b4 (or the `_neon`/`_neon_dotprod` twin of a base `_scalar` cell) | 30 | BASE |
-| N1: NUMA binding/policy required ("libnuma reports NUMA unavailable; NUMA binding is required", "NUMA policy APIs are unavailable", "CPU root first-touch placement failed", node −1) | 41 | PRODUCT GAP, known: idea 15 proposal 1 (typed single-memory-domain endpoint) |
-| N2: multi-rank inventory or rank-local backend requires NUMA affinity | 20 | PRODUCT GAP, known; shares the G5/G7 detection path |
-| N3: cache sizes unpublished ("Streaming CPU measurement requires observed aggregate cache coverage") | 1 | PRODUCT GAP, known: idea 15 proposal 2 (measured cache geometry) |
-| X1: build break, the 8 fused-completion NEON/NEON_DOTPROD cells. The target does not compile on aarch64: unguarded `__m256` in `CPUNativeQuantisedUnsignedWeightDotLifecycle.inc:90-94`, from develop commit `cc502b95a`. | 8 | BUILD BREAK (reported to Main) |
-| V1: slow VM. Load timeouts under the parallel gate; pass standalone in 2–8 s. | 3 | ENVIRONMENT (VM) |
-| V2: slow VM. The MTP benchmark-matrix suite takes 34 s against its 30 s budget (idea 01-4). | 2 | ENVIRONMENT (VM budget) |
+| N1 NUMA binding/policy required | 41 | 3 |
+| N2 multi-rank/rank-local NUMA affinity | 25 | 2 |
+| UNRESOLVED | 10 | 8 |
+| E3 nested configure | 9 | 9 |
+| X1 build break | 8 | 0 |
+| F1 fixtures | 4 | 4 |
+| V1 timeout, passes standalone | 3 | 0 |
+| E2 docker | 2 | 2 |
+| V2 suite over its 30 s budget | 2 | 0 |
+| N3 unpublished cache sizes | 1 | 0 |
+| **Total** | **105** | **28** |
 
-Notes:
+- **UNRESOLVED (10):** MoEForbiddenDependencyScan, ProductionParityCampaigns (timeout under the gate),
+  CPUNativeQuantisedGroupedSealedPlan, NativeQuantisedCommonDispatchPolicy (registry 10 vs 9),
+  CPUShardRouteCollective, DevelopPRGateContract, CPUStartupAffinity, and
+  CPUShardFusedFinalAddPreweight_scalar/_neon/_neon_dotprod. Eight of these also fail by name on x86.
+- **X1 (historical; recorded, not closed by the fix).** These 8 cells failed at a27c7ed4f because their
+  target did not compile on aarch64. The source defect is fixed in `f69446e3c`.
+  - Closure is separate rerun evidence: at `f69446e3c` (plus the two Bundle-1 test-only commits) all 8
+    built and passed on this Mac container (`01-tip-f69446e3c.log`).
+  - That is a focused rerun of the 8 cells, not a full Unit/preflight rerun.
+- **Revision-1 correction:** v1 put `TensorFactory{Aggregate,Bound}NUMAPolicy` in N1 because the test
+  *name* matched `NUMAPolicy`. v2 classifies them by their output (`get_mempolicy: Function not
+  implemented`, the kernel's ENOSYS), which is still N1.
 
-- The base attribution is by name at 39c24d8b4, while the Mac ran at a27c7ed4f (declared
-  content-equivalent for CPU code). Several base rows fail on the Mac for a different reason than on
-  x86. For example, `ModelKLDCanary` cannot find `docker` in the container. These rows stay BASE
-  rather than being re-attributed.
-- The Mac VM launch matters (§1). Under Docker's default seccomp, N1 failures surface as EPERM
-  instead of ENOSYS.
-- Cross-host view:
-  - N1/N2/N3 are the NUMA-less and cache-unpublished classes this idea scopes. They do not appear on
-    Grace, which has NUMA and published caches.
-  - G1/G2/G6 are 64K-page gaps that do not appear on the 4K Mac.
-  - G3 (CPU-less/zero nodes) and G7 (procfs substring parse) are latent on any host with that
-    topology.
+Cross-host view:
 
-Evidence (SHA-256 prefixes):
-
-| File | Content | SHA-256 |
-|---|---|---|
-| `mac/unit-a27c7ed4f.log` | Unit run | `d561d7c2…` |
-| `mac/preflight-a27c7ed4f.log` | Preflight run | `cd8b31f2…` |
-| `mac/build-a27c7ed4f.log` | Final `-k 0` build | `f27ad5ca…` |
-| `mac/timeouts-standalone-a27c7ed4f.log` | Standalone reruns of the timeouts | `d22b6828…` |
-
-Also kept: the two earlier aborted build attempts, `build-…attempt1-oom.log` (my concurrent 09
-compiles) and `build-…attempt2-break.log`.
+- N1/N2/N3 appear only on the NUMA-less Mac.
+- G1/G2/G6 appear only on 64K-page Grace.
+- G3 (CPU-less/zero nodes) and G7 (procfs substring parse) are latent wherever that topology exists.
+- E2/E3/F1 are container or tree conditions seen on both ARM hosts. Whether x86 fails for the same
+  reasons cannot be determined from the WSL logs.
 
 ## 6. Evidence
 
-Paths are relative to `/tmp/armqual-b1`; archive into the tracker.
+Raw logs, relative to `/tmp/armqual-b1`:
 
 | Path | Content | SHA-256 |
 |---|---|---|
@@ -210,11 +244,22 @@ Paths are relative to `/tmp/armqual-b1`; archive into the tracker.
 | `raw/dgx/unmasking/probes_b1.txt` | Station probes | `ffb04ec0…` |
 | `raw/dgx/i8mm/unit_i8mm.log` | DGX I8MM Unit | `59e593f3…` |
 | `raw/dgx/i8mm/preflight_i8mm.log` | DGX I8MM preflight | `24c87a16…` |
-| `raw/wsl/unit.log`, `raw/wsl/preflight.log` | x86 base reference | — |
+| `raw/wsl/unit.log` | x86 failing-name baseline, no failure output | `f736ea26…` |
+| `raw/wsl/preflight.log` | x86 failing-name baseline, no failure output | `442daceb…` |
+| `mac/unit-a27c7ed4f.log` | Mac Unit | `d561d7c2…` |
+| `mac/preflight-a27c7ed4f.log` | Mac preflight | `cd8b31f2…` |
+| `mac/build-a27c7ed4f.log` | Mac `-k 0` build | `f27ad5ca…` |
+| `mac/timeouts-standalone-a27c7ed4f.log` | Standalone reruns of the timeouts | `d22b6828…` |
+| `01-tip-f69446e3c.log` | X1 closure rerun | — |
 
-Other files:
+Mac probes: `mac/env-probe-a27c7ed4f.log`, `mac/env-probe-seccomp-split.log`, `mac/env_probe.c`.
 
-- `mac/env-probe-a27c7ed4f.log`, `mac/env-probe-seccomp-split.log`, `mac/env_probe.c`: Mac probes.
-- `15/extract.py`, `15/classify.py`, `15/classification-39c24d8b4.csv`: the DGX/WSL classifier and
-  its output, reproducible from the raw logs.
-- `15/classify_mac.py`, `15/classification-mac-a27c7ed4f.csv`: the Mac classifier and its output.
+Classifiers, archived in the tracker at `docs/v2/projects/2026-11/arm-perf-review/evidence/bundle1/`:
+
+- `classify.py` and `classification-39c24d8b4.csv`: revision 1, DGX/WSL. **Superseded** by v2; it used
+  base-by-name attribution.
+- `classify_mac.py` and `classification-mac-a27c7ed4f.csv`: revision 1, Mac. **Superseded**, for the
+  same reason plus the name-matched N1 rule.
+- **To add (revision 2, authoritative):** `15/classify_v2.py` (`ac0a624f…`),
+  `15/classification-v2.csv` (`35c21aff…`, one row per (run, test) with `x86_same_name`, `tags`,
+  `primary`), and the shared block splitter `15/extract.py`.

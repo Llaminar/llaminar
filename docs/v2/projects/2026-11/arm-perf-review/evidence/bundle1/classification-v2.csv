@@ -1,0 +1,288 @@
+run,test,status,x86_same_name,tags,primary,verdict
+dgx-canonical,V2_Unit_MoEOverlayCapacityResolver,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Unit_MoEForbiddenDependencyScan,Failed,True,,UNRESOLVED,?
+dgx-canonical,V2_Unit_ModelKLDCanary,Failed,True,E2,E2 docker CLI absent in container,ENVIRONMENT
+dgx-canonical,V2_Unit_ExpertGemmRegistry,Failed,False,S1;T2,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Unit_CPUBackend,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Unit_ROCmArchitecturePolicy,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+dgx-canonical,V2_Unit_Qwen4ExpPrimitives,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Unit_OptionalGPUPreflightRegistration,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+dgx-canonical,V2_Unit_ProductionParityCampaigns,Failed,True,,UNRESOLVED,?
+dgx-canonical,V2_Unit_CPUNativeQuantisedGroupedSealedPlan,Failed,True,,UNRESOLVED,?
+dgx-canonical,V2_Unit_ROCmNativeQuantisedTrainerCsvValidator,Failed,True,F1,F1 ROCm trainer fixtures absent from tree,FIXTURE MISSING
+dgx-canonical,V2_Unit_ROCmNativeQuantisedTrainerGenerator,Failed,True,F1,F1 ROCm trainer fixtures absent from tree,FIXTURE MISSING
+dgx-canonical,V2_Unit_ROCmNativeQuantisedDecodeTrainerGenerator,Failed,True,F1,F1 ROCm trainer fixtures absent from tree,FIXTURE MISSING
+dgx-canonical,V2_Unit_ROCmNativeQuantisedBatchedDecodeTrainerGenerator,Failed,True,F1,F1 ROCm trainer fixtures absent from tree,FIXTURE MISSING
+dgx-canonical,V2_Unit_DeviceRegistry,Failed,False,G3,G3 CPU device per CPU-less/zero node,PRODUCT GAP
+dgx-canonical,V2_Unit_TransferEngine,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Unit_MappedHostTransferRegion,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Unit_Qwen35MoEGraph,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Unit_ModelLoaderRowSlice,Failed,True,S1;T2,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Unit_PreparedEmbeddingWeightsLifecycle,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Unit_VocabParallelEmbeddingSharding,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Unit_WeightMemoryEstimator,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Unit_ActivationMemoryEstimator,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Unit_OneDNNBuildLifecycle,Failed,False,E1,E1 container git: oneDNN origin probe,ENVIRONMENT
+dgx-canonical,V2_Unit_CPUShardRouteCollective,Failed,True,,UNRESOLVED,?
+dgx-canonical,V2_Unit_ROCmMoEAutomaticOwnerConfiguration,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+dgx-canonical,V2_Unit_MemoryPlanner,Failed,False,T1;T2,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Unit_NativeQuantisedCommonDispatchPolicy,Failed,True,,UNRESOLVED,?
+dgx-canonical,V2_Unit_NUMAAllocator,Failed,False,S1;G1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_DevelopPRGateContract,Failed,True,,UNRESOLVED,?
+dgx-canonical,V2_Integration_ModelKLDCanary,Failed,True,E2,E2 docker CLI absent in container,ENVIRONMENT
+dgx-canonical,V2_Integration_PreflightDeviceInventoryIsolation,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+dgx-canonical,V2_Integration_Qwen4ExpCPUContracts,Failed,False,S1;T1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUStartupAffinity,Failed,True,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_ClusterInventoryBootstrap,Failed,False,S1;N2,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_ROCmArchitectureIdentityReplay,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+dgx-canonical,V2_Integration_NativeGTestRequiredExecution,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+dgx-canonical,V2_Integration_OptionalGPUPreflightRegistration,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+dgx-canonical,V2_Integration_CPU_NativeQuantisedWeightPackingAllFormats,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUFlashAttentionCausalRowOwnership,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_GroupedVerifierRows_CPU_Attention_NonQ16NativeFormats,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUFlashAttentionAQ8NativeEntries,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_FrontendAutomaticSelection_MPI,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_FrontendAutomaticSelection_selected-follower_MPI,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_FrontendAutomaticSelection_cost-failure_MPI,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_FrontendAutomaticSelection_preparation-failure_MPI,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_FrontendAutomaticSelection_sample-failure_MPI,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_FrontendAutomaticSelection_follower-evaluator_MPI,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_PlanCommandPublication_MPI,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUFinalEmbeddingStorage,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_NativeEmbeddingPreparedOwnership,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPURootedGatherParallelCopyReplay,Failed,True,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_Qwen4ExpImmutableLookupStage,Failed,False,S1;T1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_Qwen4ExpImmutableRAMNUMA,Failed,False,S1;T1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_MTPSpecCPUBatchedVerifierPlans,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_Qwen4ExpPLEBuilder,Failed,False,S1;T1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_Qwen4ExpLookupStatistics,Failed,False,S1;T1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_Qwen4ExpLookupWindowStatistics,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableRowTableIndexedWindowReplay,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_Qwen4ExpImmutableHostPlacement,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_NgramMandatoryExecutionProvision,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CpuAdaptiveImmutableRowCache,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableFutureLookupOnlySourceReplay,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CpuImmutableLookupOnlyReplay,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ConsumerLocalSubordinateGeometryContract,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_HostAdaptiveRequestCapacity,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_HostImmutableRowProvider,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CpuAdaptiveImmutableRowCachePinAuthentication,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableRowTableContiguousGatherAlias,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_HostImmutableRowRetainedOwnerObservation,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CpuAdaptiveImmutableRowCacheReuseAuthentication,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_HostAdaptiveNgramPlanning,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_HostAdaptiveImmutableLookupCPUStage,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_HostAdaptiveImmutableLookupProtocol,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_HostAdaptiveModelContext,Failed,False,S1;T1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_Qwen4ExpPLEVerifierRowsContract,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_Qwen4ExpPLEPreparedVerifierCPU,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableLookupSubordinateCPU,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableLookupSubordinateRequesterIdentityReplay,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableLookupWorkerCancellationReplay,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_GPUAdaptiveImmutableLookupCohortGeometry,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_TensorFactoryAggregateNUMAPolicy,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_TensorFactoryBoundNUMAPolicy,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_MappedDispatchTicketFreshZeroAllocation,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CPUGraphArenaDeclarations,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CPUDisabledMTPArenaAdmission,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ROCmMoEAutomaticOwnerConfiguration,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+dgx-canonical,V2_Integration_NativeMPITestLaunchDefaults,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+dgx-canonical,V2_Integration_OneDNNOriginAuthentication,Failed,False,E1,E1 container git: oneDNN origin probe,ENVIRONMENT
+dgx-canonical,V2_Integration_ImmutableLookupWorkerSourceAbortReplay,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_PooledImmutableSourceCompletionRetirementReplay,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableLookupClosedWorkerGateLifecycle,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_PooledNativeOriginalTicketAbortReplay,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_PooledImmutableOrderingGeometryReplay,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_PooledExpertOriginalSourceFailureLifecycle,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableLookup_SharedSourceGroupInterleavesExactFramesAndRepeatedReset,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableLookup_SharedSourceOutstandingGrantsKeepOriginalRowsAndPins,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableLookup_SharedSourcePartialAdmissionUsesOriginalGroupCancellation,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableLookup_SharedSourceEarlyTerminalWaitsForLegitimatePeerClose,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableLookup_SharedSourceMissingPeerCloseCancelsConcurrentTerminalWait,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ImmutableLookup_SharedSourceJoinedFailureRemainsObservableBeforePeerRetirement,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_ConsumerLocalTP4AndTP8OriginalService,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_PooledSourceOriginalFailureCallback,Failed,False,S1;T1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_AdaptiveFullRAMOwners,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_AdaptiveFullRAMTerminalPublication,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_AdaptiveFullRAMPhysicalSourceGeometry,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CPUExpertShardExecution_QFNOriginalMixedFormatsAndNative320CutsReplay,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CPUExpertShardExecution_QFNOriginalQ4KQ8_0Native320CutsReplay,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CPUExpertShardExecution_QFNOriginalQ5KQ8_0Native320CutsReplay,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CPUJointPreparedSourceContract,Failed,False,S1;T2,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUJointBoundedSourceLifecycle,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CPUJointBoundedNativeFormatWindows,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUJointBufferedSourceFailureLifecycle,Failed,True,S1;T2,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUJointBufferedSourceEconomy,Failed,True,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUJointStaticResidencyLifecycle,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUJointSourceAuthorityLifecycle,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUJointLateGraphSourceLifecycle,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUJointColdGraphAdmissionLifecycle,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUJointSerialSourceGeometryLifecycle,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUFragmentPayloadContract,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUFragmentEpochBankContract,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUJointInitialBankPrepassContract,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUJointReusableRegistryBinding,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_CPUShardPreparedPackedQFNClasses,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CPUShardFusedFinalAddPreweight_scalar,Failed,True,,UNRESOLVED,?
+dgx-canonical,V2_Integration_CPUShardFusedFinalAddPreweight_neon,Failed,False,,UNRESOLVED,?
+dgx-canonical,V2_Integration_CPUJointSerialGeometryContract,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CPUJointColocatedSerialArenaLifecycle,Failed,False,S1,S1 container seccomp: NUMA syscall EPERM,ENVIRONMENT (launch)
+dgx-canonical,V2_Integration_NativeWeightLoadStagingContract,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-canonical,V2_Integration_CpuImmutableLookupOnlyFreeRetentionReplay,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-unmasked,V2_Unit_Qwen4ExpPrimitives,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-unmasked,V2_Integration_Qwen4ExpCPUContracts,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-unmasked,V2_Unit_MoEOverlayCapacityResolver,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-unmasked,V2_Unit_CPUBackend,Failed,False,G2,G2 CPUBackend 4K-aligned mbind,PRODUCT GAP
+dgx-unmasked,V2_Unit_ExpertGemmRegistry,Failed,False,G6;T2,G6 expert estimate Heap vs page-mapped,PRODUCT GAP
+dgx-unmasked,V2_Integration_CPUStartupAffinity,Failed,True,,UNRESOLVED,?
+dgx-unmasked,V2_Unit_DeviceRegistry,Failed,False,G3,G3 CPU device per CPU-less/zero node,PRODUCT GAP
+dgx-unmasked,V2_Integration_ClusterInventoryBootstrap,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+dgx-unmasked,V2_Unit_TransferEngine,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-unmasked,V2_Unit_MappedHostTransferRegion,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-unmasked,V2_Unit_Qwen35MoEGraph,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Unit_PreparedEmbeddingWeightsLifecycle,Failed,False,G2,G2 CPUBackend 4K-aligned mbind,PRODUCT GAP
+dgx-unmasked,V2_Unit_VocabParallelEmbeddingSharding,Failed,False,G2,G2 CPUBackend 4K-aligned mbind,PRODUCT GAP
+dgx-unmasked,V2_Integration_CPU_NativeQuantisedWeightPackingAllFormats,Failed,False,M1,M1 test targets a CPU-less node,TEST ASSUMPTION
+dgx-unmasked,V2_Unit_WeightMemoryEstimator,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-unmasked,V2_Integration_CPUFlashAttentionCausalRowOwnership,Failed,False,G2,G2 CPUBackend 4K-aligned mbind,PRODUCT GAP
+dgx-unmasked,V2_Unit_ActivationMemoryEstimator,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-unmasked,V2_Integration_GroupedVerifierRows_CPU_Attention_NonQ16NativeFormats,Failed,False,G2,G2 CPUBackend 4K-aligned mbind,PRODUCT GAP
+dgx-unmasked,V2_Integration_CPUFlashAttentionAQ8NativeEntries,Failed,False,G2,G2 CPUBackend 4K-aligned mbind,PRODUCT GAP
+dgx-unmasked,V2_Integration_FrontendAutomaticSelection_MPI,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_FrontendAutomaticSelection_selected-follower_MPI,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_FrontendAutomaticSelection_cost-failure_MPI,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_FrontendAutomaticSelection_preparation-failure_MPI,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_FrontendAutomaticSelection_sample-failure_MPI,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_FrontendAutomaticSelection_follower-evaluator_MPI,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_PlanCommandPublication_MPI,Failed,False,G2,G2 CPUBackend 4K-aligned mbind,PRODUCT GAP
+dgx-unmasked,V2_Integration_NativeEmbeddingPreparedOwnership,Failed,False,G2,G2 CPUBackend 4K-aligned mbind,PRODUCT GAP
+dgx-unmasked,V2_Integration_CPURootedGatherParallelCopyReplay,Failed,True,,UNRESOLVED,?
+dgx-unmasked,V2_Integration_Qwen4ExpImmutableLookupStage,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-unmasked,V2_Integration_Qwen4ExpImmutableRAMNUMA,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-unmasked,V2_Unit_MemoryPlanner,Failed,False,T1;T2,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-unmasked,V2_Unit_CPUShardRouteCollective,Failed,True,,UNRESOLVED,?
+dgx-unmasked,V2_Integration_MTPSpecCPUBatchedVerifierPlans,Failed,False,G2,G2 CPUBackend 4K-aligned mbind,PRODUCT GAP
+dgx-unmasked,V2_Unit_NUMAAllocator,Failed,False,G1;M1,G1 NUMAAllocator 4K page constant,PRODUCT GAP
+dgx-unmasked,V2_Integration_Qwen4ExpPLEBuilder,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-unmasked,V2_Integration_Qwen4ExpLookupStatistics,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-unmasked,V2_Integration_HostAdaptiveModelContext,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-unmasked,V2_Integration_PooledSourceOriginalFailureCallback,Failed,False,T1,T1 test mmap window 4096,TEST ASSUMPTION
+dgx-unmasked,V2_Integration_CPUJointPreparedSourceContract,Failed,False,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-unmasked,V2_Integration_CPUJointBoundedNativeFormatWindows,Failed,False,G6,G6 expert estimate Heap vs page-mapped,PRODUCT GAP
+dgx-unmasked,V2_Integration_CPUJointBufferedSourceFailureLifecycle,Failed,True,T2,T2 4K-host byte literal/cap,TEST ASSUMPTION
+dgx-unmasked,V2_Integration_CPUJointBufferedSourceEconomy,Passed,True,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_CPUJointStaticResidencyLifecycle,Failed,False,G6,G6 expert estimate Heap vs page-mapped,PRODUCT GAP
+dgx-unmasked,V2_Integration_CPUJointSourceAuthorityLifecycle,Failed,False,G6,G6 expert estimate Heap vs page-mapped,PRODUCT GAP
+dgx-unmasked,V2_Integration_CPUJointLateGraphSourceLifecycle,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_CPUJointColdGraphAdmissionLifecycle,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_CPUJointSerialSourceGeometryLifecycle,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_CPUFragmentPayloadContract,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_CPUFragmentEpochBankContract,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_CPUJointInitialBankPrepassContract,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_CPUJointReusableRegistryBinding,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+dgx-unmasked,V2_Integration_CPUJointColocatedSerialArenaLifecycle,Passed,False,,PASS (S1-masked only),ENVIRONMENT (launch)
+mac,V2_Unit_Qwen4ExpPrimitives,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Unit_ModelKLDCanary,Failed,True,E2,E2 docker CLI absent in container,ENVIRONMENT
+mac,V2_Unit_ExpertGemmRegistry,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Unit_Static_NoKernelFactoryPreparedEmbeddingRegistry,Timeout,False,V1,V1 timeout under parallel gate,ENVIRONMENT (VM)
+mac,V2_Unit_MoEForbiddenDependencyScan,Failed,True,,UNRESOLVED,?
+mac,V2_Unit_TensorTransitionEncapsulationPolicy,Timeout,False,V1,V1 timeout under parallel gate,ENVIRONMENT (VM)
+mac,V2_Unit_CPUBackend,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Unit_MTPIterationBenchmarkMatrix,Timeout,False,V2,V2 slow VM: 34 s suite vs 30 s budget (01-4),ENVIRONMENT (VM budget)
+mac,V2_Unit_ProductionParityCampaigns,Timeout,True,,UNRESOLVED,?
+mac,V2_Unit_ROCmArchitecturePolicy,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+mac,V2_Unit_OptionalGPUPreflightRegistration,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+mac,V2_Unit_CPUNativeQuantisedGroupedSealedPlan,Failed,True,,UNRESOLVED,?
+mac,V2_Unit_ROCmNativeQuantisedTrainerCsvValidator,Failed,True,F1,F1 ROCm trainer fixtures absent from tree,FIXTURE MISSING
+mac,V2_Unit_ROCmNativeQuantisedTrainerGenerator,Failed,True,F1,F1 ROCm trainer fixtures absent from tree,FIXTURE MISSING
+mac,V2_Unit_ROCmNativeQuantisedDecodeTrainerGenerator,Failed,True,F1,F1 ROCm trainer fixtures absent from tree,FIXTURE MISSING
+mac,V2_Unit_ROCmNativeQuantisedBatchedDecodeTrainerGenerator,Failed,True,F1,F1 ROCm trainer fixtures absent from tree,FIXTURE MISSING
+mac,V2_Unit_NativeQuantisedCommonDispatchPolicy,Failed,True,,UNRESOLVED,?
+mac,V2_Unit_NUMAAllocator,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Unit_ModelLoaderRowSlice,Failed,True,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Unit_Qwen35MoEGraph,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Unit_PreparedEmbeddingWeightsLifecycle,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Unit_CPUEmbeddingGroupedVerifier,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Unit_VocabParallelEmbeddingSharding,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Unit_PhysicalMemoryAuthority,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Unit_ROCmMoEAutomaticOwnerConfiguration,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+mac,V2_Unit_PreparedNativeLookupFixture,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Unit_CPUShardRouteCollective,Failed,True,,UNRESOLVED,?
+mac,V2_Integration_DevelopPRGateContract,Failed,True,,UNRESOLVED,?
+mac,V2_Integration_ModelKLDCanary,Failed,True,E2,E2 docker CLI absent in container,ENVIRONMENT
+mac,V2_Integration_PreflightDeviceInventoryIsolation,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+mac,V2_Integration_Qwen4ExpCPUContracts,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_NativeSharedFileProofPackaging,Timeout,False,V1,V1 timeout under parallel gate,ENVIRONMENT (VM)
+mac,V2_Integration_CPUStartupAffinity,Failed,True,,UNRESOLVED,?
+mac,V2_Integration_ClusterInventoryBootstrap,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_MTPBenchmarkPolicyEvidence,Timeout,False,V2,V2 slow VM: 34 s suite vs 30 s budget (01-4),ENVIRONMENT (VM budget)
+mac,V2_Integration_ROCmArchitectureIdentityReplay,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+mac,V2_Integration_NativeGTestRequiredExecution,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+mac,V2_Integration_OptionalGPUPreflightRegistration,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+mac,V2_Integration_CPU_NativeQuantisedFusedProjectionEvidenceIdentity_NEON,Failed,False,X1,X1 build break: unguarded AVX2 .inc (cc502b95a),BUILD BREAK
+mac,V2_Integration_CPU_NativeQuantisedOrderedNibbleReplay_NEON,Failed,False,X1,X1 build break: unguarded AVX2 .inc (cc502b95a),BUILD BREAK
+mac,V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_NEON,Failed,False,X1,X1 build break: unguarded AVX2 .inc (cc502b95a),BUILD BREAK
+mac,V2_Integration_CPU_NativeQuantisedFusedCompletion_NEON,Failed,False,X1,X1 build break: unguarded AVX2 .inc (cc502b95a),BUILD BREAK
+mac,V2_Integration_CPU_NativeQuantisedFusedProjectionEvidenceIdentity_NEON_DOTPROD,Failed,False,X1,X1 build break: unguarded AVX2 .inc (cc502b95a),BUILD BREAK
+mac,V2_Integration_CPU_NativeQuantisedOrderedNibbleReplay_NEON_DOTPROD,Failed,False,X1,X1 build break: unguarded AVX2 .inc (cc502b95a),BUILD BREAK
+mac,V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_NEON_DOTPROD,Failed,False,X1,X1 build break: unguarded AVX2 .inc (cc502b95a),BUILD BREAK
+mac,V2_Integration_CPU_NativeQuantisedFusedCompletion_NEON_DOTPROD,Failed,False,X1,X1 build break: unguarded AVX2 .inc (cc502b95a),BUILD BREAK
+mac,V2_Integration_CPUFlashAttentionCausalRowOwnership,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_GroupedVerifierRows_CPU_Attention_NonQ16NativeFormats,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUFlashAttentionAQ8NativeEntries,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_MPITopology,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_MPITopology_CPUOnly,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_MoEOverlayResidencyConsensus_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_RankInitializationLifecycle_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_PlanningMPITransfers_2Ranks,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_PlanningProjectionPolicyAgreement_2Ranks,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_PlanningMPITransfers_3Ranks,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_PlanningProjectionPolicyAgreement_3Ranks,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_ExecutionSessionRetirement_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_FrontendExecutionSelection_selected-follower_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_FrontendExecutionSelection_reversed-selection_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_FrontendAutomaticSelection_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_FrontendAutomaticSelection_selected-follower_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_FrontendAutomaticSelection_cost-failure_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_FrontendAutomaticSelection_preparation-failure_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_FrontendAutomaticSelection_sample-failure_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_FrontendAutomaticSelection_follower-evaluator_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_PlanCommandPublication_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_PlanCommandPublication_Local,Failed,False,N3,N3 unpublished cache sizes: streaming measurement refused,PRODUCT GAP (WP J)
+mac,V2_Integration_PlanningStreamingBandwidth_CPU,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_CPUFinalEmbeddingStorage,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_NativeTensorViewOwnership,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_NativeCPUWeightAllocatorOwnership,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_EmbeddingSourceRepresentation,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_NativeEmbeddingSource_CPU,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_NativeEmbeddingPreparedOwnership,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPURootedGatherParallelCopyReplay,Failed,True,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_ShmemSpinAbsorbingAbortReplay,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_MTPSpecCPUBatchedVerifierPlans,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_Qwen4ExpImmutableHostPlacement,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_TensorFactoryAggregateNUMAPolicy,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_TensorFactoryBoundNUMAPolicy,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_ROCmMoEAutomaticOwnerConfiguration,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+mac,V2_Integration_NativeMPITestLaunchDefaults,Failed,True,E3,E3 nested CMake configure fails in test sandbox,UNRESOLVED-ENV? (cause of configure error not extracted)
+mac,V2_Integration_MoEOwnedSharedBackingNativeStartup,Failed,True,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_PreparedNativeLookupFixtureReplay,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointPreparedSourceContract,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointBoundedSourceLifecycle,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointBoundedNativeFormatWindows,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointBufferedSourceFailureLifecycle,Failed,True,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointBufferedSourceEconomy,Failed,True,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointStaticResidencyLifecycle,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointSourceAuthorityLifecycle,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointLateGraphSourceLifecycle,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointColdGraphAdmissionLifecycle,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointSerialSourceGeometryLifecycle,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUFragmentPayloadContract,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUFragmentEpochBankContract,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointInitialBankPrepassContract,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_CPUJointReusableRegistryBinding,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
+mac,V2_Integration_MoEOverlayCPUCompactWire_MPI,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_CPUShardSourceRangesLivePrefix,Failed,False,N2,N2 multi-rank/rank-local requires NUMA affinity (G5/G7 path),PRODUCT GAP
+mac,V2_Integration_CPUShardFusedFinalAddPreweight_scalar,Failed,True,,UNRESOLVED,?
+mac,V2_Integration_CPUShardFusedFinalAddPreweight_neon,Failed,False,,UNRESOLVED,?
+mac,V2_Integration_CPUShardFusedFinalAddPreweight_neon_dotprod,Failed,False,,UNRESOLVED,?
+mac,V2_Integration_CPUJointColocatedSerialArenaLifecycle,Failed,False,N1,N1 NUMA binding/policy required on NUMA-less kernel,PRODUCT GAP (WP J)
