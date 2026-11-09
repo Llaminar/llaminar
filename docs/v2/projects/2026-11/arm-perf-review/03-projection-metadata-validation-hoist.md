@@ -228,3 +228,16 @@ separate (shared) path with the same pattern but different owners.
   separately (dispatch<8>/<16>, loadScales256/512) on poisoned + normalized.
 - Reviewer still inspecting NEON family/policy tests + arrival ordering; final
   scope follows. Successor re-check = separately identified.
+
+## SOURCE112 addendum (2026-11-09) — two more
+
+- (3) UNKNOWN-ENCODING 0-STRIDE CASE: unknown encoding, is_asymmetric=true,
+  N=1, N_padded=64, blocks_per_row=1, data_stride=interleaved_block_stride=0,
+  EMPTY storage → prepared*Stride(unknown)=0 → all comparisons pass (0-byte
+  extent), then normalization forms data()+256 and memsets past null/empty.
+  FIX: reject unsupported source/encoding + validate canonical structure
+  BEFORE any mutable span/pointer arithmetic; no executable metadata-admitted
+  WeightView before sealing. Same fixture as a regression (reject, no mutation).
+- (4) COVERAGE: verifyTailPadding focused matrix = contiguous Rows1/2 +
+  ordered Rows1/2/3/4 (NOT Rows1..4 × both policies as claimed) → add
+  CONTIGUOUS Rows3/4 (preferred) or narrow the claim.
