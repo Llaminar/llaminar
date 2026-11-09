@@ -79,12 +79,15 @@ namespace llaminar2::cpu::native_quantised
 #if defined(__ARM_FEATURE_DOTPROD)
             ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
 #endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+            ARMCPUCapabilities::native().require(ARMCPUFeature::IntegerMatMul);
+#endif
             return CPUNativeNEONProjectionBatch(weights, activation, output, output_stride, width, grid, bias, n_block_chunks);
         }
 
         /**
          * @brief Execute independent original-coordinate tiles on the current/new team.
-         * @tparam Instruction Explicit ASIMD or separately compiled/admitted DotProd.
+         * @tparam Instruction Explicit ASIMD, or separately compiled/admitted DotProd or I8MM.
          * @details Every member of an existing OpenMP team enters the workshare,
          * following OMP_WORKSHARE_REGION. Fixed per-row K trees make ownership
          * independent of positive team size. Inactive rows and output padding
@@ -94,8 +97,10 @@ namespace llaminar2::cpu::native_quantised
         template <multi_scale::NEONByteDot Instruction = multi_scale::NEONByteDot::ASIMD>
         void execute() const
         {
-            if constexpr (Instruction == multi_scale::NEONByteDot::DotProd)
+            if constexpr (Instruction == multi_scale::NEONByteDot::DotProd || Instruction == multi_scale::NEONByteDot::I8MM)
                 ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
+            if constexpr (Instruction == multi_scale::NEONByteDot::I8MM)
+                ARMCPUCapabilities::native().require(ARMCPUFeature::IntegerMatMul);
             if (!grid_.beginWorkshare()) return;
             const std::int64_t tasks = taskCount();
             // Tasks are independent output tiles whose full-K arithmetic does
