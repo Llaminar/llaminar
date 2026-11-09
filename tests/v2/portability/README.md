@@ -8,7 +8,7 @@ engine Unit and `ProductionTestPreflight` gates.
 
 ## Configure, build, discover
 
-Use a genuine C++ toolchain, installed GTest/OpenMP and the dependencies required
+Use genuine C/C++ toolchains, installed GTest/OpenMP and the dependencies required
 by the shared registrations. Select the actual architecture's compiler envelope;
 foreign or unavailable ISA requests fail instead of choosing another path.
 
@@ -30,6 +30,16 @@ observations as another ISA. The supported values and exact flags belong to
 `cmake/CPUInstructionSet.cmake`. Keep Debug, sanitizer, alternate-compiler and
 Release evidence separate. Test discovery, not a copied count or name list,
 is the inventory authority.
+
+Integration defaults initialize both compiler languages before `project()` opens
+its per-configuration caches. Authored nonempty final flags and preexisting
+normal/cache `_INIT` values remain caller-owned; defaults do not force another
+envelope. An inherited empty Integration cache is rejected: use a fresh build
+directory or explicitly supply the intended optimized flags. A configuration
+name alone is not optimization evidence. The installed native C/C++ witness
+checks optimization-present/NDEBUG; exact flags, symbols, ISA and every relevant
+TU still require actual compile-command/codegen evidence. Cache-state tests use
+genuine CMake without a runtime compiler SDK or executable temporary mount.
 
 AppleClang may require explicit paths to a genuine installed OpenMP runtime.
 Configure the standard `OpenMP_CXX_FLAGS`, `OpenMP_CXX_INCLUDE_DIR`,
