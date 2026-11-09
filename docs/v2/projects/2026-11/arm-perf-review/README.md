@@ -168,3 +168,11 @@ After i8mm merge (same tile / post-merge):
   NEON_I8MM explicit supported + hardware capable → FOLLOW-UP OFFERED:
   -DLLAMINAR_CPU_ISA=NEON_I8MM gate (real SMMLA datapoint on new CPU).
 - VOCAB-only GGUFs only → smoke skipped (no fetch allowed).
+
+- Arm tip moved again (Main): **a27c7ed4f** (replaces 7d1a94479; routine base
+  rebase; no-regate rule). Bundle 1 (measurement lane 01a1bd53) executing:
+  15 (doc) → 20 → 09 → 01; answers: raw WSL logs pulled
+  (/tmp/armqual-b1/raw/wsl/); DGX extracts incoming; deliverables = docs→
+  tracker, 01 code = codex/bundle1-perf-harness @ a27c7ed4f → reviewer →
+  FF to Main; 01 scope = 01-1 + 01-3; isolation = own container/private
+  ccache (the (C) lesson).
