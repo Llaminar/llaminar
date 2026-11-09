@@ -401,3 +401,12 @@ the source policy). Dead persistent_state parameter removed.
   dca2a3021 run = portability + preflight only (NOT V2_Unit_*). Production
   contract stays; stale tests updated. Lane fixing; WSL (5'') held until the
   fixed SHA. Rebase equivalence confirmed (0 lines, 45 files +2855/-1162).
+
+- REVIEWER FINAL dca2a3021: narrow mechanical source-only ACK; no rebase
+  discrepancy. 10 linear commits; range-diff all `=`; base-change deltas =
+  same 50 paths/numstats (48 identical blobs; 2 CMake patches equal after
+  index/hunk normalization; registrations retained). Final source =
+  reviewed cleanup + R1 delta, no extra rebase content. No semantic
+  non-interference claim; owner evidence boundaries; merge authority = Main.
+  Fix commit (4 unit regressions) = new tip → quick test-delta re-ACK →
+  WSL (5'').
