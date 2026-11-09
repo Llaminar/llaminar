@@ -320,7 +320,7 @@ namespace llaminar2::cpu::native_quantised
             return vandq_u8(vtstq_u8(raw, positions), vdupq_n_u8(bit));
         }
 
-        /** @brief Decode one Q6_K group's six-bit source integers for four columns.
+        /** @brief Decode one Q6_K group's six-bit source integers for four columns (I8MM pair block only).
          * @param unit Prepared interleaved unit of the current block.
          * @param column First of four output columns.
          * @param group Four-value group in [0,7].
@@ -444,7 +444,16 @@ namespace llaminar2::cpu::native_quantised
 #pragma GCC unroll 1
                             for (int group = 0; group < 8; ++group)
                             {
-                                const auto centered = q6Group(unit, column, group);
+                                const auto raw = vld1q_u8(unit + (group % 4) * 256 + column * 4);
+                                auto values = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
+                                const auto *planes = unit + 1024 + group * 64 + (column / 16) * 16;
+                                std::uint64_t bits0 = 0, bits1 = 0;
+                                std::memcpy(&bits0, planes, sizeof(bits0));
+                                std::memcpy(&bits1, planes + 8, sizeof(bits1));
+                                const int shift = (column % 16) * 4;
+                                values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits0 >> shift), 16));
+                                values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits1 >> shift), 32));
+                                const auto centered = vsubq_s8(vreinterpretq_s8_u8(values), vdupq_n_s8(32));
                                 if (group < 4) consume<Ops>(centered, block, group, low);
                                 else consume<Ops>(centered, block, group, high);
                             }
