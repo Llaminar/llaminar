@@ -14,6 +14,7 @@
 #include "utils/RoPEAngleTestStorage.h"
 #include <gtest/gtest.h>
 #include <omp.h>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -527,6 +528,96 @@ TEST(CPURoPEWorkshare, InverseFrequencyLookupAlternatesConfigurationsInRetainedT
         }
     }
     EXPECT_EQ(mismatches.load(), 0);
+}
+
+/** @brief Seeded Q8_1 query/key banks for one-row integer RoPE regressions. */
+struct Q8Rows
+{
+    std::vector<Q8_1Block> query, key;
+    Q8Rows(int rows, int dim) : query(std::size_t(rows) * 3 * dim / 32), key(std::size_t(rows) * dim / 32)
+    { seedBank(query, 23); seedBank(key, 29); }
+    /** @return Query then key bytes. */
+    std::vector<std::uint8_t> bytes() const
+    {
+        const auto *q = reinterpret_cast<const std::uint8_t *>(query.data());
+        const auto *k = reinterpret_cast<const std::uint8_t *>(key.data());
+        std::vector<std::uint8_t> out(q, q + query.size() * sizeof(Q8_1Block));
+        out.insert(out.end(), k, k + key.size() * sizeof(Q8_1Block));
+        return out;
+    }
+};
+
+/**
+ * @test One-row Q8_1 RoPE inside a retained team rotates each shared head exactly once.
+ *
+ * Every member of an existing team calls the kernel on the same banks. The
+ * former one-row path rotated all heads on every member; one head workshare
+ * must reproduce the standalone bytes for any team width and a late member.
+ */
+TEST(CPURoPEWorkshare, Q8OneRowRetainedTeamRotatesEachHeadOnce)
+{
+    Budget budget;
+    constexpr int dim = 64;
+    const int position = 17231;
+    Q8Rows expected(1, dim);
+    RoPEAngleTestStorage reference(1, dim / 2);
+    primitives::apply_rope_q8_1_integer(expected.query.data(), expected.key.data(), &position, 1, 3, 1, dim,
+        10000.0f, reference.view(1, dim / 2));
+    for (int team : {2, 3, 10})
+        for (int iteration = 0; iteration < 5; ++iteration)
+        {
+            Q8Rows actual(1, dim);
+            RoPEAngleTestStorage storage(1, dim / 2);
+            const auto angles = storage.view(1, dim / 2);
+#pragma omp parallel num_threads(team)
+            {
+                if (omp_get_thread_num() == team - 1)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                primitives::apply_rope_q8_1_integer(actual.query.data(), actual.key.data(), &position, 1, 3, 1,
+                    dim, 10000.0f, angles);
+            }
+            ASSERT_EQ(actual.bytes(), expected.bytes()) << "team=" << team;
+        }
+}
+
+/**
+ * @test A negative one-row Q8_1 position never reuses a previous call's angles.
+ *
+ * The former one-row path skipped its table fill for a negative position and
+ * rotated by whatever the thread's previous call had left behind. The row is
+ * now computed like the multi-row program: independent of the prior position
+ * on the same thread and equal to row 0 of a two-row call.
+ */
+TEST(CPURoPEWorkshare, Q8OneRowNegativePositionIsIndependentOfPriorCall)
+{
+    Budget budget;
+    constexpr int dim = 64;
+    RoPEAngleTestStorage storage(2, dim / 2);
+    const int padding = -1;
+    std::vector<std::vector<std::uint8_t>> observed;
+    for (const int prior : {777, 17231, 0})
+    {
+        Q8Rows warm(1, dim);
+        primitives::apply_rope_q8_1_integer(warm.query.data(), warm.key.data(), &prior, 1, 3, 1, dim, 10000.0f,
+            storage.view(1, dim / 2));
+        Q8Rows padded(1, dim);
+        primitives::apply_rope_q8_1_integer(padded.query.data(), padded.key.data(), &padding, 1, 3, 1, dim,
+            10000.0f, storage.view(1, dim / 2));
+        observed.push_back(padded.bytes());
+    }
+    EXPECT_EQ(observed[0], observed[1]);
+    EXPECT_EQ(observed[0], observed[2]);
+
+    // The same row inside a two-row call, where the multi-row program always computed it.
+    Q8Rows pair(2, dim);
+    const std::array<int, 2> positions = {padding, 5};
+    primitives::apply_rope_q8_1_integer(pair.query.data(), pair.key.data(), positions.data(), 2, 3, 1, dim,
+        10000.0f, storage.view(2, dim / 2));
+    const auto rows = pair.bytes();
+    const std::size_t q_row = 3 * dim / 32 * sizeof(Q8_1Block), k_row = dim / 32 * sizeof(Q8_1Block);
+    std::vector<std::uint8_t> first_row(rows.begin(), rows.begin() + q_row);
+    first_row.insert(first_row.end(), rows.begin() + 2 * q_row, rows.begin() + 2 * q_row + k_row);
+    EXPECT_EQ(observed[0], first_row);
 }
 } // namespace
 } // namespace llaminar2::test

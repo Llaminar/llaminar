@@ -185,8 +185,8 @@ TEST(CPURoPEAngleWorkspaceLifecycle, UndersizedBindingIsFatalBeforeAnyStore)
     EXPECT_EQ(values(*c.k), c.k_original);
 }
 
-/** @test The CPU declaration depends only on graph rows and the physical head width. */
-TEST(CPURoPEAngleWorkspaceLifecycle, DeclarationFollowsRowsAndHeadWidthOnly)
+/** @test The CPU declaration depends only on graph rows and the effective rotated width. */
+TEST(CPURoPEAngleWorkspaceLifecycle, DeclarationFollowsRowsAndRotatedWidthOnly)
 {
     CPURoPEKernelT<ActivationPrecision::FP32> kernel;
     const auto requirements = kernel.getWorkspaceRequirements(512, 256);
@@ -194,6 +194,19 @@ TEST(CPURoPEAngleWorkspaceLifecycle, DeclarationFollowsRowsAndHeadWidthOnly)
     EXPECT_EQ(requirements.buffers.front().size_bytes, primitives::rope_angle_layout(512, 128).bytes);
     EXPECT_TRUE(kernel.getWorkspaceRequirements(512, 0).buffers.empty());
     EXPECT_EQ(kernel.getWorkspaceRequirements(512, 256).total_bytes_with_alignment(),
-              cpu_rope_workspace::requirements({.graph_rows = 512, .head_dim = 256}).total_bytes_with_alignment());
+              cpu_rope_workspace::requirements({.graph_rows = 512, .rotary_dim = 256}).total_bytes_with_alignment());
+
+    // A partial-RoPE stage declares only its rotated prefix and executes within it.
+    CPUDeviceContext ctx(DeviceId::cpu(), 4);
+    auto c = makeStage({40, 41, 42}, false);
+    RoPEStage::Params params = c.stage->getParams();
+    params.partial_rotary_factor = 0.25f;
+    RoPEStage partial(params);
+    const auto declared = partial.getWorkspaceRequirements(3);
+    ASSERT_EQ(declared.buffers.size(), 1u);
+    EXPECT_EQ(declared.buffers.front().size_bytes, primitives::rope_angle_layout(3, kHeadDim / 8).bytes);
+    CPUProjectionTestWorkspace workspace(declared);
+    partial.bindWorkspace(workspace.get());
+    EXPECT_TRUE(partial.execute(&ctx));
 }
 }
