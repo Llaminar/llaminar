@@ -425,3 +425,10 @@ the source policy). Dead persistent_state parameter removed.
   installer (HEAD 3/3 fail), gcc-16 syntax (2 macOS-env only), byte-exact
   contract compile. WSL (5'') = first real execution; reviewer test-delta
   pass + WSL in flight.
+
+- WSL (5'') queued at 0b32f8edd (after (5') preflight, ahead of N2/N3);
+  diff saved; equivalence dca2a3021 = b199ccfa0 + R1 holds through the fix.
+- GPU-gate note: Test__RoPEGraphCaptureNoH2D registered only as
+  V2_Integration_{CUDA,ROCm}RoPEGraphCaptureNoH2D → x86 can't certify it;
+  plan: GB10 full CUDA gate at merged tip (post spill-fix) exercises it
+  (arm-sparks informed; handover note for the lane — not a seal blocker).
