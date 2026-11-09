@@ -257,3 +257,16 @@ the source policy). Dead persistent_state parameter removed.
   equivalence + Mac portability carry over (file never built). WSL (5') at
   407347f6c; ThreadSweep the only RMSNorm perf cell; dead DebugEnv
   LLAMINAR_RMSNORM_* fields = Main follow-up (handover).
+
+## Reviewer interim (2026-11-09) — RoPE negative-position contract (P2 likely)
+
+- Unchanged production code: ordinary floating RoPE fills with
+  RoPEPaddingRows::Skip (negative-position angle rows untouched) but
+  consumers rotate those rows unconditionally (RoPEPrimitives.cpp:531–542,
+  694–696, 826–856; BF16/FP16 share). Old ordinary helper computed angles for
+  EVERY abs position; direct primitive call with n_past=-1 consumes
+  dirty/uninitialized workspace. Typed FP32 kernel skips negative positions
+  BEFORE invoking primitives → reviewer NOT claiming ordinary-stage path
+  impact. Likely bounded P2 (exported primitive contract) + focused
+  dirty-workspace negative-position regression. Ownership TBD after pass
+  (lane's 7a/7a2 RoPE workspace vs base). No probe; tip stays stable.
