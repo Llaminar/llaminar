@@ -1002,6 +1002,11 @@ v2_add_core_free_test(V2_Integration_CPUNativeQuantisedMetadataSealCoverage
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Metadata Regression)
 # Partial final chunks: producers normalize padding words in the owned
 # generation; raw poisoned padding is rejected, normalized arrivals admitted.
+# Admitted in-team metadata access keeps a fatal (never throwing) coordinate bound.
+v2_add_core_free_test(V2_Integration_CPUNativeQuantisedAdmittedAccessBound
+    COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
+        --gtest_filter=CPUNativeQuantisedMetadataSeal.AdmittedMetadataAccessIsFatalOutsideThePublication
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Metadata Regression)
 v2_add_core_free_test(V2_Integration_CPUNativeQuantisedPaddingNormalization
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
         --gtest_filter=CPUNativeQuantisedMetadataSeal.PaddingNormalization*
