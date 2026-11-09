@@ -47,6 +47,29 @@ Configure the standard `OpenMP_CXX_FLAGS`, `OpenMP_CXX_INCLUDE_DIR`,
 headers/libraries or weakening runtime identity checks. This focused build does
 not implement the full engine's platform memory/placement backend.
 
+## Original INT32 RMSNorm
+
+The shared RMS targets compile the actual production TU and the legacy INT32
+and precision caller TUs. Focused INT32 preflights exercise full-width FP64
+summary programs, native original-row code/scale publication, explicit scalar
+controls, complete-bank exclusions and immediate retained completion. The
+precision target's focused case replaces an obsolete decoded-row helper; its
+other precision cases retain their canonical full-engine Unit registration.
+
+```sh
+cmake --build build_arm_portability --parallel --target \
+  v2_test_cpu_rmsnorm_workshare v2_test_cpu_rmsnorm_precision
+ctest --test-dir build_arm_portability -R '^V2_Integration_CPURMSNormInt32' \
+  --output-on-failure --parallel
+```
+
+Scalar diagnostics are not an empty native receipt. Original integers widen
+straight to FP64 for summaries; publication separately rounds
+`(float(x)*inverse)*gamma`, with no decoded/TLS row or scratch resizing. Native
+vector RNE and scalar-tail ties-away remain distinct, as do ISA summary trees.
+This row-INT8 scale has no block-Q8/FP32-quantizer floor. Do not infer factory,
+physical placement, whole-engine inference or economy from these checks.
+
 ## Isolated AQ8 kernel economics
 
 The canonical model-free `Perf__CPUAttentionKeyQ8.cpp` target measures exactly

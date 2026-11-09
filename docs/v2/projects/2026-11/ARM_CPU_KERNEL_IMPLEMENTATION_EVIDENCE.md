@@ -10,6 +10,105 @@ kernel slices from the unfinished objective in
 production factory/workspace bindings, real models, HTTP/MTP/prefix campaigns,
 exact-overlay installation and final `Perf__` scaling have not passed.
 
+## 2026-11-06 immutable4e56 successor audit
+
+Main independently verified the x86 return archive SHA256
+`46aa1c53a25217c217b60bc5b759b13cb26012228aa352b542f4358d21af58ca`
+(4432870B), all157 raw hashes and archive/extracted bytes. Actual GNU14 Release
+AVX2 and AVX512 each pass24 registered cells and12 individually counted
+focused cells×20=240 raw passes, without skips. Only after both pass, actual
+AVX512-built binaries under runtime AVX2 pass15 AQ8/value,8 lookup and1
+separately compiled C/C++ configuration GTests. Explicit dot-ISA sweeps do not
+prove that every dot in that suite uses the environment-selected ISA. Three
+canonical auto-ISA dot invocations independently authenticate byte-exact output
+and identities AVX2/AVX2,AVX512/AVX512,AVX512/AVX2; their timings are not economy.
+
+Ten native ELF machine62 binaries, actual built-TU commands, raw XML/repeat
+counts, source-authored TIMEOUT30 and before/after default-FP probes were
+checked. Source owns GNU++20 for AQ8/Perf/ISA/compiler witnesses, GNU++23 for
+lookup and a real separate C compiler. A packaging helper's incorrect demand
+for C++23 everywhere remains disclosed; metadata correction did not rebuild or
+rerun the producer. Exact SDKf492 config/36 layers, all3989 installed-prefix
+records and selected tools match the independently qualified payload. A new
+owned ext4 build/cache volume was admitted separately from the nearly full
+source/evidence filesystem; no other owner's storage was reclaimed.
+
+The separate ARM return SHA256 is
+`3ab1ac742962ae5111e5086193dea300d933dd707f8239c3054899329558a667`
+(1952164B), all111 raw hashes verified. Normal Integration NEON/GNU14 configures
+in96.419s; unrestricted app+both gate-target build exits1 after216.702s. The
+first actual failed command is `CPUQwenSparseAttention.cpp:22`, missing
+`immintrin.h` (build.log854–856). Source additionally contains an explicit
+AVX-only dot compile error and NEON-rejecting ISA admission; these are source
+observations, not extra compiler diagnostics. Actual immutable-lookup object
+891136B/SHA`abf09cf2b152db89ce4bcb328bc945c2bb3bb25b9396ed6230ef669eeda6fa92`
+and KV append now have successful Ninja records. Neither implies an executable.
+Parent inventory is2145 commands/3446 SHOW-ONLY tests/3145 genuine SIGTERM36
+pairs; **zero tests execute**. Actual O3/g/NDEBUG/custom-assertions/ASIMD flags
+and the archive-bound43-member SDK closure were checked.
+
+Both complete7076-entry before/after maps equal SHA256
+`12700915c91245ea7c6192595772ff8dbe4c0934abb4c1d3b52b95d9252158db`.
+Capture starts81.036ms(x86) and223.991ms(ARM) after terminal exit, not removal.
+Actual target/ancestor cgroups and host capacity were inspected; missing ARM
+root limits stay absent. Private peaks are2186571776B and36692869120B, with
+zero OOM/throttling; Docker terminal states are PID0/OOMfalse. Owned producers
+and collectors were retired and both windows released. Immutable4e56 scopes do
+not cover the later INT32 changes, complete engine/FA2/PMA/serving or performance.
+
+## Original INT32 summary/publication vertical work
+
+A full-width INT32 summary must not pass original integers through FP32.
+Eight copies of16777217 require2251800082120712, not2251799813685248. AVX2 now
+widens directly into eight FP64 chains; NEON retains its original full-width
+eight-chain program and AVX512 its distinct existing program. Explicit scalar
+intent is increasing-column FP64 FMA. Typed complete-bank borrows reject
+source/output/options/inverse/gamma intersections and wrapping geometry before
+stores. Empty and small retained calls use lexical collective completion.
+
+Changing summary ownership alone exposed the old fused caller's private TLS
+summary/inverse banks. The repair therefore replaces staged/fused publication
+together: original integers and gamma are streamed twice through native
+register fragments; `(float(x)*inverse)*gamma` has separate FP32 edges. Complete
+NEON/AVX2 eight-coordinate or AVX512 sixteen-coordinate fragments retain RNE;
+scalar tails and explicit scalar diagnostics retain ties-away. Original scale
+is `A>0?A/127:1`, without a foreign quantizer floor. Inverse0 publishes zero
+codes/scale1 without reading gamma values. Nonfinite/unrepresentable rows are
+fatal before that row stores; earlier retired rows are not rolled back. Fused
+ARM summaries share1..4 original rows and keep their FP64-mean inverse and
+publication under one owner. There is no decoded row, TLS bank or scratch
+resizing; the replaced scratch type/overload and helper declarations are retired.
+
+Actual unchanged old publication-region bytes (SHA256
+`8980f84558ff80c788f91f9b39747d848c2955c4025d3a93bdf7338db2bd1737`)
+reproduce the missing native half-tie program and staged empty early returns.
+Review found a live private-helper caller in the actual legacy precision TU;
+its complete target reproduces an undefined scalar-normalization symbol before
+retirement is completed. The repaired case uses the public admitted publisher
+with independent FP32 products and poisoned code/scale output. A core-free
+selection compiles the **entire actual TU**; the canonical whole precision Unit
+registration and existing numerical thresholds remain unchanged. Strict Debug
+then exposed three otherwise-vacuous scalar reference cases when no x86
+comparison is compiled: they now check independent original arithmetic, not an
+unused-variable suppression. The unused fixture EPSILON constant was removed;
+no case's authored epsilon changed. The actual strict whole TU and all four
+affected cases pass. Numeric fixtures reject a Scalar/foreign inventory rather
+than skipping it.
+
+Before this caller/test closure, the scoped five-profile matrix passes195
+registrations per profile and152 preflights×20=3040 independently counted raw
+passes. Genuine GNU14 ARM passes37 actual RMS cases,9 Q16 legacy cases,27
+registrations,10 INT32 preflights×20 and2 compiler-policy cells with actual
+O3/g/NDEBUG commands; its15663-entry source maps match. These are explicitly
+**pre-review source scopes**, not later-source or full-engine certificates.
+The first local producer helper had a Python parse error before any admission
+or container creation; the separate corrected producer ran. A metadata verifier
+also initially expected the wrong armv8.2 envelope; actual source correctly
+uses armv8-a+simd+dotprod. Both helper failures remain preserved, not relabeled
+kernel failures. Current AVX2/AVX512 paths have real cross-target compiler syntax
+checks only; native x86 execution, CPU PMU/economy and full integration remain
+required. No older4e56 x86 receipt supplies that proof.
+
 ## 2026-11-05 RMSNorm integration checkpoint (incomplete)
 
 The new native `NEONRMSNormReduction.h` consumes original noncontiguous

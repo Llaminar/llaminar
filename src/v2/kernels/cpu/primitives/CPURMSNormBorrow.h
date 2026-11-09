@@ -1,6 +1,6 @@
 /**
  * @file CPURMSNormBorrow.h
- * @brief Complete original floating/compressed RMSNorm bank borrows before worksharing.
+ * @brief Complete original floating/integer/compressed RMSNorm bank borrows before worksharing.
  *
  * Geometry, address arithmetic, exact-alias policy and immutable gamma/metadata
  * protection are established before workers can write. These synchronous views
@@ -130,6 +130,185 @@ private:
     std::size_t rows_,columns_;
     float epsilon_;
 };
+/** @brief Checked full-width integer input and disjoint FP64 summary publication.
+ * @details Original integer words never pass through a decoded FP32 bank. These
+ * synchronous spans authenticate address arithmetic/metadata exclusion only;
+ * physical allocation capacity and lease lifetime remain caller-owned.
+ */
+class Int32ReductionBorrow final
+{
+public:
+    /** @brief Bind every original input row and summary before the workshare edge.
+     * @param source Complete original INT32 bank; @param output Disjoint FP64 row summaries.
+     * @param rows Original logical rows; @param columns Original integer width.
+     * @return Immutable checked addressing; zero rows/columns admit no payload work.
+     * @throws std::invalid_argument For wrapping geometry, missing banks or source/output intersection.
+     */
+    static Int32ReductionBorrow bind(const std::int32_t*source,double*output,std::size_t rows,std::size_t columns)
+    {
+        constexpr auto bound=std::size_t(std::numeric_limits<std::ptrdiff_t>::max());
+        if(rows>bound/sizeof(double)||columns>bound/sizeof(std::int32_t)||
+            (columns&&rows>bound/sizeof(std::int32_t)/columns))
+            throw std::invalid_argument("INT32 RMS summary requires representable original row geometry");
+        const auto outputRows=rows&&columns?rows:0;
+        requireBank(source,rows*columns,sizeof(std::int32_t));
+        requireBank(output,outputRows,sizeof(double));
+        if(overlaps(source,rows*columns*sizeof(std::int32_t),output,outputRows*sizeof(double)))
+            throw std::invalid_argument("INT32 RMS summary aliases original integer storage");
+        return Int32ReductionBorrow(source,output,rows,columns);
+    }
+    /** @return Whether this invocation owns no arithmetic/payload publication. */
+    [[nodiscard]]bool empty()const noexcept{return !rows_||!columns_;}
+    /** @return Original logical rows, not worker-local ownership. */
+    [[nodiscard]]std::size_t rows()const noexcept{return rows_;}
+    /** @return Original integer width, independent of SIMD padding. */
+    [[nodiscard]]std::size_t columns()const noexcept{return columns_;}
+    /** @brief Borrow one complete original integer row.
+     * @param row Original row coordinate; @return Synchronous immutable integers.
+     * @throws std::out_of_range For a coordinate outside the declared bank.
+     */
+    [[nodiscard]]std::span<const std::int32_t> sourceRow(std::size_t row)const
+    {
+        if(row>=rows_)throw std::out_of_range("INT32 RMS source row outside original bank");
+        return {columns_?source_+row*columns_:source_,columns_};
+    }
+    /** @brief Publish one owned row summary after its complete fixed-order reduction.
+     * @param row Original row coordinate; @param value Complete FP64 summary.
+     * @throws std::out_of_range For an empty/out-of-range publication.
+     */
+    void publish(std::size_t row,double value)const
+    {
+        if(empty()||row>=rows_)throw std::out_of_range("INT32 RMS summary outside live original bank");
+        output_[row]=value;
+    }
+    /** @brief Exclude original immutable policy from every worker-owned output byte.
+     * @param metadata Complete original options; @param bytes Complete descriptor extent.
+     * @throws std::invalid_argument For an output/metadata intersection.
+     */
+    void requireMetadataReadOnly(const void*metadata,std::size_t bytes)const
+    {
+        if(overlaps(output_,empty()?0:rows_*sizeof(double),metadata,bytes))
+            throw std::invalid_argument("INT32 RMS summary aliases retained invocation policy");
+    }
+private:
+    /** @brief Retain only already validated original addressing and geometry.
+     * @param source Original integers; @param output Original summaries.
+     * @param rows Original rows; @param columns Original width.
+     */
+    Int32ReductionBorrow(const std::int32_t*source,double*output,std::size_t rows,std::size_t columns)
+        :source_(source),output_(output),rows_(rows),columns_(columns){}
+    const std::int32_t*source_;
+    double*output_;
+    std::size_t rows_,columns_;
+};
+
+/** @brief Complete original integer/gamma and disjoint INT8/row-scale publication borrow.
+ * @details Row descriptors can only be constructed by this complete-bank
+ * authority. They preserve original coordinates without proving allocated
+ * capacity, extending caller leases, or retaining a converted FP32 row.
+ */
+class Int32QuantizationBorrow final
+{
+public:
+    /** @brief One already-admitted original row and its exclusive publication. */
+    class Row final
+    {
+    public:
+        /** @return Complete immutable original integers. */
+        [[nodiscard]]std::span<const std::int32_t> source()const noexcept{return {source_,columns_};}
+        /** @return Complete immutable gamma, or empty identity intent. */
+        [[nodiscard]]std::span<const float> gamma()const noexcept{return gamma_?std::span<const float>(gamma_,columns_):std::span<const float>{};}
+        /** @return Complete exclusive signed-code publication. */
+        [[nodiscard]]std::span<std::int8_t> output()const noexcept{return {output_,columns_};}
+        /** @brief Publish the matching row scale after its complete payload.
+         * @param value Original row-scale program's finite positive result.
+         */
+        void publishScale(float value)const noexcept{*scale_=value;}
+    private:
+        friend class Int32QuantizationBorrow;
+        /** @brief Retain validated original row roots only.
+         * @param source Original integers; @param gamma Original gamma or identity.
+         * @param output Exclusive codes; @param scale Exclusive row metadata.
+         * @param columns Original live width.
+         */
+        Row(const std::int32_t*source,const float*gamma,std::int8_t*output,float*scale,std::size_t columns)
+            :source_(source),gamma_(gamma),output_(output),scale_(scale),columns_(columns){}
+        const std::int32_t*source_;
+        const float*gamma_;
+        std::int8_t*output_;
+        float*scale_;
+        std::size_t columns_;
+    };
+    /** @brief Authenticate the complete invocation before any worker publication.
+     * @param source Original integer bank; @param gamma Optional immutable weights.
+     * @param output Exclusive signed-code bank; @param scales Exclusive FP32 row metadata.
+     * @param rows Original rows; @param columns Original live integer width.
+     * @return Synchronous checked original bank; no scratch or allocation is owned.
+     * @throws std::invalid_argument For malformed geometry, missing/wrapping banks or any source/output intersection.
+     */
+    static Int32QuantizationBorrow bind(const std::int32_t*source,const float*gamma,std::int8_t*output,
+        float*scales,std::size_t rows,std::size_t columns)
+    {
+        constexpr auto bound=std::size_t(std::numeric_limits<std::ptrdiff_t>::max());
+        if(rows>bound/sizeof(float)||columns>bound/sizeof(std::int32_t)||
+            (columns&&rows>bound/sizeof(std::int32_t)/columns))
+            throw std::invalid_argument("INT32 RMS quantization requires representable original geometry");
+        const auto words=rows*columns,outputRows=words?rows:0;
+        requireBank(source,words,sizeof(std::int32_t));requireBank(output,words,sizeof(std::int8_t));
+        requireBank(scales,outputRows,sizeof(float));
+        if(gamma&&words)requireBank(gamma,columns,sizeof(float));
+        const auto sourceBytes=words*sizeof(std::int32_t),codeBytes=words*sizeof(std::int8_t),scaleBytes=outputRows*sizeof(float);
+        if(overlaps(output,codeBytes,source,sourceBytes)||overlaps(scales,scaleBytes,source,sourceBytes)||
+            overlaps(output,codeBytes,scales,scaleBytes)||
+            (gamma&&(overlaps(output,codeBytes,gamma,columns*sizeof(float))||overlaps(scales,scaleBytes,gamma,columns*sizeof(float)))))
+            throw std::invalid_argument("INT32 RMS codes/scales intersect an original bank or another publication");
+        return Int32QuantizationBorrow(source,gamma,output,scales,rows,columns);
+    }
+    /** @return Whether no live payload or row metadata is published. */
+    [[nodiscard]]bool empty()const noexcept{return !rows_||!columns_;}
+    /** @return Original logical rows, independent of team ownership. */
+    [[nodiscard]]std::size_t rows()const noexcept{return rows_;}
+    /** @return Original logical columns, independent of vector tails. */
+    [[nodiscard]]std::size_t columns()const noexcept{return columns_;}
+    /** @brief Borrow an original immutable row for a shared fixed-order summary.
+     * @param row Original coordinate; @return Complete immutable original input.
+     * @throws std::out_of_range For an empty/out-of-range row.
+     */
+    [[nodiscard]]std::span<const std::int32_t> sourceRow(std::size_t row)const
+    {return this->row(row).source();}
+    /** @brief Obtain one exclusive original-coordinate publication descriptor.
+     * @param index Original row coordinate; @return Already checked source/output roots.
+     * @throws std::out_of_range For an empty/out-of-range row.
+     */
+    [[nodiscard]]Row row(std::size_t index)const
+    {
+        if(empty()||index>=rows_)throw std::out_of_range("INT32 RMS publication outside original row bank");
+        return Row(source_+index*columns_,gamma_,output_+index*columns_,scales_+index,columns_);
+    }
+    /** @brief Exclude retained invocation policy/inverses from both writable banks.
+     * @param metadata Complete readonly descriptor/bank; @param bytes Its original byte extent.
+     * @throws std::invalid_argument For a metadata/publication intersection.
+     */
+    void requireMetadataReadOnly(const void*metadata,std::size_t bytes)const
+    {
+        if(overlaps(output_,rows_*columns_,metadata,bytes)||overlaps(scales_,empty()?0:rows_*sizeof(float),metadata,bytes))
+            throw std::invalid_argument("INT32 RMS publication aliases retained policy or inverse metadata");
+    }
+private:
+    /** @brief Retain only validated original addressing and geometry.
+     * @param source Original integers; @param gamma Original optional gamma.
+     * @param output Exclusive codes; @param scales Exclusive scales.
+     * @param rows Original row count; @param columns Original live width.
+     */
+    Int32QuantizationBorrow(const std::int32_t*source,const float*gamma,std::int8_t*output,float*scales,std::size_t rows,std::size_t columns)
+        :source_(source),gamma_(gamma),output_(output),scales_(scales),rows_(rows),columns_(columns){}
+    const std::int32_t*source_;
+    const float*gamma_;
+    std::int8_t*output_;
+    float*scales_;
+    std::size_t rows_,columns_;
+};
+
 /** @brief Checked original Q16-to-FP32 expansion; compressed storage is never an output alias.
  * @details The physical72-byte source block and128-byte publication fragment
  * have different geometries. Complete-bank protection precedes worksharing,
