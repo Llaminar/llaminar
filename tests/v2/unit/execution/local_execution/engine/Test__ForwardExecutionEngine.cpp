@@ -1633,20 +1633,25 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_ExecutesChunksInOrd
  */
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_PublishesHostChunkGapAndFamilyTimers)
 {
-    std::map<std::string, std::optional<std::string>> environment;
+    // Restores the caller's PerfStats environment and collector on every exit,
+    // including an ASSERT that returns early.
+    struct PerfStatsEnvironmentRestore
+    {
+        std::map<std::string, std::optional<std::string>> saved;
+        ~PerfStatsEnvironmentRestore()
+        {
+            for (const auto &[key, value] : saved)
+                if (value) ::setenv(key.c_str(), value->c_str(), 1);
+                else ::unsetenv(key.c_str());
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
+            PerfStatsCollector::reset();
+        }
+    } restore;
     for (const char *key : {"LLAMINAR_PERF_STATS_JSON", "LLAMINAR_PERF_STATS_FILTER"})
     {
         const char *value = std::getenv(key);
-        environment[key] = value ? std::optional<std::string>(value) : std::nullopt;
+        restore.saved[key] = value ? std::optional<std::string>(value) : std::nullopt;
     }
-    const auto restore = [&]
-    {
-        for (const auto &[key, value] : environment)
-            if (value) ::setenv(key.c_str(), value->c_str(), 1);
-            else ::unsetenv(key.c_str());
-        PerfStatsCollector::reloadConfigurationFromEnvironment();
-        PerfStatsCollector::reset();
-    };
     const auto run = [&]
     {
         auto engine = makeEngine(/*cache_enabled=*/false);
@@ -1703,7 +1708,6 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_PublishesHostChunkG
     run();
     EXPECT_FALSE(family("prefill_chunk_host_wall"));
     EXPECT_FALSE(family("prefill_family_host_wall"));
-    restore();
 }
 
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_HoldsDistinctAuthorityLeaseAcrossEverySubmission)
