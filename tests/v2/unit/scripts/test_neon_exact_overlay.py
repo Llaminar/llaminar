@@ -4,8 +4,9 @@
 
 The generator may only replace the total four-row/one-chunk NEON policy for a
 fully measured runtime key whose byte-exact winner pools across every source
-alias without regressing any of them. Incomplete, non-exact, duplicated or
-mixed-ISA evidence fails; nothing is interpolated.
+alias and independent replica without regressing any of them. Incomplete,
+non-exact, duplicated, unreplicated or mixed-ISA evidence fails; nothing is
+interpolated.
 """
 
 from __future__ import annotations
@@ -56,12 +57,40 @@ def write(rows) -> Path:
 class NeonExactOverlayTest(unittest.TestCase):
     """Exact-only, alias-pooled and fail-closed generator semantics."""
 
-    def generate(self, rows, *extra):
+    def generate(self, rows, *extra, replica_rows=None):
+        """Run the generator over ``rows`` and an independent second replica.
+
+        The second replica defaults to the same latencies with a distinct
+        per-file shape label, so the identical-bytes guard is not tripped.
+        """
+        if replica_rows is None:
+            replica_rows = [dict(row, shape="S2") for row in rows]
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "table.inc"
             receipt = Path(directory) / "receipt.json"
-            overlay.main(["--csv", str(write(rows)), "--output", str(out), "--receipt", str(receipt), *extra])
+            overlay.main(["--csv", str(write(rows)), "--csv", str(write(replica_rows)),
+                          "--output", str(out), "--receipt", str(receipt), *extra])
             return out.read_text(), receipt.read_text()
+
+    def test_single_replica_missing_key_or_replica_regression_is_rejected(self):
+        rows = rows_for("Q4_K", 4, {("Pair", 2): 80.0})
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "t.inc"
+            receipt = Path(directory) / "r.json"
+            with self.assertRaises(overlay.OverlayError):
+                overlay.main(["--csv", str(write(rows)), "--output", str(out), "--receipt", str(receipt)])
+            same = write(rows)
+            with self.assertRaises(overlay.OverlayError):
+                overlay.main(["--csv", str(same), "--csv", str(same), "--output", str(out),
+                              "--receipt", str(receipt)])
+        with self.assertRaises(overlay.OverlayError):
+            self.generate(rows, replica_rows=rows_for("Q4_K", 8, {}))
+        # A noisy first-run winner that regresses in the replica is never installed.
+        table, _ = self.generate(rows, replica_rows=rows_for("Q4_K", 4, {("Pair", 2): 101.0}))
+        self.assertIn("std::array<NativeNEONExactOverlayEntry, 0>", table)
+        table, receipt = self.generate(rows, replica_rows=rows_for("Q4_K", 4, {("Pair", 2): 90.0}))
+        self.assertIn("std::array<NativeNEONExactOverlayEntry, 1>", table)
+        self.assertIn('"replicas": 2', receipt)
 
     def test_winner_emitted_only_when_it_beats_total_policy_for_every_alias(self):
         rows = (rows_for("Q4_K", 4, {("Pair", 2): 80.0}) +
