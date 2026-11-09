@@ -300,3 +300,25 @@ the source policy). Dead persistent_state parameter removed.
   restore lambda not RAII across ASSERT (optional fold). Nothing
   authenticated/promoted to this tip. Reviewer next: 407347f6c deletion
   delta; then fix SHA.
+
+## RoPE fix — beffdbe13 (2026-11-09)
+
+- One commit FF from 407347f6c. EveryPosition/VerifierPadding replaces
+  Skip/Compute (no fatal; base contract kept). EveryPosition: 5 ordinary
+  fills + Q8_1 (:540/:703/:835/:1447/:1989/:2718); VerifierPadding: verifier
+  fill only (:904; consumers skip by active).
+- Regression V2_Integration_CPURoPENegativePositionDirtyWorkspace
+  (Preflight; CPURoPEWorkshare.OrdinaryNegativePositionsIgnoreDirtyAngle
+  Workspace): FP32 full+partial 1/8/40; FP16/BF16 1+40 (32+ tables);
+  n_past -1/-3; poison 3 ways; standalone + team of 3 (one late); reference =
+  original serial arithmetic via odd symmetry (P<0 = conjugate of conjugated
+  input rotated at -P; signed zeros folded).
+- NEGATIVE CONTROL at 407347f6c: 120/120 FAIL (all entry/rows/poison/team,
+  incl. 40-row tables) → after fix 13/13. Cross-TU byte proof (base TU vs
+  fixed TU): -3/-40/-100 IDENTICAL; -1 rows>=2 IDENTICAL; 0/17231 incl Q8
+  IDENTICAL; unfixed TU differs at byte 1. Exclusions (base defects):
+  Q8_1 one-row negative (stale-TLS, own regression) and base rows==1
+  n_past=-1 ABORT (last_pos -1 sentinel). RAII env restore folded in.
+- Gates: Mac NEON_DOTPROD/NEON 271/271 0 skips; preflight 215/215 x20;
+  source policy clean; gcc aarch64 + clang x86 syntax OK. WSL (5') final =
+  beffdbe13; reviewer per-tip pass in flight.
