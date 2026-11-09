@@ -36,6 +36,7 @@
 #include "mocks/MockModelLoader.h"
 #include "mocks/MockMPIContext.h"
 #include "tensors/TensorFactory.h"
+#include "tensors/NativeQuantisedScalePlane.h"
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/QuantizedVerifierFormats.h"
 #include "utils/PlanningGGUFFixture.h"
@@ -587,7 +588,10 @@ void prove(DeviceId first)
                         const auto *metadata = native_quantised_formats::forQuantType(format.name);
                         ASSERT_NE(metadata, nullptr);
                         expectPlane(device, stream.get(), actual.payload, expected.payload, metadata->payload_bytes, shape);
-                        expectPlane(device, stream.get(), actual.scales, expected.scales, sizeof(uint16_t), shape);
+                        // The primary plane width follows the physical codebook:
+                        // one E8M0 byte for native MXFP4, one FP16 word otherwise.
+                        expectPlane(device, stream.get(), actual.scales, expected.scales,
+                            nativeQuantisedScalePlaneBytes(actual.codebook_id), shape);
                         if (metadata->is_asymmetric)
                             expectPlane(device, stream.get(), actual.mins, expected.mins, sizeof(uint16_t), shape);
                         if (metadata->has_emins)
@@ -908,7 +912,7 @@ void proveStaticPreparation(DeviceId first)
                         expectPlane(device, observation_stream.get(), descriptor.payload, oracle.payload,
                             metadata->payload_bytes, expected);
                         expectPlane(device, observation_stream.get(), descriptor.scales, oracle.scales,
-                            sizeof(uint16_t), expected);
+                            nativeQuantisedScalePlaneBytes(descriptor.codebook_id), expected);
                         if (metadata->is_asymmetric)
                             expectPlane(device, observation_stream.get(), descriptor.mins, oracle.mins,
                                 sizeof(uint16_t), expected);
