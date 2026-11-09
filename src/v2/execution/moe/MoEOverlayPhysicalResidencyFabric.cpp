@@ -2678,9 +2678,26 @@ namespace llaminar2
                     std::shared_ptr<ITensorGemm> engine(
                         assignment->lifetime,
                         projection.engine.get());
+                    std::span<std::uint8_t> destination =
+                        projection.cpu_destination;
+                    if (!destination.empty() &&
+                        projection.engine->exportCPUNativeQuantisedPackedWeights())
+                    {
+                        /* The epoch rewrites these bytes: unadmitted until arrival. */
+                        destination =
+                            projection.engine->beginRetiredCPUNativeQuantisedRewrite();
+                        if (destination.data() !=
+                                projection.cpu_destination.data() ||
+                            destination.size() !=
+                                projection.cpu_destination.size())
+                        {
+                            throw std::logic_error(
+                                "ExpertOverlay adopted CPU engine no longer owns its recyclable final storage");
+                        }
+                    }
                     lease.projections.push_back({
                         .projection = projection.projection,
-                        .destination_bytes = projection.cpu_destination,
+                        .destination_bytes = destination,
                         .engine = std::move(engine),
                     });
                 }

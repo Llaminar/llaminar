@@ -377,19 +377,24 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
 
     if (placement)
     {
-        packed.native_interleaved = placement->allocate<uint8_t>(sections.interleaved_size);
+        packed.native_interleaved.replace(placement->allocate<uint8_t>(sections.interleaved_size));
         packed.payload = placement->allocate<uint8_t>(sections.payload_size);
         packed.int8_flat = placement->allocate<int8_t>(sections.int8_flat_size);
     }
     else
     {
-        resizeDirectReceiveSection(packed.native_interleaved, sections.interleaved_size);
+        {
+            AlignedVector<uint8_t> interleaved;
+            resizeDirectReceiveSection(interleaved, sections.interleaved_size);
+            packed.native_interleaved.replace(std::move(interleaved));
+        }
         resizeDirectReceiveSection(packed.payload, sections.payload_size);
         resizeDirectReceiveSection(packed.int8_flat, sections.int8_flat_size);
     }
 
     PackedWeightsReceiveTarget target;
-    target.data[0] = packed.native_interleaved.data();
+    // The receive writes this generation; attachment admits it after completion.
+    target.data[0] = packed.native_interleaved.beginRewrite().data();
     target.data[1] = packed.payload.data();
     target.data[2] =
         reinterpret_cast<uint8_t *>(packed.int8_flat.data());
@@ -596,8 +601,8 @@ inline std::unique_ptr<IPackedWeights> deserialize(
     {
         // Establish the final CPU destination before copying the eager wire
         // representation. Never migrate or repack it after engine publication.
-        packed.native_interleaved = placement.allocate<uint8_t>(sections.interleaved_size);
-        std::memcpy(packed.native_interleaved.data(), src, sections.interleaved_size);
+        packed.native_interleaved.replace(placement.allocate<uint8_t>(sections.interleaved_size));
+        std::memcpy(packed.native_interleaved.beginRewrite().data(), src, sections.interleaved_size);
         src += sections.interleaved_size;
     }
 

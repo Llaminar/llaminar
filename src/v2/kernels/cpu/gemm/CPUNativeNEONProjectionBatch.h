@@ -76,6 +76,9 @@ namespace llaminar2::cpu::native_quantised
             // family before spawning a team. A narrower diagnostic route does
             // not narrow a DotProd compiler envelope.
             ARMCPUCapabilities::native().requireCompiledEnvelope();
+            // Everything a task could reject is decided here, before any team:
+            // the seal admitted metadata, this admits policy/encoding/K tree.
+            CPUNativeNEONProjectionTile<1>::requireExecutable(weights);
             return CPUNativeNEONProjectionBatch(weights, activation, output, output_stride, width, grid, bias, n_block_chunks);
         }
 
@@ -85,8 +88,8 @@ namespace llaminar2::cpu::native_quantised
          * @details Every member of an existing OpenMP team enters the workshare,
          * following OMP_WORKSHARE_REGION. Fixed per-row K trees make ownership
          * independent of positive team size. Inactive rows and output padding
-         * remain untouched. Metadata corruption during a tile is fatal, not
-         * rollback; only successful completion may be published by the owner.
+         * remain untouched. bind() admitted the publication, so no task can
+         * fail; only successful completion may be published by the owner.
          */
         template <multi_scale::NEONByteDot Instruction = multi_scale::NEONByteDot::ASIMD>
         void execute() const
@@ -128,7 +131,7 @@ namespace llaminar2::cpu::native_quantised
          * @param task Index in [0, taskCount()).
          */
         template <multi_scale::NEONByteDot Instruction = multi_scale::NEONByteDot::ASIMD>
-        void runTask(std::int64_t task) const
+        void runTask(std::int64_t task) const noexcept
         {
             const int chunks = weights_.N_padded / 64;
             const auto n_blocks = chunkGroups();
@@ -145,7 +148,7 @@ namespace llaminar2::cpu::native_quantised
                 case 2: tile<2, Instruction>(span.first, chunk); break;
                 case 3: tile<3, Instruction>(span.first, chunk); break;
                 case 4: tile<4, Instruction>(span.first, chunk); break;
-                default: throw std::logic_error("Native NEON task exceeds its bound shared-row tile");
+                default: __builtin_unreachable(); // The grid never forms a span wider than width_ <= 4.
                 }
             }
         }
@@ -212,7 +215,7 @@ namespace llaminar2::cpu::native_quantised
          * @param chunk Physical 64-column output chunk.
          */
         template <std::size_t Rows, multi_scale::NEONByteDot Instruction>
-        void tile(int first, int chunk) const
+        void tile(int first, int chunk) const noexcept
         {
             const int columns = std::min(64, weights_.N - chunk * 64);
             std::array<std::span<const Q8_1Block>, Rows> input;
@@ -222,7 +225,8 @@ namespace llaminar2::cpu::native_quantised
                 input[row] = activation_.subspan((std::size_t(first) + row) * weights_.blocks_per_row, weights_.blocks_per_row);
                 output[row] = output_.subspan((std::size_t(first) + row) * stride_ + chunk * 64, columns);
             }
-            CPUNativeNEONProjectionTile<Rows>::bind(weights_, input, output, chunk).template execute<Instruction>();
+            // bind() proved every tile's spans, aliases and executability once.
+            CPUNativeNEONProjectionTile<Rows>::admitted(weights_, input, output, chunk).template executeAdmitted<Instruction>();
             if (bias_.empty()) return;
             for (std::size_t row = 0; row < Rows; ++row)
             {

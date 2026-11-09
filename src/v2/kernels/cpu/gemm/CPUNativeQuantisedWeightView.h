@@ -8,6 +8,12 @@
  * storage implementation. Shape/encoding/span admission is performed once;
  * block readers retain the existing 64-column, 32-K physical layout. The
  * owning prepared store must retain its immutable publication during the call.
+ *
+ * Every view is backed by a CPUNativeQuantisedMetadataSeal: one complete pass over
+ * the published metadata plane that rejects reserved source-coefficient bits.
+ * Execution readers therefore never test metadata inside a worker team; the
+ * owner of the bytes decides when a seal is current (see
+ * CPUNativeQuantisedPublishedBytes).
  */
 #pragma once
 
@@ -27,6 +33,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <string>
 
 namespace llaminar2::cpu::native_quantised
 {
@@ -106,6 +113,88 @@ namespace llaminar2::cpu::native_quantised
         return fp16_to_fp32(secondary);
     }
 
+    class CPUNativeQuantisedWeightView;
+
+    /**
+     * @brief Proof that one exact byte range passed complete metadata admission.
+     *
+     * Only validate() constructs a seal, after checking the descriptor and the
+     * byte extent and scanning every metadata word any reader can load,
+     * including the padding lanes of partial 64-column chunks:
+     *
+     * | Encoding | Secondary word rule |
+     * |---|---|
+     * | ExpandedInt8 (symmetric or asymmetric) | none; the asymmetric word is an FP16 minimum |
+     * | NibbleLUT (any admitted codebook) | none; an FP16 minimum where asymmetric |
+     * | NibbleLUTSourceScale (IQ4_XS) | native_quantised_iq4xs_scale::valid, i.e. <= 63 |
+     * | IQ3SExpandedSourceScale (IQ3_S) | native_quantised_iq3s_scale::valid, i.e. <= 15 |
+     * | Q6KNativeDualScale | none; both bytes are signed coefficients |
+     * | CompactMultiScale codebook 13 (IQ2_S) | native_quantised_iq2s_scale::valid, i.e. <= 255 |
+     * | CompactMultiScale other codebooks | none; FP16 scales and minima |
+     *
+     * This is exactly the set of reserved-bit checks that execution performed
+     * per K block. The seal binds the byte root, extent and every descriptor
+     * field that changes how metadata is interpreted; arithmetic policy is not
+     * part of metadata validity. Whether a seal is still current for mutable
+     * storage is decided by its owner, not by this value.
+     */
+    class CPUNativeQuantisedMetadataSeal final
+    {
+    public:
+        /**
+         * @brief Admit the structure and scan the complete metadata plane once.
+         * @param descriptor Shape/source/encoding publication.
+         * @param bytes Exact canonical resident stream.
+         * @return Seal of exactly these bytes under exactly this interpretation.
+         * @throws std::invalid_argument For invalid structure or any reserved metadata bit.
+         * @throws std::overflow_error For padded geometry/extent overflow.
+         */
+        [[nodiscard]] static CPUNativeQuantisedMetadataSeal validate(
+            const CPUNativeQuantisedWeightDescriptor &descriptor, std::span<const std::uint8_t> bytes);
+
+        /**
+         * @brief Test whether this seal covers a publication.
+         * @param descriptor Interpretation the reader will apply.
+         * @param bytes Byte range the reader will borrow.
+         * @return Whether root, extent and metadata interpretation are identical.
+         */
+        [[nodiscard]] bool admits(const CPUNativeQuantisedWeightDescriptor &descriptor,
+            std::span<const std::uint8_t> bytes) const noexcept
+        {
+            return bytes.data() == root_ && bytes.size() == extent_ &&
+                descriptor.columns == identity_.columns &&
+                descriptor.reduction_width == identity_.reduction_width &&
+                descriptor.source.codebook_id == identity_.source.codebook_id &&
+                descriptor.source.is_superblock == identity_.source.is_superblock &&
+                descriptor.source.present == identity_.source.present &&
+                descriptor.encoding == identity_.encoding &&
+                descriptor.is_asymmetric == identity_.is_asymmetric;
+        }
+
+        /**
+         * @brief The same proof for a content-identical copy at another root.
+         * @param bytes Deep copy of the sealed range, written in full.
+         * @return Seal of @p bytes; the copier vouches that the content is identical.
+         * @throws std::invalid_argument If the extent differs.
+         */
+        [[nodiscard]] CPUNativeQuantisedMetadataSeal rebound(std::span<const std::uint8_t> bytes) const
+        {
+            if (bytes.size() != extent_ || (extent_ != 0 && !bytes.data()))
+                throw std::invalid_argument("Native CPU metadata seal can only follow a complete identical copy");
+            auto copy = *this;
+            copy.root_ = bytes.data();
+            return copy;
+        }
+
+    private:
+        CPUNativeQuantisedMetadataSeal(const CPUNativeQuantisedWeightDescriptor &identity, std::span<const std::uint8_t> bytes) noexcept
+            : identity_(identity), root_(bytes.data()), extent_(bytes.size()) {}
+
+        CPUNativeQuantisedWeightDescriptor identity_; ///< Metadata interpretation; policy is ignored by admits().
+        const std::uint8_t *root_ = nullptr;     ///< Exact sealed root; a move keeps it, a copy must rebind.
+        std::size_t extent_ = 0;                 ///< Exact sealed extent.
+    };
+
     /** @brief Validated immutable layout and borrowed storage for native CPU readers. */
     class CPUNativeQuantisedWeightView final
     {
@@ -124,48 +213,25 @@ namespace llaminar2::cpu::native_quantised
         const int data_stride; ///< Weight data bytes before inline metadata.
         const int interleaved_block_stride; ///< Total physical bytes per 64-column/K block.
 
+        /// Every view is metadata-admitted: readers need no reserved-bit tests.
+        static constexpr bool metadata_admitted = true;
+
         /**
-         * @brief Admit a complete resident publication without allocating/repacking it.
+         * @brief Admit a complete sealed resident publication without allocating/repacking it.
          * @param descriptor Original shape/source/encoding/arithmetic publication.
          * @param bytes Exact canonical resident stream, with at least uint32 alignment.
+         * @param seal Metadata seal of exactly these bytes under this interpretation.
          * @return Immutable synchronous read view; the external owner retains storage.
-         * @throws std::invalid_argument For invalid source, encoding, arithmetic, shape or storage.
+         * @throws std::invalid_argument For invalid structure or a seal of other bytes.
          * @throws std::overflow_error For padded geometry/extent overflow.
+         * @details O(1): the metadata plane was scanned when the seal was made.
          */
-        [[nodiscard]] static CPUNativeQuantisedWeightView fromPublished(
-            const CPUNativeQuantisedWeightDescriptor &descriptor, std::span<const std::uint8_t> bytes)
+        [[nodiscard]] static CPUNativeQuantisedWeightView fromPublished(const CPUNativeQuantisedWeightDescriptor &descriptor,
+            std::span<const std::uint8_t> bytes, const CPUNativeQuantisedMetadataSeal &seal)
         {
-            if (descriptor.columns <= 0 || descriptor.reduction_width <= 0 || !descriptor.source.present)
-                throw std::invalid_argument("Native CPU weight view requires positive geometry and original source identity");
-            const auto *source = native_quantised_formats::forSourceIdentity(
-                descriptor.source.codebook_id, descriptor.source.is_superblock);
-            if (!source || !isKnownPreparedEncoding(descriptor.encoding) ||
-                (descriptor.numerical_policy != CPUProjectionNumericalPolicy::BackendNative &&
-                 descriptor.numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert))
-                throw std::invalid_argument("Native CPU weight view requires a known source, encoding and numerical policy");
-            // Explicit rotation may publish ExpandedInt8 for any original source.
-            // Other encodings must retain the source-aware canonical preparation.
-            if (descriptor.encoding != CPUNativeQuantisedEncoding::ExpandedInt8 &&
-                descriptor.encoding != preparedEncodingForSource(*source))
-                throw std::invalid_argument("Native CPU weight view encoding disagrees with original source");
-            if (descriptor.is_asymmetric != source->is_asymmetric &&
-                !(descriptor.encoding == CPUNativeQuantisedEncoding::ExpandedInt8 && !descriptor.is_asymmetric))
-                throw std::invalid_argument("Native CPU weight view has inconsistent secondary metadata");
-            const std::int64_t padded = ((std::int64_t{descriptor.columns} + 63) / 64) * 64;
-            const std::int64_t blocks = (std::int64_t{descriptor.reduction_width} + 31) / 32;
-            if (padded > std::numeric_limits<int>::max())
-                throw std::overflow_error("Native CPU padded output width exceeds its ABI");
-            const std::size_t stride = preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric);
-            const std::size_t chunks = static_cast<std::size_t>(padded / 64);
-            if (chunks > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(blocks) / stride)
-                throw std::overflow_error("Native CPU weight stream extent overflow");
-            const std::size_t extent = chunks * static_cast<std::size_t>(blocks) * stride;
-            if (bytes.empty() || !bytes.data() || bytes.size() != extent ||
-                reinterpret_cast<std::uintptr_t>(bytes.data()) % alignof(std::uint32_t) != 0)
-                throw std::invalid_argument("Native CPU weight view requires the exact aligned resident byte extent");
-            static_assert(std::endian::native == std::endian::little,
-                          "Canonical CPU native weight metadata requires little-endian storage");
-            return CPUNativeQuantisedWeightView(descriptor, *source, static_cast<int>(padded), static_cast<int>(blocks), bytes);
+            if (!seal.admits(descriptor, bytes))
+                throw std::invalid_argument("Native CPU weight view requires a metadata seal of exactly these bytes");
+            return admitStructure(descriptor, bytes);
         }
 
         /** @return Whether a four-bit payload is retained in the stream. */
@@ -215,6 +281,24 @@ namespace llaminar2::cpu::native_quantised
                 throw std::logic_error("Native CPU weight encoding has no secondary metadata");
             return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 256 : 128));
         }
+
+        /**
+         * @brief Primary words of an admitted unit, without coordinate checks.
+         * @param chunk Chunk inside [0, N_padded/64), proven by the caller's binding.
+         * @param block Block inside [0, blocks_per_row), proven by the caller's traversal.
+         * @return Sixty-four primary half words.
+         */
+        [[nodiscard]] const std::uint16_t *admittedScales(int chunk, int block) const noexcept
+        { return reinterpret_cast<const std::uint16_t *>(admittedUnit(chunk, block) + data_stride + (usesInlineCompensation() ? 128 : 0)); }
+
+        /**
+         * @brief Secondary words of an admitted unit, without coordinate or encoding checks.
+         * @param chunk Chunk inside [0, N_padded/64), proven by the caller's binding.
+         * @param block Block inside [0, blocks_per_row), proven by the caller's traversal.
+         * @return Sixty-four secondary words; meaningful only for encodings that own them.
+         */
+        [[nodiscard]] const std::uint16_t *admittedMins(int chunk, int block) const noexcept
+        { return reinterpret_cast<const std::uint16_t *>(admittedUnit(chunk, block) + data_stride + (usesInlineCompensation() ? 256 : 128)); }
 
         /** @brief Borrow Q2_K's packed pair of effective minima.
          * @param chunk Physical output chunk.
@@ -277,6 +361,52 @@ namespace llaminar2::cpu::native_quantised
         }
 
     private:
+        friend class CPUNativeQuantisedMetadataSeal;
+
+        /**
+         * @brief Admit shape, source, encoding, policy and extent; metadata is not read.
+         * @param descriptor Original shape/source/encoding/arithmetic publication.
+         * @param bytes Exact canonical resident stream, with at least uint32 alignment.
+         * @return Structurally checked view, used only by the metadata seal and sealed admission.
+         * @throws std::invalid_argument For invalid source, encoding, arithmetic, shape or storage.
+         * @throws std::overflow_error For padded geometry/extent overflow.
+         */
+        [[nodiscard]] static CPUNativeQuantisedWeightView admitStructure(
+            const CPUNativeQuantisedWeightDescriptor &descriptor, std::span<const std::uint8_t> bytes)
+        {
+            if (descriptor.columns <= 0 || descriptor.reduction_width <= 0 || !descriptor.source.present)
+                throw std::invalid_argument("Native CPU weight view requires positive geometry and original source identity");
+            const auto *source = native_quantised_formats::forSourceIdentity(
+                descriptor.source.codebook_id, descriptor.source.is_superblock);
+            if (!source || !isKnownPreparedEncoding(descriptor.encoding) ||
+                (descriptor.numerical_policy != CPUProjectionNumericalPolicy::BackendNative &&
+                 descriptor.numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert))
+                throw std::invalid_argument("Native CPU weight view requires a known source, encoding and numerical policy");
+            // Explicit rotation may publish ExpandedInt8 for any original source.
+            // Other encodings must retain the source-aware canonical preparation.
+            if (descriptor.encoding != CPUNativeQuantisedEncoding::ExpandedInt8 &&
+                descriptor.encoding != preparedEncodingForSource(*source))
+                throw std::invalid_argument("Native CPU weight view encoding disagrees with original source");
+            if (descriptor.is_asymmetric != source->is_asymmetric &&
+                !(descriptor.encoding == CPUNativeQuantisedEncoding::ExpandedInt8 && !descriptor.is_asymmetric))
+                throw std::invalid_argument("Native CPU weight view has inconsistent secondary metadata");
+            const std::int64_t padded = ((std::int64_t{descriptor.columns} + 63) / 64) * 64;
+            const std::int64_t blocks = (std::int64_t{descriptor.reduction_width} + 31) / 32;
+            if (padded > std::numeric_limits<int>::max())
+                throw std::overflow_error("Native CPU padded output width exceeds its ABI");
+            const std::size_t stride = preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric);
+            const std::size_t chunks = static_cast<std::size_t>(padded / 64);
+            if (chunks > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(blocks) / stride)
+                throw std::overflow_error("Native CPU weight stream extent overflow");
+            const std::size_t extent = chunks * static_cast<std::size_t>(blocks) * stride;
+            if (bytes.empty() || !bytes.data() || bytes.size() != extent ||
+                reinterpret_cast<std::uintptr_t>(bytes.data()) % alignof(std::uint32_t) != 0)
+                throw std::invalid_argument("Native CPU weight view requires the exact aligned resident byte extent");
+            static_assert(std::endian::native == std::endian::little,
+                          "Canonical CPU native weight metadata requires little-endian storage");
+            return CPUNativeQuantisedWeightView(descriptor, *source, static_cast<int>(padded), static_cast<int>(blocks), bytes);
+        }
+
         /** @brief Seal a completely validated immutable publication.
          * @param d Checked source/encoding/arithmetic descriptor.
          * @param source Canonical original source metadata.
@@ -317,6 +447,40 @@ namespace llaminar2::cpu::native_quantised
             return bytes_.data() + (std::size_t(chunk) * blocks_per_row + block) * interleaved_block_stride;
         }
 
+        /** @brief Unit address for coordinates an admitted binding already proved in range. */
+        [[nodiscard]] const std::uint8_t *admittedUnit(int chunk, int block) const noexcept
+        { return bytes_.data() + (std::size_t(chunk) * blocks_per_row + block) * interleaved_block_stride; }
+
         std::span<const std::uint8_t> bytes_; ///< Borrowed immutable stream; storage remains prepared-store owned.
     };
+
+    inline CPUNativeQuantisedMetadataSeal CPUNativeQuantisedMetadataSeal::validate(
+        const CPUNativeQuantisedWeightDescriptor &descriptor, std::span<const std::uint8_t> bytes)
+    {
+        const auto view = CPUNativeQuantisedWeightView::admitStructure(descriptor, bytes);
+        bool (*rule)(std::uint16_t) noexcept = nullptr;
+        const char *name = nullptr;
+        if (view.usesIQ3SExpandedSourceScale())
+        { rule = native_quantised_iq3s_scale::valid; name = "IQ3_S"; }
+        else if (view.usesNibbleLUTSourceScale())
+        { rule = native_quantised_iq4xs_scale::valid; name = "IQ4_XS"; }
+        else if (view.usesCompactMultiScale() && view.codebook_id == 13)
+        { rule = native_quantised_iq2s_scale::valid; name = "IQ2_S"; }
+        if (rule)
+        {
+            // Every lane of every unit, padding columns included: wider native
+            // loads read them, so the proof must not depend on a reader's width.
+            for (int chunk = 0; chunk < view.N_padded / 64; ++chunk)
+                for (int block = 0; block < view.blocks_per_row; ++block)
+                {
+                    const std::uint16_t *words = view.chunkMins(chunk, block);
+                    std::uint16_t reserved = 0;
+                    for (int column = 0; column < 64; ++column)
+                        reserved |= rule(words[column]) ? 0 : 1;
+                    if (reserved)
+                        throw std::invalid_argument(std::string(name) + " coefficient contains reserved bits");
+                }
+        }
+        return CPUNativeQuantisedMetadataSeal(descriptor, bytes);
+    }
 } // namespace llaminar2::cpu::native_quantised
