@@ -565,3 +565,19 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - STILL OPEN (not cleared by the GNU rerun): NBSP Unicode-split P1 (P:1591);
   last-observation/no-receipt P2 (P:2133–2134); relative-driver precision
   note. Gate stays HOLD; Mac one-of-four failure stays separate/unresolved.
+
+## SOURCE126 successor c1b3fbd35 (2026-11-09)
+
+- Depfile delimiters: printable-ASCII/space/tab/newline only; ASCII space+tab
+  split; NBSP/U+3000/vertical-tab/non-ASCII fail; stand-in verbatim; NBSP
+  real/decoy build no-receipt + raw-line controls.
+- Final-observation epoch: identities re-checked AFTER final plan
+  re-observation, before publication; final-query-only retarget control.
+- Temp grammar: fullmatch (trailing-newline plan + receipt fail).
+- Precision: relative-driver rule tested directly.
+- REAL FINDING RESOLVED: the 'unreproduced' failure = 30s core-free TIMEOUT
+  (module 25–30s at load 10–24; parallel ctest timed out both Evidence tests)
+  → 5 shards (Analysis + Binding0..3), -S -E stand-ins, 0.2–12s at load>10,
+  84 tests; NAMES: V2_{Unit,Integration}_CPUNativeTileRegisterEvidence
+  {Analysis,Binding0..3}. Mac E2E 12/12 at load avg 24.
+- GB10 census pending (-j6; expecting 12/12).
