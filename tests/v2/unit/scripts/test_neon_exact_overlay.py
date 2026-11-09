@@ -83,8 +83,19 @@ class NeonExactOverlayTest(unittest.TestCase):
             with self.assertRaises(overlay.OverlayError):
                 overlay.main(["--csv", str(same), "--csv", str(same), "--output", str(out),
                               "--receipt", str(receipt)])
+        # A key measured by only one replica fails closed.
         with self.assertRaises(overlay.OverlayError):
             self.generate(rows, replica_rows=rows_for("Q4_K", 8, {}))
+        # Per-format replica files combine: each alias needs its own two replicas.
+        q4 = rows_for("Q4_K", 4, {("Pair", 2): 80.0})
+        q8 = rows_for("Q8_0", 4, {("Pair", 4): 70.0}, codebook=19, superblock=0)
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "t.inc"
+            receipt = Path(directory) / "r.json"
+            overlay.main(["--csv", str(write(q4)), "--csv", str(write([dict(r, shape="S2") for r in q4])),
+                          "--csv", str(write(q8)), "--csv", str(write([dict(r, shape="S2") for r in q8])),
+                          "--output", str(out), "--receipt", str(receipt)])
+            self.assertIn("std::array<NativeNEONExactOverlayEntry, 2>", out.read_text())
         # A noisy first-run winner that regresses in the replica is never installed.
         table, _ = self.generate(rows, replica_rows=rows_for("Q4_K", 4, {("Pair", 2): 101.0}))
         self.assertIn("std::array<NativeNEONExactOverlayEntry, 0>", table)
