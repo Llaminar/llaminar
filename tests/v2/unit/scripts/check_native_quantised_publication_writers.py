@@ -35,7 +35,7 @@ ALLOWED_WRITERS = {
 }
 
 MUTATION = re.compile(
-    r"\b(?:beginRewrite|retainedSlotRoot)\s*\(|"
+    r"\b(?:beginRewrite|retainedSlotRoot|unsealedGenerationBytes)\s*\(|"
     r"\bnative_interleaved\s*\.\s*(?:replace|resize|resize_uninitialized|resize_uninitialized_aligned|reserve|release)\s*\(")
 CONST_CAST = re.compile(
     r"\bconst_cast\s*<[^>]*>\s*\(\s*[^;]*?(?:native_interleaved\s*\.\s*data\s*\(|interleavedBase\s*\()")
