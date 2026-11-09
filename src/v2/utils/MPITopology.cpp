@@ -38,7 +38,7 @@ namespace llaminar2
     namespace
     {
         constexpr uint32_t kInventoryMagic = 0x4c494e56u; ///< LINV, not an unversioned rank id.
-        constexpr uint32_t kInventoryVersion = 6u; ///< Carries original PCI ancestry plus native CPU projection ABI and actual compiler/runtime ISA.
+        constexpr uint32_t kInventoryVersion = 7u; ///< Carries original PCI ancestry, native CPU projection ABI/ISA and typed accelerator physical-memory backing.
         /** @brief Lend a checked communicator to a standalone topology constructor. */
         MPIContext standaloneTopologyContext(MPI_Comm comm)
         {
@@ -173,6 +173,7 @@ namespace llaminar2
             writeValue(buffer, static_cast<uint32_t>(info.pcie_upstream_bdfs.size()));
             for (const auto &bridge : info.pcie_upstream_bdfs) writeString(buffer, bridge);
             writeValue(buffer, static_cast<uint64_t>(info.last_level_cache_bytes));
+            writeValue(buffer, static_cast<uint8_t>(info.memory_backing));
         }
 
         // Deserialize a single DeviceInfo
@@ -209,6 +210,9 @@ namespace llaminar2
             for (uint32_t index = 0; index < bridge_count; ++index)
                 info.pcie_upstream_bdfs.push_back(readString(ptr, end));
             info.last_level_cache_bytes = readValue<uint64_t>(ptr, end);
+            info.memory_backing = physicalMemoryBackingFromWire(readValue<uint8_t>(ptr, end));
+            if (info.memory_backing == PhysicalMemoryBacking::RankHostPool && !info.isGPU())
+                throw std::invalid_argument("Rank host pool backing requires a GPU device record");
             return info;
         }
     } // anonymous namespace

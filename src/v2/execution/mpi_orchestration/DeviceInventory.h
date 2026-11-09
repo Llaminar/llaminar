@@ -27,6 +27,7 @@
 
 #pragma once
 #include "backends/CPUExecutionGeometry.h"
+#include "backends/PhysicalMemoryBacking.h"
 
 #include "../../backends/DeviceType.h"
 #include "../../backends/CPUSocketInfo.h"
@@ -111,6 +112,8 @@ namespace llaminar2
         int local_device_id = 0;      ///< Device index within this rank (0, 1, 2, ...)
         size_t memory_bytes = 0;      ///< Total device memory (VRAM for GPU, RAM for CPU)
         size_t free_memory_bytes = 0; ///< Available memory at discovery time
+        /// RankHostPool: an integrated GPU whose free_memory_bytes samples the rank host pool.
+        PhysicalMemoryBacking memory_backing = PhysicalMemoryBacking::Dedicated;
 
         // Compute capability
         int compute_units = 0;            ///< SM count (GPU) or core count (CPU)

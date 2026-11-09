@@ -179,7 +179,8 @@ TEST(NgramExecutionProvision, WireRoundTripReauthenticatesSourceGeometryAndExact
         // arena bytes, but omit the lookup arena contribution. Decode must
         // rederive common+execution and reject this otherwise well-formed frame.
         auto underpriced=wire;const auto &fixed=q.execution_provision->requiredBase();
-        constexpr std::size_t record=28u+16u*PhysicalMemoryBOM::ownerCount();
+        constexpr std::size_t resource_header=40u; // rank,type,ordinal,total,available,backing,pool
+        constexpr std::size_t record=resource_header+16u*PhysicalMemoryBOM::ownerCount();
         const auto plan_start=underpriced.size()-(4u+record*fixed.resources().size());
         std::size_t resource_index=0;
         while(resource_index<fixed.resources().size() && fixed.resources()[resource_index].resource().device!=c.device)++resource_index;
@@ -190,7 +191,7 @@ TEST(NgramExecutionProvision, WireRoundTripReauthenticatesSourceGeometryAndExact
         const auto lookup_arena=bytes(q.execution_provision->executionPlan(),{0,c.device},PhysicalMemoryOwner::ActivationArena);
         ASSERT_GT(full_arena,lookup_arena);const auto common_arena=full_arena-lookup_arena;
         EXPECT_GT(common_arena,lookup_arena); // An execution-only coverage test would wrongly pass.
-        const auto offset=plan_start+4u+resource_index*record+28u+owner_index*16u;
+        const auto offset=plan_start+4u+resource_index*record+resource_header+owner_index*16u;
         ASSERT_LE(offset+8u,underpriced.size());
         for(std::size_t b=0;b<8u;++b)underpriced[offset+b]=static_cast<std::uint8_t>(static_cast<std::uint64_t>(common_arena)>>(8u*b));
         EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(underpriced,0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument);

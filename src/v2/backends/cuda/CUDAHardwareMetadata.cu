@@ -74,6 +74,7 @@ namespace llaminar2
                     .shared_memory_per_sm = properties.sharedMemPerMultiprocessor,
                     .total_memory = properties.totalGlobalMem,
                     .last_level_cache = static_cast<std::size_t>(std::max(properties.l2CacheSize, 0)),
+                    .integrated = properties.integrated != 0,
                 };
                 static_assert(sizeof(properties.uuid.bytes) == 16);
                 std::memcpy(hardware.uuid.data(), properties.uuid.bytes, hardware.uuid.size());

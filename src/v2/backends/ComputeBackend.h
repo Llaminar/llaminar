@@ -21,6 +21,7 @@
 #include "DeviceId.h"
 #include "GlobalDeviceAddress.h"
 #include "PeerAccessCoverage.h"
+#include "PhysicalMemoryBacking.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -234,6 +235,8 @@ namespace llaminar2
         size_t last_level_cache_bytes = 0;
         /// Driver-native ISA target, including feature suffixes; empty means unobserved.
         std::string native_isa;
+        /// Integrated accelerators draw on the host pool; free_memory_bytes then samples that pool.
+        PhysicalMemoryBacking memory_backing = PhysicalMemoryBacking::Dedicated;
     };
 
     /**
