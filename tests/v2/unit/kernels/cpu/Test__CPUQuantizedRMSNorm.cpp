@@ -21,6 +21,9 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <csignal>
+#include <cstdlib>
+#include <exception>
 #include <stdexcept>
 #include <limits>
 #include <span>
@@ -294,14 +297,23 @@ TEST(CPUQuantizedRMSNorm, Q16PolicyAndNonfiniteSummaryFailHard)
     RMSNormExecOptions t5{.t5_compat_mode=true};
     EXPECT_THROW(rmsnorm_q16_1_fp32_fused(input.data(),gamma.data(),output.data(),1,32,1e-5f,t5),std::invalid_argument);
     // Numeric corruption is fatal inside a collective: an exception cannot
-    // cross an OpenMP parallel boundary. Exec-based death tests avoid forking
-    // the retained teams exercised by earlier cases in this same executable.
+    // cross an OpenMP parallel boundary. The child distinguishes an escaped
+    // exception (exit 97) and std::terminate (exit 98) from the real SIGABRT,
+    // so only the typed sink can satisfy KilledBySignal(SIGABRT) here.
     const auto death_style=GTEST_FLAG_GET(death_test_style);
     GTEST_FLAG_SET(death_test_style,"threadsafe");
     input[0].d=std::numeric_limits<float>::infinity();
-    EXPECT_DEATH(rmsnorm_q16_1_fp32_fused(input.data(),gamma.data(),output.data(),1,32,1e-5f),"nonfinite FP32-square summary");
+    EXPECT_EXIT({
+        std::set_terminate([](){std::_Exit(98);});
+        try{rmsnorm_q16_1_fp32_fused(input.data(),gamma.data(),output.data(),1,32,1e-5f);}
+        catch(...){std::_Exit(97);}
+    },::testing::KilledBySignal(SIGABRT),"CPU RMS numeric contract violation \\[NonfiniteSummary\\]");
     input[0].d=0.0f;
-    EXPECT_DEATH(rmsnorm_q16_1_fp32_fused(input.data(),gamma.data(),output.data(),1,32,0.0f),"inverse is not representable");
+    EXPECT_EXIT({
+        std::set_terminate([](){std::_Exit(98);});
+        try{rmsnorm_q16_1_fp32_fused(input.data(),gamma.data(),output.data(),1,32,0.0f);}
+        catch(...){std::_Exit(97);}
+    },::testing::KilledBySignal(SIGABRT),"CPU RMS numeric contract violation \\[NonfiniteInverse\\]");
     GTEST_FLAG_SET(death_test_style,death_style);
     EXPECT_EQ(output,before);
 }
