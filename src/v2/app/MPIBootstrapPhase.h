@@ -119,6 +119,32 @@ namespace llaminar2
          */
         static std::vector<int> capacityOrderedCpus(
             std::vector<int> cpus, const std::string &sysfs_root = "/sys/devices/system/cpu");
+        /**
+         * @brief Plan OpenMP worker places: one physical core each, fastest first.
+         * @param allowed_cpus The rank's admitted CPU mask; never widened.
+         * @param sysfs_root Linux CPU sysfs root (a device-free fixture seam).
+         * @return One place per physical core with an allowed CPU, holding that
+         *         core's allowed siblings. Places follow capacityOrderedCpus()
+         *         over the cores' first allowed siblings.
+         * @details This is the OMP_PLACES=cores place list in capacity order.
+         * Without published capacities it is libgomp's own CPU-id core order.
+         */
+        static std::vector<std::vector<int>> capacityOrderedCorePlaces(
+            const std::vector<int> &allowed_cpus, const std::string &sysfs_root = "/sys/devices/system/cpu");
+        /**
+         * @brief Bind the persistent OpenMP worker pool to capacity-ordered core places.
+         * @throws std::runtime_error If the rank mask is unreadable/empty or a binding fails.
+         * @details The single authority for every OMP_PLACES=cores /
+         * OMP_PROC_BIND=close rank. libgomp has no runtime place setter and
+         * orders places by CPU id, so on GB10 workers 0-4, which include the
+         * serial master, would otherwise run on A725 cores. One region of one
+         * thread per place binds pool thread t, whose close-binding place is t,
+         * to place t. Any later close team of w threads therefore occupies the
+         * w fastest cores. The admitted set is this thread's mask joined
+         * with libgomp's place list, which libgomp derived from the rank mask
+         * before binding the initial thread; it is never widened further.
+         */
+        static void bindOpenMPWorkersFastestFirst();
         /** @return Whether current thread affinity meets the requested socket/core policy. */
         static bool verifyStartupThreadAffinity(int required_numa,
                                                 bool require_physical_only,
