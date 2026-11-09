@@ -341,3 +341,18 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   unbound cases; mutation control alongside C++ header controls.
 - Precision: 'lo12 on stack base FAILS' = memory operands only (ADD generalizes
   to UNKNOWN_STACK) — narrow claim or enforce/test the broader rule.
+
+## SOURCE120 successor fa92d351a (2026-11-09)
+
+- P1a: object-bound complete coverage (full symtab/sections from object;
+  every 4-byte address exactly once; headings = defined symbols; bodies from
+  OBJECT extents; non-padding outside extents/oversized/overlapping fail;
+  ELF $d data-in-code + Mach-O LC_DATA_IN_CODE fail; consistent real fixtures).
+- P1b: trusted = unique UNDEFINED strongly-bound imports only (defined/weak/
+  alias/absolute variants fail, both formats; undefined-import positives).
+- P1c: explicit rejection — preprocessed TU sha-bound; every asm construct
+  parsed (literals decoded); ANY .include/.incbin fails (all spellings);
+  .incbin TU fails before -c; proof.i mutation fails verify.
+- Nonblocking: lo12 ADD on stack base fails too (memory + arithmetic claim).
+- Evidence: 57 tests; GNU-14 + AppleClang re-audit identical counts; Mac E2E
+  I8MM + NEON; proof.i declared. GB10 9-cell census at fa92d351a pending.
