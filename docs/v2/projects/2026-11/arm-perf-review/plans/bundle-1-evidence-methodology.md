@@ -40,3 +40,11 @@ merge (evidence + method changes only where pull-requested separately).
 - Runs after R2 gates finish (hosts quiet) OR in parallel where CPU-only
   and no overlap; 19/18/14 need GPU windows (book via arm-perf after the
   GB10 CUDA gates).
+
+## Executing (2026-11-09, operator GO)
+
+- Lane: qual/measurement session 01a1bd53 (reopened after ideas-7+25 close;
+  it offered). Start: 15 (doc) + Mac-fit (01/09) now; 19/14/18 deferred to
+  GPU windows (book after GB10 CUDA gates at 7d1a94479; no self-booking).
+  Rules: measurement-only; evidence = log + SHA + per-file; reviewer
+  checkpoint. arm-sparks heads-up (future slots; no collision with R2).
