@@ -18,6 +18,7 @@
  */
 
 #include "../../../../utils/NativeQuantisedTestPartialStorage.h"
+#include "../../../../utils/CPUPerfStatsTimingCollectionScope.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>

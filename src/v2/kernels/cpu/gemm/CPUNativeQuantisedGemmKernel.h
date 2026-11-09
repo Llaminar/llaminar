@@ -1220,8 +1220,9 @@ namespace llaminar2::cpu::native_quantised
             /**
              * Grouped-row policy override used by byte-exact certification.
              * Production descriptors retain Auto. One-row projections ignore
-             * this field because their independent M=1 policy has a distinct
-             * generated authority.
+             * legacy grouped overrides because M=1 has a distinct generated
+             * authority. OrderedThreeRows requires M>=3 and is rejected before
+             * singleton normalization, never advertised as an executed override.
              */
             VerifierRowsPolicy verifier_schedule = VerifierRowsPolicy::Auto;
             /** Distinguish prompt work from equally large speculative batches. */
@@ -1295,6 +1296,15 @@ namespace llaminar2::cpu::native_quantised
                 {
                     LOG_ERROR("[CPUNativeQuantisedGemmKernel] batched pre-quantized "
                               "projection contract mismatch at descriptor "
+                              << projection);
+                    return false;
+                }
+
+                // The explicit three-row mechanism has no singleton/pair alias.
+                // Validate the entire source set before any output is touched.
+                if (source.verifier_schedule == VerifierRowsPolicy::OrderedThreeRows && source.rows < 3)
+                {
+                    LOG_ERROR("[CPUNativeQuantisedGemmKernel] OrderedThreeRows requires at least three rows at descriptor "
                               << projection);
                     return false;
                 }

@@ -153,7 +153,11 @@ namespace llaminar2::cpu::native_quantised
      * the verifier-specialized three-row or four-row AVX512 policy that shares
      * each decoded B chunk across more rows. The generated table is trained from strict
      * decode-equivalent microbench CSVs independently for the compiled ISA,
-     * effective runtime ISA, and OpenMP thread count. An untrained runtime key
+     * effective runtime ISA, and OpenMP thread count. OrderedThreeRows is a
+     * separately named explicit Prefill experiment using the existing ordered
+     * three-row body for regular tiles. It is not emitted by existing tables
+     * and never changes the meaning of WideRows or historical evidence.
+     * An untrained runtime key
      * is an unsupported production configuration and fails explicitly; it is
      * never converted into an unmeasured Pairwise policy.
      */
@@ -174,6 +178,8 @@ namespace llaminar2::cpu::native_quantised
         FullKTwoRowPairGridNbc2,
         FullKTwoRowPairGridNbc4,
         FullKTwoRowPairGridNbc8,
+        /** Explicit AVX512 GPU-aligned nibble Prefill candidate; never an Auto alias. */
+        OrderedThreeRows,
     };
 
     /**
@@ -194,6 +200,8 @@ namespace llaminar2::cpu::native_quantised
             return "Pairwise";
         case VerifierRowsPolicy::WideRows:
             return "WideRows";
+        case VerifierRowsPolicy::OrderedThreeRows:
+            return "OrderedThreeRows";
         case VerifierRowsPolicy::FullKRowChunkGrid:
             return "FullKRowChunkGrid";
         case VerifierRowsPolicy::FullKTwoRowNbc1:
@@ -235,6 +243,7 @@ namespace llaminar2::cpu::native_quantised
         case VerifierRowsPolicy::Auto:
         case VerifierRowsPolicy::Pairwise:
         case VerifierRowsPolicy::WideRows:
+        case VerifierRowsPolicy::OrderedThreeRows:
             return false;
         }
         return false;
@@ -260,6 +269,7 @@ namespace llaminar2::cpu::native_quantised
         case VerifierRowsPolicy::Auto:
         case VerifierRowsPolicy::Pairwise:
         case VerifierRowsPolicy::WideRows:
+        case VerifierRowsPolicy::OrderedThreeRows:
         case VerifierRowsPolicy::FullKRowChunkGrid:
         case VerifierRowsPolicy::FullKTwoRowNbc1:
         case VerifierRowsPolicy::FullKTwoRowNbc2:
@@ -290,6 +300,7 @@ namespace llaminar2::cpu::native_quantised
         case VerifierRowsPolicy::Auto:
         case VerifierRowsPolicy::Pairwise:
         case VerifierRowsPolicy::WideRows:
+        case VerifierRowsPolicy::OrderedThreeRows:
         case VerifierRowsPolicy::FullKRowChunkGrid:
             return ambient_n_block_chunks;
         }
@@ -320,6 +331,8 @@ namespace llaminar2::cpu::native_quantised
             return false;
         if (policy == VerifierRowsPolicy::WideRows)
             return use_avx512 && M >= 3;
+        if (policy == VerifierRowsPolicy::OrderedThreeRows)
+            return use_avx512 && M >= 3 && serial_k_tiles > 1;
         if (verifierRowsPolicyRequiresFullK(policy))
             return serial_k_tiles <= 1;
         return true;
@@ -501,6 +514,13 @@ namespace llaminar2::cpu::native_quantised
         return "invalid";
     }
 
+    /** @brief Actual immutable arithmetic/source domain, not a policy override. */
+    enum class VerifierRowsScheduleDomain
+    {
+        General,
+        GPUAlignedExpertNibblePrefill,
+    };
+
     /**
      * @brief Complete geometry required to resolve a grouped verifier policy.
      *
@@ -520,6 +540,7 @@ namespace llaminar2::cpu::native_quantised
         int ambient_n_block_chunks = 0;
         bool use_avx512 = false;
         int full_k_n_block_chunks_override = 0;
+        VerifierRowsScheduleDomain domain = VerifierRowsScheduleDomain::General;
     };
 
     /** @brief Fully resolved physical identity for one grouped launch. */
@@ -598,6 +619,10 @@ namespace llaminar2::cpu::native_quantised
                 "the runtime ISA/M/K geometry");
         }
 
+        if (selected == VerifierRowsPolicy::OrderedThreeRows &&
+            geometry.domain != VerifierRowsScheduleDomain::GPUAlignedExpertNibblePrefill)
+            throw std::invalid_argument("OrderedThreeRows requires the original GPU-aligned nibble Prefill domain");
+
         const int policy_n_chunks = (geometry.policy_n + 63) / 64;
         const VerifierRowsPolicy effective = normalizeVerifierRowsPolicy(
             selected,
@@ -643,8 +668,8 @@ namespace llaminar2::cpu::native_quantised
                 VerifierRowsExecutionRoute::GroupedKParallelRowTiles;
             result.task_grid =
                 VerifierRowsTaskGrid::RowTileNChunkKTile;
-            result.physical_row_tile =
-                effective == VerifierRowsPolicy::WideRows ? 4 : 2;
+            result.physical_row_tile = effective == VerifierRowsPolicy::OrderedThreeRows ? 3 :
+                (effective == VerifierRowsPolicy::WideRows ? 4 : 2);
             result.n_block_chunks = 1;
             result.n_blocks = result.n_chunks;
             const int64_t row_tiles =
@@ -7433,6 +7458,17 @@ namespace llaminar2::cpu::native_quantised
                                 d.packed->K, use_avx512 ? ISALevel::AVX512 : ISALevel::AVX2,
                                 num_threads, plan.k_tiles);
                 }
+                VerifierRowsScheduleDomain schedule_domain=VerifierRowsScheduleDomain::General;
+                if(selected==VerifierRowsPolicy::OrderedThreeRows) {
+                    const auto* source=native_quantised_formats::forSourceIdentity(
+                        d.packed->codebook_id,d.packed->is_superblock);
+                    if(d.purpose!=ProjectionRowsPurpose::Prefill ||
+                       d.packed->numerical_policy!=CPUProjectionNumericalPolicy::GPUAlignedExpert ||
+                       !d.packed->usesNibbleLUT() || !is_nibble_lut_format(d.packed->codebook_id) ||
+                       !source || source->is_asymmetric!=d.packed->is_asymmetric)
+                        throw std::invalid_argument("OrderedThreeRows requires canonical prepared nibble GPU-aligned Prefill metadata");
+                    schedule_domain=VerifierRowsScheduleDomain::GPUAlignedExpertNibblePrefill;
+                }
                 plan.verifier_resolution = resolveVerifierRowsSchedule(
                     d.verifier_schedule,
                     selected,
@@ -7443,6 +7479,7 @@ namespace llaminar2::cpu::native_quantised
                         .k_tiles = plan.k_tiles,
                         .ambient_n_block_chunks = plan.n_block_chunks,
                         .use_avx512 = use_avx512,
+                        .domain = schedule_domain,
                     });
                 plan.effective_verifier_schedule =
                     plan.verifier_resolution.effective;
@@ -7510,17 +7547,10 @@ namespace llaminar2::cpu::native_quantised
                 const auto &plan = plans[static_cast<size_t>(projection)];
                 maximum_partitions = std::max(maximum_partitions, plan.k_tiles);
                 const int row_tile_width =
-                    plan.rows == 1
-                        ? 1
-                        : (use_avx512 &&
-                                   plan.effective_verifier_schedule ==
-                                       VerifierRowsPolicy::WideRows
-                               ? 4
-                               : 2);
+                    plan.rows == 1 ? 1 : plan.verifier_resolution.physical_row_tile;
                 layer_local_ordered_tree_tasks +=
                     static_cast<size_t>(
-                        (plan.rows + row_tile_width - 1) /
-                        row_tile_width) *
+                        (plan.rows - 1) / row_tile_width + 1) *
                     static_cast<size_t>(plan.n_chunks);
                 result.worker_partial_stride = std::max(result.worker_partial_stride,
                     cpuProjectionPartialFloats(std::min(plan.rows, row_tile_width), 64, plan.k_tiles));
@@ -7619,6 +7649,33 @@ namespace llaminar2::cpu::native_quantised
             if (!eligible || two_pair_jobs / static_cast<size_t>(workers) < 4u)
                 return 1u;
             return four_pair_jobs / static_cast<size_t>(workers) >= 4u ? 4u : 2u;
+        }
+
+        /**
+         * @brief Give an explicit three-row bundle contiguous independent job chunks.
+         * @param has_ordered_three Whether an actual effective new three-row member executes.
+         * @param jobs Original flattened local-tree job count after same-panel grouping.
+         * @param workers Actual invocation team width, not the configured thread maximum.
+         * @return One for every legacy bundle, otherwise ceil(jobs/workers), always positive.
+         * @throws std::invalid_argument For an empty new grid or invalid team width.
+         * @throws std::overflow_error When a new grid cannot fit the existing signed loop index.
+         *
+         * Cyclic stride28 aliases four row-runs at M38/39: seven workers receive
+         * only short last runs. Contiguous chunks break that fixed ownership
+         * without changing a job, panel, arithmetic operation or output writer.
+         * Division/remainder avoids overflow in jobs+workers-1. A final chunk
+         * may be shorter; this is not a claim of universal weighted load balance.
+         */
+        [[nodiscard]] constexpr long long selectOrderedThreeRowStaticChunk(
+            bool has_ordered_three, size_t jobs, int workers)
+        {
+            if (!has_ordered_three) return 1;
+            if (workers <= 0 || jobs == 0)
+                throw std::invalid_argument("CPU ordered-three job ownership requires positive jobs and actual workers");
+            if (jobs > static_cast<size_t>(std::numeric_limits<long long>::max()))
+                throw std::overflow_error("CPU ordered-three job count exceeds its signed workshare index");
+            const auto team = static_cast<size_t>(workers);
+            return static_cast<long long>(jobs / team + (jobs % team != 0));
         }
     }
 
@@ -7784,7 +7841,7 @@ namespace llaminar2::cpu::native_quantised
             // Other grids already own all rows or have no shared row tiles.
             const size_t adjacent_weight_users = plan.rows > 1 &&
                     plan.verifier_resolution.task_grid == VerifierRowsTaskGrid::RowTileNBlock
-                ? static_cast<size_t>((plan.rows + row_width - 1) / row_width)
+                ? static_cast<size_t>((plan.rows - 1) / row_width + 1)
                 : 1u;
             shared_weight_task_run = std::min(shared_weight_task_run, adjacent_weight_users);
             total_full_k_tasks += static_cast<size_t>(
@@ -8226,7 +8283,7 @@ namespace llaminar2::cpu::native_quantised
                     case VerifierRowsTaskGrid::RowTileNBlock:
                     {
                         const int row_tiles =
-                            (plan.rows + row_width - 1) / row_width;
+                            (plan.rows - 1) / row_width + 1;
                         const int block_idx = static_cast<int>(
                             local_task / static_cast<size_t>(row_tiles));
                         const int row_tile = static_cast<int>(
@@ -8291,10 +8348,12 @@ namespace llaminar2::cpu::native_quantised
             size_t total_pair_run_tasks = 0;
             size_t total_four_pair_run_tasks = 0;
             bool has_prefill_pair_runs = false;
+            bool has_ordered_three_rows = false;
             // A bounded ownership experiment, not a four-row microkernel:
-            // each job repeats the existing pair body for at most four adjacent
-            // pairs of the same descriptor/N64 panel. Decode, verifier, wide
-            // rows and nonlocal partial banks retain their existing task grid.
+            // Each job repeats at most four adjacent calls of one exact row
+            // tile on the same descriptor/N64 panel. The explicit three-row
+            // Prefill candidate reuses this same existing occupancy floor;
+            // legacy WideRows, Decode/verifier and nonlocal banks are unchanged.
             const auto pair_run_width = [&](int projection, size_t maximum_pairs = 2u) -> size_t
             {
                 const auto &descriptor = descs[projection];
@@ -8302,22 +8361,17 @@ namespace llaminar2::cpu::native_quantised
                 return bundle.partial_route == NativeQuantisedFusedPartialRoute::OutputTileLocal &&
                         descriptor.purpose == ProjectionRowsPurpose::Prefill &&
                         descriptor.packed->numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert &&
-                        plan.effective_verifier_schedule == VerifierRowsPolicy::Pairwise && plan.rows > 2
+                        (plan.effective_verifier_schedule == VerifierRowsPolicy::Pairwise ||
+                         plan.effective_verifier_schedule == VerifierRowsPolicy::OrderedThreeRows) && plan.rows > 2
                     ? maximum_pairs : 1u;
             };
             for (int projection = 0; projection < num_descs; ++projection)
             {
                 const auto &plan = plans[static_cast<size_t>(projection)];
                 const int row_tile_width =
-                    plan.rows == 1
-                        ? 1
-                        : (use_avx512 &&
-                                   plan.effective_verifier_schedule ==
-                                       VerifierRowsPolicy::WideRows
-                               ? 4
-                               : 2);
+                    plan.rows == 1 ? 1 : plan.verifier_resolution.physical_row_tile;
                 const int row_tiles =
-                    (plan.rows + row_tile_width - 1) / row_tile_width;
+                    (plan.rows - 1) / row_tile_width + 1;
                 const size_t projection_producers = plan.rows == 1
                     ? static_cast<size_t>(plan.total_blocks) *
                           static_cast<size_t>(plan.k_tiles)
@@ -8337,6 +8391,8 @@ namespace llaminar2::cpu::native_quantised
                     static_cast<size_t>(plan.n_chunks);
                 local_tree_task_ends[static_cast<size_t>(projection)] =
                     total_local_tree_tasks;
+                has_ordered_three_rows = has_ordered_three_rows ||
+                    plan.effective_verifier_schedule == VerifierRowsPolicy::OrderedThreeRows;
                 const auto run_width = pair_run_width(projection);
                 has_prefill_pair_runs = has_prefill_pair_runs || run_width > 1u;
                 total_pair_run_tasks +=
@@ -8652,18 +8708,21 @@ namespace llaminar2::cpu::native_quantised
                     for (int projection = 0; projection < num_descs; ++projection)
                     {
                         const auto &plan = plans[static_cast<size_t>(projection)];
-                        const int row_width = plan.rows == 1 ? 1 :
-                            (use_avx512 && plan.effective_verifier_schedule == VerifierRowsPolicy::WideRows ? 4 : 2);
-                        const auto row_tiles = static_cast<size_t>((plan.rows + row_width - 1) / row_width);
+                        const int row_width = plan.rows == 1 ? 1 : plan.verifier_resolution.physical_row_tile;
+                        const auto row_tiles = static_cast<size_t>((plan.rows - 1) / row_width + 1);
                         const auto run_width = pair_run_width(projection, maximum_pair_run);
                         total_local_tree_tasks += ((row_tiles + run_width - 1u) / run_width) *
                             static_cast<size_t>(plan.n_chunks);
                         local_tree_task_ends[static_cast<size_t>(projection)] = total_local_tree_tasks;
                     }
                 }
+                // Only a bundle executing the explicit new mechanism changes
+                // workshare grain. Every old policy keeps original cyclic IDs.
+                const long long static_chunk = detail::selectOrderedThreeRowStaticChunk(
+                    has_ordered_three_rows, total_local_tree_tasks, num_threads);
                 auto execute_layer_local_ordered_tree = [&]()
                 {
-#pragma omp for schedule(static, 1) nowait
+#pragma omp for schedule(static, static_chunk) nowait
                     for (long long global_task = 0;
                          global_task <
                              static_cast<long long>(total_local_tree_tasks);
@@ -8685,15 +8744,9 @@ namespace llaminar2::cpu::native_quantised
                         const auto &plan =
                             plans[static_cast<size_t>(projection)];
                         const int row_tile_width =
-                            plan.rows == 1
-                                ? 1
-                                : (use_avx512 &&
-                                           plan.effective_verifier_schedule ==
-                                               VerifierRowsPolicy::WideRows
-                                       ? 4
-                                       : 2);
+                            plan.rows == 1 ? 1 : plan.verifier_resolution.physical_row_tile;
                         const size_t run_width = use_pair_runs ? pair_run_width(projection, maximum_pair_run) : 1u;
-                        const int row_tiles = (plan.rows + row_tile_width - 1) / row_tile_width;
+                        const int row_tiles = (plan.rows - 1) / row_tile_width + 1;
                         const auto row_runs = (static_cast<size_t>(row_tiles) + run_width - 1u) / run_width;
                         // Ineligible descriptors retain their original local
                         // order. A paired run is one (panel,row-run) job and
@@ -8729,7 +8782,8 @@ namespace llaminar2::cpu::native_quantised
                             // addresses, partitions and N64 panel, with no row replay.
                             if (tile_rows == 3 && use_avx512 && packed.usesNibbleLUT() &&
                                 packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert &&
-                                plan.effective_verifier_schedule == VerifierRowsPolicy::WideRows)
+                                (plan.effective_verifier_schedule == VerifierRowsPolicy::WideRows ||
+                                 plan.effective_verifier_schedule == VerifierRowsPolicy::OrderedThreeRows))
                             {
                                 const Q8_1Block *input = descriptor.input ? descriptor.input : A_q8_all;
                                 const int n_start = chunk * 64;
@@ -9142,11 +9196,7 @@ namespace llaminar2::cpu::native_quantised
                         chunk_and_row_tile /
                         static_cast<size_t>(plan.n_chunks));
                     const int row_tile_width =
-                        use_avx512 &&
-                                plan.effective_verifier_schedule ==
-                                    VerifierRowsPolicy::WideRows
-                            ? 4
-                            : 2;
+                        plan.verifier_resolution.physical_row_tile;
                     const int first_row = row_tile * row_tile_width;
                     execute_partial_tile(
                         projection,
@@ -9362,14 +9412,9 @@ namespace llaminar2::cpu::native_quantised
                      * one-row K-part tasks.
                      */
                     const int row_tile_width =
-                        use_avx512 &&
-                                plan.effective_verifier_schedule ==
-                                    VerifierRowsPolicy::WideRows
-                            ? 4
-                            : 2;
+                        plan.verifier_resolution.physical_row_tile;
                     const int row_tile_count =
-                        (projection_rows + row_tile_width - 1) /
-                        row_tile_width;
+                        (projection_rows - 1) / row_tile_width + 1;
                     const int total_shared_tile_tasks =
                         row_tile_count * N_chunks * k_tiles;
 #pragma omp for schedule(static)

@@ -26,9 +26,10 @@ and11 grouped cells. M1 is installed; paid evidence resumes unchanged.
 Four/two/one panel scheduling gives **1.62× CPU FFN over two-pair**. Live-plan
 initialization saves **2.3% MTP /2.5% prefill** in AVX512 components.
 M3 overlay: **11% component gain**, model flat.
-Prepared-Q8 N64/MT16 passes MI50/XTX byte gates; **9–25% faster than N64/MT32**,
-unpromoted. HIP ingress: **8–12% small-case gain**, bulk/model flat. Root combine/weight
-worksharing: **~2× M64, 3–6% M448** component gain; model result above.
+Prepared-Q8 MT16: **9–25% component gain**, unpromoted. Root combine/weight
+worksharing: **~2× M64, 3–6% M448**. CPU3-row Prefill saves **29–33%** gate/up
+and **25–28%** FFN latency; bytes pass. **Auto unchanged**.
+[Candidate and correction](../2026-11/QFN_CPU_ORDERED_THREE_PREFILL_20261109.md).
 Shared gather: **~3× at16MiB**; sparse prefill remains unpromoted.
 [Exact-overlay scope and measurements](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md).
 [Launch omission, matched controls and timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md).

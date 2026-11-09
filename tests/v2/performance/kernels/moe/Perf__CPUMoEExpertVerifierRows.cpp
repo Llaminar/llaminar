@@ -38,10 +38,17 @@
  * `LLAMINAR_CPU_MOE_EXPERT_PURPOSE=decode|mtp|prefill` selects the
  * explicit scheduling purpose for grouped descriptors only (default Decode).
  * The independent one-row arithmetic oracle remains Decode.
+ * Optional GATE_UP_POLICY/DOWN_POLICY independently name explicit existing
+ * kernel policies; they inherit the old shared VERIFIER_POLICY by default.
+ * MEASURE_POLICY=both|native|aligned makes timing scope explicit (default both).
+ * Missing numerical-domain columns are NaN, never invented costs. Clocked
+ * warmups/samples reuse the same quiescent PerfStats suppression as exact batch;
+ * fresh actual phase authentication and isolated profiler work remain outside.
  * Geometry is authored without reconstructing a recorded model route vector.
  */
 
 #include "../../../utils/NativeQuantisedTestPartialStorage.h"
+#include "../../../utils/CPUPerfStatsTimingCollectionScope.h"
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
@@ -50,14 +57,18 @@
 #include "utils/QuantizedVerifierFormats.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <map>
+#include <optional>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -173,17 +184,16 @@ namespace
     }
 
     /** @brief Parse a forceable grouped-row policy for exact perf comparison. */
-    VerifierRowsPolicy selectedVerifierPolicy()
+    VerifierRowsPolicy parseVerifierPolicy(std::string_view policy)
     {
-        const char *raw =
-            std::getenv("LLAMINAR_CPU_MOE_EXPERT_VERIFIER_POLICY");
-        const std::string policy = raw && *raw ? raw : "Auto";
         if (policy == "Auto")
             return VerifierRowsPolicy::Auto;
         if (policy == "Pairwise")
             return VerifierRowsPolicy::Pairwise;
         if (policy == "WideRows")
             return VerifierRowsPolicy::WideRows;
+        if (policy == "OrderedThreeRows")
+            return VerifierRowsPolicy::OrderedThreeRows;
         if (policy == "FullKRowChunkGrid")
             return VerifierRowsPolicy::FullKRowChunkGrid;
         if (policy == "FullKTwoRowNbc1")
@@ -200,6 +210,38 @@ namespace
             return VerifierRowsPolicy::FullKTwoRowPairGridNbc8;
         throw std::invalid_argument(
             "LLAMINAR_CPU_MOE_EXPERT_VERIFIER_POLICY names an unknown policy");
+    }
+
+    /**
+     * @brief Read one explicit role policy, retaining the old shared default.
+     * @param name Exact environment field owned by this fixture.
+     * @param fallback Original shared policy when the optional field is unset/empty.
+     * @return Parsed physical policy; unknown names are rejected, never substituted.
+     */
+    VerifierRowsPolicy selectedVerifierPolicy(const char* name,
+        VerifierRowsPolicy fallback=VerifierRowsPolicy::Auto)
+    {
+        const char* raw=std::getenv(name);
+        if(!raw || !*raw)return fallback;
+        try{return parseVerifierPolicy(raw);}
+        catch(const std::invalid_argument& error){throw std::invalid_argument(std::string(name)+": "+error.what());}
+    }
+
+    /** @brief Explicit timing scope; no absent numerical policy becomes a zero cost. */
+    enum class MeasurementPolicy { Both, Native, Aligned };
+    /** @brief Parse the existing numerical domains without changing their arithmetic. */
+    MeasurementPolicy parseMeasurementPolicy(std::string_view value)
+    {
+        if(value=="both")return MeasurementPolicy::Both;
+        if(value=="native")return MeasurementPolicy::Native;
+        if(value=="aligned")return MeasurementPolicy::Aligned;
+        throw std::invalid_argument("LLAMINAR_CPU_MOE_EXPERT_MEASURE_POLICY must be both, native or aligned");
+    }
+    /** @brief Preserve original both-domain timing unless the caller explicitly narrows it. */
+    MeasurementPolicy selectedMeasurementPolicy()
+    {
+        const char* raw=std::getenv("LLAMINAR_CPU_MOE_EXPERT_MEASURE_POLICY");
+        return parseMeasurementPolicy(raw?raw:"both");
     }
 
     /** @brief Parse the one policy that a profiler launch may exercise. */
@@ -326,22 +368,30 @@ namespace
      * on this geometry. Repeating it inside one clock interval makes timing
      * proportional to kernel work while retaining the same prepared weights,
      * worker team, and rotating expert working set.
+     * @param function Original complete phase invocation, including its normal team lifetime.
+     * @param warmup Unmeasured invocation batches before the sample clocks.
+     * @param samples Number of independent native clock intervals.
+     * @param batch_iterations Calls per clock interval; normalization occurs once.
+     * @param raw_samples Optional chronological native doubles, copied after clocks.
+     * @return Original upper median in microseconds per invocation.
      */
     template <typename Function>
     double medianMicros(
         Function &&function,
         int warmup,
         int samples,
-        int batch_iterations)
+        int batch_iterations,
+        std::vector<double>* raw_samples=nullptr)
     {
+        std::vector<double> measurements;
+        measurements.reserve(static_cast<size_t>(samples));
+        {
+        test::CPUExactTimingCollectionScope recording_pause;
         for (int iteration = 0; iteration < warmup; ++iteration)
         {
             for (int batch = 0; batch < batch_iterations; ++batch)
                 function();
         }
-
-        std::vector<double> measurements;
-        measurements.reserve(static_cast<size_t>(samples));
         for (int sample = 0; sample < samples; ++sample)
         {
             const auto begin = std::chrono::steady_clock::now();
@@ -352,6 +402,10 @@ namespace
                 std::chrono::duration<double, std::micro>(end - begin).count() /
                 static_cast<double>(batch_iterations));
         }
+        } // All worker teams have joined before restoring recording.
+        // Retain chronological native doubles only after every clock and team
+        // has retired. Sorting below preserves the original median definition.
+        if(raw_samples)*raw_samples=measurements;
         std::sort(measurements.begin(), measurements.end());
         return measurements[measurements.size() / 2u];
     }
@@ -435,7 +489,8 @@ namespace
      * @param d_model Logical hidden width.
      * @param intermediate Logical FFN width.
      * @param numerical_policy Independent native or GPU-aligned arithmetic contract.
-     * @param verifier_schedule Explicit diagnostic candidate, or production Auto.
+     * @param gate_up_schedule Explicit gate/up candidate, or original Auto.
+     * @param down_schedule Explicit down candidate, or original Auto.
      * @param purpose Typed grouped scheduling intent; serial oracles remain Decode.
      * @param warmup Untimed batches before measurements.
      * @param samples Number of independently timed batches.
@@ -452,7 +507,8 @@ namespace
         int d_model,
         int intermediate,
         CPUProjectionNumericalPolicy numerical_policy,
-        VerifierRowsPolicy verifier_schedule,
+        VerifierRowsPolicy gate_up_schedule,
+        VerifierRowsPolicy down_schedule,
         ProjectionRowsPurpose purpose,
         int warmup,
         int samples,
@@ -520,7 +576,7 @@ namespace
                 .rows = expert.rows,
                 .n = intermediate,
                 .ldc = intermediate,
-                .verifier_schedule = verifier_schedule,
+                .verifier_schedule = gate_up_schedule,
                 .purpose = purpose,
             });
             gate_up_descriptors.push_back({
@@ -531,7 +587,7 @@ namespace
                 .rows = expert.rows,
                 .n = intermediate,
                 .ldc = intermediate,
-                .verifier_schedule = verifier_schedule,
+                .verifier_schedule = gate_up_schedule,
                 .purpose = purpose,
             });
             down_descriptors.push_back({
@@ -543,7 +599,7 @@ namespace
                 .rows = expert.rows,
                 .n = d_model,
                 .ldc = d_model,
-                .verifier_schedule = verifier_schedule,
+                .verifier_schedule = down_schedule,
                 .purpose = purpose,
             });
         }
@@ -758,6 +814,8 @@ namespace
                 << cpuNativeQuantisedSerialEquivalentPolicyN(intermediate)
                 << " down_policy_n="
                 << cpuNativeQuantisedSerialEquivalentPolicyN(d_model)
+                << " gate_up_policy=" << cpu::native_quantised::verifierRowsPolicyName(gate_up_schedule)
+                << " down_policy=" << cpu::native_quantised::verifierRowsPolicyName(down_schedule)
                 << " iterations=" << profile_iterations
                 << " checksum=" << checksum << '\n';
             // Profiling and paired timing are disjoint executions. Returning
@@ -766,21 +824,79 @@ namespace
         }
 
         PipelineTiming timing;
+        std::array<std::vector<double>,6> raw_samples;
         timing.gate_up_us =
-            medianMicros(grouped_gate_up, warmup, samples, batch_iterations);
+            medianMicros(grouped_gate_up, warmup, samples, batch_iterations,&raw_samples[0]);
         timing.swiglu_q8_us =
-            medianMicros(grouped_swiglu_q8, warmup, samples, batch_iterations);
+            medianMicros(grouped_swiglu_q8, warmup, samples, batch_iterations,&raw_samples[1]);
         timing.down_us =
             medianMicros(
-                grouped_down_projection, warmup, samples, batch_iterations);
+                grouped_down_projection, warmup, samples, batch_iterations,&raw_samples[2]);
         timing.complete_us =
-            medianMicros(grouped_complete, warmup, samples, batch_iterations);
+            medianMicros(grouped_complete, warmup, samples, batch_iterations,&raw_samples[3]);
         timing.persistent_complete_us =
             medianMicros(
-                grouped_complete_persistent, warmup, samples, batch_iterations);
+                grouped_complete_persistent, warmup, samples, batch_iterations,&raw_samples[4]);
         timing.serial_us =
             medianMicros(
-                serial_complete, /*warmup=*/1, samples, batch_iterations);
+                serial_complete, /*warmup=*/1, samples, batch_iterations,&raw_samples[5]);
+        // Snapshot only outside clocks. One fresh complete call then proves
+        // actual selected kinds under the REAL existing FFN team entry, not
+        // a metadata-only standalone guess of an installed exact key.
+        constexpr const char* route_counter="kernel.cpu_native_quantised_fused_verifier_rows_projection_launch";
+        std::map<PerfStatsCollector::Tags,uint64_t> prior;
+        for(const auto& record:PerfStatsCollector::snapshot({route_counter}))prior[record.tags]=record.count;
+        grouped_complete_persistent();
+        uint64_t fresh_descriptors=0;bool saw_ordered_three=false;
+        for(const auto& record:PerfStatsCollector::snapshot({route_counter})) {
+            const auto found=prior.find(record.tags);
+            const auto before=found==prior.end()?uint64_t{0}:found->second;
+            if(record.count<before)throw std::runtime_error("FFN route epoch changed during fresh authentication");
+            const auto count=record.count-before;
+            if(!count)continue;
+            fresh_descriptors+=count;
+            saw_ordered_three=saw_ordered_three || record.tags.at("effective_verifier_policy")=="OrderedThreeRows";
+            std::cout<<"CPU_FFN_RESOLVED,format="<<format.label<<",down_format="<<down_format.label
+                <<",numerical_policy="<<(numerical_policy==CPUProjectionNumericalPolicy::GPUAlignedExpert?"GPUAlignedExpert":"BackendNative")
+                <<",fresh_descriptors="<<count;
+            for(const auto name:{"m","n","policy_n","k","codebook","purpose","isa","k_tiles",
+                 "requested_verifier_policy","effective_verifier_policy","physical_row_tile","route","task_grid"})
+                std::cout<<','<<name<<'='<<record.tags.at(name);
+            std::cout<<",outside_timing=1\n";
+        }
+        if(gate_up_schedule==VerifierRowsPolicy::OrderedThreeRows || down_schedule==VerifierRowsPolicy::OrderedThreeRows) {
+            if(!saw_ordered_three || fresh_descriptors!=3u*static_cast<uint64_t>(active_experts))
+                throw std::runtime_error("Explicit OrderedThreeRows FFN diagnostic requires the exact projection PerfStats filter for fresh outside-timing route proof");
+        }
+        expectByteEqual(grouped_gate,serial_gate,std::string(format.label)+" post-timing gate");
+        expectByteEqual(grouped_up,serial_up,std::string(format.label)+" post-timing up");
+        expectByteEqual(grouped_activation,serial_activation,std::string(format.label)+" post-timing activation Q8");
+        expectByteEqual(grouped_down,serial_down,std::string(format.label)+" post-timing down");
+        // Publish only after ALL six phase clocks and fresh authentication.
+        // These are chronological per-bundle microseconds, divided by repeat
+        // count exactly once inside medianMicros; profiler mode never reaches here.
+        constexpr std::array<const char*,6> phases{
+            "gate_up","swiglu_q8","down","complete","persistent_complete","serial_oracle"};
+        const auto original_precision=std::cout.precision();
+        std::cout<<std::setprecision(std::numeric_limits<double>::max_digits10);
+        for(size_t phase=0;phase<raw_samples.size();++phase)
+            for(size_t sample=0;sample<raw_samples[phase].size();++sample)
+                std::cout<<"CPU_FFN_SAMPLE,format="<<format.label<<",down_format="<<down_format.label
+                    <<",numerical_policy="<<(numerical_policy==CPUProjectionNumericalPolicy::GPUAlignedExpert?"GPUAlignedExpert":"BackendNative")
+                    <<",purpose="<<projectionRowsPurposeName(phase==5?ProjectionRowsPurpose::Decode:purpose)
+                    <<",grouped_purpose="<<projectionRowsPurposeName(purpose)
+                    <<",arithmetic_scope="<<(phase==5?"independent_serial_decode_oracle":"production_grouped")
+                    <<",runtime_isa="<<isaLevelName(activeISALevel())<<",threads="<<omp_get_max_threads()
+                    <<",candidate=gate_up:"<<cpu::native_quantised::verifierRowsPolicyName(gate_up_schedule)
+                    <<"|down:"<<cpu::native_quantised::verifierRowsPolicyName(down_schedule)
+                    <<",gate_up_policy_n="<<cpuNativeQuantisedSerialEquivalentPolicyN(intermediate)
+                    <<",down_policy_n="<<cpuNativeQuantisedSerialEquivalentPolicyN(d_model)
+                    <<",d_model="<<d_model<<",intermediate="<<intermediate
+                    <<",active_experts="<<active_experts<<",route_rows="<<local_route_rows
+                    <<",phase="<<phases[phase]<<",warmups="<<(phase==5?1:warmup)
+                    <<",repeats="<<batch_iterations<<",sample="<<sample
+                    <<",us="<<raw_samples[phase][sample]<<",outside_timing=1\n";
+        std::cout.precision(original_precision);
         return timing;
     }
 } // namespace
@@ -796,6 +912,57 @@ TEST(Perf_CPUMoEExpertVerifierRows, ExplicitPurposeSelectionContract)
     EXPECT_THROW((void)parseProjectionPurpose("unknown"), std::invalid_argument);
     EXPECT_THROW((void)parseProjectionPurpose(""), std::invalid_argument);
     EXPECT_THROW((void)parseProjectionPurpose("Decode"), std::invalid_argument);
+}
+
+/** @test Authored policy controls remain explicit; no weights, GPU or timing work. */
+TEST(Perf_CPUMoEExpertVerifierRows, ExplicitRoleAndNumericalPolicyContract)
+{
+    EXPECT_EQ(parseVerifierPolicy("Auto"),VerifierRowsPolicy::Auto);
+    EXPECT_EQ(parseVerifierPolicy("Pairwise"),VerifierRowsPolicy::Pairwise);
+    EXPECT_EQ(parseVerifierPolicy("WideRows"),VerifierRowsPolicy::WideRows);
+    EXPECT_EQ(parseVerifierPolicy("OrderedThreeRows"),VerifierRowsPolicy::OrderedThreeRows);
+    EXPECT_THROW((void)parseVerifierPolicy("unknown"),std::invalid_argument);
+    EXPECT_THROW((void)parseVerifierPolicy(""),std::invalid_argument);
+    EXPECT_EQ(parseMeasurementPolicy("both"),MeasurementPolicy::Both);
+    EXPECT_EQ(parseMeasurementPolicy("native"),MeasurementPolicy::Native);
+    EXPECT_EQ(parseMeasurementPolicy("aligned"),MeasurementPolicy::Aligned);
+    EXPECT_THROW((void)parseMeasurementPolicy(""),std::invalid_argument);
+    EXPECT_THROW((void)parseMeasurementPolicy("unknown"),std::invalid_argument);
+}
+
+/** @test CPU phase warmup/sample calls emit zero records; fresh proof stays outside clocks. */
+TEST(Perf_CPUMoEExpertVerifierRows, TimingCollectionScopeContract)
+{
+    struct Restore {
+        std::optional<std::string> filter,summary;
+        Restore(){
+            if(const char* value=std::getenv("LLAMINAR_PERF_STATS_FILTER"))filter=value;
+            if(const char* value=std::getenv("LLAMINAR_PERF_STATS_SUMMARY"))summary=value;
+            if(setenv("LLAMINAR_PERF_STATS_FILTER","kernel.ffn_timing_collection_contract",1) ||
+               setenv("LLAMINAR_PERF_STATS_SUMMARY","1",1))throw std::runtime_error("Cannot bind timing contract");
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
+        }
+        ~Restore(){
+            if(filter)setenv("LLAMINAR_PERF_STATS_FILTER",filter->c_str(),1);else unsetenv("LLAMINAR_PERF_STATS_FILTER");
+            if(summary)setenv("LLAMINAR_PERF_STATS_SUMMARY",summary->c_str(),1);else unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
+        }
+    } restore;
+    const auto observations=[](){uint64_t count=0;for(const auto& record:PerfStatsCollector::snapshot(
+        {"kernel.ffn_timing_collection_contract"}))count+=record.count;return count;};
+    const auto call=[](){PerfStatsCollector::addCounter("kernel","ffn_timing_collection_contract",1.0,"gemm","cpu");};
+    const auto before=observations();
+    std::vector<double> raw_samples;
+    const auto median=medianMicros(call,2,3,2,&raw_samples);
+    ASSERT_EQ(raw_samples.size(),3u);
+    EXPECT_TRUE(std::all_of(raw_samples.begin(),raw_samples.end(),
+        [](double value){return std::isfinite(value) && value>=0.0;}));
+    auto sorted=raw_samples;
+    std::sort(sorted.begin(),sorted.end());
+    EXPECT_EQ(median,sorted[sorted.size()/2u]);
+    EXPECT_EQ(observations(),before);
+    call();
+    EXPECT_EQ(observations(),before+1u);
 }
 
 /**
@@ -834,8 +1001,21 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
             ? profile_phase_raw
             : "complete";
     const ProfilePolicy profile_policy = selectedProfilePolicy();
-    const VerifierRowsPolicy verifier_schedule = selectedVerifierPolicy();
+    const VerifierRowsPolicy verifier_schedule = selectedVerifierPolicy("LLAMINAR_CPU_MOE_EXPERT_VERIFIER_POLICY");
+    const VerifierRowsPolicy gate_up_schedule=selectedVerifierPolicy("LLAMINAR_CPU_MOE_EXPERT_GATE_UP_POLICY",verifier_schedule);
+    const VerifierRowsPolicy down_schedule=selectedVerifierPolicy("LLAMINAR_CPU_MOE_EXPERT_DOWN_POLICY",verifier_schedule);
+    const auto measurement_policy=selectedMeasurementPolicy();
+    const bool include_native=measurement_policy!=MeasurementPolicy::Aligned;
+    const bool include_aligned=measurement_policy!=MeasurementPolicy::Native;
     const ProjectionRowsPurpose purpose = selectedProjectionPurpose();
+    const bool ordered_three=gate_up_schedule==VerifierRowsPolicy::OrderedThreeRows ||
+        down_schedule==VerifierRowsPolicy::OrderedThreeRows;
+    if(ordered_three) {
+        ASSERT_EQ(purpose,ProjectionRowsPurpose::Prefill);
+        if(profile_iterations>0)ASSERT_EQ(profile_policy,ProfilePolicy::Aligned);
+        else ASSERT_EQ(measurement_policy,MeasurementPolicy::Aligned)
+            << "OrderedThreeRows requires explicit aligned-only clocks, never a BackendNative substitution";
+    }
     // Batched descriptors have no original-output-slice binding. Query the
     // same serial-width authority used by the production fused planner; do
     // not substitute an imagined TP parent width for these physical matrices.
@@ -873,7 +1053,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                "native_complete_us,native_persistent_us,"
                "aligned_gate_up_us,aligned_swiglu_q8_us,aligned_down_us,"
                "aligned_complete_us,aligned_persistent_us,"
-               "aligned_over_native_persistent,purpose,gate_up_policy_n,down_policy_n\n";
+               "aligned_over_native_persistent,purpose,gate_up_policy_n,down_policy_n,requested_gate_up_policy,requested_down_policy,measured_numerics\n";
     }
     int executed = 0;
     std::cout
@@ -888,6 +1068,9 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
         << ", down_policy_n=" << down_policy_n
         << ", verifier_policy="
         << cpu::native_quantised::verifierRowsPolicyName(verifier_schedule)
+        << ", gate_up_policy=" << cpu::native_quantised::verifierRowsPolicyName(gate_up_schedule)
+        << ", down_policy=" << cpu::native_quantised::verifierRowsPolicyName(down_schedule)
+        << ", measured_numerics=" << (include_native?(include_aligned?"both":"native"):"aligned")
         << ")\n"
         << "gate_up_format/down_format native_persistent_us aligned_persistent_us "
            "aligned/native native_speedup aligned_speedup\n";
@@ -908,14 +1091,15 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 profile_policy == ProfilePolicy::Aligned
                     ? CPUProjectionNumericalPolicy::GPUAlignedExpert
                     : CPUProjectionNumericalPolicy::BackendNative,
-                verifier_schedule, purpose, warmup, samples, batch_iterations,
+                gate_up_schedule, down_schedule, purpose, warmup, samples, batch_iterations,
                 profile_iterations, profile_phase);
             ++executed;
             continue;
         }
 
-        PipelineTiming native;
-        PipelineTiming aligned;
+        const double missing=std::numeric_limits<double>::quiet_NaN();
+        PipelineTiming native{missing,missing,missing,missing,missing,missing};
+        PipelineTiming aligned=native;
         auto measure_native = [&]
         {
             native = runFormat(
@@ -926,7 +1110,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 d_model,
                 intermediate,
                 CPUProjectionNumericalPolicy::BackendNative,
-                verifier_schedule,
+                gate_up_schedule, down_schedule,
                 purpose,
                 warmup,
                 samples,
@@ -946,7 +1130,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 d_model,
                 intermediate,
                 CPUProjectionNumericalPolicy::GPUAlignedExpert,
-                verifier_schedule,
+                gate_up_schedule, down_schedule,
                 purpose,
                 warmup,
                 samples,
@@ -959,18 +1143,18 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
         /* Alternate first policy to avoid systematic cache-temperature bias. */
         if ((executed & 1) != 0)
         {
-            measure_aligned();
-            measure_native();
+            if(include_aligned)measure_aligned();
+            if(include_native)measure_native();
         }
         else
         {
-            measure_native();
-            measure_aligned();
+            if(include_native)measure_native();
+            if(include_aligned)measure_aligned();
         }
-        const double native_speedup = native.persistent_complete_us > 0.0
+        const double native_speedup = !include_native?missing:native.persistent_complete_us > 0.0
             ? native.serial_us / native.persistent_complete_us
             : 0.0;
-        const double aligned_speedup = aligned.persistent_complete_us > 0.0
+        const double aligned_speedup = !include_aligned?missing:aligned.persistent_complete_us > 0.0
             ? aligned.serial_us / aligned.persistent_complete_us
             : 0.0;
         const double slowdown = aligned.persistent_complete_us /
@@ -999,12 +1183,15 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 << aligned.down_us << ',' << aligned.complete_us << ','
                 << aligned.persistent_complete_us << ',' << slowdown << ','
                 << projectionRowsPurposeName(purpose) << ','
-                << gate_up_policy_n << ',' << down_policy_n << '\n';
+                << gate_up_policy_n << ',' << down_policy_n << ','
+                << cpu::native_quantised::verifierRowsPolicyName(gate_up_schedule) << ','
+                << cpu::native_quantised::verifierRowsPolicyName(down_schedule) << ','
+                << (include_native?(include_aligned?"both":"native"):"aligned") << '\n';
         }
-        EXPECT_GT(native_speedup, 1.0)
+        if(include_native)EXPECT_GT(native_speedup, 1.0)
             << format.label
             << " backend-native grouped execution must beat serial row replay";
-        EXPECT_GT(aligned_speedup, 1.0)
+        if(include_aligned)EXPECT_GT(aligned_speedup, 1.0)
             << format.label
             << " GPU-aligned grouped execution must beat serial row replay";
         ++executed;

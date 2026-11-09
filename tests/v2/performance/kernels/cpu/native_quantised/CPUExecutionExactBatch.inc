@@ -10,39 +10,6 @@
  * final route proof uses one fresh, fully recorded call outside the clocks.
  */
 
-/**
- * @brief Test-owner recording suppression; all workers must be quiescent on entry/exit.
- *
- * Only the collection filter changes. Existing immutable PerfStats policies own
- * publication/lifetime; production execution, request topology and record data
- * are untouched. This cold owner control never surrounds profiler evidence.
- */
-class CPUExactTimingCollectionScope final
-{
-public:
-    /** @brief Retain the exact original filter, then withdraw every timing record. */
-    CPUExactTimingCollectionScope()
-    {
-        if (const char *value = std::getenv("LLAMINAR_PERF_STATS_FILTER")) prior_filter_ = value;
-        if (setenv("LLAMINAR_PERF_STATS_FILTER", "cpu_exact_timing_disabled", 1) != 0)
-            throw std::runtime_error("Cannot suppress CPU exact timing collection");
-        PerfStatsCollector::reloadConfigurationFromEnvironment();
-    }
-    /** @brief Restore the caller's exact policy before a later proof/export. */
-    ~CPUExactTimingCollectionScope() noexcept
-    {
-        const int status = prior_filter_
-            ? setenv("LLAMINAR_PERF_STATS_FILTER", prior_filter_->c_str(), 1)
-            : unsetenv("LLAMINAR_PERF_STATS_FILTER");
-        if (status != 0) std::terminate();
-        PerfStatsCollector::reloadConfigurationFromEnvironment();
-    }
-    CPUExactTimingCollectionScope(const CPUExactTimingCollectionScope &) = delete;
-    CPUExactTimingCollectionScope &operator=(const CPUExactTimingCollectionScope &) = delete;
-private:
-    std::optional<std::string> prior_filter_; ///< Restored after the team retires its timed reads.
-};
-
 /** @brief One immutable request; source/geometry/worker contract belongs to the batch. */
 struct CPUExecutionExactBatchRequest
 {
@@ -123,6 +90,11 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
         else { ASSERT_EQ(request.purpose_name, "prefill"); request.purpose = ProjectionRowsPurpose::Prefill; }
         if (request.candidate_name == "Auto") request.candidate = VerifierRowsPolicy::Auto;
         else if (request.candidate_name == "Pairwise") request.candidate = VerifierRowsPolicy::Pairwise;
+        else if (request.candidate_name == "OrderedThreeRows") {
+            ASSERT_FALSE(tournament) << "New explicit physical candidates require full-grade diagnostic clocks";
+            ASSERT_EQ(request.purpose,ProjectionRowsPurpose::Prefill);
+            request.candidate=VerifierRowsPolicy::OrderedThreeRows;
+        }
         else { ASSERT_EQ(request.candidate_name, "WideRows"); request.candidate = VerifierRowsPolicy::WideRows; }
         const bool profiling = !request.profile_request_id.empty();
         ASSERT_EQ(profiling, !request.profile_output_path.empty());
@@ -221,6 +193,8 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
         if (member.rows == 1) return static_cast<uint32_t>(member.effective_decode_schedule);
         if (member.effective_verifier_schedule == VerifierRowsPolicy::Pairwise) return 0;
         if (member.effective_verifier_schedule == VerifierRowsPolicy::WideRows) return 1;
+        if(member.effective_verifier_schedule==VerifierRowsPolicy::OrderedThreeRows)
+            return uint32_t{0x10000}+static_cast<uint32_t>(VerifierRowsPolicy::OrderedThreeRows);
         throw std::runtime_error("Exact filled K-part class cannot emit a foreign physical row policy");
     };
     const auto bind_request = [&](bool refresh_inputs = true)
@@ -395,6 +369,13 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
             {"activation_row_offsets", std::vector<size_t>(live_offsets.begin(), live_offsets.begin() + live_projections)},
             {"output_role", role}, {"placement", {{"workers", workers}, {"admitted_physical_cores", allowed_physical_cores.size()},
                 {"disjoint_single_core_masks", disjoint_masks}}}};
+        if(current->candidate==VerifierRowsPolicy::OrderedThreeRows) {
+            // Keep the explicit new mechanism distinct from legacy WideRows
+            // and its installed-choice ABI. Existing Python admission rejects
+            // this diagnostic name/foreign policy ID until separately extended.
+            evidence["explicit_candidate_scope"]="ordered_three_rows_prefill_contiguous_diagnostic_v1";
+            evidence["promotion_eligible"]=false;
+        }
         if (profiling)
         {
             evidence["profile_request_id"] = current->profile_request_id;

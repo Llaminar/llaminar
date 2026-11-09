@@ -18221,6 +18221,12 @@ foreach(V2_FUSED_COMPLETION_ISA AVX2 AVX512)
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;MTP;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedPrefillOrderedThreeTile_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+            --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedPrefillOrderedThreeRowTile*
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
     add_v2_test(V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_${V2_FUSED_COMPLETION_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
             --gtest_filter=CPUNativeQuantisedFusedCompletion.UnsignedCoefficientDomainContract:CPUNativeQuantisedFusedCompletion.UnsignedWeightDotAllFormatByteLifecycle
@@ -27290,6 +27296,14 @@ add_v2_test(V2_Perf_CPUMoEExpertVerifierRows
     MPI_PROCS 1
     TIMEOUT 120
 )
+
+# Device-free fixture controls share the original FFN owner; no weight preparation.
+add_v2_test(V2_Integration_CPUMoEExpertExplicitPolicyTimingContract
+    COMMAND $<TARGET_FILE:v2_perf_cpu_moe_expert_verifier_rows>
+        --gtest_filter=Perf_CPUMoEExpertVerifierRows.ExplicitPurposeSelectionContract:Perf_CPUMoEExpertVerifierRows.ExplicitRoleAndNumericalPolicyContract:Perf_CPUMoEExpertVerifierRows.TimingCollectionScopeContract
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Prefill;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 
 # Performance: exact cross-tier floating expert projections at production shape.
 add_executable(v2_perf_cpu_floating_moe_expert
@@ -36754,6 +36768,7 @@ if(NOT V2_PERF_TESTS_ONLY)
             V2_Integration_CPU_NativeQuantisedFusedProjectionEvidenceIdentity_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedOrderedNibbleReplay_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedOrderedThreeRowNibble_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeQuantisedPrefillOrderedThreeTile_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedLivePlanFill_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedFusedLivePrefix_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedSamePanelPairRunReplay_${_cpu_checkpoint_isa}
@@ -36761,6 +36776,11 @@ if(NOT V2_PERF_TESTS_ONLY)
             V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_gate_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_down_${_cpu_checkpoint_isa})
     endforeach()
+endif()
+
+if(TEST V2_Integration_CPUMoEExpertExplicitPolicyTimingContract)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CPUMoEExpertExplicitPolicyTimingContract)
 endif()
 
 # Completed CPU expert observation and exact profiler/reset equivalence.
