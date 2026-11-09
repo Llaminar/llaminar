@@ -39,6 +39,7 @@ from typing import Callable, Iterable, Mapping
 
 import numpy as np
 
+from .host_cores import physical_core_count
 from .corpus import (
     GenericDomain,
     ObservationCorpus,
@@ -276,41 +277,11 @@ def _physical_core_worker_count(
 ) -> int:
     """Return affinity-visible physical cores for process-pool defaults.
 
-    The policy fitter runs independent CPU-bound Python/sklearn processes.
-    Scheduling one process per SMT sibling doubles resident model state and
-    run-queue pressure without doubling tree throughput. Linux exposes stable
-    package/core identities for every logical CPU; count unique identities only
-    within the process affinity mask so container and NUMA pinning remain
-    authoritative. A platform without complete topology metadata falls back to
-    its visible logical count rather than guessing an SMT ratio.
+    One independent CPU-bound fit process per SMT sibling doubles resident
+    model state without doubling throughput; see ``host_cores``.
     """
 
-    if affinity is None:
-        try:
-            visible_cpus = tuple(sorted(os.sched_getaffinity(0)))
-        except AttributeError:
-            visible_cpus = tuple(range(os.cpu_count() or 1))
-    else:
-        visible_cpus = tuple(sorted(set(affinity)))
-    if not visible_cpus:
-        return 1
-
-    physical_cores = set()
-    for cpu in visible_cpus:
-        topology = topology_root / f"cpu{cpu}" / "topology"
-        try:
-            package_id = int(
-                (topology / "physical_package_id").read_text(
-                    encoding="utf-8"
-                ).strip()
-            )
-            core_id = int(
-                (topology / "core_id").read_text(encoding="utf-8").strip()
-            )
-        except (OSError, ValueError):
-            return len(visible_cpus)
-        physical_cores.add((package_id, core_id))
-    return max(1, len(physical_cores))
+    return physical_core_count(affinity=affinity, topology_root=topology_root)
 
 
 def _profiler_surrogate_cuda_devices() -> tuple[str, ...]:

@@ -2107,10 +2107,12 @@ namespace
                 const std::string &task_grid = record.tags.at("task_grid");
                 const int row_tile =
                     std::stoi(record.tags.at("physical_row_tile"));
-                if (route == "native_neon_shared_rows")
+                if (route.rfind("grouped_neon_full_k_", 0) == 0)
                 {
                     // ARM native shared-row tiles (two or four physical rows).
                     EXPECT_EQ(task_grid, "row_tile_n_block");
+                    EXPECT_EQ(route, row_tile == 2 ? "grouped_neon_full_k_pair_rows"
+                                                   : "grouped_neon_full_k_four_rows");
                     EXPECT_TRUE(row_tile == 2 || row_tile == 4) << row_tile;
                 }
                 else if (route == "grouped_full_k_row_chunk_grid")
