@@ -494,3 +494,18 @@ the source policy). Dead persistent_state parameter removed.
   (reset+replay rotate; fail-fast case). NOTE: adaptive-diag patch applied
   at b199ccfa0 (not 912d0107 — gate tree untouched; files byte-identical);
   reverted clean. WSL's own earlier null-adapt = disregard (not product).
+
+## (B) resolved — 39c24d8b4 (2026-11-09) — TEST-SIDE root cause
+
+- CORRECTION: execute() NOT a no-op; binding/kernel state NOT invalidated.
+  resetSessionState() (base, RoPEStage.h:202) clears REQUEST-LOCAL params;
+  test executed WITHOUT republishing → seq_len-from-tensor fallback
+  (RoPEStage.cpp:154) + pos 0..n−1; row0 pos0 = identity (cos1/sin0);
+  binding intact (getWorkspace/address EXPECTs passed); primitives exact on
+  x86 (WSL). Production republishes every request (DGO:26161/26176/61286;
+  FEE:653) — test never modelled it. FIX (39c24d8b4, +20/−5): each replay
+  publishes via updateDynamicPositionIds (different live positions +1000×
+  replay; −1 kept) → reset+republication byte-exact vs serial incl. verifier
+  rows; binding/address survives reset. Main follow-up (handover): base
+  RoPEStage silent 0..rows−1 fallback on reset-without-republication (fail-
+  fast candidate; outside lane). (5'') final re-targeted to 39c24d8b4.
