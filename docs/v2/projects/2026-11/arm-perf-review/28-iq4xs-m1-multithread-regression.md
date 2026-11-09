@@ -553,3 +553,15 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   9/9 cells single=0 grouped=budget 0 mismatches; no rejection/flake; final
   `driver_plan != plan` now passes; still-different controls exercised
   in-fixture. Fix confirmed. (SOURCE124 epoch still HOLD w/ folded items.)
+
+## SOURCE125 FINAL (2026-11-09) — successor scope updates (SOURCE126)
+
+- Temp-name P1 source-closed NARROWLY (validate_plan output/input link;
+  normalization = masked twice-occurring basename only; fixture covers
+  composed path).
+- NEW P2: basename grammar `$` accepts a final NEWLINE (`.match` semantics) —
+  `/tmp/ccAb12Cd.s\n` passes + plan_shape erases it → use FULL-STRING check
+  (`fullmatch`) + trailing-newline structured-plan/receipt negative.
+- STILL OPEN (not cleared by the GNU rerun): NBSP Unicode-split P1 (P:1591);
+  last-observation/no-receipt P2 (P:2133–2134); relative-driver precision
+  note. Gate stays HOLD; Mac one-of-four failure stays separate/unresolved.
