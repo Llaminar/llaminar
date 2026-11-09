@@ -509,3 +509,17 @@ the source policy). Dead persistent_state parameter removed.
   rows; binding/address survives reset. Main follow-up (handover): base
   RoPEStage silent 0..rows−1 fallback on reset-without-republication (fail-
   fast candidate; outside lane). (5'') final re-targeted to 39c24d8b4.
+
+## 39c24d8b4 FINAL source ACK (2026-11-09)
+
+- Narrow source-only ACK; no blocker. Correction matches unchanged contract
+  (reset clears request-local; base reset + CPU reset don't retire the
+  admitted workspace; seq_len==0 → rows from Q + offset 0 → identity row0;
+  NOT no-op/binding issue). Per-iteration verify: copy+shift 1000×iter
+  (non-cumulative), −1 preserved, Q/K restored, publish via
+  updateDynamicPositionIds before execute (stage-owned copy → lifetime safe);
+  serial uses same new positions; memcmp + workspace checks remain. Cited
+  DGO/FEE paths publish — bounded caller check. Oracle = serial invocation of
+  the SAME production kernel (NOT independent arithmetic — handover wording).
+  execute-after-reset default-position/fail-fast = Main follow-up. SOURCE
+  COMPLETE at 39c24d8b4; only WSL (5'') remains → handover.
