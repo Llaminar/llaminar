@@ -549,10 +549,43 @@ namespace llaminar2::cpu::native_quantised
                     throw std::invalid_argument("Native ARM fused destination aliases a sibling publication");
             }
         }
-        auto run = [&] {
-            for (int p = 0; p < count; ++p) neon_execution::execute(*batches[p], dot);
+        /*
+         * Pool every member's independent (row tile, chunk group) tasks into
+         * one dynamic workshare. Running members one after another put a team
+         * barrier between them and left most workers idle on narrow members:
+         * 35B-A3B decode fuses 16 routed gate/up projections of N=512 (8 tasks
+         * each), i.e. 16 serial phases of 8 tasks on 20 workers. Each task
+         * still writes only its own tile with the same full-K arithmetic, so
+         * pooling changes no byte.
+         */
+        std::array<std::int64_t, NativeQuantisedFusedRowsPlan::capacity + 1> first_task{};
+        for (int p = 0; p < count; ++p)
+            first_task[p + 1] = first_task[p] + batches[p]->taskCount();
+        const std::int64_t total = first_task[count];
+        if (!llaminar::v2::beginWorkshare(total > 0)) return true;
+        auto pooled = [&]<multi_scale::NEONByteDot Instruction>() {
+            auto workshare = [&] {
+#pragma omp for schedule(dynamic, 1)
+                for (std::int64_t task = 0; task < total; ++task)
+                {
+                    int p = 0;
+                    while (task >= first_task[p + 1]) ++p;
+                    batches[p]->template runTask<Instruction>(task - first_task[p]);
+                }
+            };
+            OMP_WORKSHARE_REGION(workshare);
         };
-        OMP_WORKSHARE_REGION(run);
+#if defined(__ARM_FEATURE_DOTPROD)
+        if (dot == multi_scale::NEONByteDot::DotProd)
+        {
+            ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
+            pooled.template operator()<multi_scale::NEONByteDot::DotProd>();
+            return true;
+        }
+#endif
+        if (dot != multi_scale::NEONByteDot::ASIMD)
+            throw std::invalid_argument("Native ARM projection instruction is unknown or outside this compiler envelope");
+        pooled.template operator()<multi_scale::NEONByteDot::ASIMD>();
         return true;
     }
 
