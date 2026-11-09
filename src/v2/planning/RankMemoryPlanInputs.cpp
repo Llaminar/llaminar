@@ -21,6 +21,7 @@
  * source and PMA handoff. Global topology remains immutable metadata; remote
  * execution, activation transport and model-context reuse are not impersonated.
  */
+#include "planning/PlanningObservedResource.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "execution/global/HostedPipelineActivationStorage.h"
 #include "execution/global_pp/GlobalPPRankPlanBuilder.h"
@@ -447,6 +448,13 @@ namespace llaminar2
                 ? debugEnv().gemm.qfn_gdn_qkv_activation
                 : QuantizedActivationOperandPrecision::SingleQ8;
             cfg.device_total_bytes = inventory.total_bytes;
+            {
+                const auto observed = withObservedBacking(
+                    {.world_rank = current_rank, .device = device, .total_bytes = inventory.total_bytes,
+                     .admission_available_bytes = inventory.free_bytes}, request.inventory);
+                cfg.device_memory_backing = observed.backing;
+                cfg.device_pool_available_bytes = observed.pool_available_bytes;
+            }
             cfg.device_free_bytes = PhysicalMemoryAuthority::admissionCapacity(inventory.free_bytes,
                 device.is_cpu() ? request.max_cpu_memory_bytes : request.max_gpu_memory_bytes);
             cfg.device_compute_units = device.is_cpu()

@@ -117,8 +117,26 @@ namespace llaminar2
         [[nodiscard]] const PhysicalMemoryBOM *find(
             PhysicalMemoryAllocatorIdentity identity) const noexcept;
 
-        /** @return Whether every unique allocator admits its incremental bytes. */
+        /**
+         * @return Whether every unique allocator admits its incremental bytes
+         *         and every rank host pool admits its joint demand.
+         */
         [[nodiscard]] bool fits() const noexcept;
+
+        /**
+         * @brief Check physical pools shared by a rank's CPU and integrated GPUs.
+         *
+         * For each rank with at least one `RankHostPool` GPU, the incremental
+         * demand of that rank's CPU allocator plus every pool GPU must fit the
+         * smallest pool observation those GPUs reported. The observations
+         * sample one physical quantity; the minimum is the most recent lower
+         * bound, not a minimum over different capacities. Retained credits
+         * are already excluded per allocator, so no byte is credited twice.
+         *
+         * @return Empty when every pool fits; otherwise the first deterministic
+         *         (lowest rank) over-subscription diagnostic.
+         */
+        [[nodiscard]] std::optional<std::string> rankHostPoolViolation() const;
 
         /** @return Sum of complete physical footprints with overflow checking. */
         [[nodiscard]] std::size_t totalBytes() const;
