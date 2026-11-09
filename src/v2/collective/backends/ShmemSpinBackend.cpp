@@ -1584,6 +1584,22 @@ namespace llaminar2
 #endif
     }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    void ShmemSpinBackend::reduce_neon(float *out,
+                                       const float *a,
+                                       const float *b,
+                                       size_t count)
+    {
+        // Elementwise FP32 add: byte-identical to the scalar program. out may
+        // alias a; each lane is loaded before its store.
+        size_t i = 0;
+        for (; i + 4 <= count; i += 4)
+            vst1q_f32(out + i, vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
+        for (; i < count; ++i)
+            out[i] = a[i] + b[i];
+    }
+#endif
+
     void ShmemSpinBackend::reduce(float *out,
                                   const float *a,
                                   const float *b,
@@ -1600,15 +1616,8 @@ namespace llaminar2
 #if defined(__aarch64__) && defined(__ARM_NEON)
         case ISALevel::NEON:
         case ISALevel::NEONDotProd:
-        {
-            // Elementwise FP32 add: byte-identical to the scalar program.
-            size_t i = 0;
-            for (; i + 4 <= count; i += 4)
-                vst1q_f32(out + i, vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
-            for (; i < count; ++i)
-                out[i] = a[i] + b[i];
+            reduce_neon(out, a, b, count);
             break;
-        }
 #endif
         default:
             reduce_scalar(out, a, b, count);

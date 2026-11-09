@@ -56,7 +56,11 @@ namespace
     template <bool AVX512>
     void verifyContributionRounding()
     {
+#if defined(__aarch64__)
+        constexpr int lanes = 4; // One NEON quad; AVX512 is not an ARM program.
+#else
         constexpr int lanes = AVX512 ? 16 : 8;
+#endif
         std::mt19937 random(0xD15F00Du);
         std::uniform_int_distribution<int> integer(-400000, 400000);
         const auto half_scale = [&]()
@@ -88,6 +92,18 @@ namespace
                         expected[lane] = reference(expected[lane], dots[lane], scales[lane],
                                                    sum, minima[lane], activation, policy, asymmetric);
                     }
+#if defined(__aarch64__)
+                    {
+                        const auto acc = vld1q_f32(actual.data());
+                        const auto dot = vld1q_s32(dots.data());
+                        const auto scale = vld1q_f32(scales.data());
+                        const auto result = asymmetric
+                            ? accumulateCorrectedSingleScaleBlockNEON(acc, dot, scale, sum,
+                                  vld1q_f32(minima.data()), activation, policy)
+                            : accumulateSingleScaleBlockNEON(acc, dot, scale, activation, policy);
+                        vst1q_f32(actual.data(), result);
+                    }
+#else
 #if defined(__AVX512F__)
                     if constexpr (AVX512)
                     {
@@ -112,6 +128,7 @@ namespace
                             : accumulateSingleScaleBlockAVX2(acc, dot, scale, activation, policy);
                         _mm256_storeu_ps(actual.data(), result);
                     }
+#endif
                     for (int lane = 0; lane < lanes; ++lane)
                         ASSERT_EQ(std::bit_cast<std::uint32_t>(actual[lane]),
                                   std::bit_cast<std::uint32_t>(expected[lane]))
@@ -121,6 +138,13 @@ namespace
         }
     }
 
+#if defined(__aarch64__)
+    /** Both NEON instruction families share these exact FP32 contribution edges. */
+    TEST(CPUContributionRounding, NEON)
+    {
+        verifyContributionRounding<false>();
+    }
+#else
     /** The AVX2 image and AVX2 runtime must retain identical rounding edges. */
     TEST(CPUContributionRounding, AVX2)
     {
@@ -135,5 +159,6 @@ namespace
         ASSERT_GE(llaminar2::activeISALevel(), llaminar2::ISALevel::AVX512);
         verifyContributionRounding<true>();
     }
+#endif
 #endif
 }

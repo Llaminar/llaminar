@@ -687,6 +687,8 @@ namespace
         omp_set_num_threads(saved_threads);
     }
 
+#if !defined(__aarch64__)
+    // x86 cache-tiled prefill geometry; ARM native shared-row tiles have no tile config.
     /**
      * @brief Prove ordinary prefill geometry is total for positive team sizes.
      *
@@ -922,6 +924,7 @@ namespace
                 invalid_cache),
             std::invalid_argument);
     }
+#endif
 
     // =========================================================================
     // Instantiate for all 20 quantized formats

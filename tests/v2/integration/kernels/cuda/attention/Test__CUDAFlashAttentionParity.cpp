@@ -1057,6 +1057,7 @@ protected:
                   << std::endl;
     }
 
+#ifdef HAVE_CUDA
     std::unique_ptr<DeviceWorkspaceManager> bindAttentionWorkspace(
         llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> &kernel,
         int n_heads,
@@ -1107,6 +1108,7 @@ protected:
         kernel.bindWorkspace(workspace.get());
         return workspace;
     }
+#endif // HAVE_CUDA
 
     /**
      * @brief Publish raw-pointer attention inputs on the bound kernel stream.

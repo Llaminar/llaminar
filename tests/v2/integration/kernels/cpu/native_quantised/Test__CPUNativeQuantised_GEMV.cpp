@@ -126,6 +126,8 @@ namespace
     }
 #endif
 
+#if !defined(__aarch64__)
+    // x86 VNNI consumes unsigned activation words; ARM signed dots need no packing.
     /** Prove integer activation packing independently of serial/grouped kernel agreement. */
     TEST(CPUActivationWordPacking, AllSignedBytesAndOffsetsMatchScalar)
     {
@@ -155,6 +157,7 @@ namespace
             ASSERT_EQ(std::memcmp(&block, &before, sizeof(block)), 0);
         }
     }
+#endif
 
     std::filesystem::path qwen36DenseModelPath()
     {
@@ -555,6 +558,12 @@ namespace
     // Test fixture
     // =========================================================================
 
+#if defined(__aarch64__)
+    constexpr int kCompactLanes = 4; ///< One NEON quad per compact multi-scale step.
+#else
+    constexpr int kCompactLanes = 8; ///< AVX2 compact multi-scale width.
+#endif
+
     class CPUNativeQuantisedGemvTest : public ::testing::Test
     {
     protected:
@@ -564,6 +573,33 @@ namespace
     // Correctness test: Q4_0 small matrix
     // =========================================================================
 
+#if defined(__aarch64__)
+    /** Exhaust the signed-byte dot domain for each compiled NEON instruction family. */
+    template <class Ops>
+    void verifyNEONCompactDot()
+    {
+        for (int weight = -127; weight <= 127; ++weight)
+        {
+            const auto w = std::bit_cast<typename Ops::I>(vdupq_n_s8(static_cast<int8_t>(weight)));
+            for (int activation = -128; activation <= 127; ++activation)
+            {
+                const auto a = std::bit_cast<typename Ops::I>(vdupq_n_s8(static_cast<int8_t>(activation)));
+                const auto result = Ops::dot(typename Ops::I{} + 37, w, a);
+                for (int lane = 0; lane < 4; ++lane)
+                    ASSERT_EQ(result[lane], 37 + 4 * weight * activation)
+                        << "weight=" << weight << " activation=" << activation << " lane=" << lane;
+            }
+        }
+    }
+
+    TEST_F(CPUNativeQuantisedGemvTest, CompactMultiScaleNEONDotExhaustiveSignedByteDomain)
+    {
+        verifyNEONCompactDot<multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::ASIMD>>();
+#if defined(__ARM_FEATURE_DOTPROD)
+        verifyNEONCompactDot<multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::DotProd>>();
+#endif
+    }
+#else
     TEST_F(CPUNativeQuantisedGemvTest, CompactMultiScaleAVX2DotExhaustiveSignedByteDomain)
     {
         using Ops = multi_scale::SIMD<8>;
@@ -582,12 +618,12 @@ namespace
             }
         }
     }
+#endif
 
     /** Compare every immutable lookup entry against direct scalar byte loads. */
-    template <int Lanes, std::size_t Entries>
+    template <int Lanes, std::size_t Entries, class Ops = multi_scale::SIMD<Lanes>>
     void verifyCompactGridPairs(const std::uint64_t (&table)[Entries])
     {
-        using Ops = multi_scale::SIMD<Lanes>;
         for (std::size_t entry = 0; entry < Entries; ++entry)
         {
             typename Ops::I indices{}, low{}, high{};
@@ -608,9 +644,16 @@ namespace
     /** Both physical widths retain every immutable IQ1/IQ2 lookup byte. */
     TEST_F(CPUNativeQuantisedGemvTest, CompactGridPairsMatchEveryScalarEntry)
     {
+#if defined(__aarch64__)
+        using ASIMD = multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::ASIMD>;
+        verifyCompactGridPairs<4, std::size(iq2s_grid), ASIMD>(iq2s_grid);
+        verifyCompactGridPairs<4, std::size(iq2xs_grid), ASIMD>(iq2xs_grid);
+        verifyCompactGridPairs<4, std::size(iq1s_grid), ASIMD>(iq1s_grid);
+#else
         verifyCompactGridPairs<8>(iq2s_grid);
         verifyCompactGridPairs<8>(iq2xs_grid);
         verifyCompactGridPairs<8>(iq1s_grid);
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
         verifyCompactGridPairs<16>(iq2s_grid);
         verifyCompactGridPairs<16>(iq2xs_grid);
@@ -619,10 +662,9 @@ namespace
     }
 
     /** Exhaust the eight sign bits and byte offsets independently of table decoding. */
-    template <int Lanes, int Byte>
+    template <int Lanes, int Byte, class Ops = multi_scale::SIMD<Lanes>>
     void verifyCompactGridSigns()
     {
-        using Ops = multi_scale::SIMD<Lanes>;
         for (int pattern = 0; pattern < 256; ++pattern)
         {
             typename Ops::I metadata{}, weights{};
@@ -653,10 +695,18 @@ namespace
     /** Sign application is an integer-only permutation for AVX2 and AVX512. */
     TEST_F(CPUNativeQuantisedGemvTest, CompactGridSignsMatchEveryByteMask)
     {
+#if defined(__aarch64__)
+        using ASIMD = multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::ASIMD>;
+        verifyCompactGridSigns<4, 0, ASIMD>();
+        verifyCompactGridSigns<4, 1, ASIMD>();
+        verifyCompactGridSigns<4, 2, ASIMD>();
+        verifyCompactGridSigns<4, 3, ASIMD>();
+#else
         verifyCompactGridSigns<8, 0>();
         verifyCompactGridSigns<8, 1>();
         verifyCompactGridSigns<8, 2>();
         verifyCompactGridSigns<8, 3>();
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
         verifyCompactGridSigns<16, 0>();
         verifyCompactGridSigns<16, 1>();
@@ -1397,6 +1447,15 @@ namespace
                 SCOPED_TRACE(rows);
                 FusedVerifierRowsDesc descriptor{.packed = &packed, .N = 64, .ldc = 64, .rows = rows};
                 const auto decode = planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7);
+#if defined(__aarch64__)
+                // ARM shared-row tiles follow only the verifier schedule, never the purpose.
+                descriptor.purpose = ProjectionRowsPurpose::Prefill;
+                const auto prefill = planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7);
+                EXPECT_EQ(prefill.tiles[0], decode.tiles[0]);
+                EXPECT_EQ(prefill.sharedPartialFloats(), 0u);
+                descriptor.purpose = static_cast<ProjectionRowsPurpose>(-1);
+                EXPECT_THROW(planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7), std::invalid_argument);
+#else
                 const auto expected_decode = selectVerifierRowsPolicy(packed, rows, 64, 2048,
                     activeISALevel(), 7, decode.projections[0].k_tiles);
                 EXPECT_EQ(decode.projections[0].effective_verifier_schedule, expected_decode);
@@ -1414,6 +1473,7 @@ namespace
                     .projections[0].effective_verifier_schedule, VerifierRowsPolicy::Pairwise);
                 descriptor.purpose = static_cast<ProjectionRowsPurpose>(-1);
                 EXPECT_THROW(planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7), std::invalid_argument);
+#endif
             }
         }
     }
@@ -1485,10 +1545,18 @@ namespace
                             outputs[row] = actual.data() + row * 64;
                         }
                         actual.fill(-12345.0f);
-                        multi_scale::dispatchOrdered<8, Rows>(packed, inputs, outputs,
+                        multi_scale::dispatchOrdered<kCompactLanes, Rows>(packed, inputs, outputs,
                             0, blocks, partitions, span);
                         expectBitwiseEqualFloatRows(format.label,
                             actual.data(), expected.data(), Rows * 64, 64);
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+                        actual.fill(-12345.0f);
+                        multi_scale::dispatchOrdered<4, Rows,
+                            multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::DotProd>>(
+                            packed, inputs, outputs, 0, blocks, partitions, span);
+                        expectBitwiseEqualFloatRows(format.label,
+                            actual.data(), expected.data(), Rows * 64, 64);
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
                         actual.fill(-12345.0f);
                         multi_scale::dispatchOrdered<16, Rows>(packed, inputs, outputs,
@@ -1502,7 +1570,7 @@ namespace
                     prove_rows.template operator()<3>();
                     prove_rows.template operator()<4>();
                     const auto invalid = [&](int length, int count, int width) {
-                        multi_scale::dispatchOrdered<8, 2>(packed,
+                        multi_scale::dispatchOrdered<kCompactLanes, 2>(packed,
                             {activation.data(), activation.data() + blocks},
                             {actual.data(), actual.data() + 64}, 0, length, count, width);
                     };
@@ -3533,6 +3601,8 @@ namespace
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
+#if !defined(__aarch64__)
+    // x86 serial K partitioning; ARM native rows own full-K trees (see the NEON batch gates).
     /**
      * @test Prove grouped prefill inherits production serial K partitioning.
      *
@@ -3721,6 +3791,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif
 
     /**
      * @test Prove the bounded wide-row tile over every runtime M and format.
@@ -5076,7 +5147,13 @@ namespace
         {
             SCOPED_TRACE(::testing::Message() << "threads=" << threads);
             omp_set_num_threads(threads);
+#if defined(__aarch64__)
+            // ARM native planning is total for every positive team width.
+            FusedVerifierRowsDesc descriptor{.packed = &packed, .N = N, .ldc = N, .rows = M};
+            EXPECT_NO_THROW((void)planNativeQuantisedFusedRows({&descriptor, 1}, M, threads));
+#else
             EXPECT_NO_THROW((void)selectVerifierRowsPolicy(packed, M, N, K));
+#endif
         }
         omp_set_num_threads(original_threads);
     }
