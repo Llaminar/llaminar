@@ -18,6 +18,7 @@
 #include <arm_neon.h>
 #include <bit>
 #include <type_traits>
+#include <span>
 
 namespace llaminar2::cpu::neon_tq_attention
 {
@@ -29,11 +30,17 @@ struct Centroids8 { float32x4_t lo, hi; };
 class TQ4Lookup final
 {
 public:
-    /** @brief Load the sole published codebook; no new physical storage owner is created. */
-    TQ4Lookup() noexcept
+    /** @brief Load the canonical attention codec's published codebook. */
+    TQ4Lookup() noexcept : TQ4Lookup(std::span<const float,16>(TQ4_CENTROIDS)) {}
+    /** @brief Load exact words from an already-admitted original codebook.
+     * @param codebook Original immutable sixteen-entry table, never an inferred global replacement.
+     * @details Only register fragments are retained. The enclosing synchronous
+     * borrow owns validity/exclusions; this lookup neither allocates nor extends its lease.
+     */
+    explicit TQ4Lookup(std::span<const float,16> codebook) noexcept
     {
         static_assert(std::endian::native == std::endian::little);
-        const auto *bytes = reinterpret_cast<const std::uint8_t *>(TQ4_CENTROIDS.data());
+        const auto *bytes = reinterpret_cast<const std::uint8_t *>(codebook.data());
         for (int i = 0; i < 4; ++i) table_.val[i] = vld1q_u8(bytes + i * 16);
     }
 private:
@@ -69,17 +76,25 @@ private:
     uint8x16x4_t table_;
 };
 
-/** @brief Perform four indexed native lane loads from the original TQ8 codebook.
- * @param indices Four immutable original byte indices, intrinsically within [0,255].
- * @return A native four-lane centroid vector; no scalar arithmetic replaces SIMD math.
+/** @brief Perform four indexed native lane loads from the admitted original TQ8 table.
+ * @param codebook Original immutable256-entry table; its authority is not replaced by a global.
+ * @param indices Four original byte indices, intrinsically within [0,255].
+ * @return Exact original FP32 words; no scalar arithmetic replaces SIMD math.
+ */
+[[gnu::always_inline]] inline float32x4_t lookupTQ8(std::span<const float,256>codebook,const std::uint8_t *indices) noexcept
+{
+    auto values = vdupq_n_f32(0);
+    values = vld1q_lane_f32(codebook.data() + indices[0], values, 0);
+    values = vld1q_lane_f32(codebook.data() + indices[1], values, 1);
+    values = vld1q_lane_f32(codebook.data() + indices[2], values, 2);
+    return vld1q_lane_f32(codebook.data() + indices[3], values, 3);
+}
+/** @brief Retain the existing canonical attention codebook program.
+ * @param indices Four original byte indices; @return Canonical exact FP32 centroid words.
  */
 [[gnu::always_inline]] inline float32x4_t lookupTQ8(const std::uint8_t *indices) noexcept
 {
-    auto values = vdupq_n_f32(0);
-    values = vld1q_lane_f32(TQ8_CENTROIDS.data() + indices[0], values, 0);
-    values = vld1q_lane_f32(TQ8_CENTROIDS.data() + indices[1], values, 1);
-    values = vld1q_lane_f32(TQ8_CENTROIDS.data() + indices[2], values, 2);
-    return vld1q_lane_f32(TQ8_CENTROIDS.data() + indices[3], values, 3);
+    return lookupTQ8(std::span<const float,256>(TQ8_CENTROIDS),indices);
 }
 
 /** @brief Empty compile-time storage: TQ8 never loads or retains the unrelated TQ4 table. */

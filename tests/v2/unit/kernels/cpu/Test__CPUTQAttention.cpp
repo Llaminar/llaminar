@@ -6,6 +6,8 @@
  * codebook/FMA oracles certify native arithmetic; real public serial calls
  * certify same-backend worker grouping. No Tensor/factory/cache/request or
  * full-attention performance certificate is implied by these leaf proofs.
+ * Supplied-codebook tests preserve original table words (including nonfinite
+ * payloads) as decode-only data, distinct from the finite numerical domain.
  */
 #include "kernels/cpu/attention/TQFusedAttentionPrimitives.h"
 #include "utils/CPUExplicitRoundingOracle.h"
@@ -15,6 +17,8 @@
 #include <bit>
 #include <cstring>
 #include <limits>
+#include <span>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 
@@ -185,6 +189,55 @@ TEST(CPUTQAttention, NativeCentroidDecodeByteDomains)
             float values[4]; vst1q_f32(values, cpu::neon_tq_attention::lookupTQ8(indices));
             for (int i = 0; i < 4; ++i) EXPECT_EQ(std::bit_cast<std::uint32_t>(values[i]), std::bit_cast<std::uint32_t>(TQ8_CENTROIDS[indices[i]]));
         }
+}
+
+/** @test Supplied original tables retain every FP32 word, not a replacement global codebook. */
+TEST(CPUTQAttention, NativeOriginalCodebookWordAuthorities)
+{
+    const auto isa=activeISALevel();
+    if((isa!=ISALevel::NEON&&isa!=ISALevel::NEONDotProd)||
+        !isNativeCPUExecutionISAPair(compiledCPUISALevel(),isa))
+        throw std::runtime_error("Original TQ codebook conformance requires an admitted native ARM program");
+    constexpr std::array<std::uint32_t,16>words={0,0x80000000u,1,0x007fffffu,0x00800000u,0x3f800001u,
+        0xbf800001u,0x7fc12345u,0xffc23456u,0x7f812345u,0xff812345u,0x7f800000u,0xff800000u,
+        0x3eaaaaabu,0x4b800001u,0xcb800001u};
+    std::array<float,16>table4;std::array<float,256>table8;
+    constexpr std::size_t prefix=7,suffix=9;constexpr std::uint32_t guard=0x45b639deu;
+    for(unsigned seed=0;seed<256;++seed)
+    {
+        for(unsigned i=0;i<table4.size();++i)table4[i]=std::bit_cast<float>(words[(i+seed)%words.size()]);
+        for(unsigned i=0;i<table8.size();++i)table8[i]=std::bit_cast<float>(words[(i+seed)%words.size()]^((i>>4)&0x7fu));
+        const auto original4=table4;const auto original8=table8;
+        const cpu::neon_tq_attention::TQ4Lookup lookup{std::span<const float,16>(table4)};
+        std::uint8_t low[8],indices4[8],indices8[8],packed[3],high=0;
+        for(unsigned lane=0;lane<8;++lane)
+        {
+            indices4[lane]=std::uint8_t((seed*73+lane*11)&15);low[lane]=indices4[lane]&7;
+            high|=std::uint8_t((indices4[lane]>>3)<<lane);indices8[lane]=std::uint8_t(seed+lane*73);
+        }
+        tq3_pack_8(low,packed);
+        std::array<float,prefix+8+suffix>out4,out8;out4.fill(std::bit_cast<float>(guard));out8=out4;
+        for(unsigned lane=0;lane<8;++lane)
+        {
+            out4[prefix+lane]=std::bit_cast<float>(~std::bit_cast<std::uint32_t>(table4[indices4[lane]]));
+            out8[prefix+lane]=std::bit_cast<float>(~std::bit_cast<std::uint32_t>(table8[indices8[lane]]));
+        }
+        const auto values=lookup.decode(packed,high);
+        vst1q_f32(out4.data()+prefix,values.lo);vst1q_f32(out4.data()+prefix+4,values.hi);
+        vst1q_f32(out8.data()+prefix,cpu::neon_tq_attention::lookupTQ8(std::span<const float,256>(table8),indices8));
+        vst1q_f32(out8.data()+prefix+4,cpu::neon_tq_attention::lookupTQ8(std::span<const float,256>(table8),indices8+4));
+        for(unsigned lane=0;lane<8;++lane)
+        {
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(out4[prefix+lane]),std::bit_cast<std::uint32_t>(table4[indices4[lane]]));
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(out8[prefix+lane]),std::bit_cast<std::uint32_t>(table8[indices8[lane]]));
+        }
+        for(unsigned i=0;i<out4.size();++i)if(i<prefix||i>=prefix+8)
+        {
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(out4[i]),guard);EXPECT_EQ(std::bit_cast<std::uint32_t>(out8[i]),guard);
+        }
+        EXPECT_EQ(std::memcmp(table4.data(),original4.data(),sizeof(table4)),0);
+        EXPECT_EQ(std::memcmp(table8.data(),original8.data(),sizeof(table8)),0);
+    }
 }
 #endif
 
