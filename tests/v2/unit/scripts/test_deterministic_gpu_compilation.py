@@ -23,8 +23,8 @@ compiler-internal partitioning. This script proves that contract twice:
   never by the suffix alone, and option sources are expanded first: nvcc
   ``--options-file``/``-optf`` and ``@response`` files (including nested
   ones) are read relative to the command's directory, environment
-  assignments in launcher chains are inspected, and the checker's own
-  NVCC_APPEND_FLAGS/NVCC_PREPEND_FLAGS are rejected. An option source that cannot be read is itself a
+  any non-empty NVCC_APPEND_FLAGS/NVCC_PREPEND_FLAGS (in a launcher chain or
+  the checker's own environment) is rejected as opaque option input. An option source that cannot be read is itself a
   violation, because its contents cannot be certified.
 
 Every invocation runs the negative controls first, so the preflight cell
@@ -86,6 +86,11 @@ def cmake_code(text: str) -> str:
             j = n if j < 0 else j + len(close)
             out.append(text[i:j])
             i = j
+            continue
+        if ch == "\\" and i + 1 < n:
+            # Unquoted escape pairs (e.g. \#) are argument data, never comments.
+            out.append(text[i : i + 2])
+            i += 2
             continue
         if ch == "#":
             comment = BRACKET_COMMENT.match(text, i)
@@ -203,17 +208,24 @@ def command_violations(entries: list[dict[str, object]]) -> list[str]:
         for problem in unreadable:
             violations.append(f"{source}: unreadable option source {problem}")
         for token in tokens:
-            # Unanchored: also catches NVCC_APPEND_FLAGS=... env assignments
-            # in launcher chains and option values embedded in other words.
-            if SPLIT_COMPILE.search(token):
+            name, _, value = token.partition("=")
+            if name in NVCC_ENVIRONMENT_FLAGS and value.strip():
+                violations.append(f"{source}: launcher injects opaque nvcc options {token}")
+            elif SPLIT_COMPILE.search(token):
                 violations.append(f"{source}: generated command uses {token}")
     return violations
 
 
 def environment_violations(environment: dict[str, str]) -> list[str]:
-    """nvcc silently appends/prepends these variables to every invocation."""
-    return [f"environment {name} requests {value}" for name in NVCC_ENVIRONMENT_FLAGS
-            if SPLIT_COMPILE.search(value := environment.get(name, ""))]
+    """Reject nvcc's implicit option sources outright.
+
+    nvcc silently appends/prepends these variables to every invocation, and
+    their values may name further option files. Builds never need them, so
+    any non-empty value is opaque, uncertifiable input rather than something
+    to search for one spelling.
+    """
+    return [f"environment {name} injects nvcc options: {environment[name]!r}"
+            for name in NVCC_ENVIRONMENT_FLAGS if environment.get(name, "").strip()]
 
 
 def verify(repo_root: pathlib.Path, build_dir: pathlib.Path | None) -> list[str]:
@@ -243,7 +255,8 @@ def run_self_test() -> int:
             "set(SAFE \"-DTEXT=--split-compile-is-only-a-word\")\n"
             "target_compile_options(t PRIVATE \"$<$<COMPILE_LANGUAGE:CUDA>:--split-compile=8>\")\n"
             "target_compile_options(t PRIVATE \"SHELL:--split-compile=8\")\n"
-            "set(CMAKE_CUDA_FLAGS [[--split-compile=8]])\n",
+            "set(CMAKE_CUDA_FLAGS [[--split-compile=8]])\n"
+            "target_compile_options(t PRIVATE -DNOTE=\\# --split-compile=8)\n",
             encoding="utf-8",
         )
         (root / "cmake").mkdir()
@@ -256,8 +269,8 @@ def run_self_test() -> int:
             "set(X --split-compile=0)\n", encoding="utf-8"
         )
         found = cmake_violations(root)
-        lines = sorted(item.split(":")[0] + ":" + item.split(":")[1] for item in found)
-        assert lines == [
+        lines = {item.split(":")[0] + ":" + item.split(":")[1] for item in found}
+        assert len(lines) == len(found) and lines == {
             "cmake/Extended.cmake:1",
             "src/CMakeLists.txt:2",
             "src/CMakeLists.txt:3",
@@ -265,7 +278,8 @@ def run_self_test() -> int:
             "src/CMakeLists.txt:7",
             "src/CMakeLists.txt:8",
             "src/CMakeLists.txt:9",
-        ], found
+            "src/CMakeLists.txt:10",
+        }, found
 
         build = root / "build"
         build.mkdir()
@@ -296,6 +310,9 @@ def run_self_test() -> int:
             {"directory": d, "file": "/s/n.cu", "command": "env NVCC_PREPEND_FLAGS='-O3 --split-compile=2' nvcc -c n.cu"},
             {"directory": d, "file": "/s/o.cu", "command": "nvcc --options-file cfg/outer.opts -c o.cu"},
             {"directory": d, "file": "/s/p.cpp", "command": "cmake -E env A=1 /opt/cuda/bin/nvcc --language cu --split-compile=8 -c p.cpp"},
+            {"directory": d, "file": "/s/q.cu", "command": "env NVCC_APPEND_FLAGS='--options-file gpu.opts' nvcc -c q.cu"},
+            {"directory": d, "file": "/s/r.cu", "command": "env NVCC_PREPEND_FLAGS='--options-file missing.opts' nvcc -c r.cu"},
+            {"directory": d, "file": "/s/s.cu", "command": "env NVCC_APPEND_FLAGS=-O3 nvcc -c s.cu"},
         ]
         found = command_violations(entries)
         offenders = sorted({item.split(":")[0] for item in found})
@@ -303,10 +320,13 @@ def run_self_test() -> int:
             "/s/a.cu", "/s/b.cu", "/s/e.hip", "/s/f.cu", "/s/h.cpp",
             "/s/i.cpp", "/s/j.cu", "/s/k.cu", "/s/l.cu.inc",
             "/s/m.cu", "/s/n.cu", "/s/o.cu", "/s/p.cpp",
+            "/s/q.cu", "/s/r.cu", "/s/s.cu",
         ], found
         assert not command_violations([entries[2], entries[3], entries[6]])
         assert environment_violations({"NVCC_APPEND_FLAGS": "--split-compile=8"})
-        assert not environment_violations({"NVCC_APPEND_FLAGS": "-O3", "OTHER": "--split-compile=8"})
+        assert environment_violations({"NVCC_APPEND_FLAGS": "--options-file /build/gpu.opts"})
+        assert environment_violations({"NVCC_PREPEND_FLAGS": "-O3"})
+        assert not environment_violations({"NVCC_APPEND_FLAGS": "  ", "OTHER": "--split-compile=8"})
     print("deterministic GPU compilation policy self-test: PASS")
     return 0
 
