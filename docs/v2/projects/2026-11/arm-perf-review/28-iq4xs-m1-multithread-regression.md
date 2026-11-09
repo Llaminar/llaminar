@@ -175,3 +175,16 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - P2b declare ALL outputs/byproducts (proof.s); success JSON LAST.
 - Scope: probe header stale under ratchet; SDK-independence not claimed.
   Owner evidence stays owner; Linux-RED/Darwin-false-clean stand.
+
+## .80 gates GREEN @7abfc0dc1 + 3-arm window running (2026-11-09)
+
+- BUILD=0 (witness: 176 programs, Rows=1 zero, grouped within budget);
+  Unit 963/965 (2 known base); Preflight 2311/2314 (3 known target-selection);
+  Focused 212/212 (fatal-access bound, tile-registers Unit+Integration,
+  evidence). 3-arm window (302318f1e/035d1d948/b01d285dc, Release NEON_I8MM,
+  IQ4_XS+IQ3_S 17408×5120+2048×4096, M=1/4, 10/20t, 5 interleaved reps) running.
+- SOURCE116 in progress (CFG/provenance, structural-fatal, exact no-return
+  identity, interprocedural provenance, ABI-save proof, envelope inventory) —
+  real GNU-14 counts unchanged; AppleClang −14/envelope (old checker
+  double-counted callee-saved reloads) → RE-CENSUS + update budget JSON when
+  the tooling lands.
