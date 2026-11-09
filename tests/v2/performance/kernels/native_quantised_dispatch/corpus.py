@@ -20,6 +20,7 @@ from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from .host_cores import physical_core_count
 from .schema import (
     AspectBucket,
     Backend,
@@ -52,30 +53,9 @@ class _SerializedDigestShard:
 
 
 def _physical_core_count() -> int:
-    """Return physical cores visible through this process's affinity mask.
+    """Return affinity-visible physical cores (one worker per core; see ``host_cores``)."""
 
-    Corpus hashing is CPU-bound and gains no useful throughput from launching
-    one Python process per SMT sibling.  Reading Linux topology also respects
-    socket or container affinity, so an offline fit cannot oversubscribe cores
-    that its parent process is not allowed to run on.
-    """
-
-    try:
-        visible_cpus = tuple(sorted(os.sched_getaffinity(0)))
-    except AttributeError:
-        visible_cpus = tuple(range(os.cpu_count() or 1))
-    physical_cores: set[tuple[str, str]] = set()
-    for cpu in visible_cpus:
-        topology = f"/sys/devices/system/cpu/cpu{cpu}/topology"
-        try:
-            with open(f"{topology}/physical_package_id", encoding="ascii") as file:
-                package_id = file.read().strip()
-            with open(f"{topology}/core_id", encoding="ascii") as file:
-                core_id = file.read().strip()
-        except OSError:
-            return max(1, len(visible_cpus))
-        physical_cores.add((package_id, core_id))
-    return max(1, len(physical_cores))
+    return physical_core_count()
 
 
 def _serialize_canonical_digest_range(
