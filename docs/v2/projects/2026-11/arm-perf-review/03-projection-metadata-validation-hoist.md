@@ -212,3 +212,19 @@ separate (shared) path with the same pattern but different owners.
 - .80 run at 661fc9284 in progress (incremental; BUILD=0 on prior tip →
   302318f1e cured outside-diff failures). Window (b) base = 302318f1e vs
   661fc9284 after.
+
+## SOURCE112 preliminary (2026-11-09, 661fc9284) — two guard/proof items
+
+- Normalization fixes the x86 acceptance mismatch for VALID layouts (positive).
+- (1) normalizePaddingMetadata geometry guard computes (N+63) in SIGNED int
+  (:233) — unsealed fixture N=INT_MAX overflows before precise rejection; never
+  compares blocks_per_row vs ceil(K/32) → changing K alone passes. FIX:
+  canonical checked structural geometry (widened/checked products,
+  positive/source/encoding admission) BEFORE mutable bytes; malformed N/K
+  controls proving NO mutation.
+- (2) x86 negative combines readers sequentially (IQ2 throws @dispatch<8> before
+  <16>; IQ3/IQ4 @loadScales256 before 512) → EXPECT_THROW(consume()) doesn't
+  falsify missing AVX512 checks. FIX: invoke/assert EACH compiled reader
+  separately (dispatch<8>/<16>, loadScales256/512) on poisoned + normalized.
+- Reviewer still inspecting NEON family/policy tests + arrival ordering; final
+  scope follows. Successor re-check = separately identified.
