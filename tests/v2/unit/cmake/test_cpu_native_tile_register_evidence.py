@@ -1078,7 +1078,7 @@ class PolicyTest(unittest.TestCase):
             CHECKER.compiler_identity("icpx (ICX) 2025.0\n")
 
 
-FAKE_COMPILER = """#!{python}
+FAKE_COMPILER = """#!{python} -S -E
 import os, pathlib, shutil, sys
 here = pathlib.Path(__file__).parent
 args = sys.argv[1:]
@@ -1125,7 +1125,8 @@ if "-E" in args:
     unit = here / "preprocessed.txt"
     pathlib.Path(value("-o")).write_text(unit.read_text() if unit.exists() else "int probe;\\n"); sys.exit(0)
 compiling = "-c" in args
-deps = (here / ("deps.c.txt" if compiling and (here / "deps.c.txt").exists() else "deps.txt")).read_text().split()
+# Prerequisites are space-separated exactly as written (no Unicode splitting).
+deps = (here / ("deps.c.txt" if compiling and (here / "deps.c.txt").exists() else "deps.txt")).read_text().strip().split(" ")
 if compiling:
     event("compile")
     mutate = here / "mutate.txt"
@@ -1137,7 +1138,7 @@ if compiling:
         sys.stderr.write((here / "headers.txt").read_text())
 pathlib.Path(value("-MF")).write_text(value("-MT") + ": " + " ".join(deps) + "\\n")
 """
-FAKE_DISASSEMBLER = """#!{python}
+FAKE_DISASSEMBLER = """#!{python} -S -E
 import pathlib, sys
 here = pathlib.Path(__file__).parent
 args = sys.argv[1:]
@@ -1487,7 +1488,8 @@ class ProofBindingTest(unittest.TestCase):
         for label, mutated in (("mismatched names", renamed("/tmp/ccAAAAAA.s", "/tmp/ccBBBBBB.s")),
                                ("not a driver temporary", renamed("/tmp/probe.s", "/tmp/probe.s")),
                                ("seven characters", renamed("/tmp/ccAAAAAAA.s", "/tmp/ccAAAAAAA.s")),
-                               ("relative temporary", renamed("ccAAAAAA.s", "ccAAAAAA.s"))):
+                               ("relative temporary", renamed("ccAAAAAA.s", "ccAAAAAA.s")),
+                               ("trailing newline", renamed("/tmp/ccAb12Cd.s\n", "/tmp/ccAb12Cd.s\n"))):
             with self.subTest(label=label):
                 with self.assertRaises(ValueError):
                     CHECKER.plan_shape(mutated)
@@ -1497,12 +1499,56 @@ class ProofBindingTest(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertNotEqual(CHECKER.plan_shape(dict(plan, jobs=mutated)), CHECKER.plan_shape(plan))
         self.assertNotEqual(CHECKER.plan_shape(dict(plan, path=["/usr/bin"])), CHECKER.plan_shape(plan))
+        receipt = self.proof()
+        temporary = jobs[0][jobs[0].index("-o") + 1]
+        newline = [[argument + "\n" if argument == temporary else argument for argument in job] for job in jobs]
+        Path(self.args.proof).write_text(json.dumps(dict(receipt, driver_plan=dict(receipt["driver_plan"],
+                                                                                   jobs=newline))))
+        with self.assertRaisesRegex(ValueError, "temporary"):
+            CHECKER.verify(self.args)
+        Path(self.args.proof).write_text(json.dumps(receipt))
+        CHECKER.verify(self.args)
         (self.tool / "event-compile.txt").write_text(
             f"write {self.tool / 'jobs.txt'} replanned\n {{here}}/cc1plus -quiet -g -MD {{deps}} -MF {{deps}} -MT probe -H "
             "{source} -o /tmp/ccXXXXXX.s\n as -EL -o {obj} /tmp/ccXXXXXX.s\n")
         with self.assertRaisesRegex(ValueError, "driver plan"):
             CHECKER.build(self.args)
         self.assertFalse(Path(self.args.proof).exists())
+
+    def test_non_ascii_dependency_names_are_rejected_before_splitting(self) -> None:
+        real = self.root / "a\u00a0b"
+        real.mkdir()
+        (real / "view.h").write_text("// real\n")
+        (self.root / "a").write_text("// decoy\n")
+        (self.root / "b").mkdir()
+        (self.root / "b" / "view.h").write_text("// decoy\n")
+        (self.tool / "deps.txt").write_text("probe.cpp a\u00a0b/view.h")
+        with self.assertRaisesRegex(ValueError, "outside the plain depfile subset"):
+            CHECKER.build(self.args)
+        self.assertFalse(Path(self.args.proof).exists())
+        depfile = self.root / "native.d"
+        for line in ("probe: /w/a\u00a0b/view.h\n", "probe: /w/a\u3000b.h\n", "probe: /w/a.h\x0b/w/b.h\n",
+                     "probe: /w/\u00e9.h\n"):
+            with self.subTest(line=line):
+                depfile.write_bytes(line.encode())
+                with self.assertRaisesRegex(ValueError, "plain depfile subset"):
+                    CHECKER.read_depfile(depfile, "/w")
+        depfile.write_text("probe: /w/a.h\t/w/b.h \\\n /w/c.h\n")
+        self.assertEqual(CHECKER.read_depfile(depfile, "/w"), ["/w/a.h", "/w/b.h", "/w/c.h"])
+
+    def test_retarget_during_the_final_plan_observation_publishes_no_receipt(self) -> None:
+        link = self.driver_symlink()
+        # The compile triggers a retarget armed for the next -### query: the final re-observation only.
+        (self.tool / "event-compile.txt").write_text(
+            f"write {self.tool / 'event-plan.txt'} retarget {link} {self.tool / 'c++-B'}")
+        with self.assertRaisesRegex(ValueError, "changed"):
+            CHECKER.build(self.args)
+        self.assertFalse(Path(self.args.proof).exists())
+
+    def test_relative_driver_is_rejected_directly(self) -> None:
+        with self.assertRaisesRegex(ValueError, "relatively"):
+            CHECKER.driver_identity(["c++", "-c"])
+        self.assertEqual(CHECKER.driver_identity([str(self.compiler)])["selected"], str(self.compiler))
 
     def test_driver_role_comes_from_the_target_command(self) -> None:
         CHECKER.build(self.args)
@@ -1630,5 +1676,28 @@ class ProofBindingTest(unittest.TestCase):
         self.assertFalse(Path(self.args.proof).exists())
 
 
+BINDING_SHARDS = 4
+
+
+def shard_suite(shard: str) -> unittest.TestSuite:
+    """'analysis' runs every compiler-free class; 'binding-K' runs every BINDING_SHARDS-th proof-binding test
+    (each spawns stand-in tools), so every registered shard stays well inside the core-free test timeout."""
+    loader = unittest.defaultTestLoader
+    module = sys.modules[__name__]
+    if shard == "analysis":
+        return unittest.TestSuite(loader.loadTestsFromTestCase(case) for case in vars(module).values()
+                                  if isinstance(case, type) and issubclass(case, unittest.TestCase)
+                                  and case is not ProofBindingTest)
+    index = int(shard.removeprefix("binding-"))
+    if not 0 <= index < BINDING_SHARDS:
+        raise SystemExit(f"unknown shard {shard}")
+    names = sorted(loader.getTestCaseNames(ProofBindingTest))
+    return unittest.TestSuite(ProofBindingTest(name) for position, name in enumerate(names)
+                              if position % BINDING_SHARDS == index)
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--shard":
+        result = unittest.TextTestRunner(verbosity=1).run(shard_suite(sys.argv[2]))
+        sys.exit(0 if result.wasSuccessful() and result.testsRun else 1)
     unittest.main()
