@@ -5,6 +5,7 @@ import importlib.util
 import argparse
 import copy
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -181,6 +182,57 @@ class LauncherTest(unittest.TestCase):
         with patch.object(guard, "run_tool", return_value=" [1] __CLANG_OFFLOAD_BUNDLE__hip PROGBITS"):
             with self.assertRaisesRegex(guard.SpillGuardError, "final device-link"):
                 guard.audit_rocm_object(Path("ir.o"), Path("/llvm"))
+
+class InspectionDiagnosticTest(unittest.TestCase):
+    """A native inspection replay supplies evidence without changing acceptance."""
+
+    def test_exact_compile_command_and_private_working_directory_are_preserved(self):
+        command = [sys.executable, str(ROOT / "scripts/build/gpu_spill_guard.py"),
+                   "--llvm-bin", "/sdk/llvm", "--config", "Release", "--policy-id", "v1", "--",
+                   "ccache", "clang++", "--offload-arch=gfx906", "--offload-arch=gfx1100",
+                   "-o", "object with spaces.o", "-c", "source with spaces.hip"]
+        args = argparse.Namespace(ninja="/active/ninja")
+        with patch.object(proof.subprocess, "check_output", return_value=shlex.join(command)), \
+                patch.object(proof.subprocess, "run", return_value=subprocess.CompletedProcess(
+                    [], 1, "", "HIP bundle inspection: targets=''")) as replay:
+            diagnostic = proof.failed_hip_inspection(args, Path("/private/build"), "clean")
+        self.assertIn("exit=1", diagnostic)
+        self.assertIn("targets=''", diagnostic)
+        actual = replay.call_args.args[0]
+        self.assertEqual(actual[:2], [sys.executable, "-c"])
+        self.assertEqual(actual[3:], command[2:])
+        self.assertEqual(replay.call_args.kwargs["cwd"], Path("/private/build"))
+
+    def test_ambiguous_or_indirect_launcher_is_rejected(self):
+        command = shlex.join([sys.executable, str(ROOT / "scripts/build/gpu_spill_guard.py"), "--"])
+        for commands in ("", command + "\n" + command, "env " + command):
+            with self.subTest(commands=commands), \
+                    patch.object(proof.subprocess, "check_output", return_value=commands), \
+                    patch.object(proof.subprocess, "run") as replay, \
+                    self.assertRaisesRegex(RuntimeError, "one direct production-guard"):
+                proof.failed_hip_inspection(argparse.Namespace(ninja="ninja"), Path("/build"), "clean")
+            replay.assert_not_called()
+
+    def test_successful_diagnostic_cannot_replace_failed_compilation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = root / "Release"
+            build.mkdir()
+            report = root / "proof.json"
+            args = argparse.Namespace(report=report, language="HIP", compiler="clang++",
+                                      architectures="gfx906;gfx1100", cmake="cmake", ninja="ninja")
+            with patch.object(proof.tempfile, "TemporaryDirectory") as temporary, \
+                    patch.object(proof.subprocess, "check_output", return_value="clang version"), \
+                    patch.object(proof.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [], 1, "original compiler failure", "")), \
+                    patch.object(proof, "cases", return_value=[("Release", "clean", "initial")]), \
+                    patch.object(proof, "failed_hip_inspection", return_value="diagnostic exit=0") as replay:
+                temporary.return_value.__enter__.return_value = directory
+                with self.assertRaisesRegex(RuntimeError, "original compiler failure"):
+                    proof.compile_report(args)
+                replay.assert_called_once_with(args, build, "clean")
+            self.assertFalse(report.exists())
+
 
 class AllocationTest(unittest.TestCase):
     """Final frame slot types distinguish memory spills from register moves."""
