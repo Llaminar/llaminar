@@ -277,6 +277,34 @@ namespace llaminar2
         return *std::min_element(sibling_cpus.begin(), sibling_cpus.end());
     }
 
+    long MPIBootstrapPhase::cpuCapacity(int cpu, const std::string &sysfs_root)
+    {
+        const std::string root = sysfs_root + "/cpu" + std::to_string(cpu);
+        for (const char *leaf : {"/cpu_capacity", "/cpufreq/cpuinfo_max_freq"})
+        {
+            std::ifstream file(root + leaf);
+            long value = 0;
+            if (file >> value && value > 0)
+                return value;
+        }
+        return 0;
+    }
+
+    std::vector<int> MPIBootstrapPhase::capacityOrderedCpus(
+        std::vector<int> cpus, const std::string &sysfs_root)
+    {
+        std::vector<std::pair<long, int>> ranked;
+        ranked.reserve(cpus.size());
+        for (const int cpu : cpus)
+            ranked.emplace_back(cpuCapacity(cpu, sysfs_root), cpu);
+        std::stable_sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
+            return a.first != b.first ? a.first > b.first : a.second < b.second;
+        });
+        for (std::size_t index = 0; index < ranked.size(); ++index)
+            cpus[index] = ranked[index].second;
+        return cpus;
+    }
+
     bool MPIBootstrapPhase::verifyStartupThreadAffinity(int required_numa,
                                                         bool require_physical_only,
                                                         std::string &details)
@@ -500,6 +528,9 @@ namespace llaminar2
         std::vector<int> worker_cpus;
         for (const auto &[physical, allowed] : physical_cores)
             worker_cpus.push_back(allowed);
+        // Fast cores first on heterogeneous hosts: worker 0 runs serial work
+        // and static partitions assign the lowest worker ids first.
+        worker_cpus = capacityOrderedCpus(std::move(worker_cpus));
         int binding_failed = 0;
 #pragma omp parallel reduction(| : binding_failed)
         {
