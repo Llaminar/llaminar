@@ -25,7 +25,7 @@ develop ruleset immediately after the push.
 
 `.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
 `develop`. One workflow matrix runs AVX512 and AVX2 builds concurrently on
-separate 64-core runners, each with a full-backend `model-free` test image.
+separate 16-core runners, each with a full-backend `model-free` test image.
 Each image executes the complete device-free `Unit` suite plus the
 production-preflight `host` lane. The canonical production scheduler owns
 host selection; CUDA, ROCm and exclusive preflight lanes are not executed. The test
@@ -65,7 +65,7 @@ workflow reference while the default checkout still tests the caller's PR
 merge ref. Both workflows grant only Contents read access and pass no secrets.
 The called job admits only same-repository pull requests targeting `develop`.
 
-The PR test job uses the same 64-core GitHub-hosted runner pool as develop publication.
+The PR test job uses the same 16-core GitHub-hosted runner pool as develop publication.
 Each PR has its own `llaminar-cloud-develop-pr-<number>` concurrency group with
 `cancel-in-progress: true`: separate PRs can run concurrently, while new commits
 cancel obsolete checks on that same PR.
@@ -77,7 +77,9 @@ visible CPU against the existing shipped ISA feature contract, including
 AVX512-VNNI. Unsupported hardware fails with the missing flags; the requested
 ISA is never changed. Build-only publication does not require native ISA support. It imports public registry layers with
 `LLAMINAR_DOCKER_BUILD_CACHE_ACCESS=import-only`; it never exports caches or logs
-into the registry. No registry-write permission is granted. The model-free image compiles Unit
+into the registry. Before source compilation, the local
+`cache-develop-toolchain` action checkpoints completed dependencies in GitHub
+Actions cache. No registry-write permission is granted. The model-free image compiles Unit
 and preflight executables, but `run_develop_pr_tests.py` executes only Unit
 and host. Unit retains unrestricted parallelism; host uses the production
 lane's serial scheduling. Both exact inventories must pass with no skips.
@@ -99,8 +101,8 @@ separate, broader gate.
 ## Develop branch image publication
 
 `.github/workflows/ci.yml` runs on pushes to `develop` and explicit manual
-dispatches on `develop`. It uses the GitHub-hosted `llaminar-cloud-64` runner
-in the `Develop CI` group: Ubuntu 24.04, 64 vCPUs, 256 GB RAM and 2,040 GB storage,
+dispatches on `develop`. It uses the GitHub-hosted `llaminar-cloud-16` runner
+in the `Develop CI` group: Ubuntu 24.04, 16 vCPUs, 64 GB RAM and 600 GB storage,
 with a maximum of four cloud runners across PR checks and publication. The
 group admits only this repository and
 `ci.yml` plus the reusable `develop-pr-tests.yml`, both pinned to
@@ -128,10 +130,26 @@ The ephemeral cloud worker uses registry-backed BuildKit caches selected by
 `LLAMINAR_DOCKER_BUILD_CACHE_IMAGE`, with separate `-avx512` and `-avx2` tags.
 The workflow stores these under `ghcr.io/llaminar/llaminar:build-cache-develop`.
 Registry access defaults to `read-write` for publication; PRs explicitly select
-`import-only`, with no cache export. Local host-path and registry cache
-authorities are mutually exclusive. Ccache
-mounts are shared within a build job; only immutable layers survive in the
-registry. Artifacts retain build/publication logs, timelines and identity
+`import-only`, with no registry cache export. Local host-path and registry cache
+authorities are mutually exclusive.
+
+Both cloud workflows first run `.github/actions/cache-develop-toolchain` on
+the same BuildKit worker used by the source-bound image driver. It exports
+`gpu-sdk` before RCCL and then `toolchain` before Llaminar compilation, using
+the GitHub Actions cache v2 backend in `mode=max`. A later build or test failure
+therefore retains completed dependency layers. The shared SDK scope is
+`llaminar-gpu-sdk`; the ISA-specific scopes are `llaminar-toolchain-avx512` and
+`llaminar-toolchain-avx2`. PR entries belong to their merge ref and cannot be
+restored by develop publication or another PR. They remain reusable across
+updates to that PR. Develop exports the same scopes for inbound PRs to read.
+The repository's existing 10 GB cache limit remains unchanged; GitHub owns
+eviction. These checkpoints contain immutable dependency layers, not source
+builds or compiler-object cache mounts. Ccache mounts are shared within a
+build job. Dependency cache steps use cache-only output, and the canonical
+image driver still admits and builds the exact source snapshot. See
+[Docker's cache backend reference](https://docs.docker.com/build/cache/backends/gha/)
+and [GitHub's cache scope rules](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#restrictions-for-accessing-a-cache).
+Artifacts retain build/publication logs, timelines and identity
 receipts, never source snapshots or compiler caches.
 
 Run the same publication locally with:

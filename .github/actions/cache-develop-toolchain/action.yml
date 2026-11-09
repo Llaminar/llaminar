@@ -1,0 +1,79 @@
+name: Cache develop toolchains
+description: Checkpoint shared GPU SDKs and ISA toolchains before source compilation
+inputs:
+  cpu-isa:
+    description: AVX512, AVX2, or both for runtime publication
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Configure dependency cache
+      id: cache
+      shell: bash
+      env:
+        CPU_ISA: ${{ inputs.cpu-isa }}
+      run: |
+        set -euo pipefail
+        case "$CPU_ISA" in
+          AVX512|AVX2|both) ;;
+          *) echo "Unsupported toolchain ISA: $CPU_ISA" >&2; exit 1 ;;
+        esac
+        printf 'image=ghcr.io/%s:build-cache-develop\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+    # Cache writes use the event's ref: a PR can restore develop's cache, but
+    # its own entries are visible only to that PR. No package token is needed.
+    # Checkpoint before RCCL so its build/proof failures retain completed SDKs.
+    - name: Checkpoint shared CUDA and ROCm SDKs
+      uses: docker/build-push-action@v7
+      env:
+        DOCKER_BUILD_RECORD_UPLOAD: "false"
+        DOCKER_BUILD_SUMMARY: "false"
+      with:
+        context: .
+        network: host
+        target: gpu-sdk
+        outputs: type=cacheonly
+        provenance: false
+        sbom: false
+        cache-from: |
+          type=gha,scope=llaminar-gpu-sdk,version=2
+          type=registry,ref=${{ steps.cache.outputs.image }}-avx512
+          type=registry,ref=${{ steps.cache.outputs.image }}-avx2
+        cache-to: type=gha,scope=llaminar-gpu-sdk,mode=max,version=2
+    - name: Checkpoint AVX512 toolchain
+      if: inputs.cpu-isa == 'AVX512' || inputs.cpu-isa == 'both'
+      uses: docker/build-push-action@v7
+      env:
+        DOCKER_BUILD_RECORD_UPLOAD: "false"
+        DOCKER_BUILD_SUMMARY: "false"
+      with:
+        context: .
+        network: host
+        target: toolchain
+        build-args: LLAMINAR_CPU_ISA=AVX512
+        outputs: type=cacheonly
+        provenance: false
+        sbom: false
+        cache-from: |
+          type=gha,scope=llaminar-gpu-sdk,version=2
+          type=gha,scope=llaminar-toolchain-avx512,version=2
+          type=registry,ref=${{ steps.cache.outputs.image }}-avx512
+        cache-to: type=gha,scope=llaminar-toolchain-avx512,mode=max,version=2
+    - name: Checkpoint AVX2 toolchain
+      if: inputs.cpu-isa == 'AVX2' || inputs.cpu-isa == 'both'
+      uses: docker/build-push-action@v7
+      env:
+        DOCKER_BUILD_RECORD_UPLOAD: "false"
+        DOCKER_BUILD_SUMMARY: "false"
+      with:
+        context: .
+        network: host
+        target: toolchain
+        build-args: LLAMINAR_CPU_ISA=AVX2
+        outputs: type=cacheonly
+        provenance: false
+        sbom: false
+        cache-from: |
+          type=gha,scope=llaminar-gpu-sdk,version=2
+          type=gha,scope=llaminar-toolchain-avx2,version=2
+          type=registry,ref=${{ steps.cache.outputs.image }}-avx2
+        cache-to: type=gha,scope=llaminar-toolchain-avx2,mode=max,version=2

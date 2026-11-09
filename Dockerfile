@@ -62,7 +62,7 @@ ARG LLAMINAR_SOURCE_TREE=
 # =============================================================================
 # Stage 1: Builder
 # =============================================================================
-FROM ubuntu:24.04 AS toolchain
+FROM ubuntu:24.04 AS gpu-sdk
 
 ARG CUTLASS_VERSION
 ARG NINJA_VERSION
@@ -133,6 +133,10 @@ RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
         echo "==> [cutlass] skipped because CUDA is disabled"; \
     fi
 RUN rm -rf /tmp/install-scripts
+
+# Cloud CI exports this completed SDK checkpoint before starting RCCL. A
+# later dependency proof or source compilation failure cannot discard it.
+FROM gpu-sdk AS toolchain
 
 WORKDIR /src
 

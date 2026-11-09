@@ -25,7 +25,7 @@ jobs:
     name: Unit + host (${{ matrix.cpu_isa }})
     runs-on:
       group: Develop CI
-      labels: llaminar-cloud-64
+      labels: llaminar-cloud-16
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6
@@ -33,11 +33,26 @@ jobs:
           submodules: false
           lfs: false
           persist-credentials: false
+      - name: Admit the requested CPU ISA before toolchain preparation
+        shell: bash
+        env:
+          CPU_ISA: ${{ matrix.cpu_isa }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, "scripts/ci")
+          from run_develop_image_gate import require_host_cpu_isa
+          require_host_cpu_isa(os.environ["CPU_ISA"])
+          PY
       - uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
           driver-opts: network=host
           cache-binary: false
+      - uses: ./.github/actions/cache-develop-toolchain
+        with:
+          cpu-isa: ${{ matrix.cpu_isa }}
       - name: Build ${{ matrix.cpu_isa }} test inventory and run Unit plus host tests
         shell: bash
         env:
