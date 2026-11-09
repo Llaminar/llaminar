@@ -336,3 +336,16 @@ failures GONE at this base. RE-GATE GO to arm-sparks.
 - VERDICT: ACCEPT — byte-identity claim holds for AppleClang + gcc-16 + gcc-14;
   NO commit; i8mm codegen claim closed. Sealed:
   K14-I8MM-OBJDUMP-GCC14-20261109/RESULT-FINAL.txt (supersedes 4-diff note).
+
+## EVIDENCE SET COMPLETE (2026-11-09) — authorized gate clean
+
+- FINAL AUTHORITATIVE GATE (ea5402a54, quiet, full scope, both ISA passes;
+  sealed K14-I8MM-GATE-EA5402A54-20261109 + SUMMARY-FINAL.md):
+  NEON_I8MM Unit 950/960 + Preflight 2266/2303; NEON_DOTPROD Unit 950/960 +
+  Preflight 2266/2302 — IDENTICAL failure sets, ZERO ISA-cell failures.
+  Classification: (a) expected base (TestTargetSelection family +
+  MoEForbiddenDependencyScan); (b) env-known EPERM/NUMA/MPI-bind (33–36;
+  host-clean 68/68); (c) C/D ABSENT (fixed in 79c1f62ab); (d) ZERO NEW.
+- i8mm evidence set COMPLETE: gate clean + Mac quadrant PASS + gcc-14 objdump
+  96/96 identical + reviewer ACK (no open P1). Merged (302318f1e), no
+  follow-up. (107-error scare = arm-sparks harness vendor overwrite; corrected.)
