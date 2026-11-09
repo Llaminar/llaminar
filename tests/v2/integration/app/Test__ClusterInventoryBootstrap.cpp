@@ -160,7 +160,13 @@ namespace
             const auto &inventory = *inventory_owner;
             passed = passed && inventory_owner == context->clusterInventory();
             const auto &local_observation = inventory.ranks.at(context->rank());
-            const NUMAInfo admitted_affinity{
+            // A lone rank deliberately owns the whole host in the inventory
+            // (numa_node -1, e.g. a single-NUMA GB10). Serving then resolves
+            // the shorthand from the process's observed affinity, exactly as
+            // RuntimeInitPhase does; distributed ranks use the inventory.
+            const bool whole_host = context->world_size() == 1;
+            passed = passed && (!whole_host || local_observation.cpu.numa_node == -1);
+            const NUMAInfo admitted_affinity = whole_host ? NUMATopology::detectLocalNUMANode() : NUMAInfo{
                 .local_numa_node = local_observation.cpu.numa_node,
                 .total_numa_nodes = local_observation.numa_nodes,
                 .detection_succeeded = local_observation.cpu.numa_node >= 0,
@@ -171,7 +177,7 @@ namespace
                 config, context->rank(), context->world_size(), admitted_affinity);
             passed = passed && config.device_map.size() == 1 &&
                 config.device_map.front().first == context->rank() &&
-                config.device_map.front().second.numa_node == local_observation.cpu.numa_node;
+                config.device_map.front().second.numa_node == admitted_affinity.local_numa_node;
             const auto topology = MPIBootstrap::detectCPUTopology();
             std::string detail;
             const bool affinity_ok = MPIBootstrapPhase::verifyStartupThreadAffinity(-1, true, detail);

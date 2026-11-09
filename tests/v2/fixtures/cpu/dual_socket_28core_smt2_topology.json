@@ -1,0 +1,750 @@
+{
+ "core_thread_widths": [
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2
+ ],
+ "cpus": [
+  {
+   "core_id": 0,
+   "cpu_id": 0,
+   "package_id": 0,
+   "thread_siblings": "0,56"
+  },
+  {
+   "core_id": 1,
+   "cpu_id": 1,
+   "package_id": 0,
+   "thread_siblings": "1,57"
+  },
+  {
+   "core_id": 2,
+   "cpu_id": 2,
+   "package_id": 0,
+   "thread_siblings": "2,58"
+  },
+  {
+   "core_id": 3,
+   "cpu_id": 3,
+   "package_id": 0,
+   "thread_siblings": "3,59"
+  },
+  {
+   "core_id": 4,
+   "cpu_id": 4,
+   "package_id": 0,
+   "thread_siblings": "4,60"
+  },
+  {
+   "core_id": 5,
+   "cpu_id": 5,
+   "package_id": 0,
+   "thread_siblings": "5,61"
+  },
+  {
+   "core_id": 6,
+   "cpu_id": 6,
+   "package_id": 0,
+   "thread_siblings": "6,62"
+  },
+  {
+   "core_id": 7,
+   "cpu_id": 7,
+   "package_id": 0,
+   "thread_siblings": "7,63"
+  },
+  {
+   "core_id": 8,
+   "cpu_id": 8,
+   "package_id": 0,
+   "thread_siblings": "8,64"
+  },
+  {
+   "core_id": 9,
+   "cpu_id": 9,
+   "package_id": 0,
+   "thread_siblings": "9,65"
+  },
+  {
+   "core_id": 10,
+   "cpu_id": 10,
+   "package_id": 0,
+   "thread_siblings": "10,66"
+  },
+  {
+   "core_id": 11,
+   "cpu_id": 11,
+   "package_id": 0,
+   "thread_siblings": "11,67"
+  },
+  {
+   "core_id": 12,
+   "cpu_id": 12,
+   "package_id": 0,
+   "thread_siblings": "12,68"
+  },
+  {
+   "core_id": 13,
+   "cpu_id": 13,
+   "package_id": 0,
+   "thread_siblings": "13,69"
+  },
+  {
+   "core_id": 14,
+   "cpu_id": 14,
+   "package_id": 0,
+   "thread_siblings": "14,70"
+  },
+  {
+   "core_id": 15,
+   "cpu_id": 15,
+   "package_id": 0,
+   "thread_siblings": "15,71"
+  },
+  {
+   "core_id": 16,
+   "cpu_id": 16,
+   "package_id": 0,
+   "thread_siblings": "16,72"
+  },
+  {
+   "core_id": 17,
+   "cpu_id": 17,
+   "package_id": 0,
+   "thread_siblings": "17,73"
+  },
+  {
+   "core_id": 18,
+   "cpu_id": 18,
+   "package_id": 0,
+   "thread_siblings": "18,74"
+  },
+  {
+   "core_id": 19,
+   "cpu_id": 19,
+   "package_id": 0,
+   "thread_siblings": "19,75"
+  },
+  {
+   "core_id": 20,
+   "cpu_id": 20,
+   "package_id": 0,
+   "thread_siblings": "20,76"
+  },
+  {
+   "core_id": 21,
+   "cpu_id": 21,
+   "package_id": 0,
+   "thread_siblings": "21,77"
+  },
+  {
+   "core_id": 22,
+   "cpu_id": 22,
+   "package_id": 0,
+   "thread_siblings": "22,78"
+  },
+  {
+   "core_id": 23,
+   "cpu_id": 23,
+   "package_id": 0,
+   "thread_siblings": "23,79"
+  },
+  {
+   "core_id": 24,
+   "cpu_id": 24,
+   "package_id": 0,
+   "thread_siblings": "24,80"
+  },
+  {
+   "core_id": 25,
+   "cpu_id": 25,
+   "package_id": 0,
+   "thread_siblings": "25,81"
+  },
+  {
+   "core_id": 26,
+   "cpu_id": 26,
+   "package_id": 0,
+   "thread_siblings": "26,82"
+  },
+  {
+   "core_id": 27,
+   "cpu_id": 27,
+   "package_id": 0,
+   "thread_siblings": "27,83"
+  },
+  {
+   "core_id": 0,
+   "cpu_id": 28,
+   "package_id": 1,
+   "thread_siblings": "28,84"
+  },
+  {
+   "core_id": 1,
+   "cpu_id": 29,
+   "package_id": 1,
+   "thread_siblings": "29,85"
+  },
+  {
+   "core_id": 2,
+   "cpu_id": 30,
+   "package_id": 1,
+   "thread_siblings": "30,86"
+  },
+  {
+   "core_id": 3,
+   "cpu_id": 31,
+   "package_id": 1,
+   "thread_siblings": "31,87"
+  },
+  {
+   "core_id": 4,
+   "cpu_id": 32,
+   "package_id": 1,
+   "thread_siblings": "32,88"
+  },
+  {
+   "core_id": 5,
+   "cpu_id": 33,
+   "package_id": 1,
+   "thread_siblings": "33,89"
+  },
+  {
+   "core_id": 6,
+   "cpu_id": 34,
+   "package_id": 1,
+   "thread_siblings": "34,90"
+  },
+  {
+   "core_id": 7,
+   "cpu_id": 35,
+   "package_id": 1,
+   "thread_siblings": "35,91"
+  },
+  {
+   "core_id": 8,
+   "cpu_id": 36,
+   "package_id": 1,
+   "thread_siblings": "36,92"
+  },
+  {
+   "core_id": 9,
+   "cpu_id": 37,
+   "package_id": 1,
+   "thread_siblings": "37,93"
+  },
+  {
+   "core_id": 10,
+   "cpu_id": 38,
+   "package_id": 1,
+   "thread_siblings": "38,94"
+  },
+  {
+   "core_id": 11,
+   "cpu_id": 39,
+   "package_id": 1,
+   "thread_siblings": "39,95"
+  },
+  {
+   "core_id": 12,
+   "cpu_id": 40,
+   "package_id": 1,
+   "thread_siblings": "40,96"
+  },
+  {
+   "core_id": 13,
+   "cpu_id": 41,
+   "package_id": 1,
+   "thread_siblings": "41,97"
+  },
+  {
+   "core_id": 14,
+   "cpu_id": 42,
+   "package_id": 1,
+   "thread_siblings": "42,98"
+  },
+  {
+   "core_id": 15,
+   "cpu_id": 43,
+   "package_id": 1,
+   "thread_siblings": "43,99"
+  },
+  {
+   "core_id": 16,
+   "cpu_id": 44,
+   "package_id": 1,
+   "thread_siblings": "44,100"
+  },
+  {
+   "core_id": 17,
+   "cpu_id": 45,
+   "package_id": 1,
+   "thread_siblings": "45,101"
+  },
+  {
+   "core_id": 18,
+   "cpu_id": 46,
+   "package_id": 1,
+   "thread_siblings": "46,102"
+  },
+  {
+   "core_id": 19,
+   "cpu_id": 47,
+   "package_id": 1,
+   "thread_siblings": "47,103"
+  },
+  {
+   "core_id": 20,
+   "cpu_id": 48,
+   "package_id": 1,
+   "thread_siblings": "48,104"
+  },
+  {
+   "core_id": 21,
+   "cpu_id": 49,
+   "package_id": 1,
+   "thread_siblings": "49,105"
+  },
+  {
+   "core_id": 22,
+   "cpu_id": 50,
+   "package_id": 1,
+   "thread_siblings": "50,106"
+  },
+  {
+   "core_id": 23,
+   "cpu_id": 51,
+   "package_id": 1,
+   "thread_siblings": "51,107"
+  },
+  {
+   "core_id": 24,
+   "cpu_id": 52,
+   "package_id": 1,
+   "thread_siblings": "52,108"
+  },
+  {
+   "core_id": 25,
+   "cpu_id": 53,
+   "package_id": 1,
+   "thread_siblings": "53,109"
+  },
+  {
+   "core_id": 26,
+   "cpu_id": 54,
+   "package_id": 1,
+   "thread_siblings": "54,110"
+  },
+  {
+   "core_id": 27,
+   "cpu_id": 55,
+   "package_id": 1,
+   "thread_siblings": "55,111"
+  },
+  {
+   "core_id": 0,
+   "cpu_id": 56,
+   "package_id": 0,
+   "thread_siblings": "0,56"
+  },
+  {
+   "core_id": 1,
+   "cpu_id": 57,
+   "package_id": 0,
+   "thread_siblings": "1,57"
+  },
+  {
+   "core_id": 2,
+   "cpu_id": 58,
+   "package_id": 0,
+   "thread_siblings": "2,58"
+  },
+  {
+   "core_id": 3,
+   "cpu_id": 59,
+   "package_id": 0,
+   "thread_siblings": "3,59"
+  },
+  {
+   "core_id": 4,
+   "cpu_id": 60,
+   "package_id": 0,
+   "thread_siblings": "4,60"
+  },
+  {
+   "core_id": 5,
+   "cpu_id": 61,
+   "package_id": 0,
+   "thread_siblings": "5,61"
+  },
+  {
+   "core_id": 6,
+   "cpu_id": 62,
+   "package_id": 0,
+   "thread_siblings": "6,62"
+  },
+  {
+   "core_id": 7,
+   "cpu_id": 63,
+   "package_id": 0,
+   "thread_siblings": "7,63"
+  },
+  {
+   "core_id": 8,
+   "cpu_id": 64,
+   "package_id": 0,
+   "thread_siblings": "8,64"
+  },
+  {
+   "core_id": 9,
+   "cpu_id": 65,
+   "package_id": 0,
+   "thread_siblings": "9,65"
+  },
+  {
+   "core_id": 10,
+   "cpu_id": 66,
+   "package_id": 0,
+   "thread_siblings": "10,66"
+  },
+  {
+   "core_id": 11,
+   "cpu_id": 67,
+   "package_id": 0,
+   "thread_siblings": "11,67"
+  },
+  {
+   "core_id": 12,
+   "cpu_id": 68,
+   "package_id": 0,
+   "thread_siblings": "12,68"
+  },
+  {
+   "core_id": 13,
+   "cpu_id": 69,
+   "package_id": 0,
+   "thread_siblings": "13,69"
+  },
+  {
+   "core_id": 14,
+   "cpu_id": 70,
+   "package_id": 0,
+   "thread_siblings": "14,70"
+  },
+  {
+   "core_id": 15,
+   "cpu_id": 71,
+   "package_id": 0,
+   "thread_siblings": "15,71"
+  },
+  {
+   "core_id": 16,
+   "cpu_id": 72,
+   "package_id": 0,
+   "thread_siblings": "16,72"
+  },
+  {
+   "core_id": 17,
+   "cpu_id": 73,
+   "package_id": 0,
+   "thread_siblings": "17,73"
+  },
+  {
+   "core_id": 18,
+   "cpu_id": 74,
+   "package_id": 0,
+   "thread_siblings": "18,74"
+  },
+  {
+   "core_id": 19,
+   "cpu_id": 75,
+   "package_id": 0,
+   "thread_siblings": "19,75"
+  },
+  {
+   "core_id": 20,
+   "cpu_id": 76,
+   "package_id": 0,
+   "thread_siblings": "20,76"
+  },
+  {
+   "core_id": 21,
+   "cpu_id": 77,
+   "package_id": 0,
+   "thread_siblings": "21,77"
+  },
+  {
+   "core_id": 22,
+   "cpu_id": 78,
+   "package_id": 0,
+   "thread_siblings": "22,78"
+  },
+  {
+   "core_id": 23,
+   "cpu_id": 79,
+   "package_id": 0,
+   "thread_siblings": "23,79"
+  },
+  {
+   "core_id": 24,
+   "cpu_id": 80,
+   "package_id": 0,
+   "thread_siblings": "24,80"
+  },
+  {
+   "core_id": 25,
+   "cpu_id": 81,
+   "package_id": 0,
+   "thread_siblings": "25,81"
+  },
+  {
+   "core_id": 26,
+   "cpu_id": 82,
+   "package_id": 0,
+   "thread_siblings": "26,82"
+  },
+  {
+   "core_id": 27,
+   "cpu_id": 83,
+   "package_id": 0,
+   "thread_siblings": "27,83"
+  },
+  {
+   "core_id": 0,
+   "cpu_id": 84,
+   "package_id": 1,
+   "thread_siblings": "28,84"
+  },
+  {
+   "core_id": 1,
+   "cpu_id": 85,
+   "package_id": 1,
+   "thread_siblings": "29,85"
+  },
+  {
+   "core_id": 2,
+   "cpu_id": 86,
+   "package_id": 1,
+   "thread_siblings": "30,86"
+  },
+  {
+   "core_id": 3,
+   "cpu_id": 87,
+   "package_id": 1,
+   "thread_siblings": "31,87"
+  },
+  {
+   "core_id": 4,
+   "cpu_id": 88,
+   "package_id": 1,
+   "thread_siblings": "32,88"
+  },
+  {
+   "core_id": 5,
+   "cpu_id": 89,
+   "package_id": 1,
+   "thread_siblings": "33,89"
+  },
+  {
+   "core_id": 6,
+   "cpu_id": 90,
+   "package_id": 1,
+   "thread_siblings": "34,90"
+  },
+  {
+   "core_id": 7,
+   "cpu_id": 91,
+   "package_id": 1,
+   "thread_siblings": "35,91"
+  },
+  {
+   "core_id": 8,
+   "cpu_id": 92,
+   "package_id": 1,
+   "thread_siblings": "36,92"
+  },
+  {
+   "core_id": 9,
+   "cpu_id": 93,
+   "package_id": 1,
+   "thread_siblings": "37,93"
+  },
+  {
+   "core_id": 10,
+   "cpu_id": 94,
+   "package_id": 1,
+   "thread_siblings": "38,94"
+  },
+  {
+   "core_id": 11,
+   "cpu_id": 95,
+   "package_id": 1,
+   "thread_siblings": "39,95"
+  },
+  {
+   "core_id": 12,
+   "cpu_id": 96,
+   "package_id": 1,
+   "thread_siblings": "40,96"
+  },
+  {
+   "core_id": 13,
+   "cpu_id": 97,
+   "package_id": 1,
+   "thread_siblings": "41,97"
+  },
+  {
+   "core_id": 14,
+   "cpu_id": 98,
+   "package_id": 1,
+   "thread_siblings": "42,98"
+  },
+  {
+   "core_id": 15,
+   "cpu_id": 99,
+   "package_id": 1,
+   "thread_siblings": "43,99"
+  },
+  {
+   "core_id": 16,
+   "cpu_id": 100,
+   "package_id": 1,
+   "thread_siblings": "44,100"
+  },
+  {
+   "core_id": 17,
+   "cpu_id": 101,
+   "package_id": 1,
+   "thread_siblings": "45,101"
+  },
+  {
+   "core_id": 18,
+   "cpu_id": 102,
+   "package_id": 1,
+   "thread_siblings": "46,102"
+  },
+  {
+   "core_id": 19,
+   "cpu_id": 103,
+   "package_id": 1,
+   "thread_siblings": "47,103"
+  },
+  {
+   "core_id": 20,
+   "cpu_id": 104,
+   "package_id": 1,
+   "thread_siblings": "48,104"
+  },
+  {
+   "core_id": 21,
+   "cpu_id": 105,
+   "package_id": 1,
+   "thread_siblings": "49,105"
+  },
+  {
+   "core_id": 22,
+   "cpu_id": 106,
+   "package_id": 1,
+   "thread_siblings": "50,106"
+  },
+  {
+   "core_id": 23,
+   "cpu_id": 107,
+   "package_id": 1,
+   "thread_siblings": "51,107"
+  },
+  {
+   "core_id": 24,
+   "cpu_id": 108,
+   "package_id": 1,
+   "thread_siblings": "52,108"
+  },
+  {
+   "core_id": 25,
+   "cpu_id": 109,
+   "package_id": 1,
+   "thread_siblings": "53,109"
+  },
+  {
+   "core_id": 26,
+   "cpu_id": 110,
+   "package_id": 1,
+   "thread_siblings": "54,110"
+  },
+  {
+   "core_id": 27,
+   "cpu_id": 111,
+   "package_id": 1,
+   "thread_siblings": "55,111"
+  }
+ ],
+ "logical_cpu_count": 112,
+ "package_count": 2,
+ "packages": [
+  {
+   "logical_cpus": 56,
+   "package_id": 0,
+   "physical_cores": 28
+  },
+  {
+   "logical_cpus": 56,
+   "package_id": 1,
+   "physical_cores": 28
+  }
+ ],
+ "physical_core_count": 56,
+ "schema_version": 1
+}
