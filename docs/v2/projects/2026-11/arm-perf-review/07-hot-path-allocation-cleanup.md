@@ -322,3 +322,20 @@ the source policy). Dead persistent_state parameter removed.
 - Gates: Mac NEON_DOTPROD/NEON 271/271 0 skips; preflight 215/215 x20;
   source policy clean; gcc aarch64 + clang x86 syntax OK. WSL (5') final =
   beffdbe13; reviewer per-tip pass in flight.
+
+## beffdbe13 production reread (2026-11-09)
+
+- P2 SOURCE-CLOSED; timer guard restores on ASSERT exits; NO new production
+  P1. EVIDENCE-LIMIT corrections (not production failures), relayed:
+  (1) regression comparator = equality modulo signed zero (not byte-exact
+  certificate) + calls current implementation → add complementary RAW
+  dirty-vs-clean byte check; :716 comment overstates.
+  (2) :760 never measures team (budget != OMP_THREAD_LIMIT) → can pass
+  serialized; record/assert actual width w/o barrier before late entrant.
+  (3) driver SKIP_Q8_INT suppresses entire Q8 block; MIN_ROWS drops one-row
+  group; sampled rows {1,2,3,7,31,32,33,40,64} ≠ contiguous 1..64.
+  (4) base −1 sentinel = fresh persistent-state route only (update_rope_cache
+  empty planes + apply_rope_cached_heads throws); OLD NO-STATE ordinary +
+  partial APIs still give valid one-row −1 → don't claim unavailable.
+- Recommended small follow-up commit before handover (raw byte check, actual
+  width assert, comment fix, accurate evidence description). Lane deciding.
