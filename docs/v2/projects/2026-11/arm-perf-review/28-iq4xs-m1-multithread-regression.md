@@ -581,3 +581,12 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   84 tests; NAMES: V2_{Unit,Integration}_CPUNativeTileRegisterEvidence
   {Analysis,Binding0..3}. Mac E2E 12/12 at load avg 24.
 - GB10 census pending (-j6; expecting 12/12).
+
+## SOURCE126 interim (2026-11-09) — shebang ABI finding
+
+- Stand-in shebangs `#!{python} -S -E`: on LINUX the shebang tail = ONE
+  optional argv element → Python receives `-S -E` as a single embedded-space
+  option string and errors before the stand-in runs (Darwin doesn't certify
+  the Linux ABI). FIX: single option cluster `-SE`; keep sharding/timeouts.
+- Census heads-up sent (stand-in/shebang failure would be this finding, not a
+  rejection). Reviewer continues (no probe; no census inference).
