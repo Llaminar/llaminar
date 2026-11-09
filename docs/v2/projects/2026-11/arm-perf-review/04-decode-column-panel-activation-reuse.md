@@ -162,3 +162,16 @@ in the plan. Any NibbleMap touch points must remain seam-based.
 - SINGLE-TIP sequence (relayed): r2gate2 7d1a94479 f9f190059 → window-panel
   f9f190059 → window-r2e 7d1a94479 f9f190059 (real exit codes; plan
   regen guard) → r2fa 7d1a94479 f9f190059 → push → reviewer → WSL.
+
+## R2 rebase — 777f7a52a on f69446e3c (2026-11-09)
+
+- Range-diff 4/4 `=` (C2c 55282a617 / C3 444f2245a / C4 a7be52cc8 / harness
+  777f7a52a); clean; only shared file tests/v2/CMakeLists.txt (hunks far
+  apart: Main L1013/L28584 vs ours L7750/L19000). r2wip; basef69; trees
+  seeded. FusedCompletion now builds (base guard in).
+- r2fa early: BASE solo arm 507s wall + exit1 = its OWN policy check
+  ('p95 regret 8.955% > 5%') → cell fails on base; solo at 85% of 600s →
+  parallel-ctest timeout expected → TENTATIVE base/env, not R2 (confirmed
+  when R2 arm + solo gated-cell rerun land; not claimed yet).
+- Orders: r2gate2 f69446e3c 777f7a52a → window-r2e f69446e3c 777f7a52a;
+  GB10 CUDA gates at f69446e3c (.79) in parallel.
