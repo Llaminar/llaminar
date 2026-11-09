@@ -534,7 +534,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     set(V2_CPU_TILE_REGISTER_ARTIFACTS
         "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.o"
         "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.dis"
-        "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.sym")
+        "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.i")
     add_custom_command(OUTPUT "${V2_CPU_TILE_REGISTER_PROOF}" ${V2_CPU_TILE_REGISTER_ARTIFACTS}
         BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.deps"
             "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.pre.deps"

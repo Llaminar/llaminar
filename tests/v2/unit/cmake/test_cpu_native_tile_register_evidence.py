@@ -53,33 +53,49 @@ def name(rows: int, dot: int, policy: int, encoding: int, nibble_map: int, minim
             f"CPUNativeQuantisedEncodingE{encoding}ELNS3_9NibbleMapE{nibble_map}ELb{minimum}EEEvv")
 
 
+class Layout:
+    """Addresses, sections and symbols of rendered functions, shared by the object and its disassembly."""
+
+    def __init__(self, functions: list[tuple[str, str]], macho: bool) -> None:
+        self.macho, self.entries, address = macho, [], 0
+        for symbol, body in functions:
+            if not macho:
+                address = 0
+            start, labels, code = address, {}, []
+            for line in textwrap.dedent(body).splitlines():
+                text = line.strip()
+                if not text:
+                    continue
+                if re.match(r"^\.L\w+:$", text):
+                    labels[text[:-1]] = address
+                    continue
+                code.append((address, text))
+                address += 4
+            section = "__TEXT,__text" if macho else f".text.{symbol}"
+            self.entries.append({"name": symbol, "section": section, "start": start, "end": address,
+                                 "labels": labels, "code": code})
+        self.imports = sorted({text.split()[-1] for entry in self.entries for _, text in entry["code"]
+                               if BRANCH.match(text.split()[0]) and not text.split()[-1].startswith(".L")
+                               and text.split()[-1] not in {other["name"] for other in self.entries}})
+
+
 def disassembly(functions: list[tuple[str, str]], macho: bool = False, path: str = "probe.o") -> str:
     """Render functions (one instruction per line, .Lname: labels) as llvm-objdump -d -r output.
 
     Branches to local labels print their address; branches to other symbols carry a branch relocation; lines
     starting with '.' or '<' render as the disassembler prints data words.
     """
+    layout = Layout(functions, macho)
     prefix = "_" if macho else ""
     out = [f"{path}:\tfile format {'mach-o arm64' if macho else 'elf64-littleaarch64'}", ""]
     if macho:
         out.append("Disassembly of section __TEXT,__text:")
-    address = 0
-    for symbol, body in functions:
+    for entry in layout.entries:
+        symbol, start, labels = entry["name"], entry["start"], entry["labels"]
         if not macho:
-            address = 0
-            out += ["", f"Disassembly of section .text.{symbol}:"]
-        start, labels, code = address, {}, []
-        for line in textwrap.dedent(body).splitlines():
-            text = line.strip()
-            if not text:
-                continue
-            if re.match(r"^\.L\w+:$", text):
-                labels[text[:-1]] = address
-                continue
-            code.append((address, text))
-            address += 4
+            out += ["", f"Disassembly of section {entry['section']}:"]
         out += ["", f"{start:016x} <{prefix}{symbol}>:"]
-        for at, text in code:
+        for at, text in entry["code"]:
             parts = text.split(None, 1)
             mnemonic, operands = parts[0], (CHECKER.split_operands(parts[1]) if len(parts) > 1 else [])
             relocation = None
@@ -101,27 +117,107 @@ def disassembly(functions: list[tuple[str, str]], macho: bool = False, path: str
     return "\n".join(out) + "\n"
 
 
-def symbol_table(functions: list[tuple[str, str]], macho: bool = False) -> str:
-    """objdump -t listing every function symbol."""
-    prefix = "_" if macho else ""
-    lines = ["", "probe.o:\tfile format x", "", "SYMBOL TABLE:"]
-    for symbol, _ in functions:
-        section = "__TEXT,__text" if macho else f".text.{symbol}\t0000000000000004"
-        lines.append(f"0000000000000000 g     F {section} {prefix}{symbol}")
-    return "\n".join(lines) + "\n"
+def witness_object(functions: list[tuple[str, str]] | None = None, inventory: str | None = NEON_INVENTORY,
+                   macho: bool = False, symbols: list[tuple] | None = None, sizes: dict[str, int] | None = None,
+                   extra: bytes = b"", bindings: dict[str, str] | None = None) -> bytes:
+    """A real ELF64 AArch64 or Mach-O arm64 object consistent with Layout(functions).
 
-
-def witness_object(inventory: str | None = NEON_INVENTORY, macho: bool = False, extra: bytes = b"") -> bytes:
-    """Minimal object bytes: format header plus the embedded instantiation inventory string."""
-    if macho:
-        header = bytes.fromhex("cffaedfe") + (0x0100000C).to_bytes(4, "little") + bytes(24)
-    else:
-        header = bytearray(64)
-        header[0:6] = b"\x7fELF\x02\x01"
-        header[18:20] = (183).to_bytes(2, "little")
-        header = bytes(header)
+    Defined functions and undefined imports come from the layout; symbols appends raw (name, kind, binding,
+    section-function-name or None, value) records; sizes overrides ELF symbol sizes.
+    """
+    layout = Layout(functions or [], macho)
     marker = b"" if inventory is None else b"llaminar-native-neon-tile-probe:" + inventory.encode() + b"\0"
-    return header + marker + extra
+    records = [(entry["name"], "function", "global", entry["name"], entry["start"]) for entry in layout.entries]
+    records += [(name, "undefined", (bindings or {}).get(name, "global"), None, 0) for name in layout.imports]
+    records += symbols or []
+    if macho:
+        return _macho(layout, records, marker + extra)
+    return _elf(layout, records, marker + extra, sizes or {})
+
+
+def _elf(layout: Layout, records: list[tuple], data: bytes, sizes: dict[str, int]) -> bytes:
+    names = [""] + [entry["section"] for entry in layout.entries] + [".rodata", ".symtab", ".strtab", ".shstrtab"]
+    shstr = b"\0" + b"".join(name.encode() + b"\0" for name in names[1:])
+    strtab, symtab = bytearray(b"\0"), bytearray(24)
+    index = {entry["name"]: number + 1 for number, entry in enumerate(layout.entries)}
+    extents = {entry["name"]: entry["end"] - entry["start"] for entry in layout.entries}
+    for name, kind, binding, owner, value in records:
+        offset = len(strtab)
+        strtab += name.encode() + b"\0"
+        info = ({"local": 0, "global": 1, "weak": 2}[binding] << 4) | {"function": 2, "notype": 0, "object": 1,
+                                                                        "undefined": 0, "absolute": 0}[kind]
+        section = index[owner] if owner else (0xFFF1 if kind == "absolute" else 0)
+        size = sizes.get(name, extents.get(name, 0)) if kind == "function" else 0
+        symtab += offset.to_bytes(4, "little") + bytes([info, 0]) + section.to_bytes(2, "little") + \
+            value.to_bytes(8, "little") + size.to_bytes(8, "little")
+    contents = [b""] + [bytes(entry["end"] - entry["start"]) for entry in layout.entries] + \
+        [data, bytes(symtab), bytes(strtab), shstr]
+    types = [0] + [1] * len(layout.entries) + [1, 2, 3, 3]
+    flags = [0] + [0x6] * len(layout.entries) + [0x2, 0, 0, 0]
+    body, offsets = bytearray(), []
+    for content in contents:
+        offsets.append(64 + len(body))
+        body += content
+    shoff = 64 + len(body)
+    header = bytearray(64)
+    header[0:6] = b"\x7fELF\x02\x01"
+    header[18:20] = (183).to_bytes(2, "little")
+    header[0x28:0x30] = shoff.to_bytes(8, "little")
+    header[0x3A:0x3C] = (64).to_bytes(2, "little")
+    header[0x3C:0x3E] = len(names).to_bytes(2, "little")
+    header[0x3E:0x40] = (len(names) - 1).to_bytes(2, "little")
+    sections = bytearray()
+    name_offsets = [0]
+    for name in names[1:]:
+        name_offsets.append(shstr.index(name.encode() + b"\0"))
+    for number, content in enumerate(contents):
+        link = len(names) - 2 if types[number] == 2 else 0
+        entsize = 24 if types[number] == 2 else 0
+        sections += name_offsets[number].to_bytes(4, "little") + types[number].to_bytes(4, "little") + \
+            flags[number].to_bytes(8, "little") + bytes(8) + offsets[number].to_bytes(8, "little") + \
+            len(content).to_bytes(8, "little") + link.to_bytes(4, "little") + bytes(12) + entsize.to_bytes(8, "little")
+    return bytes(header) + bytes(body) + bytes(sections)
+
+
+def _macho(layout: Layout, records: list[tuple], data: bytes) -> bytes:
+    text_size = max([entry["end"] for entry in layout.entries], default=0)
+    commands = 72 + 2 * 80 + 24
+    text_offset = 32 + commands
+    const_offset = text_offset + text_size
+    strtab, nlist = bytearray(b"\0"), bytearray()
+    starts = {entry["name"]: entry["start"] for entry in layout.entries}
+    for name, kind, binding, owner, value in records:
+        offset = len(strtab)
+        strtab += b"_" + name.encode() + b"\0"
+        if kind == "undefined":
+            kind_bits, section, value = 0x01, 0, 0
+        elif kind == "absolute":
+            kind_bits, section = 0x03, 0
+        else:
+            kind_bits, section = (0x0F if binding != "local" else 0x0E), 1
+            value = value if owner == name else starts.get(owner, 0) + value
+        description = 0x80 if binding == "weak" and kind != "undefined" else (0x40 if binding == "weak" else 0)
+        nlist += offset.to_bytes(4, "little") + bytes([kind_bits, section]) + description.to_bytes(2, "little") + \
+            value.to_bytes(8, "little")
+    symoff = const_offset + len(data)
+    stroff = symoff + len(nlist)
+
+    def section(sectname: bytes, address: int, size: int, offset: int, flags: int) -> bytes:
+        return sectname.ljust(16, b"\0") + b"__TEXT".ljust(16, b"\0") + address.to_bytes(8, "little") + \
+            size.to_bytes(8, "little") + offset.to_bytes(4, "little") + bytes(12) + flags.to_bytes(4, "little") + bytes(12)
+    segment = (0x19).to_bytes(4, "little") + (72 + 160).to_bytes(4, "little") + b"".ljust(16, b"\0") + bytes(32) + \
+        bytes(8) + (2).to_bytes(4, "little") + bytes(4)
+    segment += section(b"__text", 0, text_size, text_offset, 0x80000400)
+    segment += section(b"__const", text_size, len(data), const_offset, 0)
+    symtab = (0x2).to_bytes(4, "little") + (24).to_bytes(4, "little") + symoff.to_bytes(4, "little") + \
+        (len(records)).to_bytes(4, "little") + stroff.to_bytes(4, "little") + len(strtab).to_bytes(4, "little")
+    header = bytes.fromhex("cffaedfe") + (0x0100000C).to_bytes(4, "little") + bytes(8) + \
+        (2).to_bytes(4, "little") + commands.to_bytes(4, "little") + bytes(8)
+    return header + segment + symtab + bytes(text_size) + data + bytes(nlist) + bytes(strtab)
+
+
+def image(functions: list[tuple[str, str]], macho: bool = False, **options) -> CHECKER.ObjectImage:
+    return CHECKER.read_object(witness_object(functions, None, macho, **options))
 
 
 def programs(bodies: dict[tuple, str] | None = None, keys: list[tuple] | None = None) -> list[tuple[str, str]]:
@@ -130,10 +226,11 @@ def programs(bodies: dict[tuple, str] | None = None, keys: list[tuple] | None = 
 
 def audit_witness(bodies: dict[tuple, str] | None = None, extra: list[tuple[str, str]] | None = None,
                   keys: list[tuple] | None = None, inventory: str | None = NEON_INVENTORY, mode: str = "NEON",
-                  macho: bool = False, table: list[tuple[str, str]] | None = None) -> dict[str, int]:
+                  macho: bool = False, symbols: list[tuple] | None = None,
+                  sizes: dict[str, int] | None = None) -> dict[str, int]:
     functions = programs(bodies, keys) + (extra or [])
-    return CHECKER.audit(witness_object(inventory, macho), disassembly(functions, macho),
-                         symbol_table(functions if table is None else table, macho), mode)
+    return CHECKER.audit(witness_object(functions, inventory, macho, symbols, sizes),
+                         disassembly(functions, macho), mode)
 
 
 def budget(limit: int = 4) -> dict:
@@ -149,11 +246,12 @@ class Result:
         self.spills, self.errors, self.noreturn = spills, errors, noreturn
 
 
-def analyse(body: str, extra: dict[str, str] | None = None, macho: bool = False) -> Result:
+def analyse(body: str, extra: dict[str, str] | None = None, macho: bool = False, **options) -> Result:
     """Run the production front end and analysis over one function (plus optional other functions)."""
     functions = [("f", body)] + list((extra or {}).items())
-    bodies = CHECKER.normalize_disassembly(disassembly(functions, macho), macho)
-    noreturn = CHECKER.noreturn_symbols(bodies, CHECKER.GENERIC)
+    image = CHECKER.read_object(witness_object(functions, macho=macho, **options))
+    bodies = CHECKER.normalize_disassembly(disassembly(functions, macho), image)
+    noreturn = CHECKER.noreturn_symbols(bodies, CHECKER.GENERIC, CHECKER.trusted_imports(image))
     spills, errors = CHECKER.analyse_function("f", bodies, CHECKER.GENERIC, noreturn)
     return Result(spills, errors, noreturn)
 
@@ -290,16 +388,22 @@ class ClassificationTest(unittest.TestCase):
             analyse("\tcbz x0, helper\n\tret\n", {"helper": "\tret\n"})
 
     def test_relocated_data_addresses_are_never_stack(self) -> None:
-        text = disassembly([("f", "\tadrp x3, 0x0 <f>\n\tldr x3, [x3]\n\tstr q0, [sp, #16]\n\tret\n")])
+        functions = [("f", "\tadrp x3, 0x0 <f>\n\tldr x3, [x3]\n\tstr q0, [sp, #16]\n\tret\n")]
+        text = disassembly(functions)
         text = text.replace("adrp\tx3, 0x0 <f>\n", "adrp\tx3, 0x0 <f>\n\t\t0000000000000000:  R_AARCH64_ADR_GOT_PAGE\tstderr\n")
         text = text.replace("ldr\tx3, [x3]\n", "ldr\tx3, [x3]\n\t\t0000000000000004:  R_AARCH64_LD64_GOT_LO12_NC\tstderr\n")
-        bodies = CHECKER.normalize_disassembly(text, False)
+        bodies = CHECKER.normalize_disassembly(text, image(functions))
         self.assertEqual([line.strip() for line in bodies["f"][1:3]], ["adrp\tx3, stderr", "ldr\tx3, [x3, :lo12:stderr]"])
         self.assertEqual(CHECKER.analyse_function("f", bodies, CHECKER.GENERIC, set()), (1, []))
-        relocated_stack = disassembly([("f", "\tldr q0, [sp]\n\tret\n")]).replace(
-            "ldr\tq0, [sp]\n", "ldr\tq0, [sp]\n\t\t0000000000000000:  R_AARCH64_LDST128_ABS_LO12_NC\tx\n")
-        bodies = CHECKER.normalize_disassembly(relocated_stack, False)
-        self.assertTrue(CHECKER.analyse_function("f", bodies, CHECKER.GENERIC, set())[1])
+        for instruction, kind in (("ldr q0, [sp]", "LDST128_ABS_LO12_NC"), ("add x9, sp, #0", "ADD_ABS_LO12_NC")):
+            with self.subTest(instruction=instruction):
+                functions = [("f", f"\t{instruction}\n\tstr q0, [x9]\n\tret\n")]
+                printed = disassembly(functions).splitlines()
+                first = next(index for index, line in enumerate(printed) if line.strip().startswith("0:"))
+                printed.insert(first + 1, f"\t\t0000000000000000:  R_AARCH64_{kind}\tx")
+                bodies = CHECKER.normalize_disassembly("\n".join(printed) + "\n", image(functions))
+                errors = CHECKER.analyse_function("f", bodies, CHECKER.GENERIC, set())[1]
+                self.assertTrue(any("relocated" in error for error in errors), errors)
 
 
 class ABITest(unittest.TestCase):
@@ -431,22 +535,24 @@ class DisassemblyTest(unittest.TestCase):
                     self.TEXT.replace("add\tx0, x1, #1", "ldr\tx0, 0x40 <f+0x40>")):
             with self.subTest(bad=bad[-80:]):
                 with self.assertRaises(ValueError):
-                    CHECKER.normalize_disassembly(bad, False)
+                    CHECKER.normalize_disassembly(bad, image([("f", "\tadd x0, x1, #1\n\tret\n")]))
 
     def test_branch_relocation_addends_fail_and_data_addends_are_dropped(self) -> None:
-        call = disassembly([("f", "\tbl helper\n\tret\n")]).replace("\thelper\n", "\thelper+0x8\n")
+        call = [("f", "\tbl helper\n\tret\n")]
         with self.assertRaisesRegex(ValueError, "addend"):
-            CHECKER.normalize_disassembly(call, False)
-        page = disassembly([("f", "\tadrp x1, 0x0 <f>\n\tret\n")]).replace(
+            CHECKER.normalize_disassembly(disassembly(call).replace("\thelper\n", "\thelper+0x8\n"), image(call))
+        page = [("f", "\tadrp x1, 0x0 <f>\n\tret\n")]
+        text = disassembly(page).replace(
             "<f>\n", "<f>\n\t\t0000000000000000:  R_AARCH64_ADR_PREL_PG_HI21\t.rodata.str1.8+0x38\n", 1)
-        self.assertEqual(CHECKER.normalize_disassembly(page, False)["f"][1].strip(), "adrp\tx1, .rodata.str1.8")
+        self.assertEqual(CHECKER.normalize_disassembly(text, image(page))["f"][1].strip(), "adrp\tx1, .rodata.str1.8")
 
     def test_object_format_must_match_the_disassembly(self) -> None:
+        single = [("f", "\tret\n")]
         with self.assertRaises(ValueError):
-            CHECKER.normalize_disassembly(self.TEXT, True)
+            CHECKER.normalize_disassembly(disassembly(single), image(single, macho=True))
         with self.assertRaises(ValueError):
-            CHECKER.normalize_disassembly(disassembly([("f", "\tret\n")], macho=True), False)
-        self.assertEqual(sorted(CHECKER.normalize_disassembly(disassembly([("f", "\tret\n")], macho=True), True)),
+            CHECKER.normalize_disassembly(disassembly(single, macho=True), image(single))
+        self.assertEqual(sorted(CHECKER.normalize_disassembly(disassembly(single, macho=True), image(single, macho=True))),
                          ["f"])  # Mach-O symbols lose their leading underscore.
 
     def test_gnu_objdump_format(self) -> None:
@@ -459,7 +565,7 @@ class DisassemblyTest(unittest.TestCase):
                "  10:\tb.ne\t8 <f+0x8>  // b.any\n"
                "  14:\tbl\t0 <fwrite>\n\t\t\t14: R_AARCH64_CALL26\tfwrite\n"
                "  18:\tbl\t0 <abort>\n\t\t\t18: R_AARCH64_CALL26\tabort\n")
-        bodies = CHECKER.normalize_disassembly(gnu, False)
+        bodies = CHECKER.normalize_disassembly(gnu, image([("f", "\tnop\n" * 7)]))
         self.assertEqual([line.strip() for line in bodies["f"][1:]],
                          ["adrp\tx3, stderr", "ldr\tx3, [x3, :lo12:stderr]", ".L8:", "mov\tx2, #0x45",
                           "cmp\tx2, #0x0", "b.ne\t.L8", "bl\tfwrite", "bl\tabort"])
@@ -473,9 +579,119 @@ class DisassemblyTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 CHECKER.object_format(data + bytes(32))
         self.assertEqual(CHECKER.object_inventory(witness_object()), [NEON_INVENTORY])
-        self.assertEqual(CHECKER.object_inventory(witness_object(None)), [])
+        self.assertEqual(CHECKER.object_inventory(witness_object(inventory=None)), [])
         doubled = witness_object(extra=b"llaminar-native-neon-tile-probe:" + NEON_INVENTORY.encode() + b"\0")
         self.assertEqual(len(CHECKER.object_inventory(doubled)), 2)
+
+
+class CoverageTest(unittest.TestCase):
+    """Function bodies are cut from object extents over a complete, ordered disassembly."""
+
+    BODY = [("f", "\tmov x9, sp\n\tadd x9, x9, #16\n\tstr q0, [x9]\n\tret\n")]
+
+    def normalize(self, text: str, **options) -> dict:
+        return CHECKER.normalize_disassembly(text, image(self.BODY, **options))
+
+    def lines(self) -> list[str]:
+        return disassembly(self.BODY).splitlines()
+
+    def test_internally_consistent_witness_passes_in_both_formats(self) -> None:
+        for macho in (False, True):
+            functions = self.BODY + [("g", "\tret\n")]
+            bodies = CHECKER.normalize_disassembly(disassembly(functions, macho), image(functions, macho))
+            self.assertEqual(CHECKER.analyse_function("f", bodies, CHECKER.GENERIC, set()), (1, []))
+
+    def test_deleted_prefix_interior_tail_duplicate_and_reordered_instructions_fail(self) -> None:
+        code = [index for index, line in enumerate(self.lines()) if re.match(r"^\s+[0-9a-f]+: ", line)]
+        variants = {"prefix": [line for index, line in enumerate(self.lines()) if index != code[0]],
+                    "interior": [line for index, line in enumerate(self.lines()) if index != code[1]],
+                    "tail": [line for index, line in enumerate(self.lines()) if index != code[-1]],
+                    "duplicate": self.lines() + [self.lines()[code[-1]]],
+                    "reordered": self.lines()[:code[1]] + [self.lines()[code[2]], self.lines()[code[1]]]
+                    + self.lines()[code[2] + 1:]}
+        for label, lines in variants.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    self.normalize("\n".join(lines) + "\n")
+
+    def test_symbol_extents_must_match_the_object(self) -> None:
+        text = disassembly(self.BODY)
+        with self.assertRaisesRegex(ValueError, "outside every function extent"):
+            self.normalize(text, sizes={"f": 8})
+        with self.assertRaisesRegex(ValueError, "outside its section"):
+            self.normalize(text, sizes={"f": 32})
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            self.normalize(text, symbols=[("inner", "function", "global", "f", 4)], sizes={"inner": 8})
+        self.normalize(text, symbols=[("alias", "function", "global", "f", 0)], sizes={"alias": 16})
+
+    def test_headings_and_sections_must_be_the_objects(self) -> None:
+        with self.assertRaisesRegex(ValueError, "heading"):
+            self.normalize(disassembly(self.BODY).replace("<f>:", "<g>:"))
+        with self.assertRaisesRegex(ValueError, "heading"):
+            self.normalize(disassembly(self.BODY).replace("0000000000000000 <f>:", "0000000000000004 <f>:"))
+        two = self.BODY + [("g", "\tret\n")]
+        swapped = disassembly(two).replace("section .text.f:", "section .text.TMP:").replace(
+            "section .text.g:", "section .text.f:").replace("section .text.TMP:", "section .text.g:")
+        with self.assertRaises(ValueError):
+            CHECKER.normalize_disassembly(swapped, image(two))
+        with self.assertRaisesRegex(ValueError, "cover|does not define"):
+            self.normalize(disassembly(self.BODY).replace("section .text.f:", "section .text.other:"))
+
+    def test_elf_data_mapping_symbol_inside_a_function_is_data_in_code(self) -> None:
+        bodies = self.normalize(disassembly(self.BODY), symbols=[("$d", "notype", "local", "f", 8)])
+        self.assertTrue(any("inside code" in error
+                            for error in CHECKER.analyse_function("f", bodies, CHECKER.GENERIC, set())[1]))
+
+
+class TrustedImportTest(unittest.TestCase):
+    """abort/fwrite/fputs are trusted only as unique, undefined, strongly bound imports of the object."""
+
+    CALLER = f"\tcbz x0, .Lok\n\tbl {FATAL}\n.Lok:\n\tret\n"
+
+    def outcome(self, macho: bool, extra: dict[str, str], **options) -> Result:
+        return analyse(self.CALLER, {FATAL: FATAL_BODY.replace("fwrite", "fputs"), **extra}, macho=macho, **options)
+
+    def test_undefined_imports_are_trusted(self) -> None:
+        for macho in (False, True):
+            with self.subTest(macho=macho):
+                self.assertEqual(self.outcome(macho, {}).errors, [])
+
+    def test_defined_rebound_weak_and_aliased_trusted_names_are_not(self) -> None:
+        exit_body = "\tmov x8, #93\n\tmov x0, #0\n\tsvc #0\n"
+        for macho in (False, True):
+            for label, extra, options in (
+                    ("defined fputs", {"fputs": exit_body}, {}),
+                    ("defined abort", {"abort": "\tret\n"}, {}),
+                    ("weak abort", {}, {"bindings": {"abort": "weak"}}),
+                    ("local alias", {}, {"symbols": [("abort", "function", "local", FATAL, 0)],
+                                         "sizes": {"abort": 16}}),
+                    ("absolute alias", {}, {"symbols": [("fputs", "absolute", "global", None, 0)]})):
+                with self.subTest(label=label, macho=macho):
+                    result = self.outcome(macho, extra, **options)
+                    self.assertNotIn(FATAL, result.noreturn)
+                    self.assertTrue(any("unsupported call boundary" in error for error in result.errors), result.errors)
+
+
+class AssemblerInputTest(unittest.TestCase):
+    """Files read by the assembler through inline assembly are outside the dependency closure: rejected."""
+
+    def test_assembler_file_directives_are_found_in_every_spelling(self) -> None:
+        for source in ('asm(".incbin \\"blob\\"");', 'asm(".inc" "bin \\"x\\"");', 'asm volatile("\\x2eincbin x");',
+                       'asm(R"(.include "x")");', 'void g() { __asm__ __volatile__ (".INCLUDE \\"y\\"" ::: "memory"); }',
+                       'asm("\\056include \\"z\\"");'):
+            with self.subTest(source=source):
+                self.assertTrue(CHECKER.assembler_file_inputs(source))
+
+    def test_ordinary_asm_and_labels_are_accepted_and_malformed_asm_fails(self) -> None:
+        for source in ('int f() __asm__("g");', 'void h(float v) { asm volatile("" : "+w"(v)); }',
+                       '# 1 "asm/unistd.h"\nint x;', 'const char* s = "asm(\\".incbin\\")";',
+                       'FILE *fopen(const char *, const char *) __asm("_" "fopen" );'):
+            with self.subTest(source=source):
+                self.assertEqual(CHECKER.assembler_file_inputs(source), [])
+        for source in ("int asm;", 'asm(".incbin'):
+            with self.subTest(source=source):
+                with self.assertRaises(ValueError):
+                    CHECKER.assembler_file_inputs(source)
 
 
 class InventoryTest(unittest.TestCase):
@@ -490,21 +706,23 @@ class InventoryTest(unittest.TestCase):
     def test_missing_duplicate_empty_and_unexpected_programs(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing"):
             audit_witness(keys=NEON_KEYS[1:])
-        with self.assertRaisesRegex(ValueError, "twice"):
+        with self.assertRaisesRegex(ValueError, "ambiguous executable section"):
             audit_witness(keys=NEON_KEYS + NEON_KEYS[:1])
-        with self.assertRaisesRegex(ValueError, "empty"):
+        with self.assertRaisesRegex(ValueError, "twice"):
+            audit_witness(keys=NEON_KEYS + NEON_KEYS[:1], macho=True)
+        with self.assertRaisesRegex(ValueError, "records no size"):
             audit_witness({NEON_KEYS[3]: ""})
         with self.assertRaisesRegex(ValueError, "outside the NEON inventory"):
             audit_witness(extra=[(name(1, 1, 0, 1, 0, 1), "\tstr q0, [sp, #-16]!\n\tret\n")])
         with self.assertRaisesRegex(ValueError, "unrecognized tile program"):
             audit_witness(extra=[(name(2, 0, 0, 1, 0, 1).replace("3runI", "3runIX"), "\tret\n")])
 
-    def test_symbol_table_must_agree_with_the_disassembly(self) -> None:
+    def test_object_function_symbols_must_be_disassembled(self) -> None:
         functions = programs()
-        with self.assertRaisesRegex(ValueError, "symbol table"):
-            audit_witness(table=functions[1:])
-        with self.assertRaisesRegex(ValueError, "symbol table"):
-            audit_witness(table=functions + [(name(1, 1, 0, 1, 0, 1), "")])
+        with self.assertRaisesRegex(ValueError, "cover"):
+            CHECKER.audit(witness_object(functions), disassembly(functions[1:]), "NEON")
+        with self.assertRaisesRegex(ValueError, "does not define"):
+            CHECKER.audit(witness_object(functions[1:]), disassembly(functions), "NEON")
 
     def test_embedded_inventory_must_agree_with_the_envelope(self) -> None:
         with self.assertRaisesRegex(ValueError, "inventory"):
@@ -584,6 +802,9 @@ if args == ["--version"]:
 (here / "invocations.txt").open("a").write(" ".join(args) + "\\n")
 def value(flag):
     return args[args.index(flag) + 1]
+if "-E" in args:
+    unit = here / "preprocessed.txt"
+    pathlib.Path(value("-o")).write_text(unit.read_text() if unit.exists() else "int probe;\\n"); sys.exit(0)
 compiling = "-c" in args
 deps = (here / ("deps.c.txt" if compiling and (here / "deps.c.txt").exists() else "deps.txt")).read_text().split()
 if compiling:
@@ -600,8 +821,7 @@ here = pathlib.Path(__file__).parent
 args = sys.argv[1:]
 if args == ["--version"]:
     sys.stdout.write((here / "objdump-version.txt").read_text()); sys.exit(0)
-source = "symbols.txt" if args[0] == "-t" else "disassembly.txt"
-sys.stdout.write((here / source).read_text().replace("probe.o", args[-1]))
+sys.stdout.write((here / "disassembly.txt").read_text().replace("probe.o", args[-1]))
 """
 
 
@@ -644,9 +864,8 @@ class ProofBindingTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def witness(self, functions: list[tuple[str, str]]) -> None:
-        (self.tool / "witness.o").write_bytes(witness_object())
+        (self.tool / "witness.o").write_bytes(witness_object(functions))
         (self.tool / "disassembly.txt").write_text(disassembly(functions))
-        (self.tool / "symbols.txt").write_text(symbol_table(functions))
 
     def proof(self) -> dict:
         return json.loads(Path(self.args.proof).read_text())
@@ -746,6 +965,19 @@ class ProofBindingTest(unittest.TestCase):
             CHECKER.verify(self.args)
         out.with_suffix(".o").unlink()
         with self.assertRaisesRegex(ValueError, "object"):
+            CHECKER.verify(self.args)
+
+    def test_inline_assembly_file_input_is_rejected_before_compiling(self) -> None:
+        (self.tool / "preprocessed.txt").write_text('void f() { asm(".incbin \\"blob.bin\\""); }\n')
+        with self.assertRaisesRegex(ValueError, "inline assembly reads files"):
+            CHECKER.build(self.args)
+        self.assertFalse(Path(self.args.proof).exists())
+        self.assertNotIn(" -c ", (self.tool / "invocations.txt").read_text())
+        (self.tool / "preprocessed.txt").unlink()
+        CHECKER.build(self.args)
+        unit = Path(self.args.proof).with_suffix(".i")
+        unit.write_text(unit.read_text() + 'asm(".include \\"other.s\\"");\n')
+        with self.assertRaisesRegex(ValueError, "translation unit"):
             CHECKER.verify(self.args)
 
     def test_unsupported_disassembler_fails(self) -> None:

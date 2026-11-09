@@ -11,26 +11,38 @@ configured objdump and audit the instructions actually assembled.
   Apple's abbreviated printer), so every operand is visible; assembler-level
   controls (macros, conditionals, directives) cannot change or hide audited
   instructions, because only the assembled bytes are read.
+- Object image: sections (with executable extents) and the complete symbol
+  table (binding, type, defining section, value, ELF size) are read from the
+  object itself. Function extents are the ELF symbol sizes, or for Mach-O the
+  next distinct defined address; extents lie in their section, never overlap,
+  and every non-padding instruction belongs to one.
 - Inventory: the expected tile K-loop programs (row tile x integer family x
   policy x encoding/map/minimum) derive from the admitted ISA envelope; the
-  inventory string embedded in the object, the object's function symbol table
-  and its disassembly must all agree. Every expected program must appear
-  exactly once with real instructions; any other tile program symbol fails.
-- Disassembly contract: every line is a format, section, symbol, instruction or
-  relocation line; relocations attach to their instruction; branches inside the
-  function become local labels, relocated branches name their symbol, page and
-  low-12 data relocations become symbolic operands. Skipped zero runs, unknown
-  relocations, branch addends, unrelocated address operands and data words in
-  code fail.
+  inventory string embedded in the object and the object's function symbols
+  must agree. Every expected program must exist exactly once; any other tile
+  program symbol fails.
+- Disassembly contract: every executable section of the object is disassembled
+  at every 4-byte address of its extent, in order, exactly once (no gaps,
+  missing prefixes or tails, duplicates or reordering); every heading names a
+  symbol defined at that address; function bodies are cut from the object's
+  extents, not from printed headings. Every line is a format, section, symbol,
+  instruction or relocation line; relocations attach to their instruction;
+  in-function branches become local labels, relocated branches name their
+  symbol, page and low-12 data relocations become symbolic operands. Unknown
+  relocations, branch addends, unrelocated address operands, data words and
+  ELF data mapping symbols in code fail; relocated memory or arithmetic on a
+  stack address fails.
 - Admitted forms: every instruction must be an admitted (mnemonic, operand
   signature) form: the forms qualified on the GNU-14 and AppleClang-21 witness
   objects plus the explicitly modelled merge definitions. This is an inventory
   of supported forms, not a complete AArch64 grammar; any other form fails.
-- Calls: the only admitted call is to the exact fatal-diagnostic symbol, whose
-  body must consist of admitted forms, call only the trusted fwrite/fputs, be
-  acyclic and end every path in a call to abort(). Every other call boundary,
-  including a direct abort(), is a structural failure, so no interprocedural
-  state needs to be modelled.
+- Calls: the only admitted call is to the exact fatal-diagnostic symbol (a
+  defined function of the object), whose body must consist of admitted forms,
+  call only fwrite/fputs, be acyclic and end every path in a call to abort().
+  fwrite, fputs and abort are trusted only as the object's unique, undefined,
+  strongly bound imports; a local definition, alias, rebinding or weak import
+  disproves the diagnostic. Every other call boundary, including a direct
+  abort(), is a structural failure, so no interprocedural state is modelled.
 - Analysis: each program is analysed over its control-flow graph. Stack
   provenance of every general register is a forward data-flow fact; merge
   definitions (bfi, bfxil, movk) keep their destination as an input; csel joins
@@ -59,7 +71,10 @@ configured objdump and audit the instructions actually assembled.
   pass with the same flags; every input is hashed before and after compiling and
   bound with its logical path, its resolved path (component-wise, as the kernel
   resolves symlinks and "..") and the symlinks followed. The Ninja depfile names
-  resolved paths; symlink retargeting is caught by verification.
+  resolved paths; symlink retargeting is caught by verification. Those lists are
+  preprocessing dependencies only, so the preprocessed translation unit (same
+  flags) is retained and any inline-assembly directive making the assembler
+  read a file (.include/.incbin, in any literal spelling) is rejected.
 
 Verify phase (Unit/preflight): no compiler is invoked, but every recorded input
 (including absolute system/SDK headers named by the compiler) must be present
@@ -77,6 +92,7 @@ import json
 import os
 from pathlib import Path
 import re
+from typing import NamedTuple
 import shlex
 import subprocess
 
@@ -220,13 +236,189 @@ def object_inventory(data: bytes) -> list[str]:
     return [entry[len(marker.decode()):] for entry in found]
 
 
-def normalize_disassembly(disassembly: str, macho: bool) -> dict[str, list[str]]:
-    """Translate disassembler output into one normalised body per symbol.
+class Section(NamedTuple):
+    name: str
+    address: int
+    size: int
+    executable: bool
 
-    Branch targets inside the function become local labels; relocated branches name their relocation symbol;
-    page/low-12 relocations become symbolic operands. Any line, relocation or operand outside this contract
-    fails. Mach-O symbol names lose their leading underscore.
+
+class ObjectSymbol(NamedTuple):
+    """One symbol-table entry. kind: function, object, notype, section, file, undefined, absolute, common,
+    indirect or other; binding: local, global or weak; size is None where the format records none (Mach-O)."""
+    name: str
+    section: str | None
+    value: int
+    size: int | None
+    kind: str
+    binding: str
+
+
+class ObjectImage(NamedTuple):
+    macho: bool
+    sections: dict[str, Section]
+    symbols: list[ObjectSymbol]
+
+
+def _field(data: bytes, offset: int, size: int) -> int:
+    if offset < 0 or offset + size > len(data):
+        raise ValueError("truncated witness object")
+    return int.from_bytes(data[offset:offset + size], "little")
+
+
+def _string(data: bytes, start: int, limit: int) -> str:
+    end = data.find(b"\0", start, limit)
+    if start < 0 or start >= limit or end < 0:
+        raise ValueError("witness object string table entry out of bounds")
+    return data[start:end].decode("utf-8", "replace")
+
+
+def read_object(data: bytes) -> ObjectImage:
+    """Sections (with executable extents) and the complete symbol table, read from the object itself."""
+    return _read_macho(data) if object_format(data) else _read_elf(data)
+
+
+def _read_elf(data: bytes) -> ObjectImage:
+    shoff, shentsize, shnum, shstrndx = (_field(data, 0x28, 8), _field(data, 0x3A, 2), _field(data, 0x3C, 2),
+                                         _field(data, 0x3E, 2))
+    if shentsize != 64 or not 0 < shstrndx < shnum:
+        raise ValueError("malformed ELF section header table")
+    headers = []
+    for index in range(shnum):
+        base = shoff + index * 64
+        headers.append({"name": _field(data, base, 4), "type": _field(data, base + 4, 4),
+                        "flags": _field(data, base + 8, 8), "address": _field(data, base + 16, 8),
+                        "offset": _field(data, base + 24, 8), "size": _field(data, base + 32, 8),
+                        "link": _field(data, base + 40, 4), "entsize": _field(data, base + 56, 8)})
+    strings = headers[shstrndx]
+    names = [_string(data, strings["offset"] + header["name"], strings["offset"] + strings["size"])
+             for header in headers]
+    sections: dict[str, Section] = {}
+    for index, header in enumerate(headers[1:], start=1):
+        executable = bool(header["flags"] & 0x4)
+        if names[index] in sections and (executable or sections[names[index]].executable):
+            raise ValueError(f"ambiguous executable section name {names[index]}")
+        sections.setdefault(names[index], Section(names[index], header["address"], header["size"], executable))
+    tables = [header for header in headers if header["type"] == 2]
+    if len(tables) != 1 or tables[0]["entsize"] != 24:
+        raise ValueError("the witness object must have exactly one ELF symbol table")
+    table, symbols = tables[0], []
+    names_table = headers[table["link"]]
+    kinds = {0: "notype", 1: "object", 2: "function", 3: "section", 4: "file"}
+    for entry in range(1, table["size"] // 24):
+        base = table["offset"] + entry * 24
+        name = _string(data, names_table["offset"] + _field(data, base, 4),
+                       names_table["offset"] + names_table["size"])
+        info, index = _field(data, base + 4, 1), _field(data, base + 6, 2)
+        binding = {0: "local", 1: "global", 2: "weak"}.get(info >> 4, "other")
+        if index == 0:
+            kind, section = "undefined", None
+        elif index == 0xFFF1:
+            kind, section = "absolute", None
+        elif index == 0xFFF2:
+            kind, section = "common", None
+        elif index < len(headers):
+            kind, section = kinds.get(info & 0xF, "other"), names[index]
+        else:
+            raise ValueError(f"symbol {name} names a nonexistent section")
+        symbols.append(ObjectSymbol(name, section, _field(data, base + 8, 8), _field(data, base + 16, 8), kind, binding))
+    return ObjectImage(False, sections, symbols)
+
+
+def _read_macho(data: bytes) -> ObjectImage:
+    commands, offset = _field(data, 16, 4), 32
+    sections: dict[str, Section] = {}
+    ordered: list[str | None] = [None]
+    symtab = None
+    for _ in range(commands):
+        command, size = _field(data, offset, 4), _field(data, offset + 4, 4)
+        if size < 8:
+            raise ValueError("malformed Mach-O load command")
+        if command == 0x19:  # LC_SEGMENT_64
+            for index in range(_field(data, offset + 64, 4)):
+                base = offset + 72 + index * 80
+                section = data[base:base + 16].rstrip(b"\0").decode()
+                segment = data[base + 16:base + 32].rstrip(b"\0").decode()
+                name = f"{segment},{section}"
+                flags = _field(data, base + 64, 4)
+                if name in sections:
+                    raise ValueError(f"ambiguous Mach-O section name {name}")
+                sections[name] = Section(name, _field(data, base + 32, 8), _field(data, base + 40, 8),
+                                         bool(flags & 0x80000400))
+                ordered.append(name)
+        elif command == 0x2:  # LC_SYMTAB
+            symtab = tuple(_field(data, offset + 8 + 4 * field, 4) for field in range(4))
+        elif command == 0x29 and _field(data, offset + 12, 4):  # LC_DATA_IN_CODE with entries
+            raise ValueError("the witness object marks data inside code")
+        offset += size
+    if symtab is None:
+        raise ValueError("the witness object has no Mach-O symbol table")
+    symoff, count, stroff, strsize = symtab
+    symbols = []
+    for index in range(count):
+        base = symoff + index * 16
+        name = _string(data, stroff + _field(data, base, 4), stroff + strsize)
+        kind_bits, number, description = _field(data, base + 4, 1), _field(data, base + 5, 1), _field(data, base + 6, 2)
+        value = _field(data, base + 8, 8)
+        if kind_bits & 0xE0:
+            continue  # Debugger (stab) entry.
+        section = None
+        if kind_bits & 0x0E == 0x0:
+            kind = "common" if value else "undefined"
+        elif kind_bits & 0x0E == 0xE:
+            if not 0 < number < len(ordered):
+                raise ValueError(f"symbol {name} names a nonexistent section")
+            section = ordered[number]
+            kind = "function" if sections[section].executable else "object"
+        else:
+            kind = {0x2: "absolute", 0xA: "indirect"}.get(kind_bits & 0x0E, "other")
+        binding = "weak" if description & 0xC0 else ("global" if kind_bits & 0x01 else "local")
+        symbols.append(ObjectSymbol(name[1:] if name.startswith("_") else name, section, value, None, kind, binding))
+    return ObjectImage(True, sections, symbols)
+
+
+def function_extents(image: ObjectImage) -> dict[str, tuple[str, int, int]]:
+    """(section, start, end) of every function symbol defined in an executable section.
+
+    ELF extents are the recorded symbol sizes; Mach-O records none, so a symbol extends to the next distinct
+    defined address in its section (or the section end). Extents must lie inside their section; distinct
+    function extents in one section must not overlap; a name may be defined only once.
     """
+    extents: dict[str, tuple[str, int, int]] = {}
+    for symbol in image.symbols:
+        # ELF notype labels (mapping symbols) and section symbols are not functions.
+        if symbol.section is None or not image.sections[symbol.section].executable or symbol.kind != "function":
+            continue
+        section = image.sections[symbol.section]
+        if image.macho:
+            later = sorted({other.value for other in image.symbols if other.section == symbol.section
+                            and other.value > symbol.value})
+            end = later[0] if later else section.address + section.size
+        else:
+            if not symbol.size:
+                raise ValueError(f"function symbol {symbol.name} records no size")
+            end = symbol.value + symbol.size
+        if not section.address <= symbol.value < end <= section.address + section.size:
+            raise ValueError(f"function symbol {symbol.name} lies outside its section")
+        if symbol.name in extents:
+            raise ValueError(f"symbol defined twice in the witness: {symbol.name}")
+        extents[symbol.name] = (symbol.section, symbol.value, end)
+    spans = sorted(set(extents.values()))
+    for (section, start, end), (other, other_start, other_end) in zip(spans, spans[1:]):
+        if section == other and other_start < end:
+            raise ValueError(f"function extents overlap in {section} at {other_start:#x}")
+    return extents
+
+
+def trusted_imports(image: ObjectImage) -> set[str]:
+    """Names bound to exactly one symbol: an undefined, strongly bound import."""
+    names = [symbol.name for symbol in image.symbols]
+    return {symbol.name for symbol in image.symbols if symbol.kind == "undefined" and symbol.binding == "global"
+            and names.count(symbol.name) == 1}
+
+
+def parse_disassembly(disassembly: str, macho: bool) -> tuple[dict[str, dict[int, list]], list[tuple[str, int, str]]]:
+    """Instruction map per section {address: [text, relocation]} and (section, address, name) headings."""
     def symbol(name: str) -> str:
         return name[1:] if macho and name.startswith("_") else name
 
@@ -234,54 +426,100 @@ def normalize_disassembly(disassembly: str, macho: bool) -> dict[str, list[str]]
     formats = [FORMAT_LINE.match(line).group(1) for line in lines if FORMAT_LINE.match(line)]
     if len(formats) != 1 or OBJECT_FORMATS.get(formats[0]) != macho:
         raise ValueError(f"disassembly object format {formats} does not match the witness object")
-    functions: list[dict] = []
-    section = None
+    code: dict[str, dict[int, list]] = {}
+    headings: list[tuple[str, int, str]] = []
+    section, last = None, None
     for line in lines:
         if not line.strip() or FORMAT_LINE.match(line):
             continue
         if SECTION_LINE.match(line):
-            section = SECTION_LINE.match(line).group(1)
+            section, last = SECTION_LINE.match(line).group(1), None
+            if section in code:
+                raise ValueError(f"section disassembled twice: {section}")
+            code[section] = {}
             continue
         if SYMBOL_LINE.match(line):
             if section is None:
                 raise ValueError(f"disassembly symbol outside a section: {line}")
             address, name = SYMBOL_LINE.match(line).groups()
-            functions.append({"name": symbol(name), "section": section, "start": int(address, 16), "code": []})
+            headings.append((section, int(address, 16), symbol(name)))
             continue
         relocation = RELOCATION_LINE.match(line)
         if relocation:
-            if not functions or not functions[-1]["code"] or functions[-1]["code"][-1][0] != int(relocation.group(1), 16):
+            if last is None or last != int(relocation.group(1), 16):
                 raise ValueError(f"relocation does not follow its instruction: {line.strip()}")
-            if functions[-1]["code"][-1][2] is not None:
+            if code[section][last][1] is not None:
                 raise ValueError(f"instruction carries two relocations: {line.strip()}")
-            functions[-1]["code"][-1][2] = (relocation.group(2), symbol(relocation.group(3)))
+            code[section][last][1] = (relocation.group(2), symbol(relocation.group(3)))
             continue
         instruction = INSTRUCTION_LINE.match(line)
-        if instruction and functions:
-            text = instruction.group(2).split("//", 1)[0].strip()
-            functions[-1]["code"].append([int(instruction.group(1), 16), text, None])
+        if instruction and section is not None and headings and headings[-1][0] == section:
+            address = int(instruction.group(1), 16)
+            if last is not None and address <= last:
+                raise ValueError(f"disassembly addresses out of order in {section} at {address:#x}")
+            code[section][address] = [instruction.group(2).split("//", 1)[0].strip(), None]
+            last = address
             continue
         raise ValueError(f"unparseable disassembly line: {line.strip()}")
-    names = [function["name"] for function in functions]
-    duplicates = sorted({name for name in names if names.count(name) > 1})
-    if duplicates:
-        raise ValueError(f"symbol defined twice in the witness: {duplicates[0]}")
+    return code, headings
+
+
+def normalize_disassembly(disassembly: str, image: ObjectImage) -> dict[str, list[str]]:
+    """Translate disassembler output into one normalised body per function symbol of the object.
+
+    Coverage is complete and bound to the object: every executable section is disassembled at every 4-byte
+    address of its extent, in order, exactly once; every heading names a symbol defined at that address; and
+    each function body is cut from its object symbol extent, not from the printed headings. Branch targets
+    inside the function become local labels; relocated branches name their relocation symbol; page/low-12
+    relocations become symbolic operands; ELF data mapping symbols inside a function mark data in code.
+    """
+    code, headings = parse_disassembly(disassembly, image.macho)
+    for name, section in image.sections.items():
+        if not section.executable:
+            if name in code:
+                raise ValueError(f"disassembly covers a non-executable section: {name}")
+            continue
+        if section.size % 4 or section.address % 4:
+            raise ValueError(f"executable section {name} is not instruction aligned")
+        expected = list(range(section.address, section.address + section.size, 4))
+        if sorted(code.get(name, {})) != expected:
+            missing = sorted(set(expected) - set(code.get(name, {})))
+            raise ValueError(f"disassembly does not cover executable section {name} exactly "
+                             f"(missing {[hex(address) for address in missing[:3]]})")
+    for name in code:
+        if name not in image.sections:
+            raise ValueError(f"disassembly names a section the object does not define: {name}")
+    defined = {(symbol.section, symbol.value, symbol.name) for symbol in image.symbols if symbol.section}
+    for heading in headings:
+        if heading not in defined:
+            raise ValueError(f"disassembly heading is not a symbol defined at that address: {heading[2]}")
+    extents = function_extents(image)
+    owned = {(section, address) for section, start, end in extents.values() for address in range(start, end, 4)}
+    for name, instructions in code.items():
+        orphans = [address for address, (text, _) in instructions.items()
+                   if (name, address) not in owned and text != "nop"]
+        if orphans:
+            raise ValueError(f"code outside every function extent in {name} at {orphans[0]:#x}")
+    starts: dict[tuple[str, int], str] = {}
+    for name, (section, start, _) in sorted(extents.items()):
+        starts.setdefault((section, start), name)
+    data_marks = {(symbol.section, symbol.value) for symbol in image.symbols
+                  if not image.macho and re.match(r"^\$d(?:\.|$)", symbol.name)}
     bodies: dict[str, list[str]] = {}
-    starts = {(function["section"], function["start"]): function["name"] for function in functions}
-    for index, function in enumerate(functions):
-        following = [other["start"] for other in functions[index + 1:] if other["section"] == function["section"]]
-        end = following[0] if following else (function["code"][-1][0] + 4 if function["code"] else function["start"])
+    for name, (section, start, end) in extents.items():
+        function = {"section": section, "start": start}
         rewritten, targets = [], set()
-        for address, text, relocation in function["code"]:
-            if not function["start"] <= address < end:
-                raise ValueError(f"instruction outside its function: {function['name']}+{address:#x}")
+        for address in range(start, end, 4):
+            text, relocation = code[section][address]
             rewritten.append((address, rewrite(text, relocation, function, end, starts, targets)))
-        body = [f'\t.section .text.{function["section"].replace(",", ".")},"ax"']
+        body = [f'\t.section .text.{section.replace(",", ".")},"ax"']
         for address, text in rewritten:
             if address in targets:
                 body.append(f".L{address:x}:")
+            if (section, address) in data_marks:
+                body.append("\t.data-mapping-symbol")
             body.append(f"\t{text}")
-        bodies[function["name"]] = body
+        bodies[name] = body
     return bodies
 
 
@@ -912,6 +1150,9 @@ class Analysis:
             return False
         values = [state.value(gp(operand)) for operand in inputs if gp(operand)]
         stack_inputs = any(provenance(value) != "N" for value in values)
+        if stack_inputs and any(operand_kind(operand) == "reloc" for operand in inputs):
+            self.fail(instruction, "relocated arithmetic on a stack address")
+            return False
         registers = fp_registers(destination)
         if registers is not None:
             if stack_inputs:
@@ -959,7 +1200,7 @@ class Analysis:
         return True
 
 
-def proven_noreturn(symbol: str, bodies: dict[str, list[str]], dialect: Dialect) -> bool:
+def proven_noreturn(symbol: str, bodies: dict[str, list[str]], dialect: Dialect, imports: set[str]) -> bool:
     """The fatal diagnostic is exempt only if every reachable instruction is an admitted form, its only calls are
     the trusted diagnostic calls, and its body is acyclic with every path ending in a call to abort()."""
     body = bodies.get(symbol)
@@ -980,6 +1221,9 @@ def proven_noreturn(symbol: str, bodies: dict[str, list[str]], dialect: Dialect)
             if instruction.base == "bl":
                 if target in labels or dialect.local(target):
                     valid = False
+                    break
+                if target not in imports:
+                    valid = False  # Trusted only as an undefined, strongly bound import; never a local body.
                     break
                 if dialect.symbol(target) in NORETURN_LEAVES:
                     ends = True
@@ -1034,10 +1278,10 @@ def analyse_function(name: str, bodies: dict[str, list[str]], dialect: Dialect,
     return analysis.spills, analysis.errors
 
 
-def noreturn_symbols(bodies: dict[str, list[str]], dialect: Dialect) -> set[str]:
+def noreturn_symbols(bodies: dict[str, list[str]], dialect: Dialect, imports: set[str]) -> set[str]:
     """The only symbol a tile program may call: the exact fatal diagnostic, when proven never to return."""
     return {name for name in bodies if dialect.symbol(name) == FATAL_DIAGNOSTIC and
-            proven_noreturn(name, bodies, dialect)}
+            proven_noreturn(name, bodies, dialect, imports)}
 
 
 def program_key(name: str) -> str:
@@ -1058,31 +1302,18 @@ ENVELOPE_PROGRAMS = {
 TILE_RUN = re.compile(r"27CPUNativeNEONProjectionTileILm\d+EE3run")
 
 
-SYMBOL_TABLE_LINE = re.compile(r"^[0-9a-f]{8,16} (.{7}) (\S+)\s+(?:[0-9a-f]{8,16}\s+)?(\S+)$")
-
-
-def function_symbols(table: str, macho: bool) -> set[str]:
-    """Names of the function symbols in the object's symbol table (objdump -t)."""
-    names = set()
-    for line in table.splitlines():
-        match = SYMBOL_TABLE_LINE.match(line)
-        if match and "F" in match.group(1):
-            name = match.group(3)
-            names.add(name[1:] if macho and name.startswith("_") else name)
-    return names
-
-
-def audit(data: bytes, disassembly: str, symbols: str, mode: str) -> dict[str, int]:
+def audit(data: bytes, disassembly: str, mode: str) -> dict[str, int]:
     """Per-program FP/SIMD spill counts of the tile programs actually assembled into the witness object.
 
-    The expected programs derive from the admitted envelope; the object's embedded inventory, its symbol table
-    and its disassembly must all agree with it. Structural failures (missing/duplicate/unexpected/empty
-    programs, unsupported calls, indirect branches, unclassifiable forms, ambiguous or unclassifiable stack
-    addressing, unproven ABI saves) are fatal and never paid from a spill budget.
+    The expected programs derive from the admitted envelope; the object's embedded inventory, its function
+    symbols and the complete disassembly of its executable sections must all agree. Structural failures
+    (missing/duplicate/unexpected/empty programs, incomplete coverage, unsupported calls, indirect branches,
+    unclassifiable forms, ambiguous or unclassifiable stack addressing, unproven ABI saves) are fatal and
+    never paid from a spill budget.
     """
     if mode not in ENVELOPE_PROGRAMS:
         raise ValueError(f"no tile program inventory for ISA envelope {mode}")
-    macho = object_format(data)
+    image = read_object(data)
     inventory = object_inventory(data)
     if inventory != [",".join(ENVELOPE_PROGRAMS[mode])]:
         raise ValueError(f"probe instantiation inventory {inventory} does not match the {mode} envelope")
@@ -1093,15 +1324,14 @@ def audit(data: bytes, disassembly: str, symbols: str, mode: str) -> dict[str, i
         for policy in (0, 1):
             for encoding, nibble_map, minimum in DISPATCH:
                 expected.add((int(rows), leaf, policy, encoding, nibble_map, minimum))
-    bodies = normalize_disassembly(disassembly, macho)
-    table = {name for name in function_symbols(symbols, macho) if TILE_RUN.search(name)}
-    disassembled = {name for name in bodies if TILE_RUN.search(name)}
-    if table != disassembled:
-        raise ValueError(f"symbol table and disassembly disagree on tile programs: "
-                         f"{sorted(table ^ disassembled)[:3]}")
-    noreturn = noreturn_symbols(bodies, GENERIC)
+    bodies = normalize_disassembly(disassembly, image)
+    tile_symbols = sorted(symbol.name for symbol in image.symbols if TILE_RUN.search(symbol.name))
+    for symbol in tile_symbols:
+        if symbol not in bodies:
+            raise ValueError(f"tile program symbol is not a function in an executable section: {symbol}")
+    noreturn = noreturn_symbols(bodies, GENERIC, trusted_imports(image))
     found: dict[tuple, str] = {}
-    for name in sorted(disassembled):
+    for name in tile_symbols:
         match = PROGRAM.search(name)
         if not match:
             raise ValueError(f"unrecognized tile program symbol: {name}")
@@ -1228,8 +1458,8 @@ def require_absolute_source(source: str) -> None:
         raise ValueError(f"the witness probe path must be absolute: {source}")
 
 
-def disassembler_commands(tool: str, obj: Path) -> tuple[list[str], list[str], str]:
-    """Disassembly and symbol-table commands for the configured objdump, and its version text."""
+def disassembler_command(tool: str, obj: Path) -> tuple[list[str], str]:
+    """Disassembly command for the configured objdump, and its version text."""
     version = subprocess.check_output([tool, "--version"], text=True)
     if "GNU objdump" in version:
         options = ["-d", "-r", "-z", "--no-show-raw-insn"]
@@ -1237,14 +1467,120 @@ def disassembler_commands(tool: str, obj: Path) -> tuple[list[str], list[str], s
         options = ["-d", "-r", "-z", "--no-show-raw-insn", "--triple=aarch64"]  # Generic, not Apple, printer.
     else:
         raise ValueError(f"unsupported disassembler: {version.splitlines()[0] if version else tool}")
-    return [tool] + options + [str(obj)], [tool, "-t", str(obj)], version
+    return [tool] + options + [str(obj)], version
 
 
-def disassemble(tool: str, obj: Path) -> tuple[str, str, list[str], list[str], str]:
-    disassembly_command, symbol_command, version = disassembler_commands(tool, obj)
-    disassembly = subprocess.check_output(disassembly_command, text=True)
-    symbols = subprocess.check_output(symbol_command, text=True)
-    return disassembly, symbols, disassembly_command, symbol_command, version
+def disassemble(tool: str, obj: Path) -> tuple[str, list[str], str]:
+    command, version = disassembler_command(tool, obj)
+    return subprocess.check_output(command, text=True), command, version
+
+
+ASM_KEYWORD = re.compile(r"(?<![\w$])(?:asm|__asm|__asm__)(?![\w$])")
+ASM_QUALIFIERS = re.compile(r"\s*(?:volatile|__volatile__|__volatile|inline|__inline__|goto)\b")
+ASSEMBLER_FILE_INPUT = re.compile(r"\.(?:include|incbin)(?![\w$])", re.IGNORECASE)
+LITERAL_START = re.compile(r'(?:u8|u|U|L)?(R?)"')
+ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v"}
+
+
+def _literal(text: str, index: int) -> tuple[str, int]:
+    """Decode the C/C++ string literal starting at index; return (contents, index after it)."""
+    start = LITERAL_START.match(text, index)
+    if not start:
+        raise ValueError("not a string literal")
+    position = start.end()
+    if start.group(1):  # Raw string: R"delimiter( ... )delimiter"
+        delimiter = text[position:text.index("(", position)]
+        close = text.index(f"){delimiter}\"", position)
+        return text[position + len(delimiter) + 1:close], close + len(delimiter) + 2
+    decoded = []
+    while True:
+        if position >= len(text) or text[position] == "\n":
+            raise ValueError("unterminated string literal")
+        character = text[position]
+        if character == '"':
+            return "".join(decoded), position + 1
+        if character != "\\":
+            decoded.append(character)
+            position += 1
+            continue
+        escape = text[position + 1]
+        if escape == "x":
+            digits = re.match(r"[0-9a-fA-F]+", text[position + 2:]).group()
+            decoded.append(chr(int(digits, 16) % 0x110000))
+            position += 2 + len(digits)
+        elif escape in "01234567":
+            digits = re.match(r"[0-7]{1,3}", text[position + 1:]).group()
+            decoded.append(chr(int(digits, 8)))
+            position += 1 + len(digits)
+        elif escape in "uU":
+            width = 4 if escape == "u" else 8
+            decoded.append(chr(int(text[position + 2:position + 2 + width], 16) % 0x110000))
+            position += 2 + width
+        else:
+            decoded.append(ESCAPES.get(escape, escape))
+            position += 2
+
+
+def _inside_literal(text: str, start: int, end: int) -> bool:
+    """Whether end lies inside a string or character literal opened on the same line after start."""
+    quote, position = None, start
+    while position < end:
+        character = text[position]
+        if quote:
+            if character == "\\":
+                position += 2
+                continue
+            if character == quote:
+                quote = None
+        elif character in "\"'":
+            quote = character
+        position += 1
+    return quote is not None
+
+
+def assembler_file_inputs(preprocessed: str) -> list[str]:
+    """Inline-assembly directives that make the assembler read external files (.include/.incbin).
+
+    The compiler's dependency lists name preprocessing inputs only; a file consumed by the assembler through
+    inline assembly is not in them, so the witness rejects any such directive rather than leave it unbound.
+    Every asm construct of the preprocessed translation unit is parsed: its string literals are decoded and
+    concatenated (adjacent-literal joining and escapes cannot hide a directive). Unparseable asm fails.
+    """
+    findings = []
+    for match in ASM_KEYWORD.finditer(preprocessed):
+        line_start = preprocessed.rfind("\n", 0, match.start()) + 1
+        if preprocessed[line_start:match.start()].lstrip().startswith("#") or \
+                _inside_literal(preprocessed, line_start, match.start()):
+            continue
+        position = match.end()
+        while True:
+            qualifier = ASM_QUALIFIERS.match(preprocessed, position)
+            if not qualifier:
+                break
+            position = qualifier.end()
+        while position < len(preprocessed) and preprocessed[position].isspace():
+            position += 1
+        if position >= len(preprocessed) or preprocessed[position] != "(":
+            raise ValueError(f"unclassifiable inline assembly near: {preprocessed[line_start:match.end() + 40]!r}")
+        depth, position, contents = 1, position + 1, []
+        while depth:
+            if position >= len(preprocessed):
+                raise ValueError("unterminated inline assembly")
+            literal = LITERAL_START.match(preprocessed, position)
+            if literal and (position == 0 or not (preprocessed[position - 1].isalnum() or
+                                                   preprocessed[position - 1] in "_$")):
+                content, position = _literal(preprocessed, position)
+                contents.append(content)
+                continue
+            character = preprocessed[position]
+            if character == "'":
+                position = preprocessed.index("'", position + 1 + (preprocessed[position + 1] == "\\")) + 1
+                continue
+            depth += {"(": 1, ")": -1}.get(character, 0)
+            position += 1
+        if ASSEMBLER_FILE_INPUT.search("".join(contents)):
+            findings.append(preprocessed[match.start():position][:120])
+    return findings
 
 
 def build(args: argparse.Namespace) -> None:
@@ -1253,11 +1589,11 @@ def build(args: argparse.Namespace) -> None:
     output = Path(args.proof)
     output.parent.mkdir(parents=True, exist_ok=True)
     obj, dependencies = output.with_suffix(".o"), output.with_suffix(".deps")
-    disassembly_path, symbols_path = output.with_suffix(".dis"), output.with_suffix(".sym")
+    disassembly_path, translation_unit = output.with_suffix(".dis"), output.with_suffix(".i")
     preprocessed, depfile, temporary = output.with_suffix(".pre.deps"), output.with_suffix(".d"), output.with_suffix(".tmp")
-    # proof.s: the retired assembly-text witness of earlier schemas.
-    for stale in (output, temporary, obj, dependencies, preprocessed, depfile, disassembly_path, symbols_path,
-                  output.with_suffix(".s")):
+    # proof.s / proof.sym: retired artifacts of earlier schemas.
+    for stale in (output, temporary, obj, dependencies, preprocessed, depfile, disassembly_path, translation_unit,
+                  output.with_suffix(".s"), output.with_suffix(".sym")):
         stale.unlink(missing_ok=True)
     command, directory = envelope.target_command(args)
     version = subprocess.check_output([command[0], "--version"], cwd=directory, text=True)
@@ -1267,6 +1603,10 @@ def build(args: argparse.Namespace) -> None:
     subprocess.run(command + WITNESS_FLAGS + ["-M", "-MF", str(preprocessed), "-MT", "probe", args.source],
                    cwd=directory, check=True, stdout=subprocess.DEVNULL)
     before = bind_inputs(read_depfile(preprocessed, directory))
+    subprocess.run(command + WITNESS_FLAGS + ["-E", args.source, "-o", str(translation_unit)], cwd=directory, check=True)
+    external = assembler_file_inputs(translation_unit.read_text(errors="replace"))
+    if external:
+        raise ValueError(f"inline assembly reads files the dependency closure cannot bind: {external[:2]}")
     executed = executed_command(command, args.source, obj, dependencies)
     subprocess.run(executed, cwd=directory, check=True)
     closure = read_depfile(dependencies, directory)
@@ -1276,13 +1616,12 @@ def build(args: argparse.Namespace) -> None:
     if after != before:
         changed = sorted(path for path in closure if before[path] != after[path])
         raise ValueError(f"inputs changed while the witness compiled: {changed[:3]}")
-    disassembly, symbols, disassembly_command, symbol_command, tool_version = disassemble(args.disassembler, obj)
+    disassembly, disassembly_command, tool_version = disassemble(args.disassembler, obj)
     disassembly_path.write_text(disassembly)
-    symbols_path.write_text(symbols)
-    counts = audit(obj.read_bytes(), disassembly, symbols, args.mode)
+    counts = audit(obj.read_bytes(), disassembly, args.mode)
     require_registers(counts, args.identity, args.mode)
     result = {
-        "schema": 5, "signature": args.signature, "identity": identity, "mode": args.mode,
+        "schema": 6, "signature": args.signature, "identity": identity, "mode": args.mode,
         "checker_sha256": envelope.digest(Path(__file__)),
         "envelope_sha256": envelope.digest(_ENVELOPE),
         "budget_sha256": envelope.digest(BUDGET_PATH),
@@ -1293,8 +1632,8 @@ def build(args: argparse.Namespace) -> None:
         "object_file": obj.name, "object_sha256": envelope.digest(obj),
         "disassembler": args.disassembler, "disassembler_version": tool_version,
         "disassembler_sha256": envelope.digest(Path(os.path.realpath(args.disassembler))),
-        "disassembly_command": disassembly_command, "symbol_command": symbol_command,
-        "disassembly_sha256": envelope.digest(disassembly_path), "symbols_sha256": envelope.digest(symbols_path),
+        "disassembly_command": disassembly_command, "disassembly_sha256": envelope.digest(disassembly_path),
+        "translation_unit_sha256": envelope.digest(translation_unit),
         "program_violations": counts,
     }
     # Ninja depfile: resolved paths (Ninja canonicalises ".." lexically, which would name another file).
@@ -1310,7 +1649,7 @@ def verify(args: argparse.Namespace) -> None:
     require_absolute_source(args.source)
     proof_path = Path(args.proof)
     proof = json.loads(proof_path.read_text())
-    if (proof.get("schema") != 5 or proof.get("signature") != args.signature or
+    if (proof.get("schema") != 6 or proof.get("signature") != args.signature or
             proof.get("identity") != args.identity or proof.get("mode") != args.mode):
         raise ValueError("tile register proof has a foreign schema/configuration")
     if compiler_identity(str(proof.get("compiler_version", ""))) != args.identity:
@@ -1339,15 +1678,18 @@ def verify(args: argparse.Namespace) -> None:
     if proof.get("disassembler") != args.disassembler or \
             proof.get("disassembler_sha256") != envelope.digest(Path(os.path.realpath(args.disassembler))):
         raise ValueError("configured disassembler changed after the register witness")
-    disassembly, symbols, disassembly_command, symbol_command, tool_version = disassemble(args.disassembler, obj)
-    if (disassembly_command != proof.get("disassembly_command") or symbol_command != proof.get("symbol_command")
-            or tool_version != proof.get("disassembler_version")):
+    disassembly, disassembly_command, tool_version = disassemble(args.disassembler, obj)
+    if disassembly_command != proof.get("disassembly_command") or tool_version != proof.get("disassembler_version"):
         raise ValueError("disassembler invocation changed after the register witness")
-    for path, text, key in ((proof_path.with_suffix(".dis"), disassembly, "disassembly_sha256"),
-                            (proof_path.with_suffix(".sym"), symbols, "symbols_sha256")):
-        if not path.is_file() or path.read_text() != text or proof.get(key) != envelope.digest(path):
-            raise ValueError(f"retained disassembly does not match the bound object: {path.name}")
-    counts = audit(obj.read_bytes(), disassembly, symbols, args.mode)
+    retained = proof_path.with_suffix(".dis")
+    if not retained.is_file() or retained.read_text() != disassembly or \
+            proof.get("disassembly_sha256") != envelope.digest(retained):
+        raise ValueError(f"retained disassembly does not match the bound object: {retained.name}")
+    unit = proof_path.with_suffix(".i")
+    if not unit.is_file() or proof.get("translation_unit_sha256") != envelope.digest(unit) or \
+            assembler_file_inputs(unit.read_text(errors="replace")):
+        raise ValueError("retained translation unit is missing, changed or reads assembler files")
+    counts = audit(obj.read_bytes(), disassembly, args.mode)
     if proof.get("program_violations") != counts:
         raise ValueError("tile register evidence changed")
     require_registers(counts, args.identity, args.mode)
@@ -1361,8 +1703,8 @@ def census(args: argparse.Namespace) -> None:
     obj = Path(args.proof).with_suffix(".census.o")
     obj.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(command + WITNESS_FLAGS + ["-c", args.source, "-o", str(obj)], cwd=directory, check=True)
-    disassembly, symbols, *_ = disassemble(args.disassembler, obj)
-    counts = audit(obj.read_bytes(), disassembly, symbols, args.mode)
+    disassembly, *_ = disassemble(args.disassembler, obj)
+    counts = audit(obj.read_bytes(), disassembly, args.mode)
     print(json.dumps({"identity": compiler_identity(version), "mode": args.mode,
                       "programs": {program_key(name): count for name, count in counts.items()}},
                      indent=1, sort_keys=True))
