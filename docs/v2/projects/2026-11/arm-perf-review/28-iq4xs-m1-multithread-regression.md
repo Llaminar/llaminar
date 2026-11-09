@@ -265,3 +265,19 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   (PASS line + "Generating proof.json, proof.s" = build-only output); Mac tree
   (stable manifest) lists the edge directly; proof.s = declared OUTPUT +
   DEPENDS → lifecycle holds.
+
+## SOURCE117 FINAL (2026-11-09) — successor scope (SOURCE118)
+
+- P1a indexed-load provenance (unknown-address loads accepted; dest NOT_STACK
+  with live pointer slots → half-reconstruction zero-counted); tainted joins
+  by union lose nonstack alternatives → MAY/MUST slot lattice.
+- P1b CSINC/CSINV/CSNEG transform-or-reject; width-vs-extent + Apple lane
+  arrangements (.s .1d etc.) for ALL slot-protecting accesses; Apple + ELF
+  overlap controls.
+- P1c alignment-directive OPERAND validation (fill bytes executable);
+  section-at-global-label; dialect bound to real format declarations; per-op
+  FORM admission (operand-less add fails).
+- P2a diagnostic proof under admitted grammar + exact-exception set
+  (noreturn_symbols direct-abort alignment).
+- P2b probe-source spelling preserved (abspath collapse false-rejection).
+- Progress kept; never alter production allocation; owner evidence separate.
