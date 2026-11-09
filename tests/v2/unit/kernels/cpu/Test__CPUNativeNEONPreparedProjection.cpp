@@ -737,4 +737,61 @@ TEST_F(CPUNativeNEONPreparedProjection, ActivationSumsIncludeSignedMinimum)
         EXPECT_EQ(activationHalfSum(values.data()), expected[0] + expected[1]);
     }
 }
+
+namespace
+{
+/**
+ * @brief Prove dotLane<G> over a loaded block equals dot() over group G's broadcast word.
+ * @tparam Ops Admitted family.
+ * @details Seeds include the extreme byte pairs (-128 x -128, -128 x 127) on
+ * every lane, so widening, sign and accumulation are all exercised.
+ */
+template <typename Ops> void verifyDotLanes()
+{
+    using I = typename Ops::I;
+    for (int seed = 0; seed < 64; ++seed)
+    {
+        std::array<std::int8_t, 32> activation;
+        std::array<std::int8_t, 16> weights;
+        for (int k = 0; k < 32; ++k)
+            activation[k] = static_cast<std::int8_t>(seed < 2 ? -128 : (seed * 37 + k * 101) % 256 - 128);
+        for (int k = 0; k < 16; ++k)
+            weights[k] = static_cast<std::int8_t>(seed == 0 ? -128 : seed == 1 ? 127 : (seed * 53 + k * 71) % 256 - 128);
+        const auto block = Ops::activationBlock(activation.data());
+        const auto weight_vector = std::bit_cast<I>(weights);
+        const I acc{seed, -seed, 1 << 20, -(1 << 20)};
+        [&]<int... G>(std::integer_sequence<int, G...>) {
+            ([&] {
+                std::int32_t word;
+                std::memcpy(&word, activation.data() + G * 4, sizeof(word));
+                const I expected = Ops::dot(acc, weight_vector, I{} + word);
+                const I actual = Ops::template dotLane<G>(acc, weight_vector, block);
+                EXPECT_EQ(std::memcmp(&expected, &actual, sizeof(I)), 0) << "seed=" << seed << " group=" << G;
+            }(), ...);
+        }(std::make_integer_sequence<int, 8>{});
+    }
+}
+} // namespace
+
+/** @test Lane-indexed activation dots equal broadcast-word dots (ASIMD). */
+TEST(CPUNativeNEONMultiScaleOps, ASIMDDotLaneEqualsBroadcastDot)
+{ verifyDotLanes<ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>>(); }
+
+#if defined(__ARM_FEATURE_DOTPROD)
+/** @test Lane-indexed activation dots equal broadcast-word dots (DotProd). */
+TEST(CPUNativeNEONMultiScaleOps, DotProdDotLaneEqualsBroadcastDot)
+{
+    cpu::ARMCPUCapabilities::native().requireCompiledEnvelope(); // The envelope is admitted, never skipped.
+    verifyDotLanes<ms::NEONMultiScaleOps<ms::NEONByteDot::DotProd>>();
+}
+#endif
+
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+/** @test The I8MM family's single-row lane leaf equals its broadcast SDOT leaf. */
+TEST(CPUNativeNEONMultiScaleOps, I8MMDotLaneEqualsBroadcastDot)
+{
+    cpu::ARMCPUCapabilities::native().requireCompiledEnvelope(); // The envelope is admitted, never skipped.
+    verifyDotLanes<ms::NEONMultiScaleOps<ms::NEONByteDot::I8MM>>();
+}
+#endif
 } // namespace llaminar2::test
