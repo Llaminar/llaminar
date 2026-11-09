@@ -148,13 +148,13 @@ envelope = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(envelope)
 
 PROGRAM = re.compile(r"27CPUNativeNEONProjectionTileILm(\d)EE3runINS1_11multi_scale17NEONMultiScaleOpsILNS\d+_11NEONByteDotE(\d)EEE"
-                     r"LNS_28CPUProjectionNumericalPolicyE(\d)ELNS1_21CPUNativeQuantisedEncodingE(\d)ELNS\d+_9NibbleMapE(\d)ELb(\d)E")
+                     r"LNS_28CPUProjectionNumericalPolicyE(\d)ELNS1_26CPUNativeQuantisedEncodingE(\d)ELNS\d+_9NibbleMapE(\d)ELb(\d)E")
 INVENTORY = re.compile(r"llaminar-native-neon-tile-probe:([A-Za-z0-9,:]*)")
 # (encoding, nibble map, with-minimum) dispatched per policy by Tile::dispatch().
 DISPATCH = ((1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1))
 DOTS = {"ASIMD": 0, "DotProd": 1, "I8MM": 2}
 # The one never-returning diagnostic a tile may call, and abort. Both must also be proven never to return.
-FATAL_DIAGNOSTIC = "_ZN9llaminar23cpu11native_quantised23CPUNativeQuantisedWeightView32rejectOutsideAdmittedPublicationEv"
+FATAL_DIAGNOSTIC = "_ZN9llaminar23cpu16native_quantised28CPUNativeQuantisedWeightView32rejectOutsideAdmittedPublicationEv"
 NORETURN_LEAVES = {"abort"}
 
 LABEL = re.compile(r"^([A-Za-z_.$][\w.$]*):(.*)$")
@@ -1465,7 +1465,7 @@ ENVELOPE_PROGRAMS = {
                   "2:I8MM", "3:I8MM", "4:I8MM"),
 }
 TILE_RUN = re.compile(r"27CPUNativeNEONProjectionTileILm\d+EE3run")
-TILE_PROGRAM = re.compile(r"_ZNK9llaminar23cpu11native_quantised" + PROGRAM.pattern + r"EEvv")
+TILE_PROGRAM = re.compile(r"_ZNK9llaminar23cpu16native_quantised" + PROGRAM.pattern + r"EEvv")
 
 
 def audit(data: bytes, disassembly: str, mode: str) -> dict[str, int]:

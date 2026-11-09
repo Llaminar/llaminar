@@ -44,7 +44,7 @@ DISPATCHED = [(1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), 
 NEON_KEYS = sorted((rows, 0, policy, encoding, nibble_map, minimum)
                    for rows in (1, 2, 3, 4) for policy in (0, 1) for encoding, nibble_map, minimum in DISPATCHED)
 NEON_INVENTORY = "1:ASIMD,2:ASIMD,3:ASIMD,4:ASIMD"
-FATAL = "_ZN9llaminar23cpu11native_quantised23CPUNativeQuantisedWeightView32rejectOutsideAdmittedPublicationEv"
+FATAL = "_ZN9llaminar23cpu16native_quantised28CPUNativeQuantisedWeightView32rejectOutsideAdmittedPublicationEv"
 CLEAN = "\tstp\tx29, x30, [sp, #-16]!\n\tmov\tx29, sp\n\tsdot\tv0.4s, v1.16b, v2.16b\n\tldp\tx29, x30, [sp], #16\n\tret"
 FATAL_BODY = "\tstp\tx29, x30, [sp, #-16]!\n\tmov\tx29, sp\n\tbl\tfwrite\n\tbl\tabort\n"
 BRANCH = re.compile(r"^(?:b|bl|cbz|cbnz|tbz|tbnz|b\.\w+)$")
@@ -52,8 +52,8 @@ BRANCH = re.compile(r"^(?:b|bl|cbz|cbnz|tbz|tbnz|b\.\w+)$")
 
 def name(rows: int, dot: int, policy: int, encoding: int, nibble_map: int, minimum: int) -> str:
     """Mangled tile run<> symbol for one program key."""
-    return (f"_ZNK9llaminar23cpu11native_quantised27CPUNativeNEONProjectionTileILm{rows}EE3runINS1_11multi_scale17"
-            f"NEONMultiScaleOpsILNS5_11NEONByteDotE{dot}EEELNS_28CPUProjectionNumericalPolicyE{policy}ELNS1_21"
+    return (f"_ZNK9llaminar23cpu16native_quantised27CPUNativeNEONProjectionTileILm{rows}EE3runINS1_11multi_scale17"
+            f"NEONMultiScaleOpsILNS5_11NEONByteDotE{dot}EEELNS_28CPUProjectionNumericalPolicyE{policy}ELNS1_26"
             f"CPUNativeQuantisedEncodingE{encoding}ELNS3_9NibbleMapE{nibble_map}ELb{minimum}EEEvv")
 
 
