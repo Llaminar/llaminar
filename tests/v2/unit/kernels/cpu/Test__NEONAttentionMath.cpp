@@ -196,6 +196,31 @@ TEST_F(NEONAttentionMath, Q16BoundRejectsUnprovenReductions)
     }
 }
 
+/**
+ * @test Tail-bearing adversarial input: n = 65 so one code is handled by the
+ * scalar tail after a vector fold already at 2,113,929,216. The invalid tail
+ * code must be rejected before any int32 tail arithmetic (which would exceed
+ * INT32_MAX), for every row program and for invalid codes in the vector part.
+ */
+TEST_F(NEONAttentionMath, Q16BoundRejectsInvalidTailCodesBeforeTailArithmetic)
+{
+    const auto bound=cpu::Q16ReductionBound::forTerms(65);
+    ASSERT_EQ(bound.queryLimit(),1008);
+    std::vector<std::int16_t> query(65,std::int16_t(-1008)),key(65,std::int16_t(-32768));
+    const std::array<std::span<const std::int16_t>,4> keys{key,key,key,key};
+    // Valid: 65 * 1008 * 32768 = 2,146,959,360 <= INT32_MAX, exact in int32.
+    for(const auto value:native::integerDot<4>(bound,query,keys))EXPECT_EQ(value,std::int32_t(2146959360));
+    for(const std::int16_t bad:{std::int16_t(-32768),std::int16_t(1009),std::int16_t(-1009),std::int16_t(32767)})
+    {
+        auto invalid=query;invalid[64]=bad;
+        EXPECT_DEATH((native::integerDot<1>(bound,invalid,{std::span<const std::int16_t>(key)})),"outside its int32 reduction bound");
+        EXPECT_DEATH((native::integerDot<2>(bound,invalid,{std::span<const std::int16_t>(key),std::span<const std::int16_t>(key)})),"outside its int32 reduction bound");
+        EXPECT_DEATH((native::integerDot<4>(bound,invalid,keys)),"outside its int32 reduction bound");
+        invalid[64]=std::int16_t(-1008);invalid[3]=bad;
+        EXPECT_DEATH((native::integerDot<4>(bound,invalid,keys)),"outside its int32 reduction bound");
+    }
+}
+
 /** @test Query quantization retains max/limit, inverse, threshold, RNE and bounded original tails. */
 TEST_F(NEONAttentionMath, OriginalQueryQuantizationProgram)
 {

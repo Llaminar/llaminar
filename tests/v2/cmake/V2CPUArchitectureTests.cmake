@@ -435,7 +435,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     # equality with int64 sums, closed-form worst cases and fatal rejection.
     v2_add_core_free_test(V2_Integration_NEONAttentionQ16Int32Bound
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math>
-            --gtest_filter=*IntegerOriginalRowsAccumulateExactlyUnderTheTypedBound:*Q16BoundWorstCaseWitnessesStayExact:*Q16BoundRejectsUnprovenReductions
+            --gtest_filter=*IntegerOriginalRowsAccumulateExactlyUnderTheTypedBound:*Q16BoundWorstCaseWitnessesStayExact:*Q16BoundRejectsUnprovenReductions:*Q16BoundRejectsInvalidTailCodesBeforeTailArithmetic
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention ByteExact Regression)
     v2_add_core_free_test(V2_Integration_NEONAttentionQueryQuantization
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*OriginalQueryQuantizationProgram

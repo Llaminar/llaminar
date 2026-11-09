@@ -232,16 +232,17 @@ inline std::array<std::int32_t,Rows> integerDot(const Q16ReductionBound&bound,st
             sums[row]=vmlal_high_s16(sums[row],q,key);
         }
     }
+    // Every query code is admitted before any scalar arithmetic that relies on
+    // the bound: the fold and the tail run only on proven input. Vector lanes
+    // above are modular SIMD adds, so invalid input cannot have caused UB yet.
+    int magnitude=vmaxvq_s16(peak);
+    for(std::size_t tail=coordinate;tail<query.size();++tail)
+        magnitude=std::max(magnitude,std::abs(int(query[tail]))); // Widened: -32768 stays out of bound.
+    if(magnitude>bound.queryLimit())rejectAttentionData("Q16 query code outside its int32 reduction bound");
     std::array<std::int32_t,Rows> result;
     for(std::size_t row=0;row<Rows;++row)result[row]=vaddvq_s32(sums[row]);
-    int magnitude=vmaxvq_s16(peak);
     for(;coordinate<query.size();++coordinate)
-    {
-        // -32768 has no positive int16 magnitude; widening first keeps it out of bound.
-        magnitude=std::max(magnitude,std::abs(int(query[coordinate])));
         for(std::size_t row=0;row<Rows;++row)result[row]+=std::int32_t(query[coordinate])*keys[row][coordinate];
-    }
-    if(magnitude>bound.queryLimit())rejectAttentionData("Q16 query code outside its int32 reduction bound");
     return result;
 }
 /** @brief Quantize one original FP32 query with the existing max/qmax, inverse, RNE program.
