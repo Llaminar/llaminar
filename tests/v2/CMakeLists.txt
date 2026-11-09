@@ -18415,6 +18415,8 @@ if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
     list(APPEND V2_CPU_MOVABLE_FLOATING_EXPERT_PREFLIGHT_TESTS
         V2_Integration_CPU_MovableFloatingExpertAllFormats_AVX512)
 endif()
+# x86 shared-K prefill and verifier-route cases; their bodies are x86-only.
+if(V2_CPU_TARGET_X86)
 add_v2_test(V2_Integration_CPU_NativeQuantised_PrefillHeuristic
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
             --gtest_filter=CPUNativeQuantisedGemvTest.NativeQuantisedPrefillFullKAllFormatsRuntimeMMatchesSerialDecode:CPUNativeQuantisedGemvTest.NativeQuantisedPrefillKPartAllFormatsRuntimeMMatchesSerialDecode
@@ -18422,6 +18424,7 @@ add_v2_test(V2_Integration_CPU_NativeQuantised_PrefillHeuristic
     LABELS "V2;Integration;CPU;GEMM;Prefill;Heuristic;AllFormats;NativeQuantised;DecodeEquivalent;Regression"
     MPI_PROCS 1
 )
+endif()
 foreach(V2_PREFILL_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     v2_cpu_native_isa_runtime("${V2_PREFILL_ISA}" V2_PREFILL_RUNTIME_ISA)
     # x86 four-row prefill grid with a separate Pairwise policy; ARM folds both into one native tile.
@@ -18703,6 +18706,8 @@ add_v2_test(V2_Integration_CPUNativeSourceAssemblyContract
     LABELS "V2;Integration;ProductionTestPreflight;CPU;Weights;AllFormats;Assembly;Contract;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=2;OMP_DYNAMIC=false")
+# x86 shared-K prefill and verifier-route cases; their bodies are x86-only.
+if(V2_CPU_TARGET_X86)
 add_v2_test(V2_Integration_CPUNativeQuantisedVerifierISAResolver
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
             --gtest_filter=CPUNativeQuantisedGemvTest.MTP_UncertifiedVerifierThreadRegimeHardFails:CPUNativeQuantisedGemvTest.MTP_VerifierRoutePublishesBuildAndRuntimeISA
@@ -18710,6 +18715,7 @@ add_v2_test(V2_Integration_CPUNativeQuantisedVerifierISAResolver
     LABELS "V2;Integration;CPU;GEMM;MTP;GroupedVerifierRows;NativeQuantised;ISA;Dispatch;PerfStats;Regression"
     MPI_PROCS 1
 )
+endif()
 
 # Performance Test: CPU NativeQuantised GEMV/GEMM Sweep (Q4_0, all model shapes)
 add_executable(v2_perf_cpu_native_quantised_sweep performance/kernels/cpu/native_quantised/Perf__CPUNativeQuantised_Sweep.cpp)
