@@ -42,6 +42,7 @@
 #include "tensors/SIMDHelpers.h"
 #include "tensors/BlockStructures.h"
 #include "execution/config/RuntimeConfig.h"
+#include "../../../../utils/CPURoPETestBinding.h"
 
 using namespace llaminar2;
 
@@ -189,6 +190,7 @@ protected:
         auto position_ids = generate_position_ids(seq_len);
 
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
 
         // Warmup
         for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
@@ -241,6 +243,7 @@ protected:
         auto position_ids = generate_position_ids(seq_len);
 
         CPURoPEKernelT<ActivationPrecision::BF16> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
 
         // Warmup
         for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
@@ -294,6 +297,7 @@ protected:
         auto position_ids = generate_position_ids(seq_len);
 
         CPURoPEKernelT<ActivationPrecision::FP16> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
 
         // Warmup
         for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
@@ -355,6 +359,7 @@ protected:
         auto position_ids = generate_position_ids(seq_len);
 
         CPURoPEKernelT<ActivationPrecision::Q8_1> kernel;
+        const test::CPURoPETestBinding kernel_angles(kernel);
 
         // Warmup
         for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)

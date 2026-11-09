@@ -221,6 +221,17 @@ public:
         const WorkspaceMemoryGeometry& geometry);
 
     /**
+     * @brief RoPE workspace contribution that estimate() adds for one participant.
+     * @param profile Parsed model geometry; zero without a full-attention layer.
+     * @param geometry Participant device, rows and owned layer interval.
+     * @return GPU publication buffers, or the CPU angle planes for the largest
+     *         graph invocation's rows at the physical head width.
+     */
+    static size_t ropeWorkspaceBytes(
+        const ModelMemoryProfile& profile,
+        const WorkspaceMemoryGeometry& geometry);
+
+    /**
      * @brief Live calibration envelope for one original resident GPU expert.
      * @param profile Original stacked expert metadata; its expert count is not rewritten.
      * @param geometry Exact physical device and owned model-layer interval.
