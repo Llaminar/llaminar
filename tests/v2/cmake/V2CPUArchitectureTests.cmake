@@ -960,7 +960,13 @@ v2_add_core_free_test(V2_Unit_CPUNativeQuantisedMetadataSeal
     LABELS V2 Unit CPU DeviceFree NativeQuantised Metadata)
 v2_add_core_free_test(V2_Integration_CPUNativeQuantisedMetadataSealCoverage
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
-        --gtest_filter=CPUNativeQuantisedMetadataSeal.CoversExactlyTheFormerInLoopRulesOnEveryLiveColumn:CPUNativeQuantisedMetadataSeal.ViewRequiresTheSealOfItsExactBytesAndInterpretation
+        --gtest_filter=CPUNativeQuantisedMetadataSeal.CoversExactlyTheFormerInLoopRulesOnEveryLane:CPUNativeQuantisedMetadataSeal.ViewRequiresTheSealOfItsExactBytesAndInterpretation
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Metadata Regression)
+# Partial final chunks: producers normalize padding words in the owned
+# generation; raw poisoned padding is rejected, normalized arrivals admitted.
+v2_add_core_free_test(V2_Integration_CPUNativeQuantisedPaddingNormalization
+    COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
+        --gtest_filter=CPUNativeQuantisedMetadataSeal.PaddingNormalization*
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Metadata Regression)
 v2_add_core_free_test(V2_Integration_CPUNativeQuantisedMetadataSealLifecycle
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>

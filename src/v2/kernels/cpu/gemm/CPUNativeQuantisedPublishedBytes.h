@@ -169,6 +169,20 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /**
+         * @brief Write into the current, still unsealed generation.
+         * @return Mutable span of the current storage; no new generation is opened.
+         * @details For a producer finishing the generation it owns (for example
+         * normalizing padding after the live writes, before sealing). Writing a
+         * sealed generation is a lifecycle defect and fatal.
+         */
+        [[nodiscard]] std::span<std::uint8_t> unsealedGenerationBytes() noexcept
+        {
+            if (seal_ && sealed_generation_ == generation_)
+                rejectUnsealedNativeQuantisedPublication("a producer tried to write a sealed generation");
+            return {bytes_.data(), bytes_.size()};
+        }
+
+        /**
          * @brief Mutable root of the current storage without opening a generation.
          * @return Stable slot destination identity.
          * @details Overlay slot infrastructure records this once at adoption; it

@@ -20,6 +20,7 @@ class NativeQuantisedPublicationWriterPolicyTests(unittest.TestCase):
     def test_mutations_outside_named_producers_fail(self):
         for statement in ("auto s=p.native_interleaved.beginRewrite();",
                           "auto r=p.native_interleaved.retainedSlotRoot();",
+                          "auto u=p.native_interleaved.unsealedGenerationBytes();",
                           "p.native_interleaved.replace(std::move(v));",
                           "p.native_interleaved.resize(n);",
                           "p.native_interleaved.resize_uninitialized(n);",

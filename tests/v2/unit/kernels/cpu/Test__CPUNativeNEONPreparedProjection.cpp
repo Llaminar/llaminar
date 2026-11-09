@@ -265,7 +265,75 @@ template <typename Ops> void verifyAllPrepared()
                 verifyPrepared<4, Ops, ms::Reduction::OrderedPartitions>(*source.metadata, n, blocks);
             }
 }
+/**
+ * @brief Prove the padding contract at a partial final chunk for one source/geometry/family.
+ * @tparam Ops Admitted family (ASIMD, DotProd, or I8MM row pairs).
+ * @details For coefficient-ruled encodings every padding word a vector of the
+ * last strip or its neighbour loads is poisoned in turn: admission must reject
+ * it before any tile exists and every output guard must stay untouched. With
+ * the producer's benign padding, every row tile 1..4 on both policies must
+ * equal serial bytes and the independent numerical program (verifyPrepared).
+ */
+template <typename Ops> void verifyTailPadding(const NativeQuantisedFormatInfo &source, int n, int blocks)
+{
+    SCOPED_TRACE(::testing::Message() << "tail codebook=" << int(source.codebook_id) << " n=" << n << " blocks=" << blocks);
+    {
+        NativeQuantisedPreparedByteFixture fixture(source, n, blocks * 32);
+        fixture.seedPayloadAndMetadata();
+        const auto view = fixture.view();
+        const bool rules = view.usesIQ3SExpandedSourceScale() || view.usesNibbleLUTSourceScale() ||
+            (view.usesCompactMultiScale() && view.codebook_id == 13);
+        if (rules)
+        {
+            const int last = view.N_padded / 64 - 1, live = n % 64 == 0 ? 64 : n % 64;
+            const std::size_t secondary = std::size_t(view.data_stride) + (view.usesInlineCompensation() ? 256 : 128);
+            // Lanes loaded with the last live column's vector, and the next vector.
+            for (int column = live; column < std::min(64, (live + 3) / 4 * 4 + 4); ++column)
+                for (int block : {0, blocks - 1})
+                {
+                    auto *word = fixture.bytes.data() + (std::size_t(last) * blocks + block) * view.interleaved_block_stride +
+                        secondary + std::size_t(column) * 2;
+                    std::uint16_t original = 0;
+                    std::memcpy(&original, word, sizeof(original));
+                    const std::uint16_t poison = 0xffff;
+                    std::memcpy(word, &poison, sizeof(poison));
+                    EXPECT_THROW((void)fixture.view(), std::invalid_argument) << "column=" << column << " block=" << block;
+                    std::memcpy(word, &original, sizeof(original));
+                }
+        }
+    }
+    verifyPrepared<1, Ops, ms::Reduction::Contiguous>(source, n, blocks);
+    verifyPrepared<2, Ops, ms::Reduction::Contiguous>(source, n, blocks);
+    verifyPrepared<3, Ops, ms::Reduction::OrderedPartitions>(source, n, blocks);
+    verifyPrepared<4, Ops, ms::Reduction::OrderedPartitions>(source, n, blocks);
+    verifyPrepared<2, Ops, ms::Reduction::OrderedPartitions>(source, n, blocks);
+    verifyPrepared<1, Ops, ms::Reduction::OrderedPartitions>(source, n, blocks);
+}
+
+/** @brief Every source family at N mod 4 = 1/2/3, inside and across chunk tails. */
+template <typename Ops> void verifyAllTailPadding()
+{
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
+        for (const int n : {1, 2, 3, 5, 6, 7, 61, 62, 63, 65, 66, 67, 127})
+            verifyTailPadding<Ops>(*source.metadata, n, 3);
+}
 } // namespace
+
+/** @test The padding contract holds at every N%4 tail for ASIMD. */
+TEST_F(CPUNativeNEONPreparedProjection, ASIMDTailPaddingContract)
+{ verifyAllTailPadding<ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>>(); }
+
+#if defined(__ARM_FEATURE_DOTPROD)
+/** @test The padding contract holds at every N%4 tail for SDOT. */
+TEST_F(CPUNativeNEONPreparedProjection, DotProdTailPaddingContract)
+{ verifyAllTailPadding<ms::NEONMultiScaleOps<ms::NEONByteDot::DotProd>>(); }
+#endif
+
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+/** @test The padding contract holds at every N%4 tail for SMMLA row pairs. */
+TEST_F(CPUNativeNEONPreparedProjection, I8MMTailPaddingContract)
+{ verifyAllTailPadding<ms::NEONMultiScaleOps<ms::NEONByteDot::I8MM>>(); }
+#endif
 
 /** @test Every source's ASIMD projection obeys serial bytes and its independent numerical program. */
 TEST_F(CPUNativeNEONPreparedProjection, ASIMDEverySourceAndEncodingMatchesSerialAndSourceOrder)
@@ -577,9 +645,8 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsIncompleteAliasedAndUnalignedExpe
 
 /**
  * @test Opaque source words cannot hide reserved bits by masking them into a
- * usable coefficient. Publication admission rejects them in every live column
- * before any tile or worker team exists, so no output is ever authored; padding
- * words past N are not admitted and provably cannot change an output byte.
+ * usable coefficient. Publication admission rejects them before any tile or
+ * worker team exists, so no output is ever authored.
  */
 TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBitsBeforeAnyWrite)
 {
@@ -596,8 +663,8 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBitsBefo
         const std::array<std::span<float>, 1> output{std::span(result)};
         CPUNativeNEONProjectionTile<1>::bind(weights, input, output, 0).execute();
         const auto reference = result;
-        // Every live column (N=8) is admitted and rejected before any tile exists.
-        for (int bad_column = 0; bad_column < 8; ++bad_column)
+        // Every lane of the unit, including the 56 padding columns past N=8.
+        for (int bad_column = 0; bad_column < 64; ++bad_column)
         {
             SCOPED_TRACE(bad_column);
             std::uint16_t original = 0;
@@ -609,21 +676,6 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBitsBefo
             EXPECT_THROW((void)fixture.view(), std::invalid_argument);
             for (const float value : result) EXPECT_EQ(value, 123.0f);
             std::memcpy(word, &original, sizeof(original));
-        }
-        // Padding words (never moved) may hold anything and cannot change a published byte.
-        for (int padding = 8; padding < 64; ++padding)
-        {
-            const std::uint16_t invalid = 0xffff;
-            std::memcpy(fixture.bytes.data() + secondary + padding * 2, &invalid, sizeof(invalid));
-        }
-        result.fill(123.0f);
-        CPUNativeNEONProjectionTile<1>::bind(fixture.view(), input, output, 0).execute();
-        for (int column = 0; column < 8; ++column)
-            EXPECT_EQ(std::bit_cast<std::uint32_t>(result[column]), std::bit_cast<std::uint32_t>(reference[column]));
-        for (int padding = 8; padding < 64; ++padding)
-        {
-            const std::uint16_t zero = 0;
-            std::memcpy(fixture.bytes.data() + secondary + padding * 2, &zero, sizeof(zero));
         }
         result.fill(123.0f);
         CPUNativeNEONProjectionTile<1>::bind(fixture.view(), input, output, 0).execute();

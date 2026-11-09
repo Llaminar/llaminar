@@ -27,7 +27,6 @@
 #include "tensors/NativeQuantisedIQ4XSScale.h"
 #include "tensors/NativeQuantisedQ6Scale.h"
 
-#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -121,11 +120,12 @@ namespace llaminar2::cpu::native_quantised
      * @brief Proof that one exact byte range passed complete metadata admission.
      *
      * Only validate() constructs a seal, after checking the descriptor and the
-     * byte extent and scanning the metadata word of every live column (every
-     * column below N) in every unit. Padding columns of a partial final chunk
-     * are not admitted: movement transfers live columns only, so their words
-     * may hold anything, and no reader publishes a value derived from them
-     * (vector lanes past N are computed independently and discarded).
+     * byte extent and scanning every metadata word any reader can load,
+     * including the padding lanes of a partial final 64-column chunk. Padding
+     * is part of the common publication contract on every ISA (x86 loaders
+     * test whole vectors): producers write a benign value there in the same
+     * publication generation (see CPUNativeQuantisedPackedWeights::normalizePaddingMetadata),
+     * and the seal rejects any garbage that remains:
      *
      * | Encoding | Secondary word rule |
      * |---|---|
@@ -137,8 +137,8 @@ namespace llaminar2::cpu::native_quantised
      * | CompactMultiScale codebook 13 (IQ2_S) | native_quantised_iq2s_scale::valid, i.e. <= 255 |
      * | CompactMultiScale other codebooks | none; FP16 scales and minima |
      *
-     * These are the reserved-bit rules execution used to test per K block,
-     * applied to every live column. The seal binds the byte root, extent and every descriptor
+     * This is exactly the set of reserved-bit checks that execution performed
+     * per K block. The seal binds the byte root, extent and every descriptor
      * field that changes how metadata is interpreted; arithmetic policy is not
      * part of metadata validity. Whether a seal is still current for mutable
      * storage is decided by its owner, not by this value.
@@ -477,15 +477,14 @@ namespace llaminar2::cpu::native_quantised
         { rule = native_quantised_iq2s_scale::valid; name = "IQ2_S"; }
         if (rule)
         {
-            // Every live column of every unit. Padding words of the final chunk
-            // are never transferred by movement and never reach an output.
+            // Every lane of every unit, padding columns included: native loads
+            // on every ISA read them, so producers must have normalized them.
             for (int chunk = 0; chunk < view.N_padded / 64; ++chunk)
                 for (int block = 0; block < view.blocks_per_row; ++block)
                 {
                     const std::uint16_t *words = view.chunkMins(chunk, block);
-                    const int live = std::min(64, view.N - chunk * 64);
                     std::uint16_t reserved = 0;
-                    for (int column = 0; column < live; ++column)
+                    for (int column = 0; column < 64; ++column)
                         reserved |= rule(words[column]) ? 0 : 1;
                     if (reserved)
                         throw std::invalid_argument(std::string(name) + " coefficient contains reserved bits");
