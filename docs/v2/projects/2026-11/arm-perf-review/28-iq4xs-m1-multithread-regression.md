@@ -82,3 +82,21 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   3) inventory: expected symbol/body inventory from every explicit
      instantiation (+ pairBlock), inline/call-closure accounting, partial-
      program negatives (mutate one body → reject).
+
+## SOURCE114 FINAL (2026-11-09) — fatal accessor ACK; gate on HOLD
+
+- Narrow source ACK for the fatal-accessor delta + focused regression
+  (bounds reject before cast/pointer arithmetic; valid addresses unchanged;
+  fputs+abort noexcept cold/noinline; no FP tree/dispatch/transfer change;
+  fixture checks all 6 IQ3_S units × both accessors + all 8 bad-coordinate/
+  accessor combos SIGABRT+diagnostic term→77; preflight registration exists).
+  Direct-accessor regression — NOT a worker-team execution or rollback proof.
+- REGISTER-EVIDENCE GATE: HOLD (tooling successor required, separately
+  identified): exact compilation dep closure (omitted deps confirmed incl.
+  tensors/NEONFP16.h + kernels/common/MoEProjectionNumericalContract.h) +
+  RECORD the command EXECUTED; header-change negatives; classify-or-reject
+  fp/SP-derived-base + s/d + ABI-save distinction; expected emitted-program
+  inventory (rows×family×policy×noncompact encoding) + body/callee closure +
+  partial/inline/outlined/empty-body negatives; never change production
+  allocation to fit the scanner.
+- Owner evidence (scheduling/0-176/M1 bytes/.80/3-arm) remains owner evidence.
