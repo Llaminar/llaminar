@@ -12,12 +12,14 @@ VNNI terminology remains accurate and unchanged.
 
 The active model target remains 500 prefill / 40 decode tok/s for QFN on two
 MI50s plus two real CPU socket ranks. The latest matched local Release result is
-267.049428 / 38.476294 tok/s (38.325996 decode excluding the first prefill token)
-with canonical passive counters, same-panel CPU scheduling and large replicated
-shared gathers. Versus217.618721 /39.048121 this is +22.71% prefill and−1.46%
-decode. All768 output IDs, MTP work and initial expert selection match;
+278.611720 / 38.800220 tok/s (38.648656 decode excluding the first prefill token)
+with canonical passive counters, four/two/one same-panel CPU scheduling and
+large replicated shared gathers. Versus the qualified two-pair267.049428 /
+38.476294 control this is +4.33% prefill and +0.84% decode. All768 output IDs,
+MTP work and initial expert selection match;
 native/driver retirement and resource observation pass. The500/40 target remains
-open. Detailed evidence is `/tmp/qfn-cpu-locality-shared-prefill-r1111/`.
+open. Detailed evidence is `/tmp/qfn-four-pair-model-r1115/`; the preceding
+two-pair/shared-gather gain is `/tmp/qfn-cpu-locality-shared-prefill-r1111/`.
 
 The preceding CPU initialization/direct-combine change measured 217.105241 /
 38.502293 against 218.074697 / 38.437912 (-0.44% prefill, +0.17% decode), also
@@ -757,3 +759,81 @@ None of these private changes modifies the active r1066 collection or frozen
 r1063 model benchmark owner. The combined patch has a clean strict whitespace
 apply-check. Native build, profiler preparation, installed Auto,
 per-architecture sweeps and matched model performance remain outstanding.
+
+## Four/two/one same-panel ownership, 2026-11-09
+
+This extends the qualified two-pair scheduler, without another exact-shape
+sweep. Ordinary Prefill/GPUAlignedExpert/Pairwise/OutputTileLocal bundles may
+retain four adjacent pair/tail calls on one prepared N64 panel. The original
+two-pair mode remains selected when four-pair jobs would fall below four jobs
+per actual worker; smaller grids retain one pair. The internal pure selector
+and job decoder use the same width. Pair bodies, K partitions, reduction order,
+row counts, bias and completion edges are unchanged. No allocation, packing,
+communication, runtime switch or exact-table update is added.
+
+The two-pair source is checkpointed in `a0fd16d04`, merged with remote maintenance
+as `f564d784e`; both were pushed. Its native control is retained at
+`/tmp/qfn-cpu-four-pair-baseline-r1112/`. Current candidate evidence is
+`/tmp/qfn-cpu-same-panel-four-pair-next/`.
+
+Six Release-owner registrations pass in 10.20 seconds, covering all 21 formats,
+AVX2 and AVX-512 runtime dispatch, live prefixes, dirty/repeated execution,
+retained teams, odd tails and decode/MTP controls. The existing explicit
+preflight aliases include the new actual-selector boundaries for worker counts
+1–64 and native single-descriptor M32/128/256 at 28 workers. These are runtime-ISA
+results from the AVX512 build, not an independent AVX2 compilation certificate.
+Final linked core and fixture inspection finds unchanged pair arithmetic and
+no new hot-loop spills or helper calls.
+
+The existing complete-FFN owner uses 28 physical socket0 workers, Q4_K gate/up
+N320/K2560 and Q5_1 down N2560/K320. Each arm has two fresh lifetimes in reversed
+order, eight warmup batches and nine samples of four transactions. All native
+serial-byte oracles pass. These balanced descriptor sets are authored controls,
+not captured production expert routes.
+
+| Authored complete operation | Two-pair us | Four/two/one us | Speedup |
+|---|---:|---:|---:|
+| Prefill E84/R519, persistent FFN |3731.390|2308.850|1.616×|
+| Same gate/up |1973.975|1162.890|1.697×|
+| Same down |1385.335|671.986|2.062×|
+| MTP E24/R72, persistent FFN |652.102|655.217|0.995×|
+| Prefill E1/R128, persistent FFN |297.818|253.452|1.175×|
+| Prefill E1/R64, persistent FFN |159.297|142.688|1.116×|
+
+MTP's +0.48% latency change lies within the observed lifetime variation.
+The same reversed comparison with forced AVX2 runtime gives 6604.335→5364.600us
+for the complete prefill FFN (1.231×) and 1145.795→1099.585us for the MTP control.
+MTP scheduling is unchanged; its timing difference is not a new MTP policy win.
+The AVX2 samples, native byte oracles and closure receipts are in `economy-avx2/`
+under the candidate evidence directory. This still uses AVX512 compiler output
+with AVX2 runtime dispatch, not a separately compiled AVX2 owner.
+E1/R128 has two gate/up descriptors, so its joint four-pair grid qualifies;
+it is not a single-descriptor two-pair performance witness. E1/R64 supplies
+that complete-FFN gate/up control (160 two-pair versus 80 four-pair jobs), while
+the native single-descriptor byte test covers M128. Native-policy control
+variation is larger for the tiny R64 case; do not assign its gate-only change
+to the unchanged two-pair schedule.
+
+A separate 2000-transaction profile records 83,735 samples, no lost samples and
+28 native TIDs. Named nibble/non-nibble sampled periods fall from 214.808/170.272G
+to 137.190/85.918G, and OpenMP from 83.046G to 46.568G. Setup/oracles are included;
+this is sampled user-cycle attribution, not cache/IPC evidence or model timing.
+The matched model comparison at `/tmp/qfn-four-pair-model-r1115/` passes at
+278.611720 prefill /38.800220 decode tok/s, versus267.049428 /38.476294:
++4.33% prefill and +0.84% decode. The unchanged decode policy does not establish
+a decode optimization. All 768 output IDs, actual MTP work, both ranks' initial
+expert selection and runtime configuration match (apart from owned output
+paths). Maximum context262144, dynamic MTP/balancing, RAM ngrams, local GPU
+cache and 16/32 GiB prefix tiers remain fixed. The observer completes 223 host
+samples and 1107 process-memory observations without error; the native process
+tree and both GPU contexts retire cleanly. This is not a leak or full-resource
+certificate. The 18 owned disk-cache files (727,912,502 bytes) are removed by
+metadata-only cleanup. No full-preflight or release claim is made.
+
+The bounded decode review at `/tmp/qfn-decode-root-attribution-r1114/` records
+5795.255ms main-verifier CPU compute over 9110 nonempty endpoints, versus217.157ms
+predictor compute over 576 endpoints, across the three measured requests.
+Readiness waits overlap device/parent scopes and are not isolated GPU timing.
+The conservative low-live gather selector would affect only 212/9792 root calls,
+half empty, and no predictor calls. That proposed optimization is parked;
+`/tmp/qfn-shmem-low-live-feasibility-r1113/` preserves its limited applicability.

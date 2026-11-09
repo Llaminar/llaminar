@@ -37,7 +37,7 @@
  * VNNI operand roles, eliminating only the exact integer bias compensation.
  * Fused prefix/LUT stack storage initializes only admitted live descriptors;
  * inactive fixed-capacity slots never enter searches or microkernel arguments.
- * Ordinary-prefill ordered pair jobs may retain two adjacent row pairs on one
+ * Ordinary-prefill ordered pair jobs may retain up to four adjacent row pairs on one
  * worker for the same prepared N panel, without changing either pair kernel.
  * GPU-aligned fused row pairs use the bounded ordered nibble kernel for all
  * eligible prepared nibble encodings. Decoder, original scale factors and
@@ -7187,6 +7187,32 @@ namespace llaminar2::cpu::native_quantised
         return result;
     }
 
+    namespace detail
+    {
+        /**
+         * @brief Select one bounded same-panel ownership width without execution state.
+         * @param eligible Whether this bundle contains ordinary-prefill pair runs.
+         * @param two_pair_jobs Complete grid at a maximum of two pairs per job.
+         * @param four_pair_jobs Complete grid at a maximum of four pairs per job.
+         * @param workers Positive actual invocation worker count.
+         * @return Four, two, or one pairs while retaining four jobs per worker.
+         * @throws std::invalid_argument For inconsistent grids or worker geometry.
+         *
+         * This internal scalar decision owns no plan, payload or retained policy.
+         * It preserves the qualified two-pair mode when a wider grid is too small;
+         * division avoids overflow when checking the four-wave threshold.
+         */
+        [[nodiscard]] constexpr size_t selectSamePanelPrefillPairRunWidth(
+            bool eligible, size_t two_pair_jobs, size_t four_pair_jobs, int workers)
+        {
+            if (workers <= 0 || four_pair_jobs > two_pair_jobs)
+                throw std::invalid_argument("CPU same-panel ownership requires consistent job grids and positive workers");
+            if (!eligible || two_pair_jobs / static_cast<size_t>(workers) < 4u)
+                return 1u;
+            return four_pair_jobs / static_cast<size_t>(workers) >= 4u ? 4u : 2u;
+        }
+    }
+
     /**
      * @brief Fused multi-projection runtime-M verifier rows.
      * @param A_q8_all Common immutable activation rows, unless a descriptor supplies its own.
@@ -7849,12 +7875,13 @@ namespace llaminar2::cpu::native_quantised
             size_t total_reduction_tasks = 0;
             size_t total_local_tree_tasks = 0;
             size_t total_pair_run_tasks = 0;
+            size_t total_four_pair_run_tasks = 0;
             bool has_prefill_pair_runs = false;
             // A bounded ownership experiment, not a four-row microkernel:
-            // each job repeats the existing pair body for at most two adjacent
+            // each job repeats the existing pair body for at most four adjacent
             // pairs of the same descriptor/N64 panel. Decode, verifier, wide
             // rows and nonlocal partial banks retain their existing task grid.
-            const auto pair_run_width = [&](int projection) -> size_t
+            const auto pair_run_width = [&](int projection, size_t maximum_pairs = 2u) -> size_t
             {
                 const auto &descriptor = descs[projection];
                 const auto &plan = plans[static_cast<size_t>(projection)];
@@ -7862,7 +7889,7 @@ namespace llaminar2::cpu::native_quantised
                         descriptor.purpose == ProjectionRowsPurpose::Prefill &&
                         descriptor.packed->numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert &&
                         plan.effective_verifier_schedule == VerifierRowsPolicy::Pairwise && plan.rows > 2
-                    ? 2u : 1u;
+                    ? maximum_pairs : 1u;
             };
             for (int projection = 0; projection < num_descs; ++projection)
             {
@@ -7900,6 +7927,10 @@ namespace llaminar2::cpu::native_quantised
                 has_prefill_pair_runs = has_prefill_pair_runs || run_width > 1u;
                 total_pair_run_tasks +=
                     ((static_cast<size_t>(row_tiles) + run_width - 1u) / run_width) *
+                    static_cast<size_t>(plan.n_chunks);
+                const size_t four_width = run_width > 1u ? 4u : 1u;
+                total_four_pair_run_tasks +=
+                    ((static_cast<size_t>(row_tiles) + four_width - 1u) / four_width) *
                     static_cast<size_t>(plan.n_chunks);
             }
 
@@ -8198,8 +8229,9 @@ namespace llaminar2::cpu::native_quantised
                 // a single wave is too fragile for skewed experts and odd tails.
                 // The original plan and all K-partition arithmetic stay
                 // intact; only this invocation's independent job ownership changes.
-                const bool use_pair_runs = has_prefill_pair_runs &&
-                    total_pair_run_tasks / static_cast<size_t>(num_threads) >= 4u;
+                const size_t maximum_pair_run = detail::selectSamePanelPrefillPairRunWidth(
+                    has_prefill_pair_runs, total_pair_run_tasks, total_four_pair_run_tasks, num_threads);
+                const bool use_pair_runs = maximum_pair_run > 1u;
                 if (use_pair_runs)
                 {
                     total_local_tree_tasks = 0;
@@ -8209,7 +8241,7 @@ namespace llaminar2::cpu::native_quantised
                         const int row_width = plan.rows == 1 ? 1 :
                             (use_avx512 && plan.effective_verifier_schedule == VerifierRowsPolicy::WideRows ? 4 : 2);
                         const auto row_tiles = static_cast<size_t>((plan.rows + row_width - 1) / row_width);
-                        const auto run_width = pair_run_width(projection);
+                        const auto run_width = pair_run_width(projection, maximum_pair_run);
                         total_local_tree_tasks += ((row_tiles + run_width - 1u) / run_width) *
                             static_cast<size_t>(plan.n_chunks);
                         local_tree_task_ends[static_cast<size_t>(projection)] = total_local_tree_tasks;
@@ -8246,7 +8278,7 @@ namespace llaminar2::cpu::native_quantised
                                                VerifierRowsPolicy::WideRows
                                        ? 4
                                        : 2);
-                        const size_t run_width = use_pair_runs ? pair_run_width(projection) : 1u;
+                        const size_t run_width = use_pair_runs ? pair_run_width(projection, maximum_pair_run) : 1u;
                         const int row_tiles = (plan.rows + row_tile_width - 1) / row_tile_width;
                         const auto row_runs = (static_cast<size_t>(row_tiles) + run_width - 1u) / run_width;
                         // Ineligible descriptors retain their original local

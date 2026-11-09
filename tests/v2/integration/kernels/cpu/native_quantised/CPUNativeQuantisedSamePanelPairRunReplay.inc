@@ -64,11 +64,18 @@ void proveSamePanelPairRun(const QuantizedVerifierFormatCase &left,
         // The full case contains an actual singleton and a long odd/even expert.
         // The short case exercises the four-wave guard; live1 also retains the
         // original small-grid/SharedBank path. Allocation capacity never changes.
-        for(int replay=0;replay<6;++replay) {
+        // The actual gate shard additionally crosses the 1/2/4 ownership
+        // thresholds at 28 workers; this is authored geometry, not a timed claim.
+        const bool gate_thresholds = workers==28 && n0==320 && k==2560;
+        const std::array<int,3> threshold_rows{32,128,256};
+        for(int replay=0;replay<(gate_thresholds?9:6);++replay) {
             const bool full=replay==0 || replay==3;
-            const int live=replay==2?1:4;
-            const std::array<int,4> rows=full?std::array<int,4>{1,maximum_rows,3,7}
-                :std::array<int,4>{1,3,2,1};
+            const bool threshold = replay>=6;
+            const int live=threshold || replay==2?1:4;
+            const std::array<int,4> rows=threshold
+                ?std::array<int,4>{threshold_rows[size_t(replay-6)],1,1,1}
+                :full?std::array<int,4>{1,maximum_rows,3,9}:std::array<int,4>{1,3,2,1};
+            SCOPED_TRACE("replay="+std::to_string(replay)+" first M="+std::to_string(rows[0])+" live="+std::to_string(live));
             const auto purpose=replay==4?ProjectionRowsPurpose::MTPVerifier:
                 replay==5?ProjectionRowsPurpose::Decode:ProjectionRowsPurpose::Prefill;
             std::array<FusedVerifierRowsDesc,5> descriptors;
@@ -91,7 +98,19 @@ void proveSamePanelPairRun(const QuantizedVerifierFormatCase &left,
                     .purpose=purpose};
             }
             const auto plan=planNativeQuantisedFusedRows({descriptors.data(),size_t(live)},1,workers);
-            if(full)ASSERT_EQ(plan.partial_route,NativeQuantisedFusedPartialRoute::OutputTileLocal);
+            if(full || threshold)ASSERT_EQ(plan.partial_route,NativeQuantisedFusedPartialRoute::OutputTileLocal);
+            if(threshold) {
+                // Establish the actual geometry, then exercise the same
+                // internal pure ownership selector used by production.
+                const auto pairs=size_t((rows[0]+1)/2),columns=size_t(plan.projections[0].n_chunks);
+                const auto two_jobs=((pairs+1u)/2u)*columns,four_jobs=((pairs+3u)/4u)*columns;
+                const std::array<size_t,3> expected_two{40u,160u,320u},expected_four{20u,80u,160u};
+                EXPECT_EQ(two_jobs,expected_two[size_t(replay-6)]);
+                EXPECT_EQ(four_jobs,expected_four[size_t(replay-6)]);
+                const auto expected_cap = replay==6?1u:replay==7?2u:4u;
+                EXPECT_EQ(cpu::native_quantised::detail::selectSamePanelPrefillPairRunWidth(true,two_jobs,four_jobs,workers),expected_cap);
+                SCOPED_TRACE("authored threshold M="+std::to_string(rows[0])+" expected maximum pairs="+std::to_string(expected_cap));
+            }
             for(int member=0;member<live;++member) {
                 ASSERT_EQ(descriptors[member].packed->numerical_policy,policy);
                 if(rows[member]>1)ASSERT_EQ(plan.projections[member].effective_verifier_schedule,VerifierRowsPolicy::Pairwise);
@@ -106,7 +125,7 @@ void proveSamePanelPairRun(const QuantizedVerifierFormatCase &left,
                 return true;
             };
             ASSERT_TRUE(invoke());ASSERT_TRUE(complete());
-            if(full) {
+            if(full || threshold) {
                 for(auto &values:output)std::fill(values.begin(),values.end(),guard);
                 std::vector<int> accepted(size_t(workers),0);
 #pragma omp parallel num_threads(workers)
@@ -121,6 +140,19 @@ void proveSamePanelPairRun(const QuantizedVerifierFormatCase &left,
 TEST(CPUNativeQuantisedFusedCompletion, GPUAlignedPrefillSamePanelPairRunReplay)
 {
     ::testing::Test::RecordProperty("input_scope","authored_byte_lifecycle_not_recorded_model_routes");
+    using cpu::native_quantised::detail::selectSamePanelPrefillPairRunWidth;
+    // Directly test the production scalar decision, not a copied selector.
+    // The actual job decoder/arithmetic is exercised by the native replays below.
+    for(int workers=1;workers<=64;++workers) {
+        const auto floor=size_t(workers)*4u;
+        EXPECT_EQ(selectSamePanelPrefillPairRunWidth(false,floor,floor,workers),1u);
+        EXPECT_EQ(selectSamePanelPrefillPairRunWidth(true,floor-1u,floor-1u,workers),1u);
+        EXPECT_EQ(selectSamePanelPrefillPairRunWidth(true,floor,floor-1u,workers),2u);
+        EXPECT_EQ(selectSamePanelPrefillPairRunWidth(true,floor,floor,workers),4u);
+    }
+    EXPECT_EQ(selectSamePanelPrefillPairRunWidth(true,160u,80u,28),2u);
+    EXPECT_THROW(static_cast<void>(selectSamePanelPrefillPairRunWidth(true,160u,80u,0)),std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(selectSamePanelPrefillPairRunWidth(true,80u,160u,28)),std::invalid_argument);
     const auto &formats=quantizedVerifierFormats();
     const std::array<int,3> workers{1,3,7};
     for(size_t format=0;format<formats.size();++format) {
