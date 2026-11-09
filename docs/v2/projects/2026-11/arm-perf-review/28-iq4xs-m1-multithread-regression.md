@@ -281,3 +281,23 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   (noreturn_symbols direct-abort alignment).
 - P2b probe-source spelling preserved (abspath collapse false-rejection).
 - Progress kept; never alter production allocation; owner evidence separate.
+
+## SOURCE118 successor c0be497e4 (2026-11-09)
+
+- P1a may/must slot sets + nonstack alternatives; unknown-offset + live
+  pointer slots fail; heap-escape fails.
+- P1b csinc/csinv/csneg/cinc not admitted (csel joins); exact footprints
+  (widths/narrow/sign-ext/structure per opcode+count+lane/arrangement, ELF or
+  Apple suffix); unknown footprints fail; both-dialect controls (st1.s 4B
+  partial = spill + pointer alive; 16B retires).
+- P1c admitted-FORM inventory (dispatched per compiler witnesses; operand-less
+  add/svc/smmla fail; docs not 'closed grammar'); .p2align only w/o fill;
+  section-in-force at label; dialect bound to compiler identity + format lines.
+- P2a diagnostic = admitted forms + fwrite/fputs only + acyclic + every path
+  aborts; tiles call ONLY exact fatal symbol (direct abort = structural fail).
+- P2b probe-path spelling preserved (resolve-as-kernel; decoy/real controls).
+- QUALIFICATION: AppleClang-21 prints SMMLA NO-OPERANDS (-S, 480 in I8MM
+  witness) → AppleClang-21 NEON_I8MM REMOVED from budgets; Mac I8MM build
+  FAILS CLOSED (no receipt; reason in _doc). GNU-14 all + AppleClang NEON/
+  NEON_DOTPROD re-audit clean, budgets unchanged. 40 tests; Mac NEON_DOTPROD
+  E2E green. GNU-14 .80 E2E queued (non-urgent).
