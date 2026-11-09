@@ -50,7 +50,8 @@ inline int vectorWidth()
 #if defined(__aarch64__) && defined(__ARM_NEON)
     const auto isa = activeISALevel();
     if (isa == ISALevel::NEON || isa == ISALevel::NEONDotProd) return 4;
-    throw std::invalid_argument("Native ARM HC channels require an admitted NEON ISA");
+    if (isa == ISALevel::Scalar) return 1; // Explicit scalar diagnostic program, as on x86.
+    throw std::invalid_argument("Native ARM HC channels require an admitted NEON or scalar ISA");
 #else
 #if defined(__AVX512F__)
     if (activeISALevel() == ISALevel::AVX512) return 16;
@@ -72,8 +73,9 @@ inline void residualDownChannels(const float* input,float* output,int begin,int 
 {
             int channel = begin;
 #if defined(__aarch64__) && defined(__ARM_NEON)
-            if (vectorWidth != 4)
-                throw std::invalid_argument("Native ARM HC channels require their explicit four-lane program");
+            if (vectorWidth != 4 && vectorWidth != 1)
+                throw std::invalid_argument("Native ARM HC channels require their four-lane or scalar program");
+            if (vectorWidth == 4)
             for (; channel + 4 <= end; channel += 4)
             {
                 const auto value = vmulq_n_f32(vld1q_f32(input + channel), 0.25f);

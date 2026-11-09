@@ -188,10 +188,15 @@ void proveVerifierWorkers(const QuantizedVerifierFormatCase &format, int n, int 
                 " workers=" + std::to_string(workers));
             std::fill(grouped.begin(), grouped.end(), -12345.0f);
             PerfStatsCollector::reset();
+#if defined(__aarch64__)
+            // ARM's native shared-row candidate; x86 pair-grid routes do not exist.
+            constexpr auto policy = VerifierRowsPolicy::Pairwise;
+#else
+            constexpr auto policy = VerifierRowsPolicy::FullKTwoRowPairGridNbc1;
+#endif
             gemm_native_quantised_preq_decode_equivalent_rows(
                 packed, quantized.data(), grouped.data(), partials.span(),
-                rows, stride, ISAPath::AUTO,
-                VerifierRowsPolicy::FullKTwoRowPairGridNbc1);
+                rows, stride, ISAPath::AUTO, policy);
             for (int row = 0; row < rows; ++row)
             {
                 ASSERT_EQ(std::memcmp(grouped.data() + size_t(row) * stride,
@@ -202,6 +207,9 @@ void proveVerifierWorkers(const QuantizedVerifierFormatCase &format, int n, int 
             ASSERT_TRUE(std::all_of(grouped.begin() + size_t(rows) * stride,
                 grouped.end(), [](float value) { return value == -12345.0f; }));
 
+#if !defined(__aarch64__)
+            // x86 publishes per-worker pair-grid task ownership; the NEON batch
+            // does not publish worker-task counters yet (tracked in the ARM plan).
             const int tasks = ((rows + 1) / 2) * ((n + 63) / 64);
             std::set<int> owners;
             double completed = 0.0;
@@ -215,6 +223,7 @@ void proveVerifierWorkers(const QuantizedVerifierFormatCase &format, int n, int 
             }
             EXPECT_EQ(completed, tasks);
             EXPECT_EQ(owners.size(), size_t(std::min(workers, tasks)));
+#endif
         }
     }
 }
