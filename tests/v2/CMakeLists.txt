@@ -2822,6 +2822,14 @@ add_v2_test(V2_Integration_WorkspaceRetentionPhysicalIdentity
     TIMEOUT 30
     NO_MPI NO_MODELS
 )
+# A decode-first serial family (prefix-hit warmup) must publish the largest
+# prefill rows in generation one; 27B on GB10 failed intermittently otherwise.
+add_v2_test(V2_Integration_DecodeFirstSerialWorkspaceFamily
+    COMMAND $<TARGET_FILE:v2_unit_workspace_allocator>
+        --gtest_filter=Test__WorkspaceAllocator.CPUDecodeFirstSerialFamilyPublishesLargestPrefillRows
+    LABELS "V2;Integration;ProductionTestPreflight;Memory;Workspace;CPU;DeviceFree;Regression"
+    MPI_PROCS 1 TIMEOUT 30 NO_MPI NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DecodeFirstSerialWorkspaceFamily)
 add_v2_test(V2_Integration_NativeVocabularyWorkspacePublication
     COMMAND $<TARGET_FILE:v2_unit_workspace_allocator>
         --gtest_filter=Test__WorkspaceAllocator.NativeVocabularySerialFamilyPublishesVerifierBank
