@@ -58,11 +58,18 @@ namespace llaminar2::cpu::native_quantised
      * AVX2-only artifact. Keep the build envelope visible to telemetry and
      * generated dispatch instead of treating the active runtime ISA as a
      * complete binary identity.
+     *
+     * NEON_I8MM is a local build/telemetry name only. Its arithmetic level is
+     * NEONDotProd (SMMLA and SDOT publish identical exact INT32 sums), so
+     * sealed CPU identities, MPI wire records and archive/cache keys never
+     * carry this name.
      */
     inline constexpr const char *compiledNativeQuantisedBuildISAName()
     {
 #if defined(__aarch64__) && defined(__ARM_NEON)
-#if defined(__ARM_FEATURE_DOTPROD)
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+        return "NEON_I8MM";
+#elif defined(__ARM_FEATURE_DOTPROD)
         return "NEON_DOTPROD";
 #else
         return "NEON";

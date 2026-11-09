@@ -29,14 +29,24 @@ def instruction_counts(assembly: str) -> dict[str, int]:
 
 
 def require_envelope(mode: str, counts: dict[str, int]) -> None:
-    """Reject implicit optional ISA, or a DotProd witness that never exercises dot instructions."""
-    if any(counts[name] for name in ("usdot", "sudot", "smmla", "ummla", "usmmla")):
+    """Reject implicit optional ISA, or a witness that never exercises its admitted instructions.
+
+    NEON_I8MM admits exactly signed SMMLA beyond DotProd; mixed-sign and
+    unsigned matrix forms remain outside every envelope.
+    """
+    if mode not in ("NEON", "NEON_DOTPROD", "NEON_I8MM"):
+        raise ValueError(f"unknown native ARM compiler envelope: {mode}")
+    if any(counts[name] for name in ("usdot", "sudot", "ummla", "usmmla")):
+        raise ValueError(f"compiler emitted unadmitted matrix/dot extensions: {counts}")
+    if mode != "NEON_I8MM" and counts["smmla"]:
         raise ValueError(f"compiler emitted unadmitted matrix/dot extensions: {counts}")
     dots = counts["sdot"] + counts["udot"]
     if mode == "NEON" and dots:
         raise ValueError(f"baseline NEON compiler envelope leaked DotProd: {counts}")
-    if mode == "NEON_DOTPROD" and not dots:
+    if mode in ("NEON_DOTPROD", "NEON_I8MM") and not dots:
         raise ValueError("DotProd compiler witness did not exercise native dot instructions")
+    if mode == "NEON_I8MM" and not counts["smmla"]:
+        raise ValueError("I8MM compiler witness did not exercise native SMMLA instructions")
 
 
 def require_native_assembly(assembly: str) -> None:
@@ -194,7 +204,7 @@ def main() -> None:
     parser.add_argument("--source", required=True)
     parser.add_argument("--policy", required=True)
     parser.add_argument("--proof", required=True)
-    parser.add_argument("--mode", choices=("NEON", "NEON_DOTPROD"), required=True)
+    parser.add_argument("--mode", choices=("NEON", "NEON_DOTPROD", "NEON_I8MM"), required=True)
     parser.add_argument("--signature", required=True)
     parser.add_argument("--compiler")
     parser.add_argument("--compiler-version")

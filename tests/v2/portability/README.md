@@ -24,7 +24,7 @@ ctest --test-dir build_arm_portability -L '^ProductionTestPreflight$' \
   --repeat until-fail:20 --output-on-failure --parallel
 ```
 
-`NEON_DOTPROD` is a separate admitted compiler envelope. On x86-64, configure
+`NEON_DOTPROD` and `NEON_I8MM` are separate admitted compiler envelopes. On x86-64, configure
 separate `AVX2` and `AVX512` build directories; do not relabel one binary's
 observations as another ISA. The supported values and exact flags belong to
 `cmake/CPUInstructionSet.cmake`. Keep Debug, sanitizer, alternate-compiler and
