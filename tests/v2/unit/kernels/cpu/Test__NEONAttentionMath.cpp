@@ -208,20 +208,35 @@ TEST_F(NEONAttentionMath, Q16BoundRejectsUnprovenReductions)
  */
 TEST_F(NEONAttentionMath, Q16BoundRejectsInvalidTailCodesBeforeTailArithmetic)
 {
+    GTEST_FLAG_SET(death_test_style,"fast");
     const auto bound=cpu::Q16ReductionBound::forTerms(65);
     ASSERT_EQ(bound.queryLimit(),1008);
     std::vector<std::int16_t> query(65,std::int16_t(-1008)),key(65,std::int16_t(-32768));
-    const std::array<std::span<const std::int16_t>,4> keys{key,key,key,key};
-    // Valid: 65 * 1008 * 32768 = 2,146,959,360 <= INT32_MAX, exact in int32.
-    for(const auto value:native::integerDot<4>(bound,query,keys))EXPECT_EQ(value,std::int32_t(2146959360));
+    const std::span<const std::int16_t> k(key);
+    const std::array<std::span<const std::int16_t>,1> keys1{k};
+    const std::array<std::span<const std::int16_t>,2> keys2{k,k};
+    const std::array<std::span<const std::int16_t>,4> keys4{k,k,k,k};
+    // Valid: 65 * 1008 * 32768 = 2,146,959,360 <= INT32_MAX, exact in int32 for every row program.
+    for(const auto value:native::integerDot<1>(bound,query,keys1))EXPECT_EQ(value,std::int32_t(2146959360));
+    for(const auto value:native::integerDot<2>(bound,query,keys2))EXPECT_EQ(value,std::int32_t(2146959360));
+    for(const auto value:native::integerDot<4>(bound,query,keys4))EXPECT_EQ(value,std::int32_t(2146959360));
+    // Explicit abort from the diagnostic: an escaped exception or terminate exits 77.
+    const auto rejects=[&](const std::vector<std::int16_t>&invalid,const char*where){
+        const auto expect=[&]<std::size_t Rows>(const std::array<std::span<const std::int16_t>,Rows>&keys){
+            EXPECT_EXIT(({
+                std::set_terminate([]{std::fputs("escaped exception or terminate\n",stderr);std::_Exit(77);});
+                (void)native::integerDot<Rows>(bound,invalid,keys);
+                std::_Exit(0);
+            }),::testing::KilledBySignal(SIGABRT),"Q16 query code outside its int32 reduction bound") << where << " rows=" << Rows;
+        };
+        expect(keys1);expect(keys2);expect(keys4);
+    };
     for(const std::int16_t bad:{std::int16_t(-32768),std::int16_t(1009),std::int16_t(-1009),std::int16_t(32767)})
     {
         auto invalid=query;invalid[64]=bad;
-        EXPECT_DEATH((native::integerDot<1>(bound,invalid,{std::span<const std::int16_t>(key)})),"outside its int32 reduction bound");
-        EXPECT_DEATH((native::integerDot<2>(bound,invalid,{std::span<const std::int16_t>(key),std::span<const std::int16_t>(key)})),"outside its int32 reduction bound");
-        EXPECT_DEATH((native::integerDot<4>(bound,invalid,keys)),"outside its int32 reduction bound");
+        rejects(invalid,"tail");
         invalid[64]=std::int16_t(-1008);invalid[3]=bad;
-        EXPECT_DEATH((native::integerDot<4>(bound,invalid,keys)),"outside its int32 reduction bound");
+        rejects(invalid,"vector");
     }
 }
 
