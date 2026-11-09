@@ -3,7 +3,7 @@
  * @brief C++ implementation of CUDA Flash Attention kernel methods
  *
  * Implements ITensorAttention interface by delegating to CUDA kernels
- * defined in CUDAFlashAttentionKernels.cu. Decode uses a capacity-stable KV
+ * defined in CUDAFlashAttentionShardImpl.cu.inc. Decode uses a capacity-stable KV
  * split envelope and the same ordered scalar/grouped reduction in every
  * determinism mode; determinism does not serialize a whole attention head.
  * Native FP16, BF16 and FP32 cache storage shares that grouped decode contract.
