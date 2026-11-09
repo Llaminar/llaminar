@@ -880,6 +880,26 @@ namespace llaminar2
             for (const auto &consumer_binding : primary_consumers)
             {
                 combined.merge(requirementsForGraphBinding(consumer_binding));
+                /*
+                 * Generation one of a serial family must cover its largest
+                 * participant even when the first graph built is an exact
+                 * decode participant (for example a warmup whose prompt hits
+                 * the prefix cache and therefore decodes before any prefill
+                 * graph exists). Row-scaled names published here at M=1 would
+                 * otherwise make the later prefill participant a fatal late
+                 * growth of a captured name. Merge the same row-scaled
+                 * prefill capacity the largest participant will request.
+                 */
+                if (hints.graph_family_policy ==
+                        WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant &&
+                    hints.serial_family_max_rows > 0 &&
+                    consumer_binding.scales_with_serial_family_rows)
+                {
+                    combined.merge(requirementsForRows(
+                        consumer_binding,
+                        hints.serial_family_max_rows,
+                        WorkspaceGraphParticipantRole::Prefill));
+                }
             }
 
             WorkspaceRequirements decode_participant;
