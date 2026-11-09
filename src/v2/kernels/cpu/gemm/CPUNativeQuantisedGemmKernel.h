@@ -508,9 +508,9 @@ namespace llaminar2::cpu::native_quantised
 
         /**
          * @brief Admit completely written slot bytes before their engine becomes reachable.
-         * @throws std::invalid_argument For reserved metadata bits in live columns; the engine stays unadmitted.
-         * @throws std::logic_error For a retired engine or storage that disagrees with its geometry.
-         * @throws std::logic_error For a retired engine.
+         * @throws std::invalid_argument For reserved metadata bits or non-canonical storage; the engine stays unadmitted.
+         * @throws std::overflow_error For unrepresentable geometry.
+         * @throws std::logic_error For a retired engine or owner fields that disagree with the canonical geometry.
          * @details A current seal is left untouched, so republishing an unchanged
          * engine never writes state that concurrent readers observe.
          */
