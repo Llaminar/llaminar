@@ -157,6 +157,13 @@ it is not full engine, factory/PMA, serving, current sparse source or economy.
 
 ## Current native sparse-attention implementation (not a full-engine certificate)
 
+**Sanitizer qualification correction:** the dedicated tester found a recovering
+UBSan null-score pointer-offset diagnostic in c759/K2 whole-caller logs despite
+GTest exit0. Historical sanitizer case-pass counts below are assertion receipts,
+not proof of UB-free execution. The working fix avoids forming an absent score
+address and makes common core-free CTest UBSan diagnostics fatal; clean reruns
+are pending. No model/engine/economy qualification is implied by old pass counts.
+
 `QwenSparseNativeBankContract.h` supplies one checked original byte-layout
 program to static validation and CPU readers. It rejects stride/address overflow,
 wrong roles/layouts/Q16 blocks and unaligned metadata before consumption;
@@ -272,6 +279,328 @@ memory/placement still requires an implemented native authority, not a libnuma
 stub. Its complete Unit/preflight dependencies never built and no such tests
 ran. A disclosed `--no-verify` draft checkpoint is not a gate waiver. The
 immutable4e56 engine build stays RED; no old ARM build token authorizes a producer.
+
+### Uncommitted native indexer preparation after a669 (not part of sealed packets)
+
+The working tree now dispatches indexer preparation once per representation into
+native full-IEEE RNE casts, a register-only128-square butterfly,
+normalization and partial split-half RoPE. Separate FP32 edges are register-sealed.
+The original rounded-input/square128 buffers are retired; normalized128 remains
+the **produced reference cast-boundary operand**, completed before output stores
+for original same-head semantics, not a decoded KV/weight mirror. At most one
+native fragment's remaining rotary pairs use scalar fringes; tables load native fragments,
+while the allowed64-wide analytic source retains original FP32 frequency/trig.
+
+New independent tests use FP64 binary grids rather than production conversion
+code, all65536 half/BF16 words, half midpoint neighbors, deterministic FP32 words
+and explicit signed half/BF16 finite-to-Inf midpoint/neighbor pins. Public query/
+pool bytes cover all64 even rotary widths, M1..16/31/33, all three representations,
+tables plus the supported64-wide analytic policy, exact query reuse and guards.
+Invariant diagnostic normalization is memoized only after original input equality
+checks; every production geometry still executes. The first oracle fixture used
+unrounded pool inputs and last-token position; its RED is retained, and only the
+reference was corrected to original operand/average casts and block-start position.
+An actual separate original-a669 **Clang** CPP bridge passes the expanded oracle.
+The genuine GNU14 old-object/current-oracle bridge instead fails4250 FP32 cells:
+GNU's default cross-statement contraction fused the second RoPE product into its
+add, while Clang did not. FP16/BF16 bridge cells pass; current separated native
+programs match the independent oracle. This is a compiler-dependent production
+defect repaired by explicit rounding boundaries, not preservation of old GNU14
+FP32 bytes. A second mean/epsilon FMA is also unsafe at allowed subnormal means:
+summary word64 divided128 rounds to0, then epsilon word1 yields variance word1;
+one FMA yields word2. New focused public regression pins that and a legitimate
+45-degree equal-product RoPE cancellation, including exact query reuse.
+
+A separate exact-header counter selects the distinct truncated-subnormal storage
+program: one parent fails the intended input0x33000001/half-minimum exact word,
+with original test/link inputs authenticated. The first full native31-case run
+failed only three precise fatal-stage strings; the implementation now retains
+original RMS/normalized/rotary diagnostics without weakening assertions. Current
+baseline/strict31 assertion runs passed; optimized31 has the recovering UB report
+above and is not sanitizer-clean. Reviews74–76 close only their bounded source
+slices; they confer no execution credit. Current c759 source passed222 registrations
+on five native profiles and174 preflights×20, plus genuine GNU14 nineteen TUs,
+26 registrations/21 cells×20/31 enabled callers. That source is isolated by the
+user-designated tester at treec759a800e911eed9f4d65e992e58e5a9fba56d72;
+Main now implements while the tester owns all long checks on immutable copies.
+K2 adds native four-original-operand pooling and passes31 assertions on baseline,
+strict and optimized-SAN, but inherits the same UB report; its compiler-resource
+classification is not inherited from c759.
+
+Static actual c759 ISA proves real vector spills in GNU14 FP16 summary/norm/table
+RoPE, Clang FP16 summary/table RoPE and Clang BF16 table RoPE; these are not the
+produced normalized128 buffer or analytic call saves. They disqualify the current
+compute-bound candidate. Tester-sealed K3, treee1810129463732a8d2a9c313ef469858b83dfcd0,
+uses native four-coordinate ASIMD registers (x86 remains eight), direct-FP32 full-
+half casts and opaque bounded copies. Actual baseline/strict/fatal-UBSan profiles
+pass32 enabled callers, explicit ranking1 and31 focused registrations each, with
+no sanitizer diagnostics. Genuine GNU14 K3 passes the same31 registrations,
+23 focused cells×20 and32 enabled callers; target peak3.72GB stays below its
+4GiB BOM, source15676 records are unchanged and its private producer is removed.
+Main inspected the raw source/terminal/admission records and32-case sanitized
+XML; artifact scopes remain K3, never later live Main. The exact old GNU14 object
+still fails the focused mean/RoPE test4 times, and the exact unguarded-score CPP
+counter aborts under fatal UBSan with offset2080. These are deliberate outside-
+source diagnostic controls, not repaired positive producers.
+
+K3 actual per-symbol code eliminates every inspected fused FMA and tail memcpy,
+but still spills: GNU14 FP16 summary has12 vector stores/reloads; Clang FP16
+TablePlanes reloads7 invariant vector slots per iteration. Other inspected
+FP32/BF16 summary/norm/table paths and produced pool phases are clean. K3 is
+therefore **not zero-spill/economy qualified**. Source review77 additionally
+finds the new common sanitizer decoration breaks legal perf-only omissions,
+and the focused cancellation only exercised a scalar rotary pair. The next
+**untested K4** passes failure policy atomically through the directory registrar,
+adds a config-only wrapped-omission regression, and pins rotary2/16/18 (scalar,
+fully native and mixed) cancellation bytes. Its pressure hypothesis sequences
+right-subtree original roots after left summaries and places half-cast register
+entry/exit dependencies to prevent interleaved integer live sets; neither changes
+machine arithmetic, input ownership or the original butterfly. The existing GNU
+`always_inline` lane helper is explicitly inline, not warning-suppressed.
+No FP environment, tolerance, source timeout or global contraction flag changes
+are used. Source-only ACK78 closes77P2/P3 without execution credit. Sealed K4 tree
+2d70cc8c4110d75e19d3af6188f44614587fa493 then passes32 callers and31 registrations
+on each of the three native profiles. Genuine GNU14 adds23 focused cells×20;
+all three
+IndexerProgram filters independently select/run1, and individually forced Scalar
+runs select1/fail native admission1/no skip on each profile. The old GNU14 object
+now fails12 cells, covering both stages/aliases and rotary2/16/18. The old K3
+registration module fails only the new perf-only omission case; current3/3 pass.
+The actual original Clang CPP object is independently byte-reproduced and passes
+both mean/RoPE stages and all three widths, not just the earlier ordinary oracle.
+
+K4 vector-pressure spills are zero in all inspected prepare/pool variants on both
+compilers, with no fused operations or memcpy in those specializations. Scalar
+pressure is **not** zero: GCC FP16 reloads position once per native table fragment;
+Clang reloads position in all three representations, plus output+half in FP32/
+BF16. All six variants reread source/dimension and branch per fragment. Separate
+fringe-loop pointer/position spills remain; these are not analytic call saves or
+normalized-buffer reads. K4 still emits17 GNU always-inline warnings after the
+lane-only fix. This is static evidence, not PMU/economy or whole-engine support.
+
+K5 binds table roots once at the original position, or borrows
+original setup-owned analytic frequencies. A typed source/value geometry drives
+the complete native/mixed rotation without rereading output-aliasable p fields.
+No original frequency array is copied or recomputed; the two supported indexer
+sources remain TablePlanes and AnalyticTheta, while the core-only engine source
+is still rejected by indexer admission. The produced normalized128 stage and
+original arithmetic/cast/fringe/copy orders remain. Remaining score/transpose
+helpers are explicitly inline, never warning-suppressed. Sealed K5 tree
+97f376d2d3ac939d29180073a9efc3c1cc032d2c passes baseline/strict32, but optimized-
+sanitizer is **RED31/32** with42 FP32 analytic64 assertions (28 query,14 pool),
+starting at query word2066 and pool word271; there are no sanitizer diagnostics.
+The tester stops before GNU14, resources or controls. Source-only ACK79 cannot
+establish compiled libm call equivalence or override that actual numerical RED.
+
+The new code shape let Clang merge production cosf/sinf into Apple's paired
+`__sincosf_stret`, while the optimized-sanitizer oracle kept the public unary
+calls. A separately labeled native diagnostic over1,383,688 angles finds8691
+cosine and14556 sine word differences, including angle0x3a83ef22. Its private
+paired call is diagnostic only, never installed production. Thus earlier
+Clang oracle bridges do not prove a compiler-independent elementary-function
+contract; their mean/FMA/table scopes remain distinct. No expectation/tolerance
+is relaxed, and no failing source producer is retried silently.
+
+**Untested K6** defines the actual host program as the two original public
+cosf/sinf functions. A native register identity between completed cosine and
+its unchanged sine argument prevents pairing after inlining without a global
+flag, FP-mode change or private ABI. Both the common host rotary helper and the
+bound analytic source consume that primitive; CUDA/HIP device policies are
+unchanged, but their new-header compilation remains unverified. The independent
+oracle uses test-only volatile public-function pointers, not the production
+factor algorithm. A new explicit Unit/preflight public regression isolates
+unary words through genuine theta10000 setup invariants at positions1/4/8/16/32,
+with inverse1, paired normalized1/0, all guards/aliases and original-frequency
+immutability; it also pins the divergent primitive angle against the live SDK.
+Sealed K6 tree8e8fd965ff0309005f1ed5ffe98060074c8d6c9f passes the existing32
+cases on all three native profiles, including the formerly failing broad
+analytic oracle, but its new case is **RED** before the alias call. At position1,
+legitimate high-pair cosf values round to1, equal to original input1, violating
+the fixture's all-word poison precondition. The primitive/disjoint-position1
+checks pass; that does not certify remaining aliases/positions. No sanitizer
+reports occur, and no libm-symbol/GNU14/resource/control work follows the RED.
+The initial sealer also preserves a missing-K4-Git-alternate metadata failure;
+its corrected full-chain tree seal precedes source execution, not a retroactive
+claim that the first metadata attempt passed.
+
+Untested K7 repairs only the fixture: original query2, mean2 and epsilon2 give
+exact inverse1/2 and the same normalized1/0 elementary-word isolation. Every
+original active word now differs from its expected output, even cosf==1; all
+poison/guard checks remain, not skipped or weakened. Production K6 code is
+unchanged. Sealed K7 treeb06114c9b1919654f7f6561bce86987b6cfc7f5a passes33
+callers/32 registrations on three native profiles and genuine GNU14, plus24 GNU
+focused cells×20. All four numeric filters select/pass1 individually and select/
+fail native admission1 under explicit Scalar. All positive logs are sanitizer-
+clean; GNU warnings are0. The base tree/blob/symlink/gitlink closure is now
+resolved before patching, with the K6 metadata first-RED retained separately.
+
+Actual K7 production objects import only public cosf/sinf (not a paired ABI),
+and all18 native-profile executables have no sincos import. Current-object
+controls pass; the actual K5 object fails the new public regression4 times and
+the broad independent oracle42 times on both Release and optimized-SAN. Mach-O
+control relinks have identical text/symbols/other bytes except fresh linker UUID
+and ad-hoc signature hashes; they are not mislabeled byte-identical ELF links.
+Source-only ACK80 closes the K6 fixture/source review without execution credit.
+
+K7 complete actual caller/helper analysis proves zero stack traffic/calls/policy
+loads in every table fragment/fringe/copy loop. Scalar resource debt remains:
+GNU FP16 analytic suffix copies reload normalized/output pointers per iteration,
+GNU BF16 reloads output; Clang-inlined FP32/BF16 pool loops reload four raw-root
+words per coordinate. Analytic library-call saves remain separately classified;
+its scalar fringe is unreachable under the admitted64-wide policy. No broad
+matrix or economy certificate follows those unresolved pressure findings.
+
+K8 seals the already-admitted analytic half32 in the typed rotation,
+failing fatally if that post-admission geometry is lost rather than silently
+substituting a width. This removes unreachable analytic fringes and exposes the
+fixed suffix. One outlined whole128-coordinate pool producer binds four original
+roots once, bounding register liveness outside the large OpenMP request lambda;
+it is not a scalar/whole-row replay or operand mirror. Arithmetic, original
+normalized/pooled stages and all K7 tests remain unchanged. Source-only ACK81
+finds no new ownership/order/geometry issue. Sealed K8 tree
+3eb767b4f8747c022ce08e40b5fd03d3ec6b1638 passes all33 callers/32 registrations
+on three native Mac profiles and GNU14; GNU repeats24 focused registrations20
+times with zero warnings, and fatal sanitizer logs have no diagnostics. The
+actual27-function prepare/pool/rotate closure has no vector OR GPR stack access
+on any call-free loop cycle on either compiler/all three representations.
+Native analytic loops keep four public cosf/sinf pairs and only separately
+classified AAPCS call saves; table loops remain free of stack/policy reloads.
+The current-link old paired-call object still fails4 new/42 broad byte asserts;
+the current control passes. These are not whole-QSA zero-spill/economy claims.
+
+The same inspection discovers unchanged GNU14 scoring-loop GPR debt outside
+preparation: fifteen unrolled key-fragment offsets pin registers, spilling the
+ISA reference/head bound per head and row/start/block/bound per block while
+reloading original policy roots. Its32 native dot FMAs are intentional, not a
+preparation-contraction defect. Broad qualification is held, not used to hide
+this old caller frontier. Untested K9 binds the original query/pool/score roots,
+visible count and ISA value to one outlined whole score phase per ranking row;
+no per-head/block call or complete M1 indexer replay is added. The original
+four-head native dot/fold/finite/ReLU/add/scale and OpenMP row/selection ownership
+remain unchanged. Its new public-indexer regression independently checks live
+scores and exact selected/count output plus every inactive/unused guard around
+the512-pool threshold, all three representations and grouped M1/3/16/33. The
+produced query/pool stages are that score oracle's inputs, not a replacement for
+the independent preparation oracle. Unit and explicit ProductionTestPreflight
+registration are added. Source-only ACK82 finds no new production issue, while
+correctly limiting the initial score oracle's claims: its produced query/pool
+inputs do not certify preparation, and explicit cutoff-tie/reversed-head
+falsification was not yet demonstrated.
+
+Sealed K9 treef559d3ed78bae5fcf33a71a310f72908623221c0 passes34 callers/33
+registrations on all three Mac profiles and GNU14, whose25 focused cells each
+pass20 times with zero warnings. Fatal sanitizer diagnostics and paired libm
+imports are absent. Actual prepare/pool/rotate text remains identical to K8,
+and both scoring callers have no pressure stack accesses on call-free cycles.
+Clang scorePools is clean. GNU14 now hoists all128 pool floats across four heads,
+using all32 vector registers and spilling seven q registers:112B stores/block,
+448B reloads/block, plus finite-check/scale constant reloads. This is a real
+register-pressure RED, not an ABI save; green bytes do not waive it. The new
+score test passes the old K5 object because its arithmetic was unchanged; that
+is positive math coverage, not a structural spill discriminator. Broad testing
+remains held.
+
+K10 ties the exact original pool root to each preceding head sum (zero
+before head0) with an inlined native-register identity. It changes no pointer
+bits, operands, arithmetic, policy, allocation or collective edge; it prevents
+compiler lifetime hoisting, not runtime memory ordering or lease/publication.
+The score fixture now includes explicit independently asserted head-order and
+cutoff-tie witnesses in all three representations: orthogonal query heads give
+X, X*2^-24, X*2^-24,0 against512 identical old pools, while the new basis pool
+wins and forces an ordinal tie at the cutoff. Reversing head addition must
+change the final scaled word. Source-only ACK83 verifies the unchanged root
+and formal witness construction, not emitted scheduling. Sealed K10 tree
+f8cb644d570a2434e2adfc04529237848764bcc7 passes34 callers/33 registrations on
+three native Mac profiles and GNU14;25 GNU focused cells each pass20 times.
+Warnings, sanitizer diagnostics and paired libm imports are absent. All29
+profiled preparation/scoring caller/helper functions have zero stack accesses
+on call-free loop cycles on both compilers; the20 preparation symbols retain
+K8 text. GNU scorePools falls from32 to14 vector registers, Clang uses9;
+intentional32 dot FMAs remain. ABI call-loop/semantic storage is distinguished;
+this scoped static result is not whole-engine or economy qualification.
+
+Exact copied-root controls reproduce the current object/links before mutation.
+Removing only the identity call preserves34/34 mathematical results but restores
+GNU's seven-q/constant spills; that is structural compiler falsification only.
+Reversing head order fails the score test with scaled0x3f7e5f8e versus0x3f7e5f90,
+but its fatal first-word assertion stops at FP32: actual FP16/BF16 failures are
+not observed. Reversing the installed tie comparator fails all24 score cells
+and the existing tie/replay regression across the tested native profiles. The
+current-link old paired-libm object still fails4/42 assertions while score
+math passes. All these controls remain distinct from positive-source tests.
+
+K11 changes only score-test reporting: every original word is still bit-compared
+and zero mismatches is required, but one nonfatal aggregate per cell lets later
+representations execute. No production arithmetic, expected bytes, guards,
+geometry, test name or registration changes. Source-only ACK84 finds the count
+logically equivalent and bounded. Sealed tree
+df5f28d4618f1c60846f4f186dd85bb09368e75a passes34 callers/33 registrations on
+three native Mac profiles and GNU14 (25 focused cells×20). Its optimized Apple
+and GNU production objects are byte-identical to K10, not newly relabeled ISA
+proof. Rebound head reversal now actually fails all24 cells: three
+representations×two demands×M1/3/16/33, on baseline, optimized sanitizer and GNU.
+Tie reversal fails the same24 cells and the existing dirty-tie regression;
+identity removal still passes math and restores GNU spills. Current copied-root
+link controls and separate paired-libm controls retain their bounded scopes.
+
+The complete configured core-free matrix on that exact immutable K11 tree
+builds all74 TUs and passes all229 registrations on each of five profiles:
+Apple ASIMD Release, DotProd Release, strict Debug, optimized DotProd ASan/UBSan
+Integration, and LLVM22 ASIMD Release. All179 registered preflight names pass20
+times per profile:17,900 actual raw pass records with exact inventory matches.
+Every test retains30-second timeout and fatal UBSan environment; all25 individual
+native numeric filters run one positive case, and all25 Scalar controls reject
+native admission without skips. Four configure-only CMake metadata cells are
+not native-execution proof. Before/after15676-entry manifests are byte-equal;
+only the separately declared read-only mode freeze distinguishes them from the
+original seal. Main independently audits the raw data and source relation, not
+newly executes these tests.
+
+Actual LLVM22 and Apple DotProd Release objects are separately reproduced and
+profiled:16 preparation/scoring caller/helper functions each have zero stack
+accesses on call-free cycles, scorePools uses9 vector registers/117 instructions
+with32 intentional dot FMAs, preparation has no FMA, and public analytic unary
+calls retain their ABI saves. This is scoped static compiler evidence, not
+whole-engine/economy or all-family certification. The110-file first data seal
+omitted build/configuration logs; its over-broad wording is preserved and a
+separate216-file supplement authenticates those logs, all74 actual compilation
+commands per profile, objects and resource records.
+
+Twelve RMSNorm omp-simd transform warnings remain OPEN in the optimized
+sanitizer build (four per TU in three targets), not hidden by the passing tests.
+They concern the explicit scalar summary/generic FP32 apply paths after native
+ARM dispatch, not a demonstrated QSA or native-fallback defect. The other four
+profiles have zero warnings. See [GitHub issue36](https://github.com/Llaminar/llaminar/issues/36);
+no sanitizer, warning or arithmetic policy is weakened. Complete indexer
+M/positive-worker totality remains open: the existing all-worker QSA lifetime
+sweep covers attention, while legacy indexer grouping uses M15/three workers
+and this independent score regression uses four representative M values with
+one caller. Neither the configured matrix nor these timings certify serving,
+current native-x86, PMA, model/HTTP behavior, or the final Perf__ round.
+
+The first canonical-hook binding attempt stops before execution: this immutable
+snapshot is a plain file tree, so git root discovery fails128. It is not a hook
+PASS or the expected macOS/libnuma failure. A separately owned exact-tree Git
+checkout then binds that same source using read-tree/checkout-index, no commit,
+no Main refs and no optional corpus initialization. The unmodified hook runs
+once with a fresh outside build directory and fails1 at CMakeLists.txt:143:
+`Could NOT find OpenMP_CXX (missing: OpenMP_CXX_FLAGS OpenMP_CXX_LIB_NAMES)`.
+The clean environment supplies no libomp discovery hints. No Unit/preflight or
+app build follows. This differs from earlier attempts with genuine OpenMP
+already configured which reached the native-macOS/libnuma guard; neither
+outcome is a passed gate. No
+retry, SDK stub or altered hook is used. The scoped checkpoint preserves all
+first failures, warning debt and a669's original sealed packet identities;
+publication does not confer execution authorization or end-to-end completion.
+
+The operator explicitly transferred all Spark/related WSL remote coordination
+to Mac arm-sparks01a1b12f. It independently verified the Main three-file handoff
+and outgoing26-file DATA transfer; no execution/window/observer grant moved.
+Outgoing cleanup of owned WSL artifacts/images is a report, not an independent
+observation or authority from the receiver's receipt ACK. Historical intake/SDK
+paths may now be absent and need fresh authorized restoration; original seals
+remain unchanged. Main retains implementation, local tester retains immutable
+local qualification, and task39's joint UMA capacity gap still blocks target15.
 
 ## 2026-11-05 RMSNorm integration checkpoint (incomplete)
 
@@ -1583,7 +1912,7 @@ The genuine SDK archive was SHA-verified on WSL; an adequate-memory Spark
 build-only attempt requires a fresh authenticated successor and capacity window,
 not a smaller worker budget or a changed source branch.
 
-## Latest functional verification
+## Historical159-registration checkpoint and native SDK verification
 
 The completed five-Mac checkpoint below rebuilt159 focused registrations;
 Linux126 and Spark125 rows deliberately retain older source scopes. These are
