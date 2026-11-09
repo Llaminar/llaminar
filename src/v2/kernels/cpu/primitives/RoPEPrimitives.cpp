@@ -435,11 +435,20 @@ namespace llaminar2::primitives
 
     namespace
     {
-        /** @brief How a row with a negative position is published. */
+        /**
+         * @brief Which rows a consumer rotates, and therefore which rows the fill publishes.
+         *
+         * The policy belongs to the consumer's loop, not to the position value:
+         * a consumer that rotates every row must receive angles for every row,
+         * including a negative absolute position, exactly as the original
+         * per-call tables computed them.
+         */
         enum class RoPEPaddingRows
         {
-            Skip,    ///< Padding: the row stays inactive and is never rotated.
-            Compute, ///< The Q8_1 integer program rotates every row by its stored position.
+            VerifierPadding, ///< Grouped verifier rows: a negative id is padding; its row stays
+                             ///< inactive and the consumer skips it by its active flag.
+            EveryPosition,   ///< Contiguous ordinary rows and the Q8_1 integer program rotate
+                             ///< every row by its stored position, negative or not.
         };
 
         /**
@@ -449,7 +458,7 @@ namespace llaminar2::primitives
          * @param inv_freq Immutable inverse frequencies; their count is the row width.
          * @param angles Borrowed planes covering rows x inv_freq.size().
          * @param rows Positive live rows.
-         * @param padding Negative-position policy of the calling format.
+         * @param padding Rows the calling consumer rotates (see RoPEPaddingRows).
          * @param position_of Row-to-position map, evaluated once per row.
          *
          * Rows are independent functions of their absolute position, so any
@@ -469,7 +478,7 @@ namespace llaminar2::primitives
             const auto fill_row = [&](int row)
             {
                 const int position = position_of(row);
-                const bool active = position >= 0 || padding == RoPEPaddingRows::Compute;
+                const bool active = position >= 0 || padding == RoPEPaddingRows::EveryPosition;
                 angles.active[static_cast<size_t>(row)] = active ? 1 : 0;
                 if (!active)
                     return;
@@ -528,7 +537,7 @@ namespace llaminar2::primitives
         int first_position, const std::vector<float> &inv_freq, const RoPEAngleRows &angles, Rotate rotate)
     {
         const int heads = q_heads + (k ? k_heads : 0);
-        fill_shared_angle_rows<false>(inv_freq, angles, rows, RoPEPaddingRows::Skip,
+        fill_shared_angle_rows<false>(inv_freq, angles, rows, RoPEPaddingRows::EveryPosition,
             [first_position](int row) { return first_position + row; });
         auto work = [&]()
         {
@@ -691,7 +700,7 @@ namespace llaminar2::primitives
         if (seq_len == 1)
         {
             // One shared row; every head reads it through one head workshare.
-            fill_shared_angle_rows<false>(inv_freq, angles, 1, RoPEPaddingRows::Skip,
+            fill_shared_angle_rows<false>(inv_freq, angles, 1, RoPEPaddingRows::EveryPosition,
                 [n_past](int) { return n_past; });
             apply_rope_row_fp32(q, k, q_heads, k_heads, head_dim, angles.cos_row(0), angles.sin_row(0));
         }
@@ -823,7 +832,7 @@ namespace llaminar2::primitives
         const int half_rotary = rotary_dim / 2;
 
         // Partial rotation shares the same absolute-position angle authority.
-        fill_shared_angle_rows<false>(inv_freq, angles, seq_len, RoPEPaddingRows::Skip,
+        fill_shared_angle_rows<false>(inv_freq, angles, seq_len, RoPEPaddingRows::EveryPosition,
             [n_past](int row) { return n_past + row; });
 
         // Apply rotation (head_dim for stride, rotary_dim for loop)
@@ -892,7 +901,7 @@ namespace llaminar2::primitives
             const int effective_rotary =
                 rotary_dim > 0 && rotary_dim < head_dim ? rotary_dim : head_dim;
             const auto &inv_freq = get_inv_freq_cached(effective_rotary, freq_base);
-            fill_shared_angle_rows<WithQ15>(inv_freq, angles, verifier_rows, RoPEPaddingRows::Skip,
+            fill_shared_angle_rows<WithQ15>(inv_freq, angles, verifier_rows, RoPEPaddingRows::VerifierPadding,
                 [position_ids, pos_offset](int row)
                 { return position_ids ? position_ids[row] : pos_offset + row; });
         }
@@ -1435,7 +1444,7 @@ namespace llaminar2::primitives
         if (seq_len == 1)
         {
             // One shared row; every head reads it through one head workshare.
-            fill_shared_angle_rows<false>(inv_freq, angles, 1, RoPEPaddingRows::Skip,
+            fill_shared_angle_rows<false>(inv_freq, angles, 1, RoPEPaddingRows::EveryPosition,
                 [n_past](int) { return n_past; });
             apply_rope_row_bf16(q_bf16, k_bf16, q_heads, k_heads, head_dim, angles.cos_row(0), angles.sin_row(0));
             return;
@@ -1977,7 +1986,7 @@ namespace llaminar2::primitives
         if (seq_len == 1)
         {
             // One shared row; every head reads it through one head workshare.
-            fill_shared_angle_rows<false>(inv_freq, angles, 1, RoPEPaddingRows::Skip,
+            fill_shared_angle_rows<false>(inv_freq, angles, 1, RoPEPaddingRows::EveryPosition,
                 [n_past](int) { return n_past; });
             apply_rope_row_fp16(q_fp16, k_fp16, q_heads, k_heads, head_dim, angles.cos_row(0), angles.sin_row(0));
             return;
@@ -2706,7 +2715,7 @@ namespace llaminar2::primitives
         // Q15 rows truncate the shared FP32 row function's values. This integer
         // program rotates every row by its stored position, padding included,
         // so a one-row call no longer reads a previous call's table.
-        fill_shared_angle_rows<true>(inv_freq, angles, seq_len, RoPEPaddingRows::Compute,
+        fill_shared_angle_rows<true>(inv_freq, angles, seq_len, RoPEPaddingRows::EveryPosition,
             [position_ids, pos_offset](int row)
             { return position_ids ? position_ids[row] : pos_offset + row; });
         const int16_t *cos_table = angles.cos_q15.data();

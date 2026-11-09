@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <atomic>
+#include <initializer_list>
 #include <limits>
 #include <cstdint>
 #include <cstring>
@@ -618,6 +619,188 @@ TEST(CPURoPEWorkshare, Q8OneRowNegativePositionIsIndependentOfPriorCall)
     std::vector<std::uint8_t> first_row(rows.begin(), rows.begin() + q_row);
     first_row.insert(first_row.end(), rows.begin() + 2 * q_row, rows.begin() + 2 * q_row + k_row);
     EXPECT_EQ(observed[0], first_row);
+}
+
+/** @brief Ordinary contiguous-position entry points whose rows are all rotated. */
+enum class Ordinary { FP32Full, FP32Partial, Half, BFloat16 };
+/** @brief Storage word of one ordinary entry point. */
+template <Ordinary Call> using OrdinaryWord = std::conditional_t<Call == Ordinary::FP32Full ||
+    Call == Ordinary::FP32Partial, float, std::uint16_t>;
+constexpr int kOrdinaryDim = 64, kOrdinaryQueryHeads = 3, kOrdinaryKeyHeads = 1;
+
+/** @return The rotated prefix width of one ordinary entry point. */
+constexpr int ordinaryRotaryWidth(Ordinary call) { return call == Ordinary::FP32Partial ? kOrdinaryDim / 2 : kOrdinaryDim; }
+
+/**
+ * @brief Call one public ordinary entry point for contiguous rows from `first`.
+ * @tparam Call Entry point under test.
+ * @param q Query rows, modified in place.
+ * @param k Key rows, modified in place.
+ * @param rows Live rows.
+ * @param first Absolute position of row 0; may be negative.
+ * @param angles Borrowed planes for this call.
+ */
+template <Ordinary Call> void callOrdinary(OrdinaryWord<Call> *q, OrdinaryWord<Call> *k, int rows, int first,
+    const primitives::RoPEAngleRows &angles)
+{
+    constexpr int dim = kOrdinaryDim, qh = kOrdinaryQueryHeads, kh = kOrdinaryKeyHeads;
+    if constexpr (Call == Ordinary::FP32Full)
+        primitives::apply_rope_vectorized(q, k, rows, dim, qh, kh, first, 10000.0f, angles);
+    else if constexpr (Call == Ordinary::FP32Partial)
+        primitives::apply_rope_partial(q, k, rows, dim, ordinaryRotaryWidth(Call), qh, kh, first, 10000.0f, angles);
+    else if constexpr (Call == Ordinary::Half)
+        primitives::apply_rope_fp16(q, k, rows, dim, qh, kh, first, 10000.0f, angles);
+    else
+        primitives::apply_rope_bf16(q, k, rows, dim, qh, kh, first, 10000.0f, angles);
+}
+
+/** @brief Negate the second element of every rotated pair: the conjugate rotation's input/output map. */
+template <class Word> void conjugateRows(Word *bank, std::size_t heads, int rotary)
+{
+    for (std::size_t head = 0; head < heads; ++head)
+        for (int i = rotary / 2; i < rotary; ++i)
+        {
+            Word &word = bank[head * kOrdinaryDim + i];
+            if constexpr (std::is_same_v<Word, float>)
+                word = std::bit_cast<float>(std::bit_cast<std::uint32_t>(word) ^ 0x80000000u);
+            else
+                word = static_cast<std::uint16_t>(word ^ 0x8000u);
+        }
+}
+
+/** @return The bank as bytes with both signed zeros folded to +0, for byte comparison. */
+template <class Word> std::vector<std::uint8_t> canonicalBytes(const std::vector<Word> &bank)
+{
+    std::vector<Word> words = bank;
+    for (Word &word : words)
+    {
+        if constexpr (std::is_same_v<Word, float>)
+        {
+            if (std::bit_cast<std::uint32_t>(word) == 0x80000000u) word = 0.0f;
+        }
+        else if (word == 0x8000u)
+            word = 0;
+    }
+    const auto *bytes = reinterpret_cast<const std::uint8_t *>(words.data());
+    return {bytes, bytes + words.size() * sizeof(Word)};
+}
+
+/** @brief Seeded query and key banks for ordinary rows. */
+template <class Word> struct OrdinaryBanks
+{
+    std::vector<Word> query, key;
+    explicit OrdinaryBanks(int rows)
+        : query(std::size_t(rows) * kOrdinaryQueryHeads * kOrdinaryDim),
+          key(std::size_t(rows) * kOrdinaryKeyHeads * kOrdinaryDim)
+    { seedBank(query, 17); seedBank(key, 31); }
+    /** @return Canonical query then key bytes. */
+    std::vector<std::uint8_t> bytes() const
+    {
+        auto out = canonicalBytes(query);
+        const auto k = canonicalBytes(key);
+        out.insert(out.end(), k.begin(), k.end());
+        return out;
+    }
+};
+
+/**
+ * @brief Original serial arithmetic for every row, built only from positive positions.
+ *
+ * A row at non-negative position P is rotated alone at P. Rotation is odd
+ * in its angle: cos(-a) == cos(a) and sin(-a) == -sin(a) with the angle
+ * product exact under negation, and every multiply, add and fused
+ * multiply-add, as well as FP16/BF16 round-to-nearest-even, commutes with
+ * sign. A row at P < 0 therefore equals the conjugate of its conjugated input
+ * rotated at -P. These standalone, positive single-row calls never read a
+ * padding row, so they reproduce the original table arithmetic (every
+ * position computed by the one row function) without the code under test.
+ */
+template <Ordinary Call> std::vector<std::uint8_t> ordinaryReference(int rows, int first)
+{
+    using Word = OrdinaryWord<Call>;
+    OrdinaryBanks<Word> banks(rows);
+    RoPEAngleTestStorage storage(1, kOrdinaryDim / 2);
+    const int rotary = ordinaryRotaryWidth(Call);
+    for (int row = 0; row < rows; ++row)
+    {
+        Word *q = banks.query.data() + std::size_t(row) * kOrdinaryQueryHeads * kOrdinaryDim;
+        Word *k = banks.key.data() + std::size_t(row) * kOrdinaryKeyHeads * kOrdinaryDim;
+        const int position = first + row;
+        if (position < 0)
+        {
+            conjugateRows(q, kOrdinaryQueryHeads, rotary);
+            conjugateRows(k, kOrdinaryKeyHeads, rotary);
+        }
+        callOrdinary<Call>(q, k, 1, position < 0 ? -position : position, storage.view(1, rotary / 2));
+        if (position < 0)
+        {
+            conjugateRows(q, kOrdinaryQueryHeads, rotary);
+            conjugateRows(k, kOrdinaryKeyHeads, rotary);
+        }
+    }
+    return banks.bytes();
+}
+
+/**
+ * @brief Rotate contiguous rows from a negative start through dirty borrowed planes.
+ * @param poison Byte written over the planes and active flags beforehand.
+ * @param team Members of an existing team that all enter the call; 1 is standalone.
+ */
+template <Ordinary Call> std::vector<std::uint8_t> ordinaryDirty(int rows, int first, std::uint8_t poison, int team)
+{
+    OrdinaryBanks<OrdinaryWord<Call>> banks(rows);
+    RoPEAngleTestStorage storage(rows, kOrdinaryDim / 2);
+    auto bytes = storage.aligned();
+    std::memset(bytes.data(), poison, bytes.size());
+    const auto angles = storage.view(rows, ordinaryRotaryWidth(Call) / 2);
+    if (team <= 1)
+        callOrdinary<Call>(banks.query.data(), banks.key.data(), rows, first, angles);
+    else
+    {
+#pragma omp parallel num_threads(team)
+        {
+            if (omp_get_thread_num() == team - 1)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            callOrdinary<Call>(banks.query.data(), banks.key.data(), rows, first, angles);
+        }
+    }
+    return banks.bytes();
+}
+
+/** @brief Check one ordinary entry point over negative starts, dirty planes and teams. */
+template <Ordinary Call> void checkOrdinaryNegativePositions(std::initializer_list<int> row_counts)
+{
+    Budget budget;
+    for (const int rows : row_counts)
+        for (const int first : {-1, -3})
+        {
+            const auto expected = ordinaryReference<Call>(rows, first);
+            // NaN planes with set flags, finite stale planes, and zeroed planes with clear flags.
+            for (const std::uint8_t poison : {std::uint8_t{0xff}, std::uint8_t{0x41}, std::uint8_t{0x00}})
+                for (const int team : {1, 3})
+                    EXPECT_TRUE(ordinaryDirty<Call>(rows, first, poison, team) == expected)
+                        << "call=" << int(Call) << " rows=" << rows << " first=" << first
+                        << " poison=" << int(poison) << " team=" << team;
+        }
+}
+
+/**
+ * @test Ordinary rows at negative positions rotate by their position, never by dirty planes.
+ *
+ * Contiguous-position entry points rotate every row; before the borrowed
+ * angle workspace they computed every row's angles, including negative
+ * positions. Each such row must still publish its angles: the result is
+ * independent of whatever the planes held and equals the original serial
+ * arithmetic. Covers one-row decode, FP32 multi-row and partial-rotary
+ * tables, and the BF16/FP16 shared tables at 32+ rows (their shorter direct
+ * program computes angles inline and is not a table consumer).
+ */
+TEST(CPURoPEWorkshare, OrdinaryNegativePositionsIgnoreDirtyAngleWorkspace)
+{
+    checkOrdinaryNegativePositions<Ordinary::FP32Full>({1, 8, 40});
+    checkOrdinaryNegativePositions<Ordinary::FP32Partial>({1, 8, 40});
+    checkOrdinaryNegativePositions<Ordinary::Half>({1, 40});
+    checkOrdinaryNegativePositions<Ordinary::BFloat16>({1, 40});
 }
 } // namespace
 } // namespace llaminar2::test
