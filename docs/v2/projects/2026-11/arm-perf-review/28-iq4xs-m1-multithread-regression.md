@@ -597,3 +597,17 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   rejection — EvidenceAnalysis 2 + NEONTileRegisters 2 + witness + lifecycle +
   9/9 census all green; proof/2714 intact. Awaiting the `-SE` successor;
   no re-run of the old SHA.
+
+## TOOLING GATE SOURCE-CLOSED (2026-11-09) — ae090ec81
+
+- SOURCE127 FINAL: narrow SOURCE-ONLY ACK, no new P1 (only the two `-SE`
+  shebang lines; Linux passes one valid option arg; Darwin accepts; fixtures/
+  shards/timeouts/checker/budgets unchanged). With the completed SOURCE126
+  review: delimiter, final-observation epoch, GNU-name grammar, driver-control
+  and shard-registration findings SOURCE-CLOSED at ae090ec81. No transfer to a
+  successor/rebase; no artifact auth; no zero-spill/baseline/economy cert;
+  no installed-runner qualification; no grants.
+- Owner evidence complete: GNU + AppleClang × 9 cells, 12/12 tile tests,
+  census green both compilers. Addon R1 remaining: WSL x86 gate; then
+  handover to Main (exact tip). Original uncaptured one-of-four failure stays
+  a separate historical observation (not retroactively authenticated).
