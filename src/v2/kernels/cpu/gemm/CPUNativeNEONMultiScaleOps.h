@@ -28,6 +28,18 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      */
     enum class NEONByteDot { ASIMD, DotProd, I8MM };
 
+    /** @return Stable evidence spelling of one native instruction family. */
+    constexpr const char *neonByteDotName(NEONByteDot dot) noexcept
+    {
+        switch (dot)
+        {
+        case NEONByteDot::ASIMD: return "ASIMD";
+        case NEONByteDot::DotProd: return "DotProd";
+        case NEONByteDot::I8MM: return "I8MM";
+        }
+        return "unknown";
+    }
+
     /** @brief Four native AArch64 columns over the existing four-byte interleaving.
      * @tparam Dot Admitted native integer instruction family.
      */
