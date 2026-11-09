@@ -7701,6 +7701,12 @@ add_v2_test(V2_Unit_CPURMSNormKernelT
     LABELS "V2;Unit;Kernels;RMSNorm;FP32;BF16;FP16;Q8_1;FusedPrecision;TypedResidual;CPU"
     MPI_PROCS 1  # CPURMSNormKernelT tests are CPU-only, single rank
 )
+add_v2_test(V2_Integration_CPURMSNormDecodedRowStackBound
+    COMMAND $<TARGET_FILE:v2_test_rmsnorm_typed_kernel>
+            --gtest_filter=CPURMSNormKernelTTest.DecodedRowScratch*
+            --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;RMSNorm;BF16;FP16;Q8_1;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_RMSNorm
     COMMAND $<TARGET_FILE:v2_test_rmsnorm_typed_kernel>
             --gtest_filter=CPURMSNormKernelTTest.GroupedVerifierRowsAllActivationFormatsMatchSerialDecodeByteExact
