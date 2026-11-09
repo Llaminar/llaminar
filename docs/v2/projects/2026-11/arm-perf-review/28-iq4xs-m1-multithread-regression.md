@@ -390,3 +390,8 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - P2 4-aligned starts/extents (sizes 5/6/7 fail; +2 start fails; 8 passes).
 - Evidence: 66 tests; GNU-14 + AppleClang re-audit identical counts (~3000
   relocations match tables); Mac E2E 3 configs. GB10 census pending (requested).
+
+- SOURCE121 census FULLY GREEN (sealed K14-SOURCE121-CENSUS-20261109): PASS
+  176; 4/4; proof GNU-14 NEON_I8MM 242/1274 (GNU objdump 2.42); lifecycle 1;
+  9/9 cells single=0 grouped=budget 0 mismatches. Owner evidence complete at
+  d0c536cd0. Reviewer SOURCE121 (source) pending.
