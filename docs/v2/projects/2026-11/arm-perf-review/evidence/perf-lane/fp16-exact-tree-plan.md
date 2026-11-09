@@ -153,3 +153,31 @@ capability API or test registration changed. Implementation HELD pending
 final base + .80 evidence + explicit plan approval. Estimate roughly 3-5
 focused engineer-days for a fully gated first family, subject to
 exceptional-value and existing coverage findings.
+
+## Reviewer #143 verdict (2026-11-09) — ACK with OPEN admission items
+
+- ACK: finite-half identity lemma sound (<=22 product bits, exact in FP32;
+  same per-lane fused op + 256-lane tree => finite-domain induction), applied
+  to operands AFTER HalfRNE conversion. 4 boolean cases correct; FP32 A
+  cannot be narrowed; keep WeightType discriminator + two completion
+  branches. Source (:1462-1477) confirms scalar-default on ARM; FP arithmetic
+  files unchanged 39c->777f (source correspondence).
+- OPEN (must be folded before any FMLAL promotion, NOT assumptions):
+  1. POST-CONVERSION domain: finite FP32 input such as 65520 -> HALF INFINITY;
+     the finite lemma does NOT cover it. Geometry admission :4660-4673 does
+     not exclude NaNs/infinities -> full exceptional/payload/conversion gates
+     + compiler/LTO isolation tests = REAL outstanding obligations.
+  2. Complete FMLAL admission design: name the exact supported FPCR profile +
+     stability/admission owner on EVERY executing worker (incl. retained
+     teams); state whether FPSR flags/traps are part of the contract.
+  3. TAIL INVARIANT: inactive K lanes receive NO arithmetic update (not
+     merely zero-filled loads). Mixed FP32xhalf: negative underflow can leave
+     a lane at -0; dummy fma(+0,+0,-0) -> +0 under nearest rounding. Preserve
+     untouched logical lanes/rows and beta==0 nonconsumption. Add independent
+     signed-zero / partial-stripe discriminating controls.
+- Idea31 v2: STATIC PLAN ACK (scope :195-202 confirmed; invariants + gates
+  right; per-block correction must STAY inside its block program, not a
+  post-K accumulated correction; both-compiler closures before any shared
+  installed-width change; GNU-only != AppleClang qualification).
+- No grants. Half-perf checkpoint still needs the FP32-oracle/tree/completion
+  + beta-state/API clarifications (relayed to the lane).
