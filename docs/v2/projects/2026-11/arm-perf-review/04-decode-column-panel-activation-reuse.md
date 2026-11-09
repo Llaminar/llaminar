@@ -95,3 +95,16 @@ in the plan. Any NibbleMap touch points must remain seam-based.
   design), keep label. arm-sparks held (b)/(c); resume at fixed SHA; no
   local patch (tree exact). R1 configured clean at 5d4e3716a (same dir) —
   .80 fine.
+
+## R2 gate (a) finding (2026-11-09) — correctness blocker
+
+- 623e44ccf: CFG=0 BUILD=0 CENSUS=0 (12/12 + 9/9 budget-exact) Release both
+  tips SUCCESS (after external oneDNN/cnpy seeding = env fix); CELLS 100%.
+- Unit 979/14 (13 R1-known base + NEW: CPUNativeNEONPreparedProjection) +
+  Pre 2363/14 (12 R1-known + NEW: CPUNativeNEONI8MMOperandGrouping +
+  CPUNativeNEONPreparedProjection). VERBATIM
+  (I8MMOperandGroupingMatchesSerialSDOTWalk, :634): serial.size() 864 vs
+  pairs.size() 816 → **48 products MISSING (6.7%)** in the R2 grouped I8MM
+  walk = REAL feature defect (grouping drops products; 816 = 864 − 48 →
+  group boundary/trailing partial chunk). Lane fix-back; arm-sparks holds
+  (b)/(c) until the cell is green at the fixed SHA.
