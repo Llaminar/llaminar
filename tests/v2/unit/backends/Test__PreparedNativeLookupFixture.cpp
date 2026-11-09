@@ -1,6 +1,7 @@
 /** @file Test__PreparedNativeLookupFixture.cpp
  * @brief Device-free actual source acquisition/freeze/admission with original mapped worker and payload roots.
  */
+#include "../../utils/HostNUMANodes.h"
 #include "fixtures/backends/PreparedNativeLookupFixtureReplayAccess.h"
 #include "fixtures/backends/NativeLookupCaseAdmission.h"
 #include "mocks/MockWorkerGPUContext.h"
@@ -18,7 +19,7 @@ private:PreparedGPUWorkerThread thread_;
 }
 /** @test Original source and physical CPU payload remain on the same authority through actual admission. */
 TEST(PreparedNativeLookupFixture, OriginalSourceFreezeAdmitAndPayloadResetReplay){
-    if(!hasCPUBackend())initCPUBackend(1);
+    if(!hasCPUBackend())initCPUBackend(llaminar2::test::hostLastNUMANode());
     using Source=NativeContextPreparationReplayAccess;using Fixture=PreparedNativeLookupFixtureReplayAccess;
     for(const auto device:{DeviceId::cuda(49),DeviceId::rocm(49)}){
         testing::installHardwareFreeGPUContextFactories();

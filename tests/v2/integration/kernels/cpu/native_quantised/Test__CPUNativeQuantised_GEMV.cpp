@@ -5810,6 +5810,10 @@ namespace
                     // This public verifier entry does not widen the inner
                     // multi-row policy inventory. The actual M1 primitive is
                     // selected before that table, whose own guard stays strict.
+#if !defined(__aarch64__)
+                    // x86 keeps its learned multi-row table strict. ARM's
+                    // grouped entry has no table: every native row tile owns the
+                    // same full-K tree, so it is total for M >= 1.
                     if (M == 1)
                     {
                         std::vector<Q8_1Block> q8(K / 32);
@@ -5819,6 +5823,7 @@ namespace
                             kernel.packedWeights(), q8.data(), grouped.mutable_data(), {}, 1, N), std::invalid_argument);
                         EXPECT_EQ(std::memcmp(grouped.data(), before_inner.data(), before_inner.size() * sizeof(float)), 0);
                     }
+#endif
 
                     // Physical M0/-1 is invalid on CPU. Rejection precedes any
                     // output or admitted workspace access, even with a valid engine.
