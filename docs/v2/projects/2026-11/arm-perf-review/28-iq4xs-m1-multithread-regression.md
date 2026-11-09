@@ -67,3 +67,18 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - Pending: .80 build+gate at b01d285dc + 3-arm confirmation runs (base /
   R1-spilling / fix, ≥5×31, IQ4_XS+IQ3_S, 17408×5120+2048×4096, M=1/4,
   10/20t, ~45 min).
+
+## Register-evidence gate hardening (SOURCE114 preliminary, 2026-11-09)
+
+- Production fatal accessor + SIGABRT/terminate-77 regression = COHERENT
+  (positive). Gate must upgrade before claiming 'complete' (else diagnostic):
+  1) header-closure authentication: hash/bind the ACTUAL transitive
+     compilation inputs (compile_commands-derived or manifest) + compiler/
+     config identity; verify() rejects STALE production headers.
+  2) detector width: catch stack-relative vector AND scalar FP (s/d) spills
+     through ANY base (sp or fp, constant offsets); DISTINGUISH ABI
+     save/restore prologue/epilogue from program spills (exclude only the
+     former); include s/d widths.
+  3) inventory: expected symbol/body inventory from every explicit
+     instantiation (+ pairBlock), inline/call-closure accounting, partial-
+     program negatives (mutate one body → reject).
