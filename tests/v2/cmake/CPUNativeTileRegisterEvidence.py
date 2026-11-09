@@ -1568,6 +1568,8 @@ def compiler_identity(version: str) -> str:
 
 
 DEPFILE_UNSUPPORTED = re.compile(r"[$#\\'\"%*?\[\]]")
+# Every character a plain-subset name may contain: printable ASCII except the space separator.
+DEPFILE_NAME = re.compile(r"[!-~]+")
 
 
 def read_depfile(path: Path, directory: str) -> list[str]:
@@ -1578,9 +1580,13 @@ def read_depfile(path: Path, directory: str) -> list[str]:
     ('$$' for '$', escaped spaces or '#', backslashes, quotes, wildcards) fails before anything is bound,
     instead of being decoded with another grammar.
     """
-    text = path.read_text()
-    if "\\\r" in text:
-        raise ValueError(f"unsupported line ending in dependency file {path}")
+    text = path.read_bytes().decode("utf-8", "replace")
+    # Separators are exactly the native ones (ASCII space, tab, newline). Any other character outside printable
+    # ASCII - e.g. a no-break space, which Make keeps inside a name but a Unicode split would treat as a
+    # separator, or a vertical tab / carriage return a line split would treat as a line end - fails before
+    # anything is split.
+    if re.search(r"[^\t\n !-~]", text):
+        raise ValueError(f"dependency file {path} contains characters outside the plain depfile subset")
     text = text.replace("\\\n", " ")
     lines = [line for line in text.splitlines() if line.strip()]
     if len(lines) != 1:
@@ -1588,8 +1594,8 @@ def read_depfile(path: Path, directory: str) -> list[str]:
     target, separator, prerequisites = lines[0].partition(": ")
     if not separator:
         raise ValueError(f"malformed compiler dependency file {path}")
-    items = prerequisites.split()
-    unsupported = [item for item in items if DEPFILE_UNSUPPORTED.search(item)]
+    items = [item for item in re.split(r"[ \t]+", prerequisites) if item]
+    unsupported = [item for item in items if DEPFILE_UNSUPPORTED.search(item) or not DEPFILE_NAME.fullmatch(item)]
     if not items or unsupported or DEPFILE_UNSUPPORTED.search(target):
         raise ValueError(f"dependency file {path} uses unsupported escaped names: {unsupported[:3]}")
     # No lexical normalisation: "link/../h.h" must keep the filesystem's meaning (".." of the link target).
@@ -1952,7 +1958,7 @@ def validate_plan(jobs: list[list[str]], identity: str, paths: JobPaths) -> None
         raise ValueError("the GNU assembler job does not write the witness object")
 
 
-GNU_TEMPORARY = re.compile(r"^cc[A-Za-z0-9]{6}\.s$")
+GNU_TEMPORARY = re.compile(r"cc[A-Za-z0-9]{6}\.s")  # Used with fullmatch: no trailing newline.
 
 
 def gnu_temporary(jobs: list[list[str]]) -> str:
@@ -1964,7 +1970,7 @@ def gnu_temporary(jobs: list[list[str]]) -> str:
     if len(outputs) != 1:
         raise ValueError("the GNU compiler job must name exactly one output")
     temporary = compiler[outputs[0] + 1]
-    if not os.path.isabs(temporary) or not GNU_TEMPORARY.match(os.path.basename(temporary)):
+    if not os.path.isabs(temporary) or not GNU_TEMPORARY.fullmatch(os.path.basename(temporary)):
         raise ValueError(f"the GNU compiler output is not a driver temporary assembly file: {temporary}")
     if compiler.count(temporary) != 1 or assembler.count(temporary) != 1 or assembler[-1] != temporary:
         raise ValueError("the GNU assembler job must read exactly the compiler's temporary output, once, last")
@@ -2131,7 +2137,10 @@ def build(args: argparse.Namespace) -> None:
         changed = sorted(path for path in closure if before[path] != after[path])
         raise ValueError(f"inputs changed while the witness compiled: {changed[:3]}")
     if program_identities(plan, command) != programs or \
-            plan_shape(driver_plan(executed, directory, identity, paths)) != plan_shape(plan):
+            plan_shape(driver_plan(executed, directory, identity, paths)) != plan_shape(plan) or \
+            program_identities(plan, command) != programs:
+        # The identities are checked again after the final plan observation, so nothing observed before
+        # publication escapes the epoch.
         raise ValueError("a compiler or assembler program, or the driver plan, changed while the witness compiled")
     disassembly, disassembly_command, tool_version = disassemble(args.disassembler, obj)
     disassembly_path.write_text(disassembly)
