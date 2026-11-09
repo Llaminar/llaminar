@@ -138,6 +138,26 @@ TEST(CPUISAProfile, NativeARMCapabilitiesHaveOneAuthority)
             EXPECT_THROW(capabilities.require(feature), std::runtime_error);
     }
     EXPECT_STREQ(ARMCPUCapabilities::name(ARMCPUFeature::DotProd), "DotProd");
+    // The shared envelope admission rejects a machine lacking any compiled
+    // feature, including I8MM on a DotProd-only host such as M1.
+    const auto bits = [](std::initializer_list<ARMCPUFeature> features) {
+        std::uint32_t value = 0;
+        for (const auto feature : features) value |= static_cast<std::uint32_t>(feature);
+        return value;
+    };
+    const auto i8mm_envelope = bits({ARMCPUFeature::ASIMD, ARMCPUFeature::DotProd, ARMCPUFeature::IntegerMatMul});
+    EXPECT_THROW(ARMCPUCapabilities::requireEnvelope(bits({ARMCPUFeature::ASIMD, ARMCPUFeature::DotProd}), i8mm_envelope),
+        std::runtime_error);
+    EXPECT_THROW(ARMCPUCapabilities::requireEnvelope(bits({ARMCPUFeature::ASIMD, ARMCPUFeature::IntegerMatMul}), i8mm_envelope),
+        std::runtime_error);
+    EXPECT_NO_THROW(ARMCPUCapabilities::requireEnvelope(i8mm_envelope, i8mm_envelope));
+    EXPECT_NO_THROW(ARMCPUCapabilities::requireEnvelope(i8mm_envelope, bits({ARMCPUFeature::ASIMD})));
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    EXPECT_EQ(ARMCPUCapabilities::compiledEnvelopeFeatures(), i8mm_envelope);
+#elif defined(__ARM_FEATURE_DOTPROD)
+    EXPECT_EQ(ARMCPUCapabilities::compiledEnvelopeFeatures(), bits({ARMCPUFeature::ASIMD, ARMCPUFeature::DotProd}));
+#endif
+    EXPECT_NO_THROW(capabilities.requireCompiledEnvelope());
     const auto invalid = static_cast<ARMCPUFeature>(0xffffffffu);
     EXPECT_THROW((void)capabilities.supports(invalid), std::invalid_argument);
     EXPECT_THROW(capabilities.require(invalid), std::invalid_argument);

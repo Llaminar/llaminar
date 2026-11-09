@@ -138,7 +138,7 @@ class NeonExactOverlayTest(unittest.TestCase):
             rows_for("Q4_K", 4, {}, exact="0"),
             complete + complete[:1],
             complete + rows_for("Q4_1", 4, {}, build_isa="NEON", instruction="ASIMD"),
-            # One NEON_I8MM binary: automatic SMMLA and a forced ASIMD run must not pool.
+            # One NEON_I8MM binary: its automatic I8MM family and a forced ASIMD run must not pool.
             rows_for("Q4_K", 4, {}, build_isa="NEON_I8MM", instruction="I8MM")
             + rows_for("Q4_1", 4, {}, build_isa="NEON_I8MM", instruction="ASIMD"),
             rows_for("Q4_K", 4, {}, instruction=""),

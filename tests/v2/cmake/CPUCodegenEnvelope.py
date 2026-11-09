@@ -47,6 +47,8 @@ def require_envelope(mode: str, counts: dict[str, int]) -> None:
         raise ValueError("DotProd compiler witness did not exercise native dot instructions")
     if mode == "NEON_I8MM" and not counts["smmla"]:
         raise ValueError("I8MM compiler witness did not exercise native SMMLA instructions")
+    if mode == "NEON_I8MM" and not counts["sdot"]:
+        raise ValueError("I8MM compiler witness did not exercise signed SDOT, its single-row leaf")
 
 
 def require_native_assembly(assembly: str) -> None:

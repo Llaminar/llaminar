@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <stdexcept>
 #include <system_error>
@@ -87,6 +88,51 @@ namespace llaminar2::cpu
             if (!supports(feature))
                 throw std::runtime_error(std::string("Required native ARM CPU feature is unavailable: ") + name(feature));
         }
+
+        /**
+         * @brief Optional features the including translation unit was compiled to use.
+         * @return ASIMD plus DotProd and I8MM when the compiler envelope enables them.
+         * @details Compiler macros never establish availability; they name what
+         * the machine must provide before code from this envelope may run.
+         */
+        [[nodiscard]] static constexpr std::uint32_t compiledEnvelopeFeatures() noexcept
+        {
+            std::uint32_t features = static_cast<std::uint32_t>(ARMCPUFeature::ASIMD);
+#if defined(__ARM_FEATURE_DOTPROD)
+            features |= static_cast<std::uint32_t>(ARMCPUFeature::DotProd);
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+            features |= static_cast<std::uint32_t>(ARMCPUFeature::IntegerMatMul);
+#endif
+            return features;
+        }
+
+        /**
+         * @brief Admit one complete compiler envelope against observed features.
+         * @param observed Native feature bits.
+         * @param envelope Features the executing code was compiled to use.
+         * @throws std::runtime_error Naming the first envelope feature the machine lacks.
+         * @details The single admission rule shared by every native leaf entry,
+         * device-free testable with any observed feature set.
+         */
+        static void requireEnvelope(std::uint32_t observed, std::uint32_t envelope)
+        {
+            for (const auto feature : {ARMCPUFeature::ASIMD, ARMCPUFeature::DotProd, ARMCPUFeature::FP16Arithmetic,
+                                       ARMCPUFeature::BF16Arithmetic, ARMCPUFeature::IntegerMatMul})
+            {
+                const auto bit = static_cast<std::uint32_t>(feature);
+                if ((envelope & bit) != 0 && (observed & bit) == 0)
+                    throw std::runtime_error(std::string("Required native ARM CPU feature is unavailable: ") + name(feature));
+            }
+        }
+
+        /**
+         * @brief Admit the including translation unit's complete envelope on this machine.
+         * @throws std::runtime_error If any compiled optional feature is not advertised.
+         * @details Auto-generated code may use any instruction of the envelope,
+         * so admission covers all of it, not only the explicitly selected leaf.
+         */
+        void requireCompiledEnvelope() const { requireEnvelope(features_, compiledEnvelopeFeatures()); }
 
         /**
          * @brief Return one stable diagnostic spelling without implying availability.
