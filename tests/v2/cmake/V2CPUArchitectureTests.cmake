@@ -499,12 +499,13 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         "${CMAKE_CURRENT_BINARY_DIR}/cpu_codegen_envelope/proof.s")
     add_dependencies(v2_unit_cpu_isa_profile v2_cpu_codegen_envelope_proof)
     # Register-allocation witness for every native NEON tile K-loop program,
-    # compiled with the same target command at -O3. Single-row (decode)
-    # programs must not spill; grouped row tiles may not exceed the committed
-    # ratchet budget for this compiler identity and ISA envelope. The proof
-    # binds the exact compiler-reported include closure (also the depfile, so
-    # any header change re-runs the witness), the executed command and the
-    # budget; preflight re-verifies all of it without a compiler.
+    # compiled with the same target command at -O3. Structural failures are
+    # fatal; single-row (decode) programs must not spill; grouped row tiles may
+    # not exceed the committed ratchet budget for the compiler identity (derived
+    # from the compiler and checked against the configured one) and ISA
+    # envelope. The proof binds the compilation's own dependency closure (also
+    # the depfile, so any header change re-runs the witness), the executed
+    # command and the budget; preflight re-verifies it without a compiler.
     set(V2_CPU_TILE_REGISTER_SOURCE "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/portability/CPUNativeNEONTileRegisterProbe.cpp")
     set(V2_CPU_TILE_REGISTER_CHECKER "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileRegisterEvidence.py")
     set(V2_CPU_TILE_REGISTER_BUDGET "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileRegisterBudget.json")
@@ -524,14 +525,18 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     else()
         file(RELATIVE_PATH V2_CPU_TILE_REGISTER_DEPFILE_TARGET "${CMAKE_BINARY_DIR}" "${V2_CPU_TILE_REGISTER_PROOF}")
     endif()
-    add_custom_command(OUTPUT "${V2_CPU_TILE_REGISTER_PROOF}"
+    set(V2_CPU_TILE_REGISTER_ASSEMBLY "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.s")
+    add_custom_command(OUTPUT "${V2_CPU_TILE_REGISTER_PROOF}" "${V2_CPU_TILE_REGISTER_ASSEMBLY}"
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.deps"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.pre.deps"
         COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_REGISTER_CHECKER}" build ${V2_CPU_TILE_REGISTER_ARGS}
             "--depfile-target=${V2_CPU_TILE_REGISTER_DEPFILE_TARGET}"
         DEPENDS "${V2_CPU_TILE_REGISTER_SOURCE}" "${V2_CPU_TILE_REGISTER_CHECKER}" "${V2_CPU_CODEGEN_CHECKER}"
             "${V2_CPU_TILE_REGISTER_BUDGET}" "${CMAKE_CXX_COMPILER}" "${V2_CPU_CODEGEN_DATABASE}"
         DEPFILE "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.d"
         VERBATIM)
-    add_custom_target(v2_cpu_native_tile_register_proof DEPENDS "${V2_CPU_TILE_REGISTER_PROOF}")
+    add_custom_target(v2_cpu_native_tile_register_proof
+        DEPENDS "${V2_CPU_TILE_REGISTER_PROOF}" "${V2_CPU_TILE_REGISTER_ASSEMBLY}")
     add_dependencies(v2_unit_cpu_isa_profile v2_cpu_native_tile_register_proof)
     foreach(scope IN ITEMS Unit Integration)
         set(labels V2 ${scope} CPU DeviceFree ISA Build Regression)
