@@ -367,6 +367,14 @@ v2_add_core_free_test(V2_Unit_CPUCodegenEvidenceLifecycle
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_envelope.py"
     LABELS V2 Unit CPU DeviceFree ISA Build Regression)
+v2_add_core_free_test(V2_Unit_CPUNativeTileRegisterEvidence
+    COMMAND "${Python3_EXECUTABLE}" -B
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_native_tile_register_evidence.py"
+    LABELS V2 Unit CPU DeviceFree ISA Build Regression)
+v2_add_core_free_test(V2_Integration_CPUNativeTileRegisterEvidence
+    COMMAND "${Python3_EXECUTABLE}" -B
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_native_tile_register_evidence.py"
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
 v2_add_core_free_test(V2_Integration_CPUCodegenFailedRebuildInvalidation
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_envelope.py"
@@ -490,6 +498,36 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     add_custom_target(v2_cpu_codegen_envelope_proof DEPENDS "${V2_CPU_CODEGEN_PROOF}"
         "${CMAKE_CURRENT_BINARY_DIR}/cpu_codegen_envelope/proof.s")
     add_dependencies(v2_unit_cpu_isa_profile v2_cpu_codegen_envelope_proof)
+    # Register-allocation witness for every native NEON tile K-loop program:
+    # compiled with the same target command at -O3; any vector stack traffic
+    # (a spill) fails the build, and preflight re-verifies the retained proof.
+    set(V2_CPU_TILE_REGISTER_SOURCE "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/portability/CPUNativeNEONTileRegisterProbe.cpp")
+    set(V2_CPU_TILE_REGISTER_CHECKER "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileRegisterEvidence.py")
+    set(V2_CPU_TILE_REGISTER_PROOF "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.json")
+    file(GLOB V2_CPU_TILE_REGISTER_HEADERS "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/gemm/CPUNative*.h")
+    add_custom_command(OUTPUT "${V2_CPU_TILE_REGISTER_PROOF}"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.s"
+        COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_REGISTER_CHECKER}" build
+            "--compiler=${CMAKE_CXX_COMPILER}" "--compile-database=${V2_CPU_CODEGEN_DATABASE}"
+            "--target-source=${V2_CPU_CODEGEN_TARGET_SOURCE}" "--source=${V2_CPU_TILE_REGISTER_SOURCE}"
+            "--signature=${V2_CPU_CODEGEN_SIGNATURE}" "--proof=${V2_CPU_TILE_REGISTER_PROOF}"
+        DEPENDS "${V2_CPU_TILE_REGISTER_SOURCE}" "${V2_CPU_TILE_REGISTER_CHECKER}" "${V2_CPU_CODEGEN_CHECKER}"
+            ${V2_CPU_TILE_REGISTER_HEADERS} "${CMAKE_CXX_COMPILER}" "${V2_CPU_CODEGEN_DATABASE}"
+        VERBATIM)
+    add_custom_target(v2_cpu_native_tile_register_proof DEPENDS "${V2_CPU_TILE_REGISTER_PROOF}")
+    add_dependencies(v2_unit_cpu_isa_profile v2_cpu_native_tile_register_proof)
+    foreach(scope IN ITEMS Unit Integration)
+        set(labels V2 ${scope} CPU DeviceFree ISA Build Regression)
+        if(scope STREQUAL "Integration")
+            list(APPEND labels ProductionTestPreflight)
+        endif()
+        v2_add_core_free_test(V2_${scope}_CPUNativeNEONTileRegisters
+            COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_REGISTER_CHECKER}" verify
+                "--compiler=${CMAKE_CXX_COMPILER}" "--compile-database=${V2_CPU_CODEGEN_DATABASE}"
+                "--target-source=${V2_CPU_CODEGEN_TARGET_SOURCE}" "--source=${V2_CPU_TILE_REGISTER_SOURCE}"
+                "--signature=${V2_CPU_CODEGEN_SIGNATURE}" "--proof=${V2_CPU_TILE_REGISTER_PROOF}"
+            LABELS ${labels})
+    endforeach()
     foreach(scope IN ITEMS Unit Integration)
         set(labels V2 ${scope} CPU DeviceFree ISA Build Regression)
         if(scope STREQUAL "Integration")
