@@ -498,21 +498,38 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     add_custom_target(v2_cpu_codegen_envelope_proof DEPENDS "${V2_CPU_CODEGEN_PROOF}"
         "${CMAKE_CURRENT_BINARY_DIR}/cpu_codegen_envelope/proof.s")
     add_dependencies(v2_unit_cpu_isa_profile v2_cpu_codegen_envelope_proof)
-    # Register-allocation witness for every native NEON tile K-loop program:
-    # compiled with the same target command at -O3; any vector stack traffic
-    # (a spill) fails the build, and preflight re-verifies the retained proof.
+    # Register-allocation witness for every native NEON tile K-loop program,
+    # compiled with the same target command at -O3. Single-row (decode)
+    # programs must not spill; grouped row tiles may not exceed the committed
+    # ratchet budget for this compiler identity and ISA envelope. The proof
+    # binds the exact compiler-reported include closure (also the depfile, so
+    # any header change re-runs the witness), the executed command and the
+    # budget; preflight re-verifies all of it without a compiler.
     set(V2_CPU_TILE_REGISTER_SOURCE "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/portability/CPUNativeNEONTileRegisterProbe.cpp")
     set(V2_CPU_TILE_REGISTER_CHECKER "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileRegisterEvidence.py")
+    set(V2_CPU_TILE_REGISTER_BUDGET "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileRegisterBudget.json")
     set(V2_CPU_TILE_REGISTER_PROOF "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.json")
-    file(GLOB V2_CPU_TILE_REGISTER_HEADERS "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/gemm/CPUNative*.h")
+    string(REGEX MATCH "^[0-9]+" V2_CPU_TILE_REGISTER_MAJOR "${CMAKE_CXX_COMPILER_VERSION}")
+    set(V2_CPU_TILE_REGISTER_IDENTITY "${CMAKE_CXX_COMPILER_ID}-${V2_CPU_TILE_REGISTER_MAJOR}")
+    set(V2_CPU_TILE_REGISTER_ARGS
+        "--compiler=${CMAKE_CXX_COMPILER}" "--compile-database=${V2_CPU_CODEGEN_DATABASE}"
+        "--target-source=${V2_CPU_CODEGEN_TARGET_SOURCE}" "--source=${V2_CPU_TILE_REGISTER_SOURCE}"
+        "--signature=${V2_CPU_CODEGEN_SIGNATURE}" "--proof=${V2_CPU_TILE_REGISTER_PROOF}"
+        "--identity=${V2_CPU_TILE_REGISTER_IDENTITY}" "--mode=${LLAMINAR_CPU_ISA_UPPER}")
+    # Ninja depfile targets are relative to the current binary directory under
+    # CMP0116 NEW and to the top binary directory otherwise.
+    cmake_policy(GET CMP0116 V2_CPU_TILE_REGISTER_DEPFILE_POLICY)
+    if(V2_CPU_TILE_REGISTER_DEPFILE_POLICY STREQUAL "NEW")
+        file(RELATIVE_PATH V2_CPU_TILE_REGISTER_DEPFILE_TARGET "${CMAKE_CURRENT_BINARY_DIR}" "${V2_CPU_TILE_REGISTER_PROOF}")
+    else()
+        file(RELATIVE_PATH V2_CPU_TILE_REGISTER_DEPFILE_TARGET "${CMAKE_BINARY_DIR}" "${V2_CPU_TILE_REGISTER_PROOF}")
+    endif()
     add_custom_command(OUTPUT "${V2_CPU_TILE_REGISTER_PROOF}"
-            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.s"
-        COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_REGISTER_CHECKER}" build
-            "--compiler=${CMAKE_CXX_COMPILER}" "--compile-database=${V2_CPU_CODEGEN_DATABASE}"
-            "--target-source=${V2_CPU_CODEGEN_TARGET_SOURCE}" "--source=${V2_CPU_TILE_REGISTER_SOURCE}"
-            "--signature=${V2_CPU_CODEGEN_SIGNATURE}" "--proof=${V2_CPU_TILE_REGISTER_PROOF}"
+        COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_REGISTER_CHECKER}" build ${V2_CPU_TILE_REGISTER_ARGS}
+            "--depfile-target=${V2_CPU_TILE_REGISTER_DEPFILE_TARGET}"
         DEPENDS "${V2_CPU_TILE_REGISTER_SOURCE}" "${V2_CPU_TILE_REGISTER_CHECKER}" "${V2_CPU_CODEGEN_CHECKER}"
-            ${V2_CPU_TILE_REGISTER_HEADERS} "${CMAKE_CXX_COMPILER}" "${V2_CPU_CODEGEN_DATABASE}"
+            "${V2_CPU_TILE_REGISTER_BUDGET}" "${CMAKE_CXX_COMPILER}" "${V2_CPU_CODEGEN_DATABASE}"
+        DEPFILE "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.d"
         VERBATIM)
     add_custom_target(v2_cpu_native_tile_register_proof DEPENDS "${V2_CPU_TILE_REGISTER_PROOF}")
     add_dependencies(v2_unit_cpu_isa_profile v2_cpu_native_tile_register_proof)
@@ -522,10 +539,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
             list(APPEND labels ProductionTestPreflight)
         endif()
         v2_add_core_free_test(V2_${scope}_CPUNativeNEONTileRegisters
-            COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_REGISTER_CHECKER}" verify
-                "--compiler=${CMAKE_CXX_COMPILER}" "--compile-database=${V2_CPU_CODEGEN_DATABASE}"
-                "--target-source=${V2_CPU_CODEGEN_TARGET_SOURCE}" "--source=${V2_CPU_TILE_REGISTER_SOURCE}"
-                "--signature=${V2_CPU_CODEGEN_SIGNATURE}" "--proof=${V2_CPU_TILE_REGISTER_PROOF}"
+            COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_REGISTER_CHECKER}" verify ${V2_CPU_TILE_REGISTER_ARGS}
             LABELS ${labels})
     endforeach()
     foreach(scope IN ITEMS Unit Integration)
