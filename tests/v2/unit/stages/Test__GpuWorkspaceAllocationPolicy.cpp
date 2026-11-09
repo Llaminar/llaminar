@@ -1512,8 +1512,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUStreamPresenceUsesTypedStageContract
         if (!entry.is_regular_file())
             continue;
         const auto extension = entry.path().extension().string();
+        // Physical-shard bodies (*.cu.inc) are CUDA translation-unit code.
         if (extension != ".cpp" && extension != ".h" &&
-            extension != ".cu" && extension != ".hip")
+            extension != ".cu" && extension != ".hip" &&
+            !entry.path().filename().string().ends_with(".cu.inc"))
         {
             continue;
         }
@@ -14845,7 +14847,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUKernelsCannotOwnTensorPlacement)
             const auto extension = entry.path().extension().string();
             if (extension != ".cpp" && extension != ".cu" &&
                 extension != ".hip" && extension != ".h" &&
-                extension != ".cuh")
+                extension != ".cuh" &&
+                !entry.path().filename().string().ends_with(".cu.inc"))
             {
                 continue;
             }
