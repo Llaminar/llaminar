@@ -1115,7 +1115,7 @@ six small foundation tests or the existence of benchmark sources.
 
 | Family | Existing owning source / target | ARM work required |
 |---|---|---|
-| NativeQuantised decode/prefill candidates | `native_quantised/Perf__CPUNativeQuantised_DispatchSweep.cpp`; `v2_perf_cpu_native_quantised_dispatch_sweep` | Native candidates, source/ISA identities, exact-only collection, same shared shapes |
+| NativeQuantised decode/prefill candidates | x86: `native_quantised/Perf__CPUNativeQuantised_DispatchSweep.cpp`; ARM: `native_quantised/Perf__CPUNativeNEONExactOverlay.cpp` | Native candidates, source/ISA identities, exact-only collection, same shared shapes |
 | NativeQuantised all-format GEMV/grouped/fusion | `Perf__CPUNativeQuantised_GEMV.cpp`, `Perf__CPUFusedVerifier.cpp`, `Perf__CPUNativeQuantised_Sweep.cpp` | Real ARM Auto and forced candidates, complete output authentication and all formats |
 | NativeQuantised thread scaling | `Perf__CPUNativeQuantised_ThreadScaling.cpp`; `v2_perf_cpu_native_quantised_thread_scaling` | Current fixture is Q4_K only and samples selected widths: extend to every format/encoding and all 1..physical widths; retain decode/grouped/prefill distinctions |
 | Attention | `Perf__CPUFlashAttentionTileTournament.cpp`, `Perf__CPUFlashAttentionVerifierRows.cpp`, `Perf__CpuFlashAttentionSweep.cpp` | Native formats/tiles, canonical summaries, all M and actual worker ownership; adapt Linux-only driver placement |
