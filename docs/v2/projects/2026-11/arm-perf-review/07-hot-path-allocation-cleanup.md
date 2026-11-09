@@ -542,3 +542,11 @@ the source policy). Dead persistent_state parameter removed.
 - Systemic: gate2.sh PCH-family clean rebuild before testing (PCHCLEAN);
   recommended for .80 r2gate.sh (addon lane). N2 relaunched PCH-clean
   20:14Z; N3 next.
+
+## Archive (2026-11-09) — ideas-7+25 evidence
+
+- Evidence archived at `evidence/ideas07-25/`: hotpath-handover.md,
+  rope-negative-position-evidence.md,
+  negctl-407347f6c-rope-negative-position.log, 25c-design-notes.md,
+  rope_neg_driver.cpp. Upstream copy from /tmp/armqual (kept until GB10
+  gates pass; then deletable).
