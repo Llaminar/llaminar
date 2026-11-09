@@ -133,3 +133,14 @@ After i8mm merge (same tile / post-merge):
   (Mac-VM-slow; pass standalone 2-8 s) + NativeQuantisedCommonDispatchPolicy =
   base defect (registry 10 vs 9; base added OrderedThreeRows; identical on
   pure base 46c35f15b). NO new ARM failures.
+
+## Arm tip update (2026-11-09, Main)
+
+- #43 rebased onto moved base **07d4f2085** → tip **7d1a94479** (147
+  commits, MERGEABLE/CLEAN; replaces d730777bd). Content unchanged apart
+  from conflict resolutions (contract-header comment; upstream packer doc
+  line; V2CPUExecutionExactPolicyTests.cmake early-return on NEON envelopes
+  reusing Main's intent; registration test new ARM case passes). CUDA stack
+  byte-identical. OPERATOR DIRECTION: routine base rebases don't trigger
+  rebuilds/regates → d730777bd-armed GB10 gates valid; run at 7d1a94479 if
+  not started. Active anchors: base 07d4f2085; tip 7d1a94479.
