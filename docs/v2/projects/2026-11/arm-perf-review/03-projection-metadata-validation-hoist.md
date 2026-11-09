@@ -315,3 +315,17 @@ separate (shared) path with the same pattern but different owners.
 - Rerun at d1f1e8e34 in progress (build/r1c.status); Release builds for window
   (b) (302318f1e + 035d1d948; kernel identical to d1f1e8e34) chained after;
   (b) announced when done.
+
+## R1 evidence GREEN @ d1f1e8e34 (owner, .80) + window (b) started
+
+- Build BUILD=0; Unit 961/963 (2 known base); Preflight 2308/2311 (3 known
+  target-selection); Focused 207/207 (ASIMD/SDOT/I8MM incl. TailPaddingContract,
+  PaddingNormalization incl. malformed-owner controls, MetadataSeal, writer
+  policy, slot reuse, NEONAttention/Q16, CPUFlashAttention, ExpertTier,
+  PackedWeights, CpuExpertSlot, full MoEOverlay/MoEPipeline) — nothing
+  attributable to the diff. x86 PartialChunkPaddingIsNormalizedForX86Readers =
+  WSL gate (d1f1e8e34), not ARM.
+- Window (b) started on .80 (302318f1e vs 035d1d948, Release NEON_I8MM):
+  kernel gemv IQ3_S/IQ4_XS threads 1/10/20, M=1 + 4/15, shapes 512×2048/
+  2048×4096/17408×5120, ABBA 31 iters raw; engine 35B MTP off/dyn saved plan;
+  OMP_PLACES=cores OMP_PROC_BIND=close; ~30–40 min → build/results/w-r1-*.
