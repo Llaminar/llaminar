@@ -134,3 +134,7 @@ the source policy). Dead persistent_state parameter removed.
   call) — both reproduce the defect against the BASE TU in standalone control.
 - Mac portability: 270/270 NEON_DOTPROD + 268/268 NEON @8a553c922, 0 skips;
   source policy clean. Bundle/patches stale; origin branch authoritative.
+
+- PR #43 = 5922cd1f5: Main RETIRED the unused KernelFactory RoPE cache + two
+  dead unregistered test sources flagged by this lane (7d/7a review). The only
+  remaining failure in that filter = MoEForbiddenDependencyScan (known base).

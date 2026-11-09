@@ -123,3 +123,20 @@ Evidence: `~/llaminar-spark-results/K14-CUDA-SPILL-MIGRATION-a62696317`.
   BK256 tail + tensor_prefill + FlashAttention (+ BK64 if confirmed).
 - Idea-25 qualifier: cff351901 runs the demoted kernels — graph/launch
   STRUCTURE only; kernel timings NOT representative of #43 (sealed that way).
+
+## Discrepancy RESOLVED + open set corrected (2026-11-09, Main)
+
+- Not split on/off: Main's A/B also used --split-compile=8 on
+  CUDANativeVNNIPrefillKernels.cu (canonical CMake sets it for that TU;
+  FlashAttention is --split-compile=0). REAL difference = ARCHITECTURE SET
+  (Main: 80;86;89;90;120;121 vs arm-sparks: 121-only): under split-compile the
+  instantiation partition (inlining + per-split-module register allocation)
+  depends on that set → BK64 '0 spills' in the A/B was a PARTITION ARTIFACT
+  ('module-level inlining'), not a code property. No A/B needed.
+- OPEN sm_121 set (real, for GB10 configs 121 or 120;121 — image default
+  80;86;89;90 has no 12.x): BK64 (h0/h4/h5/h24, 4–68 B), BK256 (≤16 B),
+  FlashAttention flash_attention_2_pipelined (44–108 B @128–255 regs),
+  tensor_prefill.
+- FIX REQUIREMENT: spill-free under EVERY partition — verified at 121-only,
+  120;121, AND the full 6-arch set, with split-compile as configured.
+- Fix awaiting the operator's go-ahead (CUDA lane).
