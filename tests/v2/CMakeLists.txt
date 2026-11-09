@@ -19155,6 +19155,24 @@ add_v2_test(V2_Perf_CPUNativeQuantised_ThreadScaling
     TIMEOUT 120
 )
 
+# Performance Test: NEON decode panel-width tournament, one candidate per
+# launch over the production batch path. Registered with the other v2_perf_*
+# targets so Release perf-only builds produce it; widths ship after E2E.
+if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
+    add_executable(v2_perf_cpu_native_neon_panel_tournament
+        performance/kernels/cpu/native_quantised/Perf__CPUNativeNEONPanelTournament.cpp)
+    target_compile_features(v2_perf_cpu_native_neon_panel_tournament PRIVATE cxx_std_20)
+    target_include_directories(v2_perf_cpu_native_neon_panel_tournament PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2 ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_perf_cpu_native_neon_panel_tournament PRIVATE OpenMP::OpenMP_CXX)
+    add_v2_test(V2_Perf_CPUNativeNEONPanelTournamentSmoke
+        COMMAND ${CMAKE_COMMAND} -E env LLAMINAR_PANEL_SHAPES=200x512 LLAMINAR_PANEL_M=1,3
+            LLAMINAR_PANEL_WARMUP=1 LLAMINAR_PANEL_ITERS=3 LLAMINAR_PANEL_STRIPS=4
+            $<TARGET_FILE:v2_perf_cpu_native_neon_panel_tournament>
+        LABELS "V2;Performance;CPU;NEON;NativeQuantised"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+endif()
+
 if(V2_CPU_TARGET_X86)
 add_v2_test(V2_Perf_CPUNativeQuantised_VerifierRows
     COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_gemv>

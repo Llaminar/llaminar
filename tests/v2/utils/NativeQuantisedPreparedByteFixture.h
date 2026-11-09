@@ -6,7 +6,8 @@
  * identity separate from execution encoding. It is not a tensor preparer,
  * allocator substitute or performance fixture: full-engine tests must also use
  * real prepared owners/slots and source tensors. The four-MiB guard prevents a
- * malformed Unit geometry from becoming a model-sized allocation.
+ * malformed Unit geometry from becoming a model-sized allocation; kernel
+ * tournaments raise it explicitly to time production-sized shapes.
  */
 #pragma once
 
@@ -28,10 +29,12 @@ public:
      * @param source Original registry metadata.
      * @param n Logical output columns.
      * @param k Logical reduction elements.
+     * @param max_bytes Allocation bound; the default is the Unit budget.
      * @throws std::invalid_argument For nonpositive geometry.
-     * @throws std::overflow_error If the requested fixture exceeds the Unit budget.
+     * @throws std::overflow_error If the requested fixture exceeds @p max_bytes.
      */
-    explicit NativeQuantisedPreparedByteFixture(const NativeQuantisedFormatInfo &source, int n = 65, int k = 65)
+    explicit NativeQuantisedPreparedByteFixture(const NativeQuantisedFormatInfo &source, int n = 65, int k = 65,
+        std::size_t max_bytes = 4u * 1024u * 1024u)
         : descriptor{.columns = n, .reduction_width = k,
             .source = {.codebook_id = source.codebook_id, .is_superblock = source.is_superblock, .present = true},
             .encoding = cpu::native_quantised::preparedEncodingForSource(source),
@@ -42,8 +45,8 @@ public:
             throw std::invalid_argument("Native CPU byte fixture requires positive geometry");
         const std::uint64_t units = ((std::uint64_t(n) + 63) / 64) * ((std::uint64_t(k) + 31) / 32);
         const auto stride = cpu::native_quantised::preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric);
-        if (units > (4u * 1024u * 1024u) / stride)
-            throw std::overflow_error("Native CPU byte fixture exceeds its four-MiB Unit bound");
+        if (units > max_bytes / stride)
+            throw std::overflow_error("Native CPU byte fixture exceeds its declared byte bound");
         const auto extent = static_cast<std::size_t>(units) * stride;
         storage_.resize(extent + 127);
         const auto offset = (64 - reinterpret_cast<std::uintptr_t>(storage_.data()) % 64) % 64;
