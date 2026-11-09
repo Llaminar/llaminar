@@ -277,3 +277,26 @@ separate (shared) path with the same pattern but different owners.
   separate-fixture proofs. (g) duplicate @throws removed. (f) measured-only.
 - SOURCE113 re-check queued. .80: 661fc9284 Unit 961/963 (2 known-base
   suspect); then incremental rerun at 035d1d948 + window (b) after.
+
+## SOURCE113 final (2026-11-09, 035d1d948) — R1 STATIC GATE PASSES
+
+- Narrow source ACK, no new P1; SOURCE112 normalization P1 source-closed.
+  R1's agreed no-P1 static-review gate passes at 035d1d948. Not
+  native/x86/resource/economy/integration/merge qualification.
+- Acked: view returns plain geometry only (admitStructure private, checked
+  source/encoding/policy, widened N/K, padded-ABI overflow, checked
+  extent+alignment); no unsealed executable view escapes; cached layout fields
+  compared before the mutable borrow; bounds from canonical geometry; only the
+  final chunk's secondary padding cleared; generation ownership +
+  normalization→seal→reachable-publication ordering intact; no arithmetic or
+  transfer-extent delta. Regression covers the malformed list incl. the exact
+  empty owner; retains bytes compared. x86 per-reader 8/16-lane raw+normalized
+  closes the AVX2-masks-AVX512 finding; NEON matrix Rows1..4 × both policies;
+  complementary fixtures documented.
+- NONBLOCKING precision note: Test__CPUNativeVNNI_GEMV.cpp:194–202 does NOT
+  prove IQ2 rejection at EVERY K block (both blocks poisoned, dispatch starts
+  at 0 → first bad block throws); IQ3/IQ4 have explicit per-block asserts →
+  independently poison each IQ2 block or narrow the claim (test precision
+  only, no re-review).
+- R1 CLOSE = the remaining evidence gates: .80 rerun @035d1d948, WSL x86,
+  window (b) economy; then R2 (rebased on successor + C2c).
