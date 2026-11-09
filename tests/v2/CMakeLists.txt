@@ -10551,13 +10551,15 @@ add_v2_test(V2_Integration_CUDABasicPipeline
 # Tests the two-flag coherence model (host_valid_, device_valid_) with full state
 # transition coverage, edge cases, and efficiency verification.
 # See: docs/v2/projects/2026-01/TENSOR_MEMORY_COHERENCE_DESIGN.md
-add_executable(v2_integration_tensor_coherence integration/execution/coherence/Test__TensorCoherence.cpp)
-target_link_libraries(v2_integration_tensor_coherence llaminar2_core GTest::gtest GTest::gtest_main)
+if(HAVE_CUDA)
+    add_executable(v2_integration_tensor_coherence integration/execution/coherence/Test__TensorCoherence.cpp)
+    target_link_libraries(v2_integration_tensor_coherence llaminar2_core GTest::gtest GTest::gtest_main)
+endif()
 add_v2_test(V2_Integration_TensorCoherence
     COMMAND $<TARGET_FILE:v2_integration_tensor_coherence>
     LABELS "V2;Integration;CUDA;TensorTransfer;Coherence;StateMachine;FP32;BF16;FP16;GPUMemory;DeviceManagement"
     MPI_PROCS 1  # Tests GPU coherence locally, no MPI needed
-)
+    REQUIRES_BACKEND CUDA)
 
 # Test: Host Release After GPU Upload (CUDA Pinned Memory Regression)
 # Regression tests for the bug where release_host_weight_data() after ensureOnDevice()
@@ -11570,86 +11572,98 @@ add_v2_test(V2_Integration_CUDAOpsParity
 
 # Canonical CUDA grouped standalone SwiGLU proof. This explicit binary avoids
 # treating the fused GEMM+SwiGLU-down sweep as coverage for the activation API.
-add_executable(v2_integration_cuda_swiglu_grouped_verifier
-    integration/kernels/cuda/ops/Test__CUDASwiGLUGroupedVerifier.cpp)
-target_include_directories(v2_integration_cuda_swiglu_grouped_verifier
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_integration_cuda_swiglu_grouped_verifier
-    llaminar2_core GTest::gtest GTest::gtest_main)
+if(HAVE_CUDA)
+    add_executable(v2_integration_cuda_swiglu_grouped_verifier
+        integration/kernels/cuda/ops/Test__CUDASwiGLUGroupedVerifier.cpp)
+    target_include_directories(v2_integration_cuda_swiglu_grouped_verifier
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_cuda_swiglu_grouped_verifier
+        llaminar2_core GTest::gtest GTest::gtest_main)
+endif()
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_SwiGLU
     COMMAND $<TARGET_FILE:v2_integration_cuda_swiglu_grouped_verifier>
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;SwiGLU;FP32;BF16;FP16;AllFormats;DeviceResident;ExplicitStream;BatchInvariant;Regression"
     MPI_PROCS 1
-)
+    REQUIRES_BACKEND CUDA)
 
 # Canonical CUDA MTP RMSNorm proof. The dedicated binary enters the real
 # tensor-aware API and covers all native formats plus both reduction launch
 # widths; the older parity binary remains a broad CPU-reference tolerance suite.
-add_executable(v2_integration_cuda_rmsnorm_grouped_verifier
-    integration/kernels/cuda/ops/Test__CUDARMSNormGroupedVerifier.cpp)
-target_include_directories(v2_integration_cuda_rmsnorm_grouped_verifier
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_integration_cuda_rmsnorm_grouped_verifier
-    llaminar2_core GTest::gtest GTest::gtest_main)
+if(HAVE_CUDA)
+    add_executable(v2_integration_cuda_rmsnorm_grouped_verifier
+        integration/kernels/cuda/ops/Test__CUDARMSNormGroupedVerifier.cpp)
+    target_include_directories(v2_integration_cuda_rmsnorm_grouped_verifier
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_cuda_rmsnorm_grouped_verifier
+        llaminar2_core GTest::gtest GTest::gtest_main)
+endif()
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_RMSNorm
     COMMAND $<TARGET_FILE:v2_integration_cuda_rmsnorm_grouped_verifier>
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;RMSNorm;FP32;BF16;FP16;AllFormats;NarrowWideReduction;DeviceResident;ExplicitStream;BatchInvariant;Regression"
     MPI_PROCS 1
-)
+    REQUIRES_BACKEND CUDA)
 
 # Canonical CUDA proof for the graph's real fused residual-plus-normalization
 # stage, including both device-published outputs and native format dispatch.
-add_executable(v2_integration_cuda_fused_residual_norm_grouped_verifier
-    integration/kernels/cuda/ops/Test__CUDAFusedResidualNormGroupedVerifier.cpp)
-target_include_directories(v2_integration_cuda_fused_residual_norm_grouped_verifier
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_integration_cuda_fused_residual_norm_grouped_verifier
-    llaminar2_core GTest::gtest GTest::gtest_main)
+if(HAVE_CUDA)
+    add_executable(v2_integration_cuda_fused_residual_norm_grouped_verifier
+        integration/kernels/cuda/ops/Test__CUDAFusedResidualNormGroupedVerifier.cpp)
+    target_include_directories(v2_integration_cuda_fused_residual_norm_grouped_verifier
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_cuda_fused_residual_norm_grouped_verifier
+        llaminar2_core GTest::gtest GTest::gtest_main)
+endif()
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_FusedResidualNorm
     COMMAND $<TARGET_FILE:v2_integration_cuda_fused_residual_norm_grouped_verifier>
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;FusedResidualNorm;ResidualAdd;RMSNorm;FP32;BF16;FP16;AllFormats;NarrowWideReduction;DeviceResident;ExplicitStream;BatchInvariant;Regression"
     MPI_PROCS 1
-)
+    REQUIRES_BACKEND CUDA)
 
 # Canonical CUDA MTP RoPE proof. The dedicated binary keeps the byte-exact
 # all-format matrix independent from the older CPU-reference tolerance suite.
-add_executable(v2_integration_cuda_rope_grouped_verifier
-    integration/kernels/cuda/ops/Test__CUDARoPEGroupedVerifier.cpp)
-target_include_directories(v2_integration_cuda_rope_grouped_verifier
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_integration_cuda_rope_grouped_verifier
-    llaminar2_core GTest::gtest GTest::gtest_main)
+if(HAVE_CUDA)
+    add_executable(v2_integration_cuda_rope_grouped_verifier
+        integration/kernels/cuda/ops/Test__CUDARoPEGroupedVerifier.cpp)
+    target_include_directories(v2_integration_cuda_rope_grouped_verifier
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_cuda_rope_grouped_verifier
+        llaminar2_core GTest::gtest GTest::gtest_main)
+endif()
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_RoPE
     COMMAND $<TARGET_FILE:v2_integration_cuda_rope_grouped_verifier>
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;RoPE;FP32;BF16;FP16;AllFormats;DeviceResident;ExplicitStream;BatchInvariant;Regression"
     MPI_PROCS 1
-)
+    REQUIRES_BACKEND CUDA)
 
 # Test: CUDA ResidualAdd Parity
 # Tests CUDA ResidualAdd kernels (FP32, BF16, FP16) against CPU reference
 # with cosine similarity and L2 error metrics
-add_executable(v2_integration_cuda_residual_add_parity integration/kernels/cuda/ops/Test__CUDAResidualAddParity.cpp)
-target_link_libraries(v2_integration_cuda_residual_add_parity llaminar2_core GTest::gtest GTest::gtest_main)
+if(HAVE_CUDA)
+    add_executable(v2_integration_cuda_residual_add_parity integration/kernels/cuda/ops/Test__CUDAResidualAddParity.cpp)
+    target_link_libraries(v2_integration_cuda_residual_add_parity llaminar2_core GTest::gtest GTest::gtest_main)
+endif()
 add_v2_test(V2_Integration_CUDAResidualAddParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_residual_add_parity>
     LABELS "V2;Integration;CUDA;Parity;ResidualAdd;FP32;BF16;FP16;CosineSimilarity"
     MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
-)
+    REQUIRES_BACKEND CUDA)
 
 # Canonical CUDA grouped residual-add proof. This explicit suite requires
 # device-only pointers, a non-default stream, native bytes, and one flat launch.
-add_executable(v2_integration_cuda_residual_add_grouped_verifier
-    integration/kernels/cuda/ops/Test__CUDAResidualAddGroupedVerifier.cpp)
-target_include_directories(v2_integration_cuda_residual_add_grouped_verifier
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_integration_cuda_residual_add_grouped_verifier
-    llaminar2_core GTest::gtest GTest::gtest_main)
+if(HAVE_CUDA)
+    add_executable(v2_integration_cuda_residual_add_grouped_verifier
+        integration/kernels/cuda/ops/Test__CUDAResidualAddGroupedVerifier.cpp)
+    target_include_directories(v2_integration_cuda_residual_add_grouped_verifier
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_cuda_residual_add_grouped_verifier
+        llaminar2_core GTest::gtest GTest::gtest_main)
+endif()
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_ResidualAdd
     COMMAND $<TARGET_FILE:v2_integration_cuda_residual_add_grouped_verifier>
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;ResidualAdd;FP32;BF16;FP16;AllFormats;DeviceResident;ExplicitStream;BatchInvariant;Regression"
     MPI_PROCS 1
     NO_MODELS
-)
+    REQUIRES_BACKEND CUDA)
 # Independent normal-FP32 vector/tail ownership and exact live-extent proof.
 add_v2_test(V2_Integration_CUDAResidualAddTailExtents
     COMMAND $<TARGET_FILE:v2_integration_cuda_residual_add_grouped_verifier>
@@ -11657,7 +11671,7 @@ add_v2_test(V2_Integration_CUDAResidualAddTailExtents
     LABELS "V2;Integration;CUDA;ResidualAdd;FP32;GroupedVerifierRows;ByteExact;Regression;GraphCapture"
     MPI_PROCS 1
     NO_MODELS
-)
+    REQUIRES_BACKEND CUDA)
 
 # Test: CUDA HiddenStateRowSelectStage graph capture/replay
 # Verifies bucketed-prefill LM-head row selection can update real length across graph replays.
@@ -28626,17 +28640,19 @@ add_v2_test(V2_Integration_MTPPublicationCommitAuthority
     TIMEOUT 30
 )
 
-add_executable(v2_integration_prefill_graph_capture_guards
-    integration/stages/Test__PrefillGraphCaptureGuards.cpp)
-target_include_directories(v2_integration_prefill_graph_capture_guards
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_integration_prefill_graph_capture_guards
-    llaminar2_core GTest::gtest GTest::gtest_main)
+if(HAVE_ROCM)
+    add_executable(v2_integration_prefill_graph_capture_guards
+        integration/stages/Test__PrefillGraphCaptureGuards.cpp)
+    target_include_directories(v2_integration_prefill_graph_capture_guards
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_prefill_graph_capture_guards
+        llaminar2_core GTest::gtest GTest::gtest_main)
+endif()
 add_v2_test(V2_Integration_PrefillGraphCaptureGuards_ROCm
     COMMAND $<TARGET_FILE:v2_integration_prefill_graph_capture_guards>
     LABELS "V2;Integration;ROCm;MoE;GDN;Stages;GraphCapture;ExplicitStream"
     MPI_PROCS 1
-)
+    REQUIRES_BACKEND ROCM)
 
 add_executable(v2_test_gpu_workspace_allocation_policy unit/stages/Test__GpuWorkspaceAllocationPolicy.cpp)
 target_include_directories(v2_test_gpu_workspace_allocation_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
