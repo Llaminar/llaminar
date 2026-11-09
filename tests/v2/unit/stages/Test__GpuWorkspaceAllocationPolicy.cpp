@@ -13266,7 +13266,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUHybridRecurrentStateHasNoHostMirror)
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedWorkspaceCriticalFilesHaveNoRawAllocations)
 {
     const std::vector<std::filesystem::path> files = {
-        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu",
+        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillShardImpl.cu.inc",
+        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillDispatch.cu",
         "src/v2/kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh",
     };
 
