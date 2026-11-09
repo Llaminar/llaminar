@@ -540,7 +540,7 @@ Do not add complete-pipeline times to their component phases. Preserve format,
 live rows, physical capacity and routing distribution when comparing revisions.
 
 The shared harness also has `_Route_hotset` and `_Route_power_law` cases,
-generated from `NativeVNNIMoERoutingProfiles`, not a second fixture-local
+generated from `NativeQuantisedMoERoutingProfiles`, not a second fixture-local
 distribution. `moe_route_profile` records the selected distribution and actual
 owned live route count. Their phase identities include the profile suffix to
 prevent accidentally combining unlike samples. Ordinal expert ownership under
@@ -619,7 +619,7 @@ the grouped expert pipeline. The exact registered filters remain in source:
 ```bash
 cmake --build build_v2_release --parallel --target \
   v2_perf_cuda_gdn_verifier_rows v2_perf_cuda_flash_attention \
-  v2_perf_cuda_native_vnni_gemm v2_perf_gpu_expert_pipeline
+  v2_perf_cuda_native_quantised_gemm v2_perf_gpu_expert_pipeline
 
 env CUDA_VISIBLE_DEVICES=0 build_v2_release/tests/v2/v2_perf_cuda_flash_attention \
   '--gtest_filter=*.Prefill_Qwen36MoE_TPShardScaling'

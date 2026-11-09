@@ -38,8 +38,8 @@
  * metadata, or scheduler-dependent reduction order, so grouped verifier
  * publication remains byte-identical to serial row decode.
  *
- * @see ROCmGemvKernel_native_VNNI.hip for decode grouped kernels (M=1)
- * @see ROCmNativeVNNIGemmShardImpl.hip.inc for non-grouped prefill GEMM
+ * @see ROCmGemvKernel_native_quantised.hip for decode grouped kernels (M=1)
+ * @see ROCmNativeQuantisedGemmShardImpl.hip.inc for non-grouped prefill GEMM
  * Native signed INT8 dot products share the exact unsaturated arithmetic
  * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */
@@ -54,10 +54,10 @@
 #include <cstdio>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
-#include "../../../tensors/NativeVnniFormatInfo.h"
+#include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../utils/DebugEnv.h"
-#include "../../common/NativeVNNIGroupedDecodePolicy.h"
-#include "../../common/DeviceNativeVNNIMatrixDesc.h"
+#include "../../common/NativeQuantisedGroupedDecodePolicy.h"
+#include "../../common/DeviceNativeQuantisedMatrixDesc.h"
 #include "../../common/DeviceOrderedRouteFold.h"
 #include "ROCmMoEGroupedPrefillKernels.h"
 #include "ROCmMoERouteOwnedTuning.h"
@@ -66,7 +66,7 @@
 #include <iterator>
 #include <string>
 #include "../ops/ROCmSwiGLUDecodeEquivalentMath.h"
-#include "ROCmNativeVNNIDecodeEquivalentMath.h"
+#include "ROCmNativeQuantisedDecodeEquivalentMath.h"
 #include "ROCmMoEGroupedPrefillDispatchGenerated.inc"
 #include "ROCmMoEProductionPrefillPolicy.h"
 #include "ROCmMoEGroupedPrefillRoutePolicy.h"
@@ -129,7 +129,7 @@ public:
      */
     void record(const llaminar2::rocm::MoERouteOwnedGateUpLaunch &leaf)
     {
-        const auto bit = llaminar2::nativeVnniCodebookMaskBit(leaf.execution_codebook);
+        const auto bit = llaminar2::nativeQuantisedCodebookMaskBit(leaf.execution_codebook);
         if (!(admission_.launchCodebookMask() & bit) || pending_.leaf_count >= pending_.leaves.size())
             throw std::logic_error("route-owned observation has a foreign leaf or exceeds its bounded ABI");
         for (std::size_t index = 0; index < pending_.leaf_count; ++index)
@@ -147,7 +147,7 @@ public:
         std::uint32_t actual = 0;
         for (std::size_t index = 0; index < pending_.leaf_count; ++index)
         {
-            const auto bit = llaminar2::nativeVnniCodebookMaskBit(pending_.leaves[index].execution_codebook);
+            const auto bit = llaminar2::nativeQuantisedCodebookMaskBit(pending_.leaves[index].execution_codebook);
             if (!bit || (actual & bit)) throw std::logic_error("route-owned observation repeated a decoder family");
             actual |= bit;
         }
@@ -164,8 +164,8 @@ private:
 void requireMoERouteOwnedUnmodifiedPolicy()
 {
     const auto &env = llaminar2::debugEnv().rocm;
-    if (env.nvnni_disable_generated || env.nvnni_gemv_kb > 0 ||
-        env.nvnni_gemv_target_waves > 0 || env.moe_prefill_gateup_tile_m > 0 ||
+    if (env.native_quantised_disable_generated || env.native_quantised_gemv_kb > 0 ||
+        env.native_quantised_gemv_target_waves > 0 || env.moe_prefill_gateup_tile_m > 0 ||
         env.moe_prefill_gateup_tile_n > 0 || env.moe_prefill_down_tile_m > 0 ||
         env.moe_prefill_down_tile_n > 0)
         throw std::logic_error("route-owned geometry requires unchanged serial arithmetic and no expert-tile overrides");
@@ -237,40 +237,40 @@ llaminar2::rocm::ScopedMoERouteOwnedGateUpGeometry::~ScopedMoERouteOwnedGateUpGe
 
 // The small shared ABI has no host tensor or x86 dependency. Do not maintain
 // another descriptor definition beside the weight-preparation authority.
-using llaminar2::DeviceNativeVNNIMatrixDesc;
+using llaminar2::DeviceNativeQuantisedMatrixDesc;
 
 __device__ __forceinline__ void moe_prefill_fail_fast_invalid_grouped_index()
 {
     __builtin_trap();
 }
 
-// NativeVNNIFormat enum (must match ROCmGemvKernel_native_VNNI.hip)
-enum NativeVNNIFormatPrefill : uint8_t {
-    NVNNI_PF_Q4_0    = 0,
-    NVNNI_PF_IQ4_XS_SOURCE = llaminar2::kNativeVnniIQ4XSSourceScaleCodebook,
-    NVNNI_PF_IQ4_NL  = 4,
-    NVNNI_PF_Q4_1    = 5,
-    NVNNI_PF_Q5_0    = 6,
-    NVNNI_PF_Q5_1    = 7,
-    NVNNI_PF_Q6_K    = 8,
-    NVNNI_PF_Q3_K    = 9,
-    NVNNI_PF_Q2_K    = 10,
-    NVNNI_PF_IQ3_S   = 11,
-    NVNNI_PF_IQ3_XXS = 12,
-    NVNNI_PF_IQ2_S   = 13,
-    NVNNI_PF_IQ2_XS  = 14,
-    NVNNI_PF_IQ2_XXS = 15,
-    NVNNI_PF_IQ1_S   = 16,
-    NVNNI_PF_IQ1_M   = 17,
-    NVNNI_PF_Q8_0    = 19,
-    NVNNI_PF_EXPANDED_INT8_MIN =
-        llaminar2::kNativeVnniExpandedInt8MinCodebook,
+// NativeQuantisedFormat enum (must match ROCmGemvKernel_native_quantised.hip)
+enum NativeQuantisedFormatPrefill : uint8_t {
+    NATIVE_QUANTISED_PF_Q4_0    = 0,
+    NATIVE_QUANTISED_PF_IQ4_XS_SOURCE = llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook,
+    NATIVE_QUANTISED_PF_IQ4_NL  = 4,
+    NATIVE_QUANTISED_PF_Q4_1    = 5,
+    NATIVE_QUANTISED_PF_Q5_0    = 6,
+    NATIVE_QUANTISED_PF_Q5_1    = 7,
+    NATIVE_QUANTISED_PF_Q6_K    = 8,
+    NATIVE_QUANTISED_PF_Q3_K    = 9,
+    NATIVE_QUANTISED_PF_Q2_K    = 10,
+    NATIVE_QUANTISED_PF_IQ3_S   = 11,
+    NATIVE_QUANTISED_PF_IQ3_XXS = 12,
+    NATIVE_QUANTISED_PF_IQ2_S   = 13,
+    NATIVE_QUANTISED_PF_IQ2_XS  = 14,
+    NATIVE_QUANTISED_PF_IQ2_XXS = 15,
+    NATIVE_QUANTISED_PF_IQ1_S   = 16,
+    NATIVE_QUANTISED_PF_IQ1_M   = 17,
+    NATIVE_QUANTISED_PF_Q8_0    = 19,
+    NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN =
+        llaminar2::kNativeQuantisedExpandedInt8MinCodebook,
 };
 
 /**
  * @brief Capture-time serial-M1 split-K policy carried into grouped prefill.
  *
- * A NativeVNNI codebook and matrix geometry select a generated serial-decode
+ * A NativeQuantised codebook and matrix geometry select a generated serial-decode
  * K-partition count. That count changes FP32 arithmetic because each partition
  * starts from zero and an ordered reducer then adds the independently rounded
  * partials. Grouped prefill therefore carries the complete codebook-indexed
@@ -295,7 +295,7 @@ struct MoEPrefillSerialM1KPartitionPolicy
      * device formats without explicit provenance retain their execution id.
      */
     __host__ __device__ int forDescriptor(
-        const DeviceNativeVNNIMatrixDesc& desc) const
+        const DeviceNativeQuantisedMatrixDesc& desc) const
     {
         uint8_t policy_codebook = desc.source_identity_present
                                       ? desc.source_codebook_id
@@ -307,65 +307,65 @@ struct MoEPrefillSerialM1KPartitionPolicy
     }
 };
 
-extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
+extern "C" bool rocmGemv_native_quantised_query_serial_m1_config(
     uint8_t codebook_id,
     int N,
     int K,
     int* kb,
     int* target_waves_per_cu);
 
-// Compile-time format properties for prefill (mirrors NVNNITraits in GEMV)
-template <NativeVNNIFormatPrefill FMT>
-struct PrefillNVNNITraits {
+// Compile-time format properties for prefill (mirrors NATIVE_QUANTISEDTraits in GEMV)
+template <NativeQuantisedFormatPrefill FMT>
+struct PrefillNATIVE_QUANTISEDTraits {
     static constexpr bool is_asymmetric =
-        FMT == NVNNI_PF_Q4_1 || FMT == NVNNI_PF_Q5_1 ||
-        FMT == NVNNI_PF_IQ1_S || FMT == NVNNI_PF_EXPANDED_INT8_MIN;
-    static constexpr bool is_iq3_grid = (FMT == NVNNI_PF_IQ3_S || FMT == NVNNI_PF_IQ3_XXS);
-    static constexpr bool is_iq2_grid = (FMT == NVNNI_PF_IQ2_S || FMT == NVNNI_PF_IQ2_XS || FMT == NVNNI_PF_IQ2_XXS);
-    static constexpr bool is_iq1_grid = (FMT == NVNNI_PF_IQ1_S || FMT == NVNNI_PF_IQ1_M);
+        FMT == NATIVE_QUANTISED_PF_Q4_1 || FMT == NATIVE_QUANTISED_PF_Q5_1 ||
+        FMT == NATIVE_QUANTISED_PF_IQ1_S || FMT == NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN;
+    static constexpr bool is_iq3_grid = (FMT == NATIVE_QUANTISED_PF_IQ3_S || FMT == NATIVE_QUANTISED_PF_IQ3_XXS);
+    static constexpr bool is_iq2_grid = (FMT == NATIVE_QUANTISED_PF_IQ2_S || FMT == NATIVE_QUANTISED_PF_IQ2_XS || FMT == NATIVE_QUANTISED_PF_IQ2_XXS);
+    static constexpr bool is_iq1_grid = (FMT == NATIVE_QUANTISED_PF_IQ1_S || FMT == NATIVE_QUANTISED_PF_IQ1_M);
     static constexpr bool is_iq_grid  = (is_iq3_grid || is_iq2_grid);
     static constexpr int qh_bits_per_lookup =
-        (FMT == NVNNI_PF_IQ2_S) ? 2 : (FMT == NVNNI_PF_IQ3_S || FMT == NVNNI_PF_IQ2_XS) ? 1 : 0;
+        (FMT == NATIVE_QUANTISED_PF_IQ2_S) ? 2 : (FMT == NATIVE_QUANTISED_PF_IQ3_S || FMT == NATIVE_QUANTISED_PF_IQ2_XS) ? 1 : 0;
     static constexpr bool has_qh = (qh_bits_per_lookup > 0);
-    static constexpr bool is_dual_scale = (FMT == NVNNI_PF_Q6_K || FMT == NVNNI_PF_Q3_K || FMT == NVNNI_PF_Q2_K
-                                        || FMT == NVNNI_PF_IQ2_S || FMT == NVNNI_PF_IQ2_XS
-                                        || FMT == NVNNI_PF_IQ1_M);
-    static constexpr bool is_dual_scale_asym = (FMT == NVNNI_PF_Q2_K);
-    static constexpr bool needs_emin_array = (FMT == NVNNI_PF_Q2_K);
-    static constexpr bool is_5bit = (FMT == NVNNI_PF_Q5_0 || FMT == NVNNI_PF_Q5_1);
-    static constexpr bool is_6bit = (FMT == NVNNI_PF_Q6_K);
-    static constexpr bool is_3bit = (FMT == NVNNI_PF_Q3_K);
-    static constexpr bool is_2bit = (FMT == NVNNI_PF_Q2_K);
+    static constexpr bool is_dual_scale = (FMT == NATIVE_QUANTISED_PF_Q6_K || FMT == NATIVE_QUANTISED_PF_Q3_K || FMT == NATIVE_QUANTISED_PF_Q2_K
+                                        || FMT == NATIVE_QUANTISED_PF_IQ2_S || FMT == NATIVE_QUANTISED_PF_IQ2_XS
+                                        || FMT == NATIVE_QUANTISED_PF_IQ1_M);
+    static constexpr bool is_dual_scale_asym = (FMT == NATIVE_QUANTISED_PF_Q2_K);
+    static constexpr bool needs_emin_array = (FMT == NATIVE_QUANTISED_PF_Q2_K);
+    static constexpr bool is_5bit = (FMT == NATIVE_QUANTISED_PF_Q5_0 || FMT == NATIVE_QUANTISED_PF_Q5_1);
+    static constexpr bool is_6bit = (FMT == NATIVE_QUANTISED_PF_Q6_K);
+    static constexpr bool is_3bit = (FMT == NATIVE_QUANTISED_PF_Q3_K);
+    static constexpr bool is_2bit = (FMT == NATIVE_QUANTISED_PF_Q2_K);
     static constexpr bool is_8bit =
-        FMT == NVNNI_PF_Q8_0 || FMT == NVNNI_PF_EXPANDED_INT8_MIN;
+        FMT == NATIVE_QUANTISED_PF_Q8_0 || FMT == NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN;
     static constexpr bool requires_secondary_metadata =
-        is_asymmetric || is_dual_scale || FMT == NVNNI_PF_IQ3_S || FMT == NVNNI_PF_IQ4_XS_SOURCE;
-    static constexpr bool uses_lut = (FMT == NVNNI_PF_IQ4_NL || FMT == NVNNI_PF_IQ4_XS_SOURCE);
+        is_asymmetric || is_dual_scale || FMT == NATIVE_QUANTISED_PF_IQ3_S || FMT == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE;
+    static constexpr bool uses_lut = (FMT == NATIVE_QUANTISED_PF_IQ4_NL || FMT == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE);
     static constexpr int payload_bytes =
         is_8bit ? 32 :
         is_iq1_grid ? 6 :
         is_iq3_grid ? (has_qh ? 13 : 12) :
         is_iq2_grid ? (has_qh ? 9 : 8) :
         is_6bit ? 24 : is_5bit ? 20 : is_3bit ? 12 : is_2bit ? 8 : 16;
-    static constexpr int center_4bit = (FMT == NVNNI_PF_Q4_0) ? 8 : 0;
-    static constexpr int center_5bit = (FMT == NVNNI_PF_Q5_0) ? 16 : 0;
+    static constexpr int center_4bit = (FMT == NATIVE_QUANTISED_PF_Q4_0) ? 8 : 0;
+    static constexpr int center_5bit = (FMT == NATIVE_QUANTISED_PF_Q5_0) ? 16 : 0;
 };
 
-template <NativeVNNIFormatPrefill FMT>
-__device__ __forceinline__ bool prefill_native_vnni_desc_shape_ok(
-    const DeviceNativeVNNIMatrixDesc& desc,
+template <NativeQuantisedFormatPrefill FMT>
+__device__ __forceinline__ bool prefill_native_quantised_desc_shape_ok(
+    const DeviceNativeQuantisedMatrixDesc& desc,
     int N,
     int K)
 {
-    using Traits = PrefillNVNNITraits<FMT>;
+    using Traits = PrefillNATIVE_QUANTISEDTraits<FMT>;
     return desc.payload &&
            desc.scales &&
            desc.n == N &&
            desc.k == K &&
            desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
            (desc.codebook_id == static_cast<uint8_t>(FMT) ||
-            (FMT == NVNNI_PF_IQ4_XS_SOURCE && desc.codebook_id == NVNNI_PF_IQ4_NL)) &&
-           (!(Traits::requires_secondary_metadata && desc.codebook_id != NVNNI_PF_IQ4_NL) || desc.mins) &&
+            (FMT == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE && desc.codebook_id == NATIVE_QUANTISED_PF_IQ4_NL)) &&
+           (!(Traits::requires_secondary_metadata && desc.codebook_id != NATIVE_QUANTISED_PF_IQ4_NL) || desc.mins) &&
            (!Traits::is_dual_scale_asym || desc.emins);
 }
 
@@ -379,27 +379,27 @@ __device__ __constant__ uint64_t d_pf_iq2xxs_grid[256];
 __device__ __constant__ uint64_t d_pf_iq1s_grid[2048];
 
 // IQ3 grid lookup (compile-time format dispatch)
-template <NativeVNNIFormatPrefill FMT>
+template <NativeQuantisedFormatPrefill FMT>
 __device__ inline uint32_t pf_iq3_grid_lookup(int idx)
 {
-    if constexpr (FMT == NVNNI_PF_IQ3_S) return d_pf_iq3s_grid[idx];
+    if constexpr (FMT == NATIVE_QUANTISED_PF_IQ3_S) return d_pf_iq3s_grid[idx];
     else                                  return d_pf_iq3xxs_grid[idx];
 }
 
 // IQ2 grid lookup (compile-time format dispatch)
-template <NativeVNNIFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
+template <NativeQuantisedFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
 __device__ inline uint64_t pf_iq2_grid_lookup(
     int idx,
     const uint64_t* __restrict__ staged_iq2s_grid = nullptr)
 {
-    if constexpr (FMT == NVNNI_PF_IQ2_S)
+    if constexpr (FMT == NATIVE_QUANTISED_PF_IQ2_S)
     {
         if constexpr (USE_STAGED_IQ2_S)
             return staged_iq2s_grid[idx];
         else
             return d_pf_iq2s_grid[idx];
     }
-    else if constexpr (FMT == NVNNI_PF_IQ2_XS) return d_pf_iq2xs_grid[idx];
+    else if constexpr (FMT == NATIVE_QUANTISED_PF_IQ2_XS) return d_pf_iq2xs_grid[idx];
     else                                        return d_pf_iq2xxs_grid[idx];
 }
 
@@ -503,13 +503,13 @@ void moe_prefill_hidden_quantize_rows_kernel(
 // Each thread computes one output element: output[slot, n] = dot(A_row, B_col_n)
 // ============================================================================
 
-template <NativeVNNIFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
+template <NativeQuantisedFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
 __device__ __forceinline__ void moe_prefill_decode_groups(
     const uint8_t* __restrict__ payload,
     int32_t* packed_groups,
     const uint64_t* __restrict__ staged_iq2s_grid = nullptr)
 {
-    using Traits = PrefillNVNNITraits<FMT>;
+    using Traits = PrefillNATIVE_QUANTISEDTraits<FMT>;
 
     if constexpr (Traits::is_8bit) {
         // Q8_0: 32 raw INT8 values — direct load, no decode needed
@@ -519,7 +519,7 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
     }
     else if constexpr (Traits::is_iq1_grid) {
         // IQ1_S / IQ1_M: 4 grid lookups × 8 signed elements {-1,0,+1} = 32 elements
-        if constexpr (FMT == NVNNI_PF_IQ1_S) {
+        if constexpr (FMT == NATIVE_QUANTISED_PF_IQ1_S) {
             const uint16_t qh_word = static_cast<uint16_t>(payload[4])
                                    | (static_cast<uint16_t>(payload[5]) << 8);
             #pragma unroll
@@ -529,7 +529,7 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
                 packed_groups[l * 2]     = static_cast<int32_t>(static_cast<uint32_t>(grid8));
                 packed_groups[l * 2 + 1] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
             }
-        } else { // NVNNI_PF_IQ1_M
+        } else { // NATIVE_QUANTISED_PF_IQ1_M
             const uint8_t qh0 = payload[4], qh1 = payload[5];
             const int idx0 = payload[0] | ((qh0 & 0x07) << 8);
             const int idx1 = payload[1] | (((qh0 >> 4) & 0x07) << 8);
@@ -729,7 +729,7 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
             packed_groups[g + 4] = static_cast<int32_t>(val_hi);
         }
     }
-    else if constexpr (FMT == NVNNI_PF_IQ4_NL || FMT == NVNNI_PF_IQ4_XS_SOURCE) {
+    else if constexpr (FMT == NATIVE_QUANTISED_PF_IQ4_NL || FMT == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE) {
         /*
          * IQ4_NL / IQ4_XS verifier prefill must follow the same v_perm decode
          * expression as the M=1 MoE row-decode helper.  The removed pair-LUT
@@ -787,7 +787,7 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
 }
 
 /**
- * @brief Accumulate one decoded NativeVNNI K block into an FP32 row result.
+ * @brief Accumulate one decoded NativeQuantised K block into an FP32 row result.
  *
  * Serial decode and grouped prefill must execute the same floating-point
  * expression for every row.  Keeping the expression in one helper is more than
@@ -798,7 +798,7 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
  * invokes this helper once per K block before its independently rounded result
  * enters the ordered partition reducer.
  *
- * @tparam FMT NativeVNNI codebook represented by @p desc.
+ * @tparam FMT NativeQuantised codebook represented by @p desc.
  * @param desc Prepared device descriptor for one expert matrix.
  * @param linear Block-major descriptor index, `k_block * N + output_column`.
  * @param payload Pointer to the encoded weight payload for @p linear.
@@ -808,9 +808,9 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
  * @param acc Running FP32 accumulator for this row and output column.
  * @return The accumulator after exactly one serial-shaped K-block update.
  */
-template <NativeVNNIFormatPrefill FMT>
+template <NativeQuantisedFormatPrefill FMT>
 __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
-    const DeviceNativeVNNIMatrixDesc& desc,
+    const DeviceNativeQuantisedMatrixDesc& desc,
     size_t linear,
     const uint8_t* __restrict__ payload,
     const int32_t* __restrict__ packed_groups,
@@ -818,7 +818,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
     float scale_ab,
     float acc)
 {
-    using Traits = PrefillNVNNITraits<FMT>;
+    using Traits = PrefillNATIVE_QUANTISEDTraits<FMT>;
     const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
     const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
     const uint32_t* emin_base = static_cast<const uint32_t*>(desc.emins);
@@ -834,7 +834,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
         for (int g = 4; g < 8; ++g)
             acc_hi = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_hi);
 
-        const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
+        const auto weight_scales = rocm_native_quantised_load_dual_weight_scales<FMT>(
             scale_base[linear], min_base[linear]);
         const float scale_lo = weight_scales.low;
         const float scale_hi = weight_scales.high;
@@ -861,7 +861,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
                 *reinterpret_cast<const __half*>(&emin_lo_bits));
             const float min_hi = __half2float(
                 *reinterpret_cast<const __half*>(&emin_hi_bits));
-            acc = rocm_native_vnni_commit_corrected_dual_scale_block(
+            acc = rocm_native_quantised_commit_corrected_dual_scale_block(
                 acc,
                 acc_lo,
                 acc_hi,
@@ -874,7 +874,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
                 scale_ab);
         }
 
-        else if constexpr (FMT == NVNNI_PF_IQ1_M)
+        else if constexpr (FMT == NATIVE_QUANTISED_PF_IQ1_M)
         {
             constexpr float IQ1S_DELTA = 0.125f;
             constexpr int32_t ones = 0x01010101;
@@ -903,7 +903,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             const float delta3 =
                 (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-            acc = rocm_native_vnni_commit_iq1_m_block(
+            acc = rocm_native_quantised_commit_iq1_m_block(
                 acc,
                 acc_lo,
                 acc_hi,
@@ -921,7 +921,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
         }
         else
         {
-            acc = rocm_native_vnni_commit_dual_scale_block(
+            acc = rocm_native_quantised_commit_dual_scale_block(
                 acc,
                 acc_lo,
                 acc_hi,
@@ -941,15 +941,15 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
         // Physical24 also admits an IQ4_NL gate/up partner. Resolve the
         // actual descriptor word meaning independently for each projection.
         float block_d;
-        if constexpr (FMT == NVNNI_PF_IQ4_XS_SOURCE)
-            block_d = desc.codebook_id == NVNNI_PF_IQ4_XS_SOURCE
-                ? rocm_native_vnni_load_single_weight_scale<NVNNI_PF_IQ4_XS_SOURCE>(
+        if constexpr (FMT == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE)
+            block_d = desc.codebook_id == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE
+                ? rocm_native_quantised_load_single_weight_scale<NATIVE_QUANTISED_PF_IQ4_XS_SOURCE>(
                       scale_bits, min_base[linear])
-                : rocm_native_vnni_load_single_weight_scale<NVNNI_PF_IQ4_NL>(
+                : rocm_native_quantised_load_single_weight_scale<NATIVE_QUANTISED_PF_IQ4_NL>(
                       scale_bits, uint16_t{0});
         else
-            block_d = rocm_native_vnni_load_single_weight_scale<FMT>(scale_bits,
-                FMT == NVNNI_PF_IQ3_S ? min_base[linear] : uint16_t{0});
+            block_d = rocm_native_quantised_load_single_weight_scale<FMT>(scale_bits,
+                FMT == NATIVE_QUANTISED_PF_IQ3_S ? min_base[linear] : uint16_t{0});
         if constexpr (Traits::is_asymmetric)
         {
             constexpr int32_t ones = 0x01010101;
@@ -961,7 +961,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             const uint16_t min_bits = min_base[linear];
             const float block_m =
                 __half2float(*reinterpret_cast<const __half*>(&min_bits));
-            acc = rocm_native_vnni_commit_corrected_single_scale_block(
+            acc = rocm_native_quantised_commit_corrected_single_scale_block(
                 acc,
                 dot,
                 block_d,
@@ -971,7 +971,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
         }
         else
         {
-            acc = rocm_native_vnni_commit_single_scale_block(
+            acc = rocm_native_quantised_commit_single_scale_block(
                 acc, dot, block_d, scale_ab);
         }
     }
@@ -980,16 +980,16 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
 }
 
 /**
- * @brief Compute one NativeVNNI dot product over a bounded K-block range.
+ * @brief Compute one NativeQuantised dot product over a bounded K-block range.
  *
  * This is the canonical single-row expression used by grouped prefill and its
  * serial-row oracle.  Long-prefill kernels below share decoded weights across
  * rows but deliberately call the same per-block accumulator so optimization
  * cannot relax byte equality.
  */
-template <NativeVNNIFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
+template <NativeQuantisedFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
 __device__ __forceinline__ float moe_prefill_dot_desc_range(
-    const DeviceNativeVNNIMatrixDesc& desc,
+    const DeviceNativeQuantisedMatrixDesc& desc,
     int n,
     const int8_t* __restrict__ slot_A,
     const float* __restrict__ slot_scales,
@@ -998,7 +998,7 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
     int b_end,
     const uint64_t* __restrict__ staged_iq2s_grid = nullptr)
 {
-    using Traits = PrefillNVNNITraits<FMT>;
+    using Traits = PrefillNATIVE_QUANTISEDTraits<FMT>;
     if (!slot_A ||
         !slot_scales ||
         n < 0 ||
@@ -1007,7 +1007,7 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
         desc.blocks_per_row == 0 ||
         b_start < 0 ||
         b_end > static_cast<int>(desc.blocks_per_row) ||
-        !prefill_native_vnni_desc_shape_ok<FMT>(
+        !prefill_native_quantised_desc_shape_ok<FMT>(
             desc, N, static_cast<int>(desc.blocks_per_row) * 32))
     {
         return 0.0f;
@@ -1043,7 +1043,7 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
  * partials in increasing partition order with the same explicit RN operation
  * used by serial decode's reducer kernel.
  *
- * @tparam FMT NativeVNNI codebook represented by @p desc.
+ * @tparam FMT NativeQuantised codebook represented by @p desc.
  * @tparam USE_STAGED_IQ2_S Whether IQ2_S codebook reads use an LDS copy.
  * @param desc Prepared matrix descriptor.
  * @param n Output column owned by this lane.
@@ -1054,9 +1054,9 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
  * @param staged_iq2s_grid Optional LDS-resident IQ2_S codebook.
  * @return Byte-equivalent serial-M1 result for this output element.
  */
-template <NativeVNNIFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
+template <NativeQuantisedFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
 __device__ __forceinline__ float moe_prefill_dot_desc_serial_m1(
-    const DeviceNativeVNNIMatrixDesc& desc,
+    const DeviceNativeQuantisedMatrixDesc& desc,
     int n,
     const int8_t* __restrict__ slot_A,
     const float* __restrict__ slot_scales,
@@ -1068,7 +1068,7 @@ __device__ __forceinline__ float moe_prefill_dot_desc_serial_m1(
     if (k_partitions <= 0 ||
         k_partitions > blocks_per_row ||
         k_partitions >
-            llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+            llaminar2::NativeQuantisedGroupedDecodePolicy::maximum_k_partitions)
     {
         moe_prefill_fail_fast_invalid_grouped_index();
         return 0.0f;
@@ -1107,7 +1107,7 @@ __device__ __forceinline__ float moe_prefill_dot_desc_serial_m1(
                                         end,
                                         staged_iq2s_grid)
                                   : 0.0f;
-        total = rocm_native_vnni_accumulate_rn(total, partial);
+        total = rocm_native_quantised_accumulate_rn(total, partial);
     }
     return total;
 }
@@ -1116,7 +1116,7 @@ __device__ __forceinline__ float moe_prefill_dot_desc_serial_m1(
  * @brief Integer and scale terms for one exact dual-scale K-block contribution.
  *
  * These are the operands consumed by
- * @ref rocm_native_vnni_commit_dual_scale_block. Keeping the FP32 accumulator
+ * @ref rocm_native_quantised_commit_dual_scale_block. Keeping the FP32 accumulator
  * out of this structure lets several lanes prepare independent K blocks while
  * one owner lane still commits them in serial-decode order.
  */
@@ -1137,7 +1137,7 @@ struct MoEPrefillDualScaleBlockTerms
  * is separated from the serial FP32 commit so neighboring lanes can expose
  * enough wavefronts to occupy gfx906 for M=1..4 verifier buckets.
  *
- * @tparam FMT Correction-free dual-scale NativeVNNI format.
+ * @tparam FMT Correction-free dual-scale NativeQuantised format.
  * @tparam USE_STAGED_IQ2_S Whether IQ2_S codebook reads use the LDS copy.
  * @param desc Prepared matrix descriptor.
  * @param n Output column owned by the cooperating lane subgroup.
@@ -1147,10 +1147,10 @@ struct MoEPrefillDualScaleBlockTerms
  * @param block_index Increasing-K block index to prepare.
  * @return Exact integer dots and scale operands for the block.
  */
-template <NativeVNNIFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
+template <NativeQuantisedFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
 __device__ __forceinline__ MoEPrefillDualScaleBlockTerms
 moe_prefill_prepare_dual_scale_block_terms(
-    const DeviceNativeVNNIMatrixDesc& desc,
+    const DeviceNativeQuantisedMatrixDesc& desc,
     int n,
     const int8_t* __restrict__ slot_A,
     const float* __restrict__ slot_scales,
@@ -1158,13 +1158,13 @@ moe_prefill_prepare_dual_scale_block_terms(
     int block_index,
     const uint64_t* __restrict__ staged_iq2s_grid = nullptr)
 {
-    using Traits = PrefillNVNNITraits<FMT>;
+    using Traits = PrefillNATIVE_QUANTISEDTraits<FMT>;
     static_assert(
         Traits::is_dual_scale &&
             !Traits::is_dual_scale_asym &&
-            FMT != NVNNI_PF_IQ1_M,
+            FMT != NATIVE_QUANTISED_PF_IQ1_M,
         "subgroup preparation requires a correction-free dual-scale format");
-    static_assert(!USE_STAGED_IQ2_S || FMT == NVNNI_PF_IQ2_S,
+    static_assert(!USE_STAGED_IQ2_S || FMT == NATIVE_QUANTISED_PF_IQ2_S,
                   "only IQ2_S may consume the staged IQ2_S codebook");
 
     const size_t linear =
@@ -1196,7 +1196,7 @@ moe_prefill_prepare_dual_scale_block_terms(
         static_cast<const uint16_t*>(desc.scales);
     const uint16_t* high_scales =
         static_cast<const uint16_t*>(desc.mins);
-    const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
+    const auto weight_scales = rocm_native_quantised_load_dual_weight_scales<FMT>(
         low_scales[linear], high_scales[linear]);
     terms.low_scale = weight_scales.low;
     terms.high_scale = weight_scales.high;
@@ -1214,7 +1214,7 @@ moe_prefill_prepare_dual_scale_block_terms(
  * FP32 expression remains block 0, block 1, ... exactly as in serial decode;
  * this is parallel work preparation, not a floating-point reduction.
  *
- * @tparam FMT Correction-free dual-scale NativeVNNI format.
+ * @tparam FMT Correction-free dual-scale NativeQuantised format.
  * @tparam USE_STAGED_IQ2_S Whether IQ2_S codebook reads use the LDS copy.
  * @tparam K_LANES Number of adjacent lanes cooperating on one output.
  * @param desc Prepared matrix descriptor.
@@ -1227,11 +1227,11 @@ moe_prefill_prepare_dual_scale_block_terms(
  * @return Exact output on subgroup lane zero; other lanes return an unused zero.
  */
 template <
-    NativeVNNIFormatPrefill FMT,
+    NativeQuantisedFormatPrefill FMT,
     bool USE_STAGED_IQ2_S,
     int K_LANES>
 __device__ __forceinline__ float moe_prefill_dual_scale_subgroup_dot(
-    const DeviceNativeVNNIMatrixDesc& desc,
+    const DeviceNativeQuantisedMatrixDesc& desc,
     int n,
     const int8_t* __restrict__ slot_A,
     const float* __restrict__ slot_scales,
@@ -1242,17 +1242,17 @@ __device__ __forceinline__ float moe_prefill_dual_scale_subgroup_dot(
 {
     static_assert(K_LANES == 2 || K_LANES == 4,
                   "dual-scale verifier subgroup width must be two or four lanes");
-    using Traits = PrefillNVNNITraits<FMT>;
+    using Traits = PrefillNATIVE_QUANTISEDTraits<FMT>;
     static_assert(
         Traits::is_dual_scale &&
             !Traits::is_dual_scale_asym &&
-            FMT != NVNNI_PF_IQ1_M,
+            FMT != NATIVE_QUANTISED_PF_IQ1_M,
         "subgroup dot requires a correction-free dual-scale format");
     const int subgroup_lane = static_cast<int>(threadIdx.x) & (K_LANES - 1);
     if (k_partitions <= 0 ||
         k_partitions > blocks_per_row ||
         k_partitions >
-            llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+            llaminar2::NativeQuantisedGroupedDecodePolicy::maximum_k_partitions)
     {
         moe_prefill_fail_fast_invalid_grouped_index();
         return 0.0f;
@@ -1304,7 +1304,7 @@ __device__ __forceinline__ float moe_prefill_dual_scale_subgroup_dot(
                 if (subgroup_lane == 0 &&
                     first_block + source_lane < end)
                 {
-                    partial = rocm_native_vnni_commit_dual_scale_block(
+                    partial = rocm_native_quantised_commit_dual_scale_block(
                         partial,
                         low_dot,
                         high_dot,
@@ -1319,7 +1319,7 @@ __device__ __forceinline__ float moe_prefill_dual_scale_subgroup_dot(
         {
             total = k_partitions == 1
                         ? partial
-                        : rocm_native_vnni_accumulate_rn(total, partial);
+                        : rocm_native_quantised_accumulate_rn(total, partial);
         }
     }
 
@@ -1681,11 +1681,11 @@ __device__ __forceinline__ void moe_prefill_visit_live_rows(
  * in one launch (`blockIdx.z`) to keep their accumulator lifetimes disjoint and
  * avoid register pressure from halving MI50 occupancy.
  *
- * @tparam FMT NativeVNNI codebook for experts handled by this launch.
+ * @tparam FMT NativeQuantised codebook for experts handled by this launch.
  * @tparam TILE_M Trained expert-row tile (4, 8, 12, or 16 rows).
  * @tparam TILE_N Trained output-column tile (64, 128, or 256 lanes).
  */
-template <NativeVNNIFormatPrefill FMT, int TILE_M, int TILE_N>
+template <NativeQuantisedFormatPrefill FMT, int TILE_M, int TILE_N>
 __global__ __launch_bounds__(TILE_N, 2)
 void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     const int8_t* __restrict__ A_int8,
@@ -1694,8 +1694,8 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     const int* __restrict__ group_counts,
     const int* __restrict__ group_offsets,
     const uint32_t* __restrict__ work_directory,
-    const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs,
-    const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ up_descs,
     float* __restrict__ gate_out,
     float* __restrict__ up_out,
     int max_directory_tiles,
@@ -1753,9 +1753,9 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     const int rows_in_tile = min(TILE_M, count - first_row);
     const int first_grouped_slot = grouped_offset + first_row;
 
-    const DeviceNativeVNNIMatrixDesc desc =
+    const DeviceNativeQuantisedMatrixDesc desc =
         projection_role == 0 ? gate_descs[expert_id] : up_descs[expert_id];
-    if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    if (!prefill_native_quantised_desc_shape_ok<FMT>(desc, N, K))
         return;
 
     const int k_partitions = k_partition_policy.forDescriptor(desc);
@@ -1765,7 +1765,7 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     if (k_partitions <= 0 ||
         k_partitions > blocks_per_row ||
         k_partitions >
-            llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+            llaminar2::NativeQuantisedGroupedDecodePolicy::maximum_k_partitions)
     {
         moe_prefill_fail_fast_invalid_grouped_index();
         return;
@@ -1819,7 +1819,7 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
         for (int b = begin; b < end; ++b)
         {
             size_t linear = 0u;
-            constexpr int payload_bytes = PrefillNVNNITraits<FMT>::payload_bytes;
+            constexpr int payload_bytes = PrefillNATIVE_QUANTISEDTraits<FMT>::payload_bytes;
             const uint8_t* payload = nullptr;
             int32_t packed_groups[8] = {};
             if (owns_column)
@@ -1879,7 +1879,7 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
                 constexpr int local_row = decltype(row_index)::value;
                 totals[local_row] = k_partitions == 1
                                         ? partials[local_row]
-                                        : rocm_native_vnni_accumulate_rn(
+                                        : rocm_native_quantised_accumulate_rn(
                                               totals[local_row], partials[local_row]);
             });
     }
@@ -1946,7 +1946,7 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
  * @param admission Device-owned live route/owner authority for this retained family.
  */
 template <
-    NativeVNNIFormatPrefill FMT,
+    NativeQuantisedFormatPrefill FMT,
     int TILE_N = 64,
     bool STAGE_IQ2_S_GRID = false,
     int K_LANES = 1,
@@ -1958,8 +1958,8 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     const float*   __restrict__ scales_A_blockwise,  // [total_slots, K / 32]
     const int*     __restrict__ grouped_token_indices, // compact row -> token or route
     int grouped_indices_are_route_slots,
-    const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs, // [num_experts]
-    const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,   // [num_experts]
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ gate_descs, // [num_experts]
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ up_descs,   // [num_experts]
     float*         __restrict__ gate_out,            // [total_slots, N]
     float*         __restrict__ up_out,              // [total_slots, N]
     int total_slots,
@@ -1979,14 +1979,14 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
         return;
     static_assert(TILE_N == 64 || TILE_N == 128 || TILE_N == 256,
                   "route-owned grouped gate/up supports measured gfx906 column tiles");
-    static_assert(!STAGE_IQ2_S_GRID || FMT == NVNNI_PF_IQ2_S,
+    static_assert(!STAGE_IQ2_S_GRID || FMT == NATIVE_QUANTISED_PF_IQ2_S,
                   "only IQ2_S may consume the staged IQ2_S codebook");
     static_assert(K_LANES == 1 || K_LANES == 2 || K_LANES == 4,
                   "route-owned grouped gate/up supports one, two, or four K lanes");
     static_assert(
         K_LANES == 1 ||
-            FMT == NVNNI_PF_Q6_K ||
-            FMT == NVNNI_PF_IQ2_S,
+            FMT == NATIVE_QUANTISED_PF_Q6_K ||
+            FMT == NATIVE_QUANTISED_PF_IQ2_S,
         "only tuned correction-free dual-scale formats may use subgroup preparation");
     static_assert(!PARALLEL_SOURCE_PARTITIONS ||
         (TILE_N == llaminar2::rocm::kMoERouteOwnedGateUpPartitionColumns && K_LANES == 1),
@@ -2032,9 +2032,9 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
 
     const int expert_id = admission.expertForSlot(grouped_slot);
 
-    const DeviceNativeVNNIMatrixDesc desc =
+    const DeviceNativeQuantisedMatrixDesc desc =
         projection_role == 0 ? gate_descs[expert_id] : up_descs[expert_id];
-    if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    if (!prefill_native_quantised_desc_shape_ok<FMT>(desc, N, K))
         return;
 
     const int k_partitions = k_partition_policy.forDescriptor(desc);
@@ -2095,7 +2095,7 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
         // column planes merely compute disjoint complete partitions concurrently.
         // A uniform failure precedes all bank accesses and barriers.
         if (k_partitions <= 0 || k_partitions > blocks_per_row ||
-            k_partitions > llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+            k_partitions > llaminar2::NativeQuantisedGroupedDecodePolicy::maximum_k_partitions)
         {
             moe_prefill_fail_fast_invalid_grouped_index();
             return;
@@ -2140,7 +2140,7 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
                 float total = 0.0f;
 #pragma unroll 1
                 for (int partition = 0; partition < k_partitions; ++partition)
-                    total = rocm_native_vnni_accumulate_rn(total,
+                    total = rocm_native_quantised_accumulate_rn(total,
                         partials[static_cast<size_t>(partition) * columns + output_lane]);
                 value = total;
             }
@@ -2195,7 +2195,7 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
  * caller's exact stream; graph replay performs no host policy lookup.  Every
  * specialization invokes the same byte-exact kernel body above.
  *
- * @tparam FMT NativeVNNI execution codebook.
+ * @tparam FMT NativeQuantised execution codebook.
  * @tparam TILE_N Output columns owned by one workgroup before K subdivision.
  * @tparam K_LANES Adjacent lanes preparing blocks within one serial partition.
  * @tparam PARALLEL_SOURCE_PARTITIONS Explicit four-plane computation of unchanged source-owned partitions; false preserves ordinary launches.
@@ -2220,7 +2220,7 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
  * @param launch_proof Optional immutable table-owned or diagnostic native capability; never resolved from model TLS.
  */
 template <
-    NativeVNNIFormatPrefill FMT,
+    NativeQuantisedFormatPrefill FMT,
     int TILE_N,
     int K_LANES,
     bool PARALLEL_SOURCE_PARTITIONS = false>
@@ -2230,8 +2230,8 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
     const float* scales_A_blockwise,
     const int* grouped_token_indices,
     int grouped_indices_are_route_slots,
-    const DeviceNativeVNNIMatrixDesc* gate_descs,
-    const DeviceNativeVNNIMatrixDesc* up_descs,
+    const DeviceNativeQuantisedMatrixDesc* gate_descs,
+    const DeviceNativeQuantisedMatrixDesc* up_descs,
     float* gate_out,
     float* up_out,
     int total_slots,
@@ -2245,7 +2245,7 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
     ROCmMoEGroupedRouteAdmission admission,
     const llaminar2::rocm::MoERouteOwnedGateUpAdmission *launch_proof = nullptr)
 {
-    constexpr bool kStageIQ2SGrid = FMT == NVNNI_PF_IQ2_S;
+    constexpr bool kStageIQ2SGrid = FMT == NATIVE_QUANTISED_PF_IQ2_S;
     constexpr bool kStageActivation = K_LANES > 1;
     constexpr int partition_workers = PARALLEL_SOURCE_PARTITIONS
         ? llaminar2::rocm::kMoERouteOwnedGateUpPartitionWorkers : 1;
@@ -2338,15 +2338,15 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
  * preserve one-lane serial-K execution until an exact profiled specialization
  * proves a different geometry.
  */
-template <NativeVNNIFormatPrefill FMT>
+template <NativeQuantisedFormatPrefill FMT>
 void launch_moe_grouped_gate_up_route_owned(
     hipStream_t stream,
     const int8_t* A_int8,
     const float* scales_A_blockwise,
     const int* grouped_token_indices,
     int grouped_indices_are_route_slots,
-    const DeviceNativeVNNIMatrixDesc* gate_descs,
-    const DeviceNativeVNNIMatrixDesc* up_descs,
+    const DeviceNativeQuantisedMatrixDesc* gate_descs,
+    const DeviceNativeQuantisedMatrixDesc* up_descs,
     float* gate_out,
     float* up_out,
     int total_slots,
@@ -2364,7 +2364,7 @@ void launch_moe_grouped_gate_up_route_owned(
     if (launch_proof)
     {
         const auto &admission_proof = *launch_proof;
-        if (!(admission_proof.launchCodebookMask() & llaminar2::nativeVnniCodebookMaskBit(static_cast<uint8_t>(FMT))) || seq_len != 1)
+        if (!(admission_proof.launchCodebookMask() & llaminar2::nativeQuantisedCodebookMaskBit(static_cast<uint8_t>(FMT))) || seq_len != 1)
             throw std::logic_error("route-owned geometry reached a foreign decoder or physical row count");
         const auto geometry = admission_proof.geometry();
         const int columns = llaminar2::rocm::moeRouteOwnedGateUpColumns(geometry);
@@ -2413,7 +2413,7 @@ void launch_moe_grouped_gate_up_route_owned(
         observation->record(receipt);
         return;
     }
-    if constexpr (FMT == NVNNI_PF_IQ2_S)
+    if constexpr (FMT == NATIVE_QUANTISED_PF_IQ2_S)
     {
         if (total_slots <= 16)
         {
@@ -2432,7 +2432,7 @@ void launch_moe_grouped_gate_up_route_owned(
                 N, K, k_partition_policy, num_experts, admission);
         }
     }
-    else if constexpr (FMT == NVNNI_PF_Q6_K)
+    else if constexpr (FMT == NATIVE_QUANTISED_PF_Q6_K)
     {
         launch_moe_grouped_gate_up_route_owned_geometry<FMT, 64, 4>(
             stream, A_int8, scales_A_blockwise, grouped_token_indices,
@@ -2527,16 +2527,16 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
  * those rows in original router order; separating projection from publication is
  * what permits weight reuse without reintroducing nondeterministic FP32 atomics.
  *
- * @tparam FMT NativeVNNI codebook for experts handled by this launch.
+ * @tparam FMT NativeQuantised codebook for experts handled by this launch.
  * @tparam TILE_M Trained expert-row tile (4, 8, 12, or 16 rows).
  * @tparam TILE_N Trained output-column tile (64, 128, or 256 lanes).
  */
-template <NativeVNNIFormatPrefill FMT, int TILE_M, int TILE_N>
+template <NativeQuantisedFormatPrefill FMT, int TILE_M, int TILE_N>
 __global__ __launch_bounds__(TILE_N, 2)
 void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
     const int8_t* __restrict__ A_int8,
     const float* __restrict__ scales_A_blockwise,
-    const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ down_descs,
     const int* __restrict__ group_counts,
     const int* __restrict__ group_offsets,
     const uint32_t* __restrict__ work_directory,
@@ -2590,8 +2590,8 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
     const int rows_in_tile = min(TILE_M, count - first_row);
     const int first_grouped_slot = grouped_offset + first_row;
 
-    const DeviceNativeVNNIMatrixDesc desc = down_descs[expert_id];
-    if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    const DeviceNativeQuantisedMatrixDesc desc = down_descs[expert_id];
+    if (!prefill_native_quantised_desc_shape_ok<FMT>(desc, N, K))
         return;
 
     const int k_partitions = k_partition_policy.forDescriptor(desc);
@@ -2600,7 +2600,7 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
     if (k_partitions <= 0 ||
         k_partitions > blocks_per_row ||
         k_partitions >
-            llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+            llaminar2::NativeQuantisedGroupedDecodePolicy::maximum_k_partitions)
     {
         moe_prefill_fail_fast_invalid_grouped_index();
         return;
@@ -2627,7 +2627,7 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
         for (int b = begin; b < end; ++b)
         {
             size_t linear = 0u;
-            constexpr int payload_bytes = PrefillNVNNITraits<FMT>::payload_bytes;
+            constexpr int payload_bytes = PrefillNATIVE_QUANTISEDTraits<FMT>::payload_bytes;
             const uint8_t* payload = nullptr;
             int32_t packed_groups[8] = {};
             if (owns_column)
@@ -2687,7 +2687,7 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
                 constexpr int local_row = decltype(row_index)::value;
                 totals[local_row] = k_partitions == 1
                                         ? partials[local_row]
-                                        : rocm_native_vnni_accumulate_rn(
+                                        : rocm_native_quantised_accumulate_rn(
                                               totals[local_row], partials[local_row]);
             });
     }
@@ -2743,13 +2743,13 @@ void moe_grouped_down_partials_ordered_publish_prefill_kernel(
         const int grouped_slot = original_to_grouped[original_slot];
         if (grouped_slot < 0)
             continue;
-        const float weighted_route = rocm_native_vnni_weight_route_rn(
+        const float weighted_route = rocm_native_quantised_weight_route_rn(
             grouped_weights[grouped_slot],
             down_partials[
                 static_cast<size_t>(grouped_slot) *
                     static_cast<size_t>(d_model) +
                 static_cast<size_t>(n)]);
-        total = rocm_native_vnni_accumulate_rn(total, weighted_route);
+        total = rocm_native_quantised_accumulate_rn(total, weighted_route);
     }
 
     output[
@@ -2759,7 +2759,7 @@ void moe_grouped_down_partials_ordered_publish_prefill_kernel(
 
 
 /**
- * @brief Dispatch one NativeVNNI down dot by the descriptor's codebook id.
+ * @brief Dispatch one NativeQuantised down dot by the descriptor's codebook id.
  *
  * The verifier publication kernel below must walk original route slots in a
  * single thread so it can preserve serial decode's `route 0, route 1, ...`
@@ -2771,68 +2771,68 @@ void moe_grouped_down_partials_ordered_publish_prefill_kernel(
  * grouped gate/up kernels and serial decode.
  */
 __device__ __forceinline__ float moe_prefill_dot_desc_serial_m1_dispatch(
-    const DeviceNativeVNNIMatrixDesc& desc,
+    const DeviceNativeQuantisedMatrixDesc& desc,
     int n,
     const int8_t* __restrict__ slot_A,
     const float* __restrict__ slot_scales,
     int N,
     int k_partitions)
 {
-    switch (static_cast<NativeVNNIFormatPrefill>(desc.codebook_id))
+    switch (static_cast<NativeQuantisedFormatPrefill>(desc.codebook_id))
     {
-    case NVNNI_PF_Q4_0:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q4_0>(
+    case NATIVE_QUANTISED_PF_Q4_0:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_Q4_0>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_IQ4_NL:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ4_NL>(
+    case NATIVE_QUANTISED_PF_IQ4_NL:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_IQ4_NL>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_IQ4_XS_SOURCE:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ4_XS_SOURCE>(
+    case NATIVE_QUANTISED_PF_IQ4_XS_SOURCE:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_IQ4_XS_SOURCE>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_Q4_1:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q4_1>(
+    case NATIVE_QUANTISED_PF_Q4_1:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_Q4_1>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_Q5_0:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q5_0>(
+    case NATIVE_QUANTISED_PF_Q5_0:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_Q5_0>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_Q5_1:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q5_1>(
+    case NATIVE_QUANTISED_PF_Q5_1:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_Q5_1>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_Q6_K:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q6_K>(
+    case NATIVE_QUANTISED_PF_Q6_K:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_Q6_K>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_Q3_K:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q3_K>(
+    case NATIVE_QUANTISED_PF_Q3_K:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_Q3_K>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_Q2_K:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q2_K>(
+    case NATIVE_QUANTISED_PF_Q2_K:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_Q2_K>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_IQ3_S:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ3_S>(
+    case NATIVE_QUANTISED_PF_IQ3_S:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_IQ3_S>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_IQ3_XXS:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ3_XXS>(
+    case NATIVE_QUANTISED_PF_IQ3_XXS:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_IQ3_XXS>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_IQ2_S:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ2_S>(
+    case NATIVE_QUANTISED_PF_IQ2_S:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_IQ2_S>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_IQ2_XS:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ2_XS>(
+    case NATIVE_QUANTISED_PF_IQ2_XS:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_IQ2_XS>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_IQ2_XXS:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ2_XXS>(
+    case NATIVE_QUANTISED_PF_IQ2_XXS:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_IQ2_XXS>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_IQ1_S:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ1_S>(
+    case NATIVE_QUANTISED_PF_IQ1_S:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_IQ1_S>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_IQ1_M:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ1_M>(
+    case NATIVE_QUANTISED_PF_IQ1_M:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_IQ1_M>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_Q8_0:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q8_0>(
+    case NATIVE_QUANTISED_PF_Q8_0:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_Q8_0>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NVNNI_PF_EXPANDED_INT8_MIN:
-        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_EXPANDED_INT8_MIN>(
+    case NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN:
+        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN>(
             desc, n, slot_A, slot_scales, N, k_partitions);
     default:
         moe_prefill_fail_fast_invalid_grouped_index();
@@ -2846,16 +2846,16 @@ constexpr int kMoEPrefillMixedCodebookTag = -1;
 /**
  * @brief Resolve one down-projection dot under a capture-time codebook policy.
  *
- * Homogeneous prepared tables instantiate the exact NativeVNNI format, letting
+ * Homogeneous prepared tables instantiate the exact NativeQuantised format, letting
  * HIP inline only that decoder and discard the per-output format switch. A
  * genuinely heterogeneous table instantiates @ref kMoEPrefillMixedCodebookTag
  * and performs the descriptor-owned dispatch intentionally.
  *
- * @tparam FORMAT_TAG NativeVNNI format value, or the mixed-table sentinel.
+ * @tparam FORMAT_TAG NativeQuantised format value, or the mixed-table sentinel.
  */
 template <int FORMAT_TAG>
 __device__ __forceinline__ float moe_prefill_down_dot(
-    const DeviceNativeVNNIMatrixDesc& desc,
+    const DeviceNativeQuantisedMatrixDesc& desc,
     int n,
     const int8_t* __restrict__ slot_A,
     const float* __restrict__ slot_scales,
@@ -2876,8 +2876,8 @@ __device__ __forceinline__ float moe_prefill_down_dot(
     else
     {
         constexpr auto kFormat =
-            static_cast<NativeVNNIFormatPrefill>(FORMAT_TAG);
-        if (!prefill_native_vnni_desc_shape_ok<kFormat>(
+            static_cast<NativeQuantisedFormatPrefill>(FORMAT_TAG);
+        if (!prefill_native_quantised_desc_shape_ok<kFormat>(
                 desc, N, blocks_per_row * 32))
         {
             /*
@@ -2914,14 +2914,14 @@ __device__ __forceinline__ float moe_prefill_down_dot(
  * each token/column lane, exactly where serial decode defines the mathematical
  * accumulation order.
  *
- * @tparam FORMAT_TAG NativeVNNI format value, or the mixed-table sentinel.
+ * @tparam FORMAT_TAG NativeQuantised format value, or the mixed-table sentinel.
  */
 template <int FORMAT_TAG>
 __global__ __launch_bounds__(64)
 void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
     const int8_t* __restrict__ swiglu_int8,          // [total_slots, intermediate]
     const float* __restrict__ swiglu_scales,         // [total_slots, intermediate / 32]
-    const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs, // [num_experts]
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ down_descs, // [num_experts]
     const int* __restrict__ original_to_grouped,     // [seq_len * top_k]
     const int* __restrict__ original_expert_ids,     // [seq_len * top_k], null when num_experts == 1
     const float* __restrict__ grouped_weights,       // [total_slots]
@@ -2958,7 +2958,7 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
         if (expert_id < 0 || expert_id >= num_experts)
             continue;
 
-        const DeviceNativeVNNIMatrixDesc desc = down_descs[expert_id];
+        const DeviceNativeQuantisedMatrixDesc desc = down_descs[expert_id];
         const int8_t* slot_A = swiglu_int8 + static_cast<size_t>(grouped_slot) * K;
         const float* slot_scales =
             swiglu_scales + static_cast<size_t>(grouped_slot) * blocks_per_row;
@@ -2970,9 +2970,9 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
             N,
             blocks_per_row,
             k_partition_policy);
-        const float weighted_route = rocm_native_vnni_weight_route_rn(
+        const float weighted_route = rocm_native_quantised_weight_route_rn(
             grouped_weights[grouped_slot], expert_acc);
-        total = rocm_native_vnni_accumulate_rn(total, weighted_route);
+        total = rocm_native_quantised_accumulate_rn(total, weighted_route);
     }
 
     output[static_cast<size_t>(token) * static_cast<size_t>(N) + static_cast<size_t>(n)] = total;
@@ -2988,7 +2988,7 @@ template <int FORMAT_TAG, int WORKERS>
 struct MoECanonicalRouteDownGeometry
 {
     static constexpr int columns = 64;
-    static_assert(WORKERS == 1 || (WORKERS == 4 && FORMAT_TAG == static_cast<int>(NVNNI_PF_Q5_1)));
+    static_assert(WORKERS == 1 || (WORKERS == 4 && FORMAT_TAG == static_cast<int>(NATIVE_QUANTISED_PF_Q5_1)));
     static constexpr int workers = WORKERS;
     static constexpr int threads = columns * workers;
 };
@@ -3006,15 +3006,15 @@ struct MoECanonicalRouteDownGeometry
  * shared bank and two slot-loop barriers preserve ascending RN publication
  * for every M. Other formats and mixed-table execution retain the original
  * single-wave implementation.
- * @tparam FORMAT_TAG NativeVNNI format value, or the mixed-table sentinel.
+ * @tparam FORMAT_TAG NativeQuantised format value, or the mixed-table sentinel.
  * @tparam WORKERS One serial wave or four original-partition worker waves.
  */
-template <int FORMAT_TAG, int WORKERS = (FORMAT_TAG == static_cast<int>(NVNNI_PF_Q5_1) ? 4 : 1)>
+template <int FORMAT_TAG, int WORKERS = (FORMAT_TAG == static_cast<int>(NATIVE_QUANTISED_PF_Q5_1) ? 4 : 1)>
 __global__ __launch_bounds__((MoECanonicalRouteDownGeometry<FORMAT_TAG, WORKERS>::threads))
 void moe_grouped_down_publish_canonical_routes_prefill_kernel(
     const int8_t* __restrict__ swiglu_int8,
     const float* __restrict__ swiglu_scales,
-    const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ down_descs,
     const int* __restrict__ original_to_grouped,
     const int* __restrict__ original_expert_ids,
     const float* __restrict__ grouped_weights,
@@ -3032,7 +3032,7 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
     {
         constexpr int columns = MoECanonicalRouteDownGeometry<FORMAT_TAG, WORKERS>::columns;
         constexpr int workers = MoECanonicalRouteDownGeometry<FORMAT_TAG, WORKERS>::workers;
-        constexpr int maximum_partitions = llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions;
+        constexpr int maximum_partitions = llaminar2::NativeQuantisedGroupedDecodePolicy::maximum_k_partitions;
         __shared__ float partials[maximum_partitions][columns];
         const int output_lane = static_cast<int>(threadIdx.x) % columns;
         const int worker = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x) / columns);
@@ -3057,8 +3057,8 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
             }
             if (grouped_slot >= total_slots)
                 moe_prefill_fail_fast_invalid_grouped_index();
-            const DeviceNativeVNNIMatrixDesc desc = down_descs[expert_id];
-            if (!prefill_native_vnni_desc_shape_ok<NVNNI_PF_Q5_1>(desc, N, K))
+            const DeviceNativeQuantisedMatrixDesc desc = down_descs[expert_id];
+            if (!prefill_native_quantised_desc_shape_ok<NATIVE_QUANTISED_PF_Q5_1>(desc, N, K))
                 moe_prefill_fail_fast_invalid_grouped_index();
             const int partitions = k_partition_policy.forDescriptor(desc);
             if (partitions <= 0 || partitions > blocks_per_row || partitions > maximum_partitions)
@@ -3074,7 +3074,7 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
                     const int begin = partition * blocks_per_partition;
                     const int end = min(begin + blocks_per_partition, blocks_per_row);
                     partials[partition][output_lane] = begin < end
-                        ? moe_prefill_dot_desc_range<NVNNI_PF_Q5_1>(
+                        ? moe_prefill_dot_desc_range<NATIVE_QUANTISED_PF_Q5_1>(
                               desc, n, slot_A, slot_scales, N, begin, end)
                         : 0.0f;
                 }
@@ -3090,10 +3090,10 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
                     float total = 0.0f;
 #pragma unroll 1
                     for (int partition = 0; partition < partitions; ++partition)
-                        total = rocm_native_vnni_accumulate_rn(total, partials[partition][output_lane]);
+                        total = rocm_native_quantised_accumulate_rn(total, partials[partition][output_lane]);
                     value = total;
                 }
-                route_output[output_index] = rocm_native_vnni_weight_route_rn(grouped_weights[grouped_slot], value);
+                route_output[output_index] = rocm_native_quantised_weight_route_rn(grouped_weights[grouped_slot], value);
             }
             // Every slot iteration retires wave 0's bank reads before any other
             // wave can overwrite them for the next slot. Keep this second barrier
@@ -3124,7 +3124,7 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
             continue;
         }
 
-        const DeviceNativeVNNIMatrixDesc desc = down_descs[expert_id];
+        const DeviceNativeQuantisedMatrixDesc desc = down_descs[expert_id];
         const int8_t* slot_A =
             swiglu_int8 + static_cast<size_t>(grouped_slot) * K;
         const float* slot_scales =
@@ -3137,7 +3137,7 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
             N,
             blocks_per_row,
             k_partition_policy);
-        route_output[output_index] = rocm_native_vnni_weight_route_rn(
+        route_output[output_index] = rocm_native_quantised_weight_route_rn(
             grouped_weights[grouped_slot], expert_acc);
     }
 }
@@ -3177,7 +3177,7 @@ void moe_grouped_down_partials_canonical_publish_prefill_kernel(
         route_output[output_index] =
             grouped_slot < 0
                 ? 0.0f
-                : rocm_native_vnni_weight_route_rn(
+                : rocm_native_quantised_weight_route_rn(
                       grouped_weights[grouped_slot],
                       down_partials[
                           static_cast<size_t>(grouped_slot) *
@@ -3315,7 +3315,7 @@ namespace
             }
 
             int k_partitions = 0;
-            if (!rocmGemv_native_vnni_query_serial_m1_config(
+            if (!rocmGemv_native_quantised_query_serial_m1_config(
                     codebook_id,
                     n,
                     k,
@@ -3324,7 +3324,7 @@ namespace
                 k_partitions <= 0 ||
                 k_partitions > k / 32 ||
                 k_partitions >
-                    llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+                    llaminar2::NativeQuantisedGroupedDecodePolicy::maximum_k_partitions)
             {
                 return false;
             }
@@ -3370,7 +3370,7 @@ namespace
      */
     MoEPrefillTileConfig moe_prefill_select_tile_config(
         MoEPrefillProjectionRole role,
-        NativeVNNIFormatPrefill format,
+        NativeQuantisedFormatPrefill format,
         int m,
         int n,
         int k)
@@ -3384,9 +3384,9 @@ namespace
         // 19 policy until a dedicated synthetic-format corpus is certified;
         // execution and telemetry retain codebook 23.
         const uint8_t policy_codebook =
-            format == NVNNI_PF_IQ4_XS_SOURCE ? static_cast<uint8_t>(NVNNI_PF_IQ4_NL) :
-            format == NVNNI_PF_EXPANDED_INT8_MIN
-                ? static_cast<uint8_t>(NVNNI_PF_Q8_0)
+            format == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE ? static_cast<uint8_t>(NATIVE_QUANTISED_PF_IQ4_NL) :
+            format == NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN
+                ? static_cast<uint8_t>(NATIVE_QUANTISED_PF_Q8_0)
                 : static_cast<uint8_t>(format);
         if (!llaminar2::rocm::generated::selectROCmMoEGroupedPrefillGenerated(
                 policy_codebook, role_id, m, n, k, generated))
@@ -3428,13 +3428,13 @@ namespace
 
         pair.gateup = moe_prefill_select_tile_config(
             MoEPrefillProjectionRole::GateUp,
-            static_cast<NativeVNNIFormatPrefill>(gateup_codebook),
+            static_cast<NativeQuantisedFormatPrefill>(gateup_codebook),
             m,
             expert_width,
             hidden_size);
         pair.down = moe_prefill_select_tile_config(
             MoEPrefillProjectionRole::Down,
-            static_cast<NativeVNNIFormatPrefill>(down_codebook),
+            static_cast<NativeQuantisedFormatPrefill>(down_codebook),
             m,
             hidden_size,
             expert_width);
@@ -3443,9 +3443,9 @@ namespace
             exact{};
         const auto policy_codebook = [](int codebook)
         {
-            return codebook == NVNNI_PF_IQ4_XS_SOURCE ? static_cast<uint8_t>(NVNNI_PF_IQ4_NL) :
-                   codebook == NVNNI_PF_EXPANDED_INT8_MIN
-                       ? static_cast<uint8_t>(NVNNI_PF_Q8_0)
+            return codebook == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE ? static_cast<uint8_t>(NATIVE_QUANTISED_PF_IQ4_NL) :
+                   codebook == NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN
+                       ? static_cast<uint8_t>(NATIVE_QUANTISED_PF_Q8_0)
                        : static_cast<uint8_t>(codebook);
         };
         if (!llaminar2::rocm::selectROCmMoEProductionPrefillOverlayForOperation(
@@ -3544,7 +3544,7 @@ namespace
     /**
      * @brief Resolve one role-specific template specialization for inspection.
      */
-    template <NativeVNNIFormatPrefill FMT, int TILE_M, int TILE_N>
+    template <NativeQuantisedFormatPrefill FMT, int TILE_M, int TILE_N>
     bool moe_prefill_query_candidate_resources(
         MoEPrefillProjectionRole role,
         int* registers_per_thread,
@@ -3588,7 +3588,7 @@ namespace
      * uninspected kernel enter the production graph through a misleadingly
      * healthy candidate record.
      *
-     * @tparam FMT NativeVNNI codebook used by both projection kernels.
+     * @tparam FMT NativeQuantised codebook used by both projection kernels.
      * @tparam TILE_N Output-column width and projection block size.
      * @param role Gate/up or down projection role.
      * @param registers_per_thread Receives the largest VGPR allocation.
@@ -3598,7 +3598,7 @@ namespace
      * @param max_active_blocks_per_sm Receives the smallest occupancy ceiling.
      * @return true only when the planner and both projections can be inspected.
      */
-    template <NativeVNNIFormatPrefill FMT, int TILE_N>
+    template <NativeQuantisedFormatPrefill FMT, int TILE_N>
     bool moe_prefill_query_adaptive_candidate_resources(
         MoEPrefillProjectionRole role,
         int* registers_per_thread,
@@ -3684,24 +3684,24 @@ auto selectMoERouteOwnedFormat(uint8_t codebook, Select select)
 {
     switch (codebook)
     {
-    case NVNNI_PF_Q4_0: return select.template operator()<NVNNI_PF_Q4_0>();
-    case NVNNI_PF_IQ4_NL: return select.template operator()<NVNNI_PF_IQ4_NL>();
-    case NVNNI_PF_IQ4_XS_SOURCE: return select.template operator()<NVNNI_PF_IQ4_XS_SOURCE>();
-    case NVNNI_PF_Q4_1: return select.template operator()<NVNNI_PF_Q4_1>();
-    case NVNNI_PF_Q5_0: return select.template operator()<NVNNI_PF_Q5_0>();
-    case NVNNI_PF_Q5_1: return select.template operator()<NVNNI_PF_Q5_1>();
-    case NVNNI_PF_Q6_K: return select.template operator()<NVNNI_PF_Q6_K>();
-    case NVNNI_PF_Q3_K: return select.template operator()<NVNNI_PF_Q3_K>();
-    case NVNNI_PF_Q2_K: return select.template operator()<NVNNI_PF_Q2_K>();
-    case NVNNI_PF_IQ3_S: return select.template operator()<NVNNI_PF_IQ3_S>();
-    case NVNNI_PF_IQ3_XXS: return select.template operator()<NVNNI_PF_IQ3_XXS>();
-    case NVNNI_PF_IQ2_S: return select.template operator()<NVNNI_PF_IQ2_S>();
-    case NVNNI_PF_IQ2_XS: return select.template operator()<NVNNI_PF_IQ2_XS>();
-    case NVNNI_PF_IQ2_XXS: return select.template operator()<NVNNI_PF_IQ2_XXS>();
-    case NVNNI_PF_IQ1_S: return select.template operator()<NVNNI_PF_IQ1_S>();
-    case NVNNI_PF_IQ1_M: return select.template operator()<NVNNI_PF_IQ1_M>();
-    case NVNNI_PF_Q8_0: return select.template operator()<NVNNI_PF_Q8_0>();
-    case NVNNI_PF_EXPANDED_INT8_MIN: return select.template operator()<NVNNI_PF_EXPANDED_INT8_MIN>();
+    case NATIVE_QUANTISED_PF_Q4_0: return select.template operator()<NATIVE_QUANTISED_PF_Q4_0>();
+    case NATIVE_QUANTISED_PF_IQ4_NL: return select.template operator()<NATIVE_QUANTISED_PF_IQ4_NL>();
+    case NATIVE_QUANTISED_PF_IQ4_XS_SOURCE: return select.template operator()<NATIVE_QUANTISED_PF_IQ4_XS_SOURCE>();
+    case NATIVE_QUANTISED_PF_Q4_1: return select.template operator()<NATIVE_QUANTISED_PF_Q4_1>();
+    case NATIVE_QUANTISED_PF_Q5_0: return select.template operator()<NATIVE_QUANTISED_PF_Q5_0>();
+    case NATIVE_QUANTISED_PF_Q5_1: return select.template operator()<NATIVE_QUANTISED_PF_Q5_1>();
+    case NATIVE_QUANTISED_PF_Q6_K: return select.template operator()<NATIVE_QUANTISED_PF_Q6_K>();
+    case NATIVE_QUANTISED_PF_Q3_K: return select.template operator()<NATIVE_QUANTISED_PF_Q3_K>();
+    case NATIVE_QUANTISED_PF_Q2_K: return select.template operator()<NATIVE_QUANTISED_PF_Q2_K>();
+    case NATIVE_QUANTISED_PF_IQ3_S: return select.template operator()<NATIVE_QUANTISED_PF_IQ3_S>();
+    case NATIVE_QUANTISED_PF_IQ3_XXS: return select.template operator()<NATIVE_QUANTISED_PF_IQ3_XXS>();
+    case NATIVE_QUANTISED_PF_IQ2_S: return select.template operator()<NATIVE_QUANTISED_PF_IQ2_S>();
+    case NATIVE_QUANTISED_PF_IQ2_XS: return select.template operator()<NATIVE_QUANTISED_PF_IQ2_XS>();
+    case NATIVE_QUANTISED_PF_IQ2_XXS: return select.template operator()<NATIVE_QUANTISED_PF_IQ2_XXS>();
+    case NATIVE_QUANTISED_PF_IQ1_S: return select.template operator()<NATIVE_QUANTISED_PF_IQ1_S>();
+    case NATIVE_QUANTISED_PF_IQ1_M: return select.template operator()<NATIVE_QUANTISED_PF_IQ1_M>();
+    case NATIVE_QUANTISED_PF_Q8_0: return select.template operator()<NATIVE_QUANTISED_PF_Q8_0>();
+    case NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN: return select.template operator()<NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN>();
     default: throw std::invalid_argument("unsupported physical ROCm route-owned native decoder");
     }
 }
@@ -3714,13 +3714,13 @@ auto selectMoERouteOwnedFormat(uint8_t codebook, Select select)
  * @param maximum_partitions Authenticated original source-policy maximum; unused by serial resources.
  * @return Actual native function, block width and exact dynamic LDS requirement.
  */
-template <NativeVNNIFormatPrefill FMT, int TN, bool PARALLEL_SOURCE_PARTITIONS = false>
+template <NativeQuantisedFormatPrefill FMT, int TN, bool PARALLEL_SOURCE_PARTITIONS = false>
 MoERouteLeafSymbol routeGateUpSymbol(int maximum_partitions)
 {
     static_assert(!PARALLEL_SOURCE_PARTITIONS ||
         (TN == llaminar2::rocm::kMoERouteOwnedGateUpPartitionColumns));
     return {reinterpret_cast<const void *>(HIP_KERNEL_NAME(
-        moe_grouped_gate_up_decode_equivalent_prefill_kernel<FMT, TN, FMT == NVNNI_PF_IQ2_S, 1, PARALLEL_SOURCE_PARTITIONS>)),
+        moe_grouped_gate_up_decode_equivalent_prefill_kernel<FMT, TN, FMT == NATIVE_QUANTISED_PF_IQ2_S, 1, PARALLEL_SOURCE_PARTITIONS>)),
         __PRETTY_FUNCTION__, TN * (PARALLEL_SOURCE_PARTITIONS ? llaminar2::rocm::kMoERouteOwnedGateUpPartitionWorkers : 1),
         llaminar2::rocm::moeRouteOwnedGateUpK1SharedLayout(static_cast<std::uint8_t>(FMT),
             PARALLEL_SOURCE_PARTITIONS
@@ -3738,7 +3738,7 @@ MoERouteLeafSymbol routeGateUpSymbol(int maximum_partitions)
  * @return Exact compiled leaf identity and immutable launch-owned LDS.
  * @throws std::invalid_argument For an unsupported explicit mode/decoder/geometry.
  */
-template <NativeVNNIFormatPrefill FMT>
+template <NativeQuantisedFormatPrefill FMT>
 MoERouteLeafSymbol routeGateUpSymbolForGeometry(llaminar2::rocm::MoERouteOwnedGateUpGeometry geometry,
     llaminar2::rocm::MoERouteOwnedGateUpPartitionExecution partition_execution, int maximum_partitions)
 {
@@ -3760,14 +3760,14 @@ MoERouteLeafSymbol routeGateUpSymbolForGeometry(llaminar2::rocm::MoERouteOwnedGa
 }
 
 /** @brief Inspect the exact format-owned 64-column publication leaf, never an expert-tiled proxy. */
-template <NativeVNNIFormatPrefill FMT>
+template <NativeQuantisedFormatPrefill FMT>
 MoERouteLeafSymbol routeDownSymbol(llaminar2::MoEPrefillOutputLayout layout,
     llaminar2::rocm::MoECanonicalDownExecution execution)
 {
     switch (layout)
     {
     case llaminar2::MoEPrefillOutputLayout::OriginalRouteRows:
-        if constexpr (FMT == NVNNI_PF_Q5_1)
+        if constexpr (FMT == NATIVE_QUANTISED_PF_Q5_1)
         {
             if (execution == llaminar2::rocm::MoECanonicalDownExecution::FourWorkers)
                 return {reinterpret_cast<const void *>(HIP_KERNEL_NAME(
@@ -3819,7 +3819,7 @@ llaminar2::rocm::MoERouteOwnedKernelResources inspectMoERouteLeaf(MoERouteLeafSy
 
 llaminar2::rocm::MoERouteOwnedGateUpPlan
 llaminar2::rocm::planMoERouteOwnedGateUp(
-    MoERouteOwnedGateUpGeometry geometry, const llaminar2::NativeVnniExecutionFormatEnvelope &envelope, int device,
+    MoERouteOwnedGateUpGeometry geometry, const llaminar2::NativeQuantisedExecutionFormatEnvelope &envelope, int device,
     MoERouteOwnedGateUpPartitionExecution partition_execution, MoERouteOwnedProjectionShape shape)
 {
     (void)moeRouteOwnedGateUpColumns(geometry);
@@ -3851,7 +3851,7 @@ llaminar2::rocm::planMoERouteOwnedGateUp(
 
 llaminar2::rocm::MoERouteOwnedGateUpAdmission
 llaminar2::rocm::admitMoERouteOwnedGateUpGeometry(
-    MoERouteOwnedGateUpGeometry geometry, const llaminar2::NativeVnniExecutionFormatEnvelope &envelope, int device,
+    MoERouteOwnedGateUpGeometry geometry, const llaminar2::NativeQuantisedExecutionFormatEnvelope &envelope, int device,
     MoERouteOwnedGateUpPartitionExecution partition_execution, MoERouteOwnedProjectionShape shape)
 {
     return admitMoERouteOwnedGateUpGeometry(planMoERouteOwnedGateUp(geometry, envelope, device, partition_execution, shape));
@@ -3874,13 +3874,13 @@ llaminar2::rocm::admitMoERouteOwnedGateUpGeometry(const MoERouteOwnedGateUpPlan 
     // Resolve every family before the first HIP query: unsupported members
     // cannot leave a partially admitted capability or skip an empty leaf.
     for (std::uint8_t codebook = 0; codebook < 32; ++codebook)
-        if (launch_mask & llaminar2::nativeVnniCodebookMaskBit(codebook))
+        if (launch_mask & llaminar2::nativeQuantisedCodebookMaskBit(codebook))
             symbols[codebook] = selectMoERouteOwnedFormat(codebook,
-                [=]<NativeVNNIFormatPrefill FMT>() { return routeGateUpSymbolForGeometry<FMT>(geometry, partition_execution, maximum_partitions); });
+                [=]<NativeQuantisedFormatPrefill FMT>() { return routeGateUpSymbolForGeometry<FMT>(geometry, partition_execution, maximum_partitions); });
     requireMoERouteOwnedColdInspection(device);
     std::array<MoERouteOwnedKernelResources, 32> resources{};
     for (std::uint8_t codebook = 0; codebook < 32; ++codebook)
-        if (launch_mask & llaminar2::nativeVnniCodebookMaskBit(codebook))
+        if (launch_mask & llaminar2::nativeQuantisedCodebookMaskBit(codebook))
             resources[codebook] = inspectMoERouteLeaf(symbols[codebook]);
     return {geometry, envelope, device, resources, partition_execution, shape, partitions, maximum_partitions};
 }
@@ -3889,9 +3889,9 @@ llaminar2::rocm::MoERouteOwnedGateUpAdmission
 llaminar2::rocm::admitMoERouteOwnedGateUpGeometry(
     MoERouteOwnedGateUpGeometry geometry, uint8_t codebook, int device)
 {
-    const auto bit = llaminar2::nativeVnniCodebookMaskBit(codebook);
+    const auto bit = llaminar2::nativeQuantisedCodebookMaskBit(codebook);
     return admitMoERouteOwnedGateUpGeometry(geometry,
-        llaminar2::NativeVnniExecutionFormatEnvelope{bit, bit}, device);
+        llaminar2::NativeQuantisedExecutionFormatEnvelope{bit, bit}, device);
 }
 
 llaminar2::rocm::MoERouteOwnedKernelResources
@@ -3900,7 +3900,7 @@ llaminar2::rocm::inspectMoERouteOwnedDown(uint8_t codebook,
 {
     const auto execution = selectMoECanonicalDownExecution(shape);
     const auto symbol = selectMoERouteOwnedFormat(codebook,
-        [=]<NativeVNNIFormatPrefill FMT>() { return routeDownSymbol<FMT>(layout, execution); });
+        [=]<NativeQuantisedFormatPrefill FMT>() { return routeDownSymbol<FMT>(layout, execution); });
     requireMoERouteOwnedColdInspection(device);
     return inspectMoERouteLeaf(symbol);
 }
@@ -3917,7 +3917,7 @@ extern "C" {
  * intentionally handled by the caller because it bypasses this generated
  * long-prefill surface.
  *
- * @param codebook_id NativeVNNI execution codebook stored in the descriptor.
+ * @param codebook_id NativeQuantised execution codebook stored in the descriptor.
  * @param projection_role Zero for gate/up, one for down.
  * @param m Number of original token rows.
  * @param n Projection output width.
@@ -3943,7 +3943,7 @@ bool rocmMoE_grouped_prefill_query_tile_config(
                           : MoEPrefillProjectionRole::Down;
     const MoEPrefillTileConfig config = moe_prefill_select_tile_config(
         role,
-        static_cast<NativeVNNIFormatPrefill>(codebook_id),
+        static_cast<NativeQuantisedFormatPrefill>(codebook_id),
         m,
         n,
         k);
@@ -4070,7 +4070,7 @@ extern "C" bool rocmMoE_grouped_prefill_query_production_pair_config(
  * register-spilling specialization and therefore excludes that specialization
  * from the launch tournament.
  *
- * @param codebook_id NativeVNNI execution codebook compiled into the decoder.
+ * @param codebook_id NativeQuantised execution codebook compiled into the decoder.
  * @param projection_role Zero for gate/up, one for down.
  * @param tile_m Candidate expert-row tile.
  * @param tile_n Candidate output-column tile and physical block width.
@@ -4153,27 +4153,27 @@ bool rocmMoE_grouped_prefill_query_kernel_resources(
             } \
         } while (0)
 
-    switch (static_cast<NativeVNNIFormatPrefill>(codebook_id))
+    switch (static_cast<NativeQuantisedFormatPrefill>(codebook_id))
     {
-    case NVNNI_PF_Q4_0: QUERY_TILE_M(NVNNI_PF_Q4_0);
-    case NVNNI_PF_IQ4_NL: QUERY_TILE_M(NVNNI_PF_IQ4_NL);
-    case NVNNI_PF_IQ4_XS_SOURCE: QUERY_TILE_M(NVNNI_PF_IQ4_XS_SOURCE);
-    case NVNNI_PF_Q4_1: QUERY_TILE_M(NVNNI_PF_Q4_1);
-    case NVNNI_PF_Q5_0: QUERY_TILE_M(NVNNI_PF_Q5_0);
-    case NVNNI_PF_Q5_1: QUERY_TILE_M(NVNNI_PF_Q5_1);
-    case NVNNI_PF_Q6_K: QUERY_TILE_M(NVNNI_PF_Q6_K);
-    case NVNNI_PF_Q3_K: QUERY_TILE_M(NVNNI_PF_Q3_K);
-    case NVNNI_PF_Q2_K: QUERY_TILE_M(NVNNI_PF_Q2_K);
-    case NVNNI_PF_IQ3_S: QUERY_TILE_M(NVNNI_PF_IQ3_S);
-    case NVNNI_PF_IQ3_XXS: QUERY_TILE_M(NVNNI_PF_IQ3_XXS);
-    case NVNNI_PF_IQ2_S: QUERY_TILE_M(NVNNI_PF_IQ2_S);
-    case NVNNI_PF_IQ2_XS: QUERY_TILE_M(NVNNI_PF_IQ2_XS);
-    case NVNNI_PF_IQ2_XXS: QUERY_TILE_M(NVNNI_PF_IQ2_XXS);
-    case NVNNI_PF_IQ1_S: QUERY_TILE_M(NVNNI_PF_IQ1_S);
-    case NVNNI_PF_IQ1_M: QUERY_TILE_M(NVNNI_PF_IQ1_M);
-    case NVNNI_PF_Q8_0: QUERY_TILE_M(NVNNI_PF_Q8_0);
-    case NVNNI_PF_EXPANDED_INT8_MIN:
-        QUERY_TILE_M(NVNNI_PF_EXPANDED_INT8_MIN);
+    case NATIVE_QUANTISED_PF_Q4_0: QUERY_TILE_M(NATIVE_QUANTISED_PF_Q4_0);
+    case NATIVE_QUANTISED_PF_IQ4_NL: QUERY_TILE_M(NATIVE_QUANTISED_PF_IQ4_NL);
+    case NATIVE_QUANTISED_PF_IQ4_XS_SOURCE: QUERY_TILE_M(NATIVE_QUANTISED_PF_IQ4_XS_SOURCE);
+    case NATIVE_QUANTISED_PF_Q4_1: QUERY_TILE_M(NATIVE_QUANTISED_PF_Q4_1);
+    case NATIVE_QUANTISED_PF_Q5_0: QUERY_TILE_M(NATIVE_QUANTISED_PF_Q5_0);
+    case NATIVE_QUANTISED_PF_Q5_1: QUERY_TILE_M(NATIVE_QUANTISED_PF_Q5_1);
+    case NATIVE_QUANTISED_PF_Q6_K: QUERY_TILE_M(NATIVE_QUANTISED_PF_Q6_K);
+    case NATIVE_QUANTISED_PF_Q3_K: QUERY_TILE_M(NATIVE_QUANTISED_PF_Q3_K);
+    case NATIVE_QUANTISED_PF_Q2_K: QUERY_TILE_M(NATIVE_QUANTISED_PF_Q2_K);
+    case NATIVE_QUANTISED_PF_IQ3_S: QUERY_TILE_M(NATIVE_QUANTISED_PF_IQ3_S);
+    case NATIVE_QUANTISED_PF_IQ3_XXS: QUERY_TILE_M(NATIVE_QUANTISED_PF_IQ3_XXS);
+    case NATIVE_QUANTISED_PF_IQ2_S: QUERY_TILE_M(NATIVE_QUANTISED_PF_IQ2_S);
+    case NATIVE_QUANTISED_PF_IQ2_XS: QUERY_TILE_M(NATIVE_QUANTISED_PF_IQ2_XS);
+    case NATIVE_QUANTISED_PF_IQ2_XXS: QUERY_TILE_M(NATIVE_QUANTISED_PF_IQ2_XXS);
+    case NATIVE_QUANTISED_PF_IQ1_S: QUERY_TILE_M(NATIVE_QUANTISED_PF_IQ1_S);
+    case NATIVE_QUANTISED_PF_IQ1_M: QUERY_TILE_M(NATIVE_QUANTISED_PF_IQ1_M);
+    case NATIVE_QUANTISED_PF_Q8_0: QUERY_TILE_M(NATIVE_QUANTISED_PF_Q8_0);
+    case NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN:
+        QUERY_TILE_M(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN);
     default: break;
     }
 
@@ -4200,9 +4200,9 @@ bool rocmMoE_grouped_prefill_pipeline(
     const int8_t* d_prequantized_hidden, // optional [seq_len, d_model] router-owned Q8 rows
     const float*  d_prequantized_hidden_scales, // optional [seq_len, d_model / 32]
     // Weight descriptors (already on device)
-    const void*   d_gate_desc_table,     // DeviceNativeVNNIMatrixDesc[num_experts]
-    const void*   d_up_desc_table,       // DeviceNativeVNNIMatrixDesc[num_experts]
-    const void*   d_down_desc_table,     // DeviceNativeVNNIMatrixDesc[num_experts]
+    const void*   d_gate_desc_table,     // DeviceNativeQuantisedMatrixDesc[num_experts]
+    const void*   d_up_desc_table,       // DeviceNativeQuantisedMatrixDesc[num_experts]
+    const void*   d_down_desc_table,     // DeviceNativeQuantisedMatrixDesc[num_experts]
     // Grouping data (from prepareExpertGroupsAsync)
     const int*    d_group_counts,        // [num_experts] per-expert token count
     const int*    d_group_offsets,       // [num_experts] prefix-sum offsets
@@ -4228,7 +4228,7 @@ bool rocmMoE_grouped_prefill_pipeline(
     int total_slots,                     // seq_len * top_k
     int top_k,                           // routes per token, needed by ordered publication
     int grouped_indices_are_route_slots, // d_group_token_indices stores route slots, not token rows
-    // Format masks launch only the compiled NativeVNNI specializations present
+    // Format masks launch only the compiled NativeQuantised specializations present
     // in each descriptor table. Mixed-codebook expert tables remain supported.
     uint32_t gateup_codebook_mask,
     uint32_t down_codebook_mask,
@@ -4548,8 +4548,8 @@ bool rocmMoE_grouped_prefill_pipeline(
     // =========================================================================
     if (executes_gateup)
     {
-        const auto* gate_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_gate_desc_table);
-        const auto* up_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_up_desc_table);
+        const auto* gate_descs = static_cast<const DeviceNativeQuantisedMatrixDesc*>(d_gate_desc_table);
+        const auto* up_descs = static_cast<const DeviceNativeQuantisedMatrixDesc*>(d_up_desc_table);
 
         #define LAUNCH_GATEUP_ROUTE_OWNED(FMT) \
             do { \
@@ -4672,24 +4672,24 @@ bool rocmMoE_grouped_prefill_pipeline(
                 } \
             } while (0)
 
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q4_0);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ4_NL);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ4_XS_SOURCE);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q4_1);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q5_0);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q5_1);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q6_K);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q3_K);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q2_K);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ3_S);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ3_XXS);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ2_S);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ2_XS);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ2_XXS);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ1_S);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ1_M);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q8_0);
-        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_EXPANDED_INT8_MIN);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_Q4_0);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_IQ4_NL);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_IQ4_XS_SOURCE);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_Q4_1);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_Q5_0);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_Q5_1);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_Q6_K);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_Q3_K);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_Q2_K);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_IQ3_S);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_IQ3_XXS);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_S);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_XS);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_XXS);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_S);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_M);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_Q8_0);
+        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN);
         if (!launched_gateup)
         {
                 fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported gate/up codebook mask=0x%x\n",
@@ -4729,7 +4729,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         constexpr int TILE_N = 64;
         dim3 block(TILE_N);
         const auto* down_descs =
-            static_cast<const DeviceNativeVNNIMatrixDesc*>(d_down_desc_table);
+            static_cast<const DeviceNativeQuantisedMatrixDesc*>(d_down_desc_table);
 
         if (use_route_owned)
         {
@@ -4760,7 +4760,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         const auto execution = llaminar2::rocm::selectMoECanonicalDownExecution( \
                             {down_columns, intermediate, total_slots}); \
                         [&]<int SelectedFormat>() { \
-                            if constexpr (SelectedFormat == static_cast<int>(NVNNI_PF_Q5_1)) { \
+                            if constexpr (SelectedFormat == static_cast<int>(NATIVE_QUANTISED_PF_Q5_1)) { \
                                 if (execution == llaminar2::rocm::MoECanonicalDownExecution::FourWorkers) { \
                                     LAUNCH_CANONICAL_DOWN_WORKERS(SelectedFormat, 4); \
                                 } else { \
@@ -4789,24 +4789,24 @@ bool rocmMoE_grouped_prefill_pipeline(
 
             switch (moe_prefill_launch_mask(down_codebook_mask))
             {
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q4_0);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ4_NL);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ4_XS_SOURCE);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q4_1);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q5_0);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q5_1);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q6_K);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q3_K);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q2_K);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ3_S);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ3_XXS);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ2_S);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ2_XS);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ2_XXS);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ1_S);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ1_M);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q8_0);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_EXPANDED_INT8_MIN);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_Q4_0);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_IQ4_NL);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_IQ4_XS_SOURCE);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_Q4_1);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_Q5_0);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_Q5_1);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_Q6_K);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_Q3_K);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_Q2_K);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_IQ3_S);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_IQ3_XXS);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_IQ2_S);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_IQ2_XS);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_IQ2_XXS);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_IQ1_S);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_IQ1_M);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_Q8_0);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN);
             default:
                 if (down_codebook_mask == 0 ||
                     (down_codebook_mask & (down_codebook_mask - 1u)) == 0)
@@ -4920,24 +4920,24 @@ bool rocmMoE_grouped_prefill_pipeline(
                     } \
                 } while (0)
 
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q4_0);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ4_NL);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ4_XS_SOURCE);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q4_1);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q5_0);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q5_1);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q6_K);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q3_K);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q2_K);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ3_S);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ3_XXS);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ2_S);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ2_XS);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ2_XXS);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_S);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_M);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q8_0);
-            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_EXPANDED_INT8_MIN);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q4_0);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ4_NL);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ4_XS_SOURCE);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q4_1);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q5_0);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q5_1);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q6_K);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q3_K);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q2_K);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ3_S);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ3_XXS);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_S);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_XS);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_XXS);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_S);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_M);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q8_0);
+            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN);
             #undef LAUNCH_DOWN_IF_PRESENT
             #undef DISPATCH_DOWN_CONFIG
             #undef DISPATCH_DOWN_TILE_N

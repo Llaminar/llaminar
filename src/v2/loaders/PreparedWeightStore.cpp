@@ -641,8 +641,8 @@ namespace llaminar2
             throw std::invalid_argument("Original output slice requires a frozen original matrix row interval with complete K");
         const auto *native_source = IINT8Unpackable::fromTensor(&source);
         const auto *format = native_source ? native_source->vnniFormatInfo() : nullptr;
-        NativeVnniSourceIdentity prepared_source;
-        if (!format || !kernel->exportNativeVNNISourceIdentity(prepared_source) ||
+        NativeQuantisedSourceIdentity prepared_source;
+        if (!format || !kernel->exportNativeQuantisedSourceIdentity(prepared_source) ||
             !prepared_source.present || prepared_source.codebook_id != format->codebook_id ||
             prepared_source.is_superblock != format->is_superblock)
             throw std::invalid_argument("Original output slice requires matching original native quantized source/prepared format; floating ordinary arithmetic is unsupported");

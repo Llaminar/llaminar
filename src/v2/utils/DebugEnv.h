@@ -482,8 +482,8 @@ namespace llaminar2
         int gemm_n_tile = 0;                ///< N-dimension tile size (0=no tiling is optimal for large batches)
 
         bool deterministic = false;               ///< Enable deterministic CUDA GEMM dispatch when LLAMINAR_DETERMINISTIC is non-zero.
-        int cuda_bk256_mode = 0;                  ///< CUDA native-VNNI BK256 mode override (LLAMINAR_BK256_MODE, default 0=auto).
-        int cuda_force_prefill_tile = -1;         ///< CUDA native-VNNI prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
+        int cuda_bk256_mode = 0;                  ///< CUDA native-quantised BK256 mode override (LLAMINAR_BK256_MODE, default 0=auto).
+        int cuda_force_prefill_tile = -1;         ///< CUDA native-quantised prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
         int cuda_moe_gateup_ordered_kpart_tile_n = 128; ///< Warp-aligned output columns per ordered split-K CUDA gate/up producer block (LLAMINAR_CUDA_MOE_GATEUP_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
         bool cuda_moe_gateup_ordered_kpart_tile_n_override_active = false; ///< True only when an explicit environment or trainer override must supersede generated capture-time dispatch.
         int cuda_moe_down_ordered_kpart_tile_n = 128;   ///< Warp-aligned output columns per ordered split-K CUDA down producer block used for canonical route publication (LLAMINAR_CUDA_MOE_DOWN_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
@@ -2935,10 +2935,10 @@ namespace llaminar2
      * - `LLAMINAR_GPU_LOAD_STAGING_MB=<mb>` - Per-GPU pinned-host startup staging cap, mirrored by per-GPU device scratch (default 512 MiB, 0=unlimited)
      * - `LLAMINAR_ROCM_REPACK_BUDGET_MB=<mb>` - Legacy alias for the startup staging cap
      * - `LLAMINAR_ROCM_REPACK_STREAMS=<n>` - Stream count hint for startup GPU repack pipeline
-     * - `LLAMINAR_ROCM_NVNNI_GEMV_KB=<n>` - Force native-VNNI GEMV K partitions (`-1` = auto)
-     * - `LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES=<n>` - Force native-VNNI GEMV target waves per CU (`-1` = auto)
-     * - `LLAMINAR_ROCM_NVNNI_FULL_TILES=<-1|0|1>` - Select automatic, checked, or divisibility-proven full-tile NativeVNNI GEMM specialization
-     * - `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1` - Disable generated ROCm NativeVNNI dispatch tables during trainer sweeps
+     * - `LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_KB=<n>` - Force native-quantised GEMV K partitions (`-1` = auto)
+     * - `LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_TARGET_WAVES=<n>` - Force native-quantised GEMV target waves per CU (`-1` = auto)
+     * - `LLAMINAR_ROCM_NATIVE_QUANTISED_FULL_TILES=<-1|0|1>` - Select automatic, checked, or divisibility-proven full-tile NativeQuantised GEMM specialization
+     * - `LLAMINAR_ROCM_NATIVE_QUANTISED_DISABLE_GENERATED=1` - Disable generated ROCm NativeQuantised dispatch tables during trainer sweeps
      * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=0` - Disable multi-stream GDN decode projection GEMVs (default: on outside deterministic mode)
      * - `LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER=0` - Disable grouped MoE decode router logits path (default: on)
      * - `LLAMINAR_ROCM_MOE_ROUTER_Q8=0` - Disable cached Q8 router gate weights for ROCm MoE decode routing (default: on)
@@ -2996,15 +2996,15 @@ namespace llaminar2
         bool blockwise_force_v3 = false;           ///< Force V3 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V3)
         bool blockwise_force_v7 = false;           ///< Force V7 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V7)
         int blockwise_quant_variant = 0;           ///< Blockwise quant kernel variant (0=auto, 1-5=manual) (LLAMINAR_ROCM_BLOCKWISE_QUANT_VARIANT)
-        int nvnni_mt = -1;                         ///< Native-VNNI M_TILE override (-1=auto, 16/32/64) (LLAMINAR_ROCM_NVNNI_MT)
-        int nvnni_unroll = -1;                     ///< Native-VNNI UNROLL_G override (-1=auto, 0=none, 1=full, 2/4=partial) (LLAMINAR_ROCM_NVNNI_UNROLL)
-        int nvnni_min_blocks = -1;                 ///< Native-VNNI MIN_BLOCKS override (-1=auto, 1=bare, 2=2-wave, 3=3-wave) (LLAMINAR_ROCM_NVNNI_MIN_BLOCKS)
-        bool nvnni_force_n64 = false;              ///< Force N64 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N64)
-        bool nvnni_force_n128 = false;             ///< Force N128 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N128)
-        int nvnni_full_tiles = -1;                 ///< Native-VNNI edge specialization (-1=auto, 0=checked, 1=full tiles) (LLAMINAR_ROCM_NVNNI_FULL_TILES)
-        int nvnni_gemv_kb = -1;                    ///< Native-VNNI GEMV K-partition override (-1=auto, 1..64) (LLAMINAR_ROCM_NVNNI_GEMV_KB)
-        int nvnni_gemv_target_waves = -1;          ///< Native-VNNI GEMV target waves/CU override (-1=auto) (LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES)
-        bool nvnni_disable_generated = false;      ///< Disable generated ROCm NativeVNNI dispatch tables for trainer sweeps (LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED)
+        int native_quantised_mt = -1;                         ///< NativeQuantised M_TILE override (-1=auto, 16/32/64) (LLAMINAR_ROCM_NATIVE_QUANTISED_MT)
+        int native_quantised_unroll = -1;                     ///< NativeQuantised UNROLL_G override (-1=auto, 0=none, 1=full, 2/4=partial) (LLAMINAR_ROCM_NATIVE_QUANTISED_UNROLL)
+        int native_quantised_min_blocks = -1;                 ///< NativeQuantised MIN_BLOCKS override (-1=auto, 1=bare, 2=2-wave, 3=3-wave) (LLAMINAR_ROCM_NATIVE_QUANTISED_MIN_BLOCKS)
+        bool native_quantised_force_n64 = false;              ///< Force N64 for all native-quantised shapes (LLAMINAR_ROCM_NATIVE_QUANTISED_FORCE_N64)
+        bool native_quantised_force_n128 = false;             ///< Force N128 for all native-quantised shapes (LLAMINAR_ROCM_NATIVE_QUANTISED_FORCE_N128)
+        int native_quantised_full_tiles = -1;                 ///< NativeQuantised edge specialization (-1=auto, 0=checked, 1=full tiles) (LLAMINAR_ROCM_NATIVE_QUANTISED_FULL_TILES)
+        int native_quantised_gemv_kb = -1;                    ///< NativeQuantised GEMV K-partition override (-1=auto, 1..64) (LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_KB)
+        int native_quantised_gemv_target_waves = -1;          ///< NativeQuantised GEMV target waves/CU override (-1=auto) (LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_TARGET_WAVES)
+        bool native_quantised_disable_generated = false;      ///< Disable generated ROCm NativeQuantised dispatch tables for trainer sweeps (LLAMINAR_ROCM_NATIVE_QUANTISED_DISABLE_GENERATED)
         int ratio_prefill_variant = -1;            ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int ratio_prefill_kb = 0;                  ///< Ratio prefill split-K blocks override (0=auto)
         int ratio_prefill_linear_variant = -1;     ///< Linear codebook ratio prefill tile override (-1=use global/auto)
@@ -3077,15 +3077,15 @@ namespace llaminar2
             blockwise_force_v3 = false;
             blockwise_force_v7 = false;
             blockwise_quant_variant = 0;
-            nvnni_mt = -1;
-            nvnni_unroll = -1;
-            nvnni_min_blocks = -1;
-            nvnni_force_n64 = false;
-            nvnni_force_n128 = false;
-            nvnni_full_tiles = -1;
-            nvnni_gemv_kb = -1;
-            nvnni_gemv_target_waves = -1;
-            nvnni_disable_generated = false;
+            native_quantised_mt = -1;
+            native_quantised_unroll = -1;
+            native_quantised_min_blocks = -1;
+            native_quantised_force_n64 = false;
+            native_quantised_force_n128 = false;
+            native_quantised_full_tiles = -1;
+            native_quantised_gemv_kb = -1;
+            native_quantised_gemv_target_waves = -1;
+            native_quantised_disable_generated = false;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
             ratio_prefill_linear_variant = -1;
@@ -3332,58 +3332,58 @@ namespace llaminar2
                 blockwise_quant_variant = std::clamp(std::atoi(bw_quant_var_env), 0, 5);
             }
 
-            const char *nvnni_mt_env = std::getenv("LLAMINAR_ROCM_NVNNI_MT");
-            if (nvnni_mt_env)
+            const char *native_quantised_mt_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_MT");
+            if (native_quantised_mt_env)
             {
-                nvnni_mt = std::atoi(nvnni_mt_env);
+                native_quantised_mt = std::atoi(native_quantised_mt_env);
             }
 
-            const char *nvnni_unroll_env = std::getenv("LLAMINAR_ROCM_NVNNI_UNROLL");
-            if (nvnni_unroll_env)
+            const char *native_quantised_unroll_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_UNROLL");
+            if (native_quantised_unroll_env)
             {
-                nvnni_unroll = std::clamp(std::atoi(nvnni_unroll_env), -1, 8);
+                native_quantised_unroll = std::clamp(std::atoi(native_quantised_unroll_env), -1, 8);
             }
 
-            const char *nvnni_min_blocks_env = std::getenv("LLAMINAR_ROCM_NVNNI_MIN_BLOCKS");
-            if (nvnni_min_blocks_env)
+            const char *native_quantised_min_blocks_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_MIN_BLOCKS");
+            if (native_quantised_min_blocks_env)
             {
-                nvnni_min_blocks = std::clamp(std::atoi(nvnni_min_blocks_env), -1, 3);
+                native_quantised_min_blocks = std::clamp(std::atoi(native_quantised_min_blocks_env), -1, 3);
             }
 
-            const char *nvnni_force_n64_env = std::getenv("LLAMINAR_ROCM_NVNNI_FORCE_N64");
-            if (nvnni_force_n64_env)
+            const char *native_quantised_force_n64_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_FORCE_N64");
+            if (native_quantised_force_n64_env)
             {
-                nvnni_force_n64 = (std::atoi(nvnni_force_n64_env) != 0);
+                native_quantised_force_n64 = (std::atoi(native_quantised_force_n64_env) != 0);
             }
 
-            const char *nvnni_force_n128_env = std::getenv("LLAMINAR_ROCM_NVNNI_FORCE_N128");
-            if (nvnni_force_n128_env)
+            const char *native_quantised_force_n128_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_FORCE_N128");
+            if (native_quantised_force_n128_env)
             {
-                nvnni_force_n128 = (std::atoi(nvnni_force_n128_env) != 0);
+                native_quantised_force_n128 = (std::atoi(native_quantised_force_n128_env) != 0);
             }
 
-            const char *nvnni_full_tiles_env = std::getenv("LLAMINAR_ROCM_NVNNI_FULL_TILES");
-            if (nvnni_full_tiles_env)
+            const char *native_quantised_full_tiles_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_FULL_TILES");
+            if (native_quantised_full_tiles_env)
             {
-                nvnni_full_tiles = std::clamp(std::atoi(nvnni_full_tiles_env), -1, 1);
+                native_quantised_full_tiles = std::clamp(std::atoi(native_quantised_full_tiles_env), -1, 1);
             }
 
-            const char *nvnni_gemv_kb_env = std::getenv("LLAMINAR_ROCM_NVNNI_GEMV_KB");
-            if (nvnni_gemv_kb_env)
+            const char *native_quantised_gemv_kb_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_KB");
+            if (native_quantised_gemv_kb_env)
             {
-                nvnni_gemv_kb = std::clamp(std::atoi(nvnni_gemv_kb_env), -1, 64);
+                native_quantised_gemv_kb = std::clamp(std::atoi(native_quantised_gemv_kb_env), -1, 64);
             }
 
-            const char *nvnni_gemv_target_waves_env = std::getenv("LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES");
-            if (nvnni_gemv_target_waves_env)
+            const char *native_quantised_gemv_target_waves_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_TARGET_WAVES");
+            if (native_quantised_gemv_target_waves_env)
             {
-                nvnni_gemv_target_waves = std::clamp(std::atoi(nvnni_gemv_target_waves_env), -1, 64);
+                native_quantised_gemv_target_waves = std::clamp(std::atoi(native_quantised_gemv_target_waves_env), -1, 64);
             }
 
-            const char *nvnni_disable_generated_env = std::getenv("LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED");
-            if (nvnni_disable_generated_env)
+            const char *native_quantised_disable_generated_env = std::getenv("LLAMINAR_ROCM_NATIVE_QUANTISED_DISABLE_GENERATED");
+            if (native_quantised_disable_generated_env)
             {
-                nvnni_disable_generated = (std::atoi(nvnni_disable_generated_env) != 0);
+                native_quantised_disable_generated = (std::atoi(native_quantised_disable_generated_env) != 0);
             }
 
             const char *ratio_prefill_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_VARIANT");
@@ -3576,10 +3576,10 @@ namespace llaminar2
     };
 
     /**
-     * @brief CPU NativeVNNI tile dispatch configuration
+     * @brief CPU NativeQuantised tile dispatch configuration
      *
-     * Override the auto-tuned tile parameters for the CPU NativeVNNI GEMV/GEMM
-     * kernel (CPUNativeVNNIGemv.h / CPUNativeVNNITileConfig.h).
+     * Override the auto-tuned tile parameters for the CPU NativeQuantised GEMV/GEMM
+     * kernel (CPUNativeQuantisedGemv.h / CPUNativeQuantisedTileConfig.h).
      * All values default to 0 (= auto, use heuristic).
      *
      * Environment Variables:
@@ -3626,7 +3626,7 @@ namespace llaminar2
         RuntimeDebugConfig runtime_debug; ///< Miscellaneous app/runtime debug environment switches.
         DequantConfig dequant;
         GemmConfig gemm;
-        CPUVNNIConfig cpu_vnni; ///< CPU NativeVNNI tile dispatch overrides
+        CPUVNNIConfig cpu_vnni; ///< CPU NativeQuantised tile dispatch overrides
         ProfileConfig profile;
         RMSNormConfig rmsnorm;
         AttentionConfig attention; ///< Q8_1 attention precision configuration

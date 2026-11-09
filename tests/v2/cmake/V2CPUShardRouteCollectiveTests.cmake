@@ -107,3 +107,19 @@ add_v2_test(V2_Integration_CPUJointPreparedComputeOriginalDomainContract
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
         "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointPreparedComputeOriginalDomainContract)
+
+
+# Replay the original copy-then-add oracle on each existing runtime ISA route.
+# This late module is included after the canonical preflight inventory is set.
+foreach(cpu_first_pair_isa IN ITEMS scalar avx2 avx512)
+    set(cpu_first_pair_name "V2_Integration_CPUShardFirstPairDirectAdd_${cpu_first_pair_isa}Replay")
+    add_v2_test(${cpu_first_pair_name}
+        COMMAND $<TARGET_FILE:v2_test_cpu_shard_route_collective>
+            --gtest_filter=CPUShardRouteCollective.FirstPairDirectAddMatchesOriginalBytesAndLiveExtents
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Shard;Replay"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+            "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1"
+            "LLAMINAR_ISA_LEVEL=${cpu_first_pair_isa}")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${cpu_first_pair_name})
+endforeach()

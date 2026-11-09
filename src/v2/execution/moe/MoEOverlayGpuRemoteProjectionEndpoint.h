@@ -3,8 +3,8 @@
  * @brief Event-polled GPU endpoints for cross-rank ExpertOverlay streaming.
  *
  * A remote projection is intentionally never materialized as a complete host
- * mirror. Source GPUs either repack one final CPU NativeVNNI unit range or copy
- * one separated NativeVNNI/contiguous floating GPU range into persistent pinned
+ * mirror. Source GPUs either repack one final CPU NativeQuantised unit range or copy
+ * one separated NativeQuantised/contiguous floating GPU range into persistent pinned
  * storage. Destination GPUs copy each authenticated MPI chunk into GPU-owned
  * storage on a named auxiliary stream. The MPI data plane and device lane
  * advance through non-blocking polls, so inference continues on the retained
@@ -163,7 +163,7 @@ namespace llaminar2
          * @param owner Exact current endpoint owner.
          * @param layout Valid GPU-to-CPU conversion layout.
          * @param source Live separated source arrays.
-         * @param first_unit First CPU NativeVNNI unit in this network chunk.
+         * @param first_unit First CPU NativeQuantised unit in this network chunk.
          * @param unit_count Number of complete units in this chunk.
          * @param error Optional launch/copy diagnostic.
          * @return True when a reusable event fences all submitted work.

@@ -980,7 +980,7 @@ namespace llaminar2
                             endpointPrefix(
                                 binding.overlay_participant_id,
                                 binding.device) +
-                            "could not export a complete NativeVNNI/FP16/BF16/FP32 expert descriptor");
+                            "could not export a complete NativeQuantised/FP16/BF16/FP32 expert descriptor");
                     }
                     descriptor.logical_expert_id =
                         static_cast<std::int32_t>(expert);

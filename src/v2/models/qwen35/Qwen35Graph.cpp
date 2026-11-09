@@ -1713,7 +1713,7 @@ namespace llaminar2
             gatedNormSingleQ8Geometry(total_tokens,value_dim,normalization)&&
             precision==QuantizedActivationOperandPrecision::SingleQ8&&gdn_layer->ssm_out&&
             gdn_layer->ssm_out->shape().size()==2&&gdn_layer->ssm_out->shape()[1]==static_cast<size_t>(value_dim)&&
-            native_vnni_formats::forQuantType(tensorTypeName(gdn_layer->ssm_out->native_type()));
+            native_quantised_formats::forQuantType(tensorTypeName(gdn_layer->ssm_out->native_type()));
         std::optional<GEMMStage::GatedNormPublication> norm_publication;
         std::string gated_norm_ready=gdn_state_ready_node;
         if(fused_normalization)

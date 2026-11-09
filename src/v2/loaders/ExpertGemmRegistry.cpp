@@ -181,13 +181,13 @@ namespace llaminar2
             [&](const auto &item) { return item.projection == role; });
         if (declared == manifest.projections.end())
             throw std::invalid_argument("Committed CPU fragment omitted original projection format");
-        const auto *format = native_vnni_formats::forQuantType(tensorTypeName(source.native_source->original.original_type));
+        const auto *format = native_quantised_formats::forQuantType(tensorTypeName(source.native_source->original.original_type));
         if (format) {
-            NativeVnniSourceIdentity actual;
-            if (!owner->exportNativeVNNISourceIdentity(actual) || !actual.present ||
+            NativeQuantisedSourceIdentity actual;
+            if (!owner->exportNativeQuantisedSourceIdentity(actual) || !actual.present ||
                 actual.codebook_id != format->codebook_id || actual.is_superblock != format->is_superblock ||
-                !declared->format.isNativeVnni() || declared->format.native_vnni.codebook_id != actual.codebook_id ||
-                declared->format.native_vnni.is_superblock != actual.is_superblock)
+                !declared->format.isNativeQuantised() || declared->format.native_quantised.codebook_id != actual.codebook_id ||
+                declared->format.native_quantised.is_superblock != actual.is_superblock)
                 throw std::invalid_argument("Committed CPU fragment changed original native codebook");
         } else {
             ContiguousFloatingPointWeightDescriptor actual;
@@ -222,17 +222,17 @@ namespace llaminar2
         const auto *native = unpackable ? unpackable->vnniFormatInfo() : nullptr;
         if (native)
         {
-            DeviceNativeVNNIMatrixDesc descriptor;
-            NativeVnniSourceIdentity original;
+            DeviceNativeQuantisedMatrixDesc descriptor;
+            NativeQuantisedSourceIdentity original;
             // CPU engines expose their canonical packed source identity rather
             // than a GPU-address descriptor. Dimensions were checked above;
             // the legacy GPU arm still requires its full device descriptor.
             const bool device_descriptor=source.cpu_joint_source ||
-                (engine->exportNativeVNNIMatrixDesc(descriptor) && descriptor.valid() &&
+                (engine->exportNativeQuantisedMatrixDesc(descriptor) && descriptor.valid() &&
                  descriptor.n==n && descriptor.k==k && descriptor.blocks_per_row==uint32_t(k/32) &&
                  descriptor.source_identity_present && descriptor.source_codebook_id==native->codebook_id &&
                  bool(descriptor.source_is_superblock)==native->is_superblock);
-            if (!device_descriptor || !engine->exportNativeVNNISourceIdentity(original) || !original.present ||
+            if (!device_descriptor || !engine->exportNativeQuantisedSourceIdentity(original) || !original.present ||
                 original.codebook_id != native->codebook_id || original.is_superblock != native->is_superblock)
                 throw std::invalid_argument("Static expert prepared native descriptor lost original geometry/codebook");
         }

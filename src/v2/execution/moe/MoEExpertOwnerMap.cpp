@@ -550,7 +550,8 @@ namespace llaminar2
     MoEExpertOwnerMap
     MoEExpertOwnerMap::buildShardTransition(const MoERoutedExpertPlacementPlan &plan,
                                             const MoEExpertOwnerMap &previous,
-                                            const MoEExpertOwnerMap &original)
+                                            const MoEExpertOwnerMap &original,
+                                            std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes)
     {
         const auto validation = validateMoERoutedExpertPlacementPlan(plan);
         if (!plan.usesExpertOverlayAuthority() || !usesCPUJointFragments(plan) ||
@@ -667,6 +668,50 @@ namespace llaminar2
             result.owners_.size() != total)
             throw std::invalid_argument(
                 "Joint placement transition changes complete original source geometry");
+        // This is an unpublished candidate, not a second live ownership table.
+        // Authenticate every explicit whole-owner edge against the canonical tier
+        // projection before changing a row. Fixed CPU fragment targets remain
+        // source-owned and cannot enter this scalar participant interface.
+        std::set<std::pair<int, int>> changed_experts;
+        std::map<std::tuple<int, int, int>, int> participant_deltas;
+        std::vector<std::pair<std::size_t, const MoEExpertOwnerParticipant *>> replacements;
+        replacements.reserve(whole_owner_changes.size());
+        for (const auto &change : whole_owner_changes)
+        {
+            if (change.layer_idx < 0 || change.expert_id < 0 ||
+                change.previous_participant < 0 || change.current_participant < 0 ||
+                change.previous_participant == change.current_participant ||
+                !changed_experts.emplace(change.layer_idx, change.expert_id).second)
+                throw std::invalid_argument("Joint whole-owner participant transition has duplicate or invalid change coordinates");
+            const auto row = std::find_if(result.owners_.begin(), result.owners_.end(),
+                [&](const auto &owner) { return owner.layer_idx == change.layer_idx && owner.expert_id == change.expert_id; });
+            if (row == result.owners_.end() || !row->resident || row->shard_cohort ||
+                row->owner_participant != change.previous_participant)
+                throw std::invalid_argument("Joint whole-owner participant transition requires its exact canonical whole source owner");
+            const auto *destination = result.participantForId(change.current_participant);
+            const auto &domain = requireDomain(plan, row->domain_name, "joint whole-owner participant transition");
+            if (!destination || destination->tier_idx != row->tier_idx ||
+                destination->domain_name != row->domain_name ||
+                !destination->world_rank_known ||
+                domain.routed_compute_policy != RoutedExpertComputePolicy::Apportioned)
+                throw std::invalid_argument("Joint whole-owner participant transition requires an original apportioned whole target in the same tier");
+            --participant_deltas[{row->layer_idx, row->tier_idx, row->owner_participant}];
+            ++participant_deltas[{row->layer_idx, row->tier_idx, destination->participant_id}];
+            replacements.emplace_back(static_cast<std::size_t>(row - result.owners_.begin()), destination);
+        }
+        for (const auto &[coordinate, delta] : participant_deltas)
+            if (delta != 0)
+                throw std::invalid_argument("Joint whole-owner participant transition changes per-layer participant slot capacity");
+        for (const auto &[index, destination] : replacements)
+        {
+            auto &row = result.owners_[index];
+            const auto placement = std::find_if(plan.placements.begin(), plan.placements.end(),
+                [&](const auto &value) { return value.layer == row.layer_idx; });
+            if (placement == plan.placements.end())
+                throw std::logic_error("Joint whole-owner participant transition lost its authenticated layer");
+            row = makeOwner(*placement, row.expert_id, row.tier_idx,
+                destination->participant_id, *destination);
+        }
         canonicalizeOwnerOrder(result.owners_);
         return result;
     }

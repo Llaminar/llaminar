@@ -48,8 +48,8 @@ TEST(PhysicalPieceMeasurementContract, CanonicalUnequalCutsMergeComplementaryAnd
 {
     std::vector<std::pair<int,int>> populations{{2,3},{3,2}};
     for(int members=2;members<=8;++members) { populations.emplace_back(1,members);populations.emplace_back(members,1); }
-    for(const auto &format:native_vnni_formats::kAllSourceFormats) {
-        const auto native=ExpertWeightFormat::nativeVnni({.codebook_id=format.metadata->codebook_id,
+    for(const auto &format:native_quantised_formats::kAllSourceFormats) {
+        const auto native=ExpertWeightFormat::nativeQuantised({.codebook_id=format.metadata->codebook_id,
             .is_superblock=format.metadata->is_superblock,.present=true});
         for(const auto [sourceMembers,destinationMembers]:populations) {
             auto first=pieceRow(sourceMembers,destinationMembers,native),second=first,empty=first;
@@ -154,8 +154,8 @@ TEST(PhysicalPieceMeasurementContract, ScalarPricesRejectCohortsAndPartialSingle
 }
 TEST(PhysicalPieceMeasurementContract, MixedFormatManifestPermutationResolvesByRole)
 {
-    const auto native=[](std::size_t index){const auto *metadata=native_vnni_formats::kAllSourceFormats[index].metadata;
-        return ExpertWeightFormat::nativeVnni({.codebook_id=metadata->codebook_id,.is_superblock=metadata->is_superblock,.present=true});};
+    const auto native=[](std::size_t index){const auto *metadata=native_quantised_formats::kAllSourceFormats[index].metadata;
+        return ExpertWeightFormat::nativeQuantised({.codebook_id=metadata->codebook_id,.is_superblock=metadata->is_superblock,.present=true});};
     MoEOverlayLayerWeightManifest layer{7,{{{ExpertTierWeightProjection::Gate,256,256,native(0)},
         {ExpertTierWeightProjection::Up,256,256,ExpertWeightFormat::floating(TensorType::FP16)},
         {ExpertTierWeightProjection::Down,256,256,native(20)}}}};

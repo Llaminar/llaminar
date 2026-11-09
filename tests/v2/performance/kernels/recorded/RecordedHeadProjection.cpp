@@ -81,7 +81,7 @@ WorkspaceRequirements workspaceRequirements(DeviceId device,int n,int k)
 void planWeight(LoadOrchestrator &pool,const Request &r,DeviceId device)
 {
     pool.addDevice(device.ordinal);
-    const auto &f=native_vnni_formats::Q8_0;
+    const auto &f=native_quantised_formats::Q8_0;
     pool.planWeightForOwner(device.ordinal,r.source_tensor,r.n,r.k,f.payload_bytes,
         canonicalDeviceVnniFormat(f).is_asymmetric,f.has_emins,std::size_t(r.n)*(r.k/32)*34,
         PhysicalMemoryOwner::PrimaryModelWeights);
@@ -349,8 +349,8 @@ public:
      */
     nlohmann::json describe(const GGUFTensorInfo &info,nlohmann::json samples,bool cohort) const
     {
-        DeviceNativeVNNIMatrixDesc prepared{};
-        checked(store->gemmKernel(ref)->inspectPreparedNativeVNNIMatrixDesc(prepared) && prepared.valid() &&
+        DeviceNativeQuantisedMatrixDesc prepared{};
+        checked(store->gemmKernel(ref)->inspectPreparedNativeQuantisedMatrixDesc(prepared) && prepared.valid() &&
             prepared.codebook_id==19 && prepared.source_identity_present && prepared.source_codebook_id==19,
             "Recorded head lost original/prepared Q8 source identity");
         nlohmann::json result={{"schema","llaminar.recorded_head_projection.result.v1"},{"scope",cohort?"cohort_participant":"local_shape"},{"request",r.document},

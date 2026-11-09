@@ -40,7 +40,7 @@ extern "C"
      *        borrowed count is read only on device, never during graph recording.
      * @return False for invalid geometry, missing resources, or launch failure.
      */
-    bool cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
+    bool cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
         const int8_t *d_A_int8, const uint8_t *d_payload,
         const uint16_t *d_scales, const uint16_t *d_mins,
         const uint32_t *d_emins, float *d_C_fp32,

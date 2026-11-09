@@ -31,7 +31,7 @@
 #include "loaders/ModelLoader.h"
 #include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "memory/NUMAAllocator.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "utils/PerfStatsCollector.h"
@@ -196,9 +196,9 @@ namespace llaminar2
         const auto source_format = [](GGUFTensorType type)
             -> ExpertWeightFormat
         {
-            const auto native = [](const NativeVnniFormatInfo &format)
+            const auto native = [](const NativeQuantisedFormatInfo &format)
             {
-                return ExpertWeightFormat::nativeVnni({
+                return ExpertWeightFormat::nativeQuantised({
                     .codebook_id = format.codebook_id,
                     .is_superblock = format.is_superblock,
                     .present = true,
@@ -207,45 +207,45 @@ namespace llaminar2
             switch (type)
             {
             case GGUFTensorType::Q4_0:
-                return native(native_vnni_formats::Q4_0);
+                return native(native_quantised_formats::Q4_0);
             case GGUFTensorType::Q4_1:
-                return native(native_vnni_formats::Q4_1);
+                return native(native_quantised_formats::Q4_1);
             case GGUFTensorType::Q5_0:
-                return native(native_vnni_formats::Q5_0);
+                return native(native_quantised_formats::Q5_0);
             case GGUFTensorType::Q5_1:
-                return native(native_vnni_formats::Q5_1);
+                return native(native_quantised_formats::Q5_1);
             case GGUFTensorType::Q8_0:
-                return native(native_vnni_formats::Q8_0);
+                return native(native_quantised_formats::Q8_0);
             case GGUFTensorType::Q2_K:
-                return native(native_vnni_formats::Q2_K);
+                return native(native_quantised_formats::Q2_K);
             case GGUFTensorType::Q3_K:
-                return native(native_vnni_formats::Q3_K);
+                return native(native_quantised_formats::Q3_K);
             case GGUFTensorType::Q4_K:
-                return native(native_vnni_formats::Q4_K);
+                return native(native_quantised_formats::Q4_K);
             case GGUFTensorType::Q5_K:
-                return native(native_vnni_formats::Q5_K);
+                return native(native_quantised_formats::Q5_K);
             case GGUFTensorType::Q6_K:
-                return native(native_vnni_formats::Q6_K);
+                return native(native_quantised_formats::Q6_K);
             case GGUFTensorType::Q8_K:
-                return native(native_vnni_formats::Q8_K);
+                return native(native_quantised_formats::Q8_K);
             case GGUFTensorType::IQ2_XXS:
-                return native(native_vnni_formats::IQ2_XXS);
+                return native(native_quantised_formats::IQ2_XXS);
             case GGUFTensorType::IQ2_XS:
-                return native(native_vnni_formats::IQ2_XS);
+                return native(native_quantised_formats::IQ2_XS);
             case GGUFTensorType::IQ3_XXS:
-                return native(native_vnni_formats::IQ3_XXS);
+                return native(native_quantised_formats::IQ3_XXS);
             case GGUFTensorType::IQ1_S:
-                return native(native_vnni_formats::IQ1_S);
+                return native(native_quantised_formats::IQ1_S);
             case GGUFTensorType::IQ4_NL:
-                return native(native_vnni_formats::IQ4_NL);
+                return native(native_quantised_formats::IQ4_NL);
             case GGUFTensorType::IQ3_S:
-                return native(native_vnni_formats::IQ3_S);
+                return native(native_quantised_formats::IQ3_S);
             case GGUFTensorType::IQ2_S:
-                return native(native_vnni_formats::IQ2_S);
+                return native(native_quantised_formats::IQ2_S);
             case GGUFTensorType::IQ4_XS:
-                return native(native_vnni_formats::IQ4_XS);
+                return native(native_quantised_formats::IQ4_XS);
             case GGUFTensorType::IQ1_M:
-                return native(native_vnni_formats::IQ1_M);
+                return native(native_quantised_formats::IQ1_M);
             case GGUFTensorType::F32:
                 return ExpertWeightFormat::floating(TensorType::FP32);
             case GGUFTensorType::F16:
@@ -896,8 +896,8 @@ namespace llaminar2
          * @return Validated independent source/destination strides without staging.
          */
         NativeCPUCopy nativeCPUCopyGeometry(
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &source,
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &destination,
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &source,
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &destination,
             const ExpertTierWeightProjectionIntersection &intersection, size_t capacity,
             std::shared_ptr<std::mutex> write_mutex)
         {
@@ -3230,7 +3230,7 @@ namespace llaminar2
                 staging_capacity_bytes < layout.cpu_block_stride)
             {
                 throw std::runtime_error(
-                    "ExpertOverlay staging capacity cannot hold one CPU NativeVNNI unit");
+                    "ExpertOverlay staging capacity cannot hold one CPU NativeQuantised unit");
             }
             return static_cast<std::uint32_t>(std::min<std::size_t>(
                 layout.unit_count,
@@ -3239,8 +3239,8 @@ namespace llaminar2
 
         /** @brief Require identical final CPU representations before NUMA copy. */
         void requireCompatibleCpuWeights(
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &source,
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &destination)
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &source,
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &destination)
         {
             if (source.N != destination.N || source.K != destination.K ||
                 source.N_padded != destination.N_padded ||
@@ -3269,7 +3269,7 @@ namespace llaminar2
             std::uint8_t payload_bytes,
             bool is_asymmetric,
             bool has_emins,
-            NativeVnniSourceIdentity source_identity)
+            NativeQuantisedSourceIdentity source_identity)
         {
             if (projection.spec.N != N || projection.spec.K != K ||
                 projection.spec.payload_bytes_per_block < payload_bytes ||
@@ -3280,14 +3280,14 @@ namespace llaminar2
                     "ExpertOverlay GPU shadow slot cannot represent an arriving projection");
             }
 
-            DeviceNativeVNNIMatrixDesc descriptor;
-            descriptor.payload = projection.slot.d_native_vnni_payload;
-            descriptor.scales = projection.slot.d_native_vnni_scales;
+            DeviceNativeQuantisedMatrixDesc descriptor;
+            descriptor.payload = projection.slot.d_native_quantised_payload;
+            descriptor.scales = projection.slot.d_native_quantised_scales;
             descriptor.mins = is_asymmetric
-                                  ? projection.slot.d_native_vnni_mins
+                                  ? projection.slot.d_native_quantised_mins
                                   : nullptr;
             descriptor.emins = has_emins
-                                   ? projection.slot.d_native_vnni_emins
+                                   ? projection.slot.d_native_quantised_emins
                                    : nullptr;
             descriptor.n = N;
             descriptor.k = K;
@@ -3328,7 +3328,7 @@ namespace llaminar2
             DeviceId device,
             const GpuExpertPackedDescriptor &descriptor,
             std::shared_ptr<void> lifetime,
-            NativeVnniSourceIdentity source_identity)
+            NativeQuantisedSourceIdentity source_identity)
         {
             if (!lifetime || !source_identity.present)
                 throw std::invalid_argument(
@@ -3348,7 +3348,7 @@ namespace llaminar2
                     descriptor.blocks_per_row,
                     std::move(lifetime),
                     source_identity,
-                    NativeVnniReusableDeviceAllocationFormat{
+                    NativeQuantisedReusableDeviceAllocationFormat{
                         .payload_bytes_per_block =
                             descriptor.allocation_payload_bytes_per_block,
                         .has_mins = descriptor.allocation_has_mins,
@@ -3371,7 +3371,7 @@ namespace llaminar2
                     descriptor.blocks_per_row,
                     std::move(lifetime),
                     source_identity,
-                    NativeVnniReusableDeviceAllocationFormat{
+                    NativeQuantisedReusableDeviceAllocationFormat{
                         .payload_bytes_per_block =
                             descriptor.allocation_payload_bytes_per_block,
                         .has_mins = descriptor.allocation_has_mins,
@@ -3394,7 +3394,7 @@ namespace llaminar2
                 format.floatingElementBytes();
             if (!type || projection.spec.format != format ||
                 projection.spec.N <= 0 || projection.spec.K <= 0 ||
-                !projection.slot.d_native_vnni_payload ||
+                !projection.slot.d_native_quantised_payload ||
                 element_bytes == 0)
             {
                 throw std::runtime_error(
@@ -3405,7 +3405,7 @@ namespace llaminar2
                 static_cast<std::size_t>(projection.spec.K) *
                 element_bytes;
             ContiguousFloatingPointWeightDescriptor descriptor{
-                .data = projection.slot.d_native_vnni_payload,
+                .data = projection.slot.d_native_quantised_payload,
                 .type = *type,
                 .n = projection.spec.N,
                 .k = projection.spec.K,
@@ -3501,15 +3501,15 @@ namespace llaminar2
         std::shared_ptr<ITensorGemm> retainNativeGpuDestination(
             DestinationProjectionStorage &storage, DeviceId device,
             const GpuExpertPackedDescriptor &descriptor, std::shared_ptr<void> lifetime,
-            NativeVnniSourceIdentity source)
+            NativeQuantisedSourceIdentity source)
         {
             if (!storage.engine)
                 storage.engine = makeGpuDestinationEngine(device, descriptor, std::move(lifetime), source);
             MoEOverlayPreparedWeightSource actual;
             std::string error;
             if (!resolveMoEOverlayPreparedWeightSource(storage.engine, device, actual, &error) ||
-                actual.kind != MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeVnni ||
-                actual.format.native_vnni != source)
+                actual.kind != MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeQuantised ||
+                actual.format.native_quantised != source)
                 throw std::invalid_argument("Final GPU role owner changed its original native source identity");
             const auto &a = actual.gpu_packed, &b = descriptor;
             if (a.ptrs.d_vnni != b.ptrs.d_vnni || a.ptrs.d_scales != b.ptrs.d_scales ||
@@ -3546,14 +3546,14 @@ namespace llaminar2
             ProjectionSignature signature;
             signature.format = source.format;
             if (source.kind ==
-                    MoEOverlayPreparedWeightSourceKind::CpuNativeVnni)
+                    MoEOverlayPreparedWeightSourceKind::CpuNativeQuantised)
             {
                 signature.N = source.cpu_packed->N;
                 signature.K = source.cpu_packed->K;
             }
             else if (source.kind ==
                      MoEOverlayPreparedWeightSourceKind::
-                         GpuSeparatedNativeVnni)
+                         GpuSeparatedNativeQuantised)
             {
                 signature.N = source.gpu_packed.n;
                 signature.K = source.gpu_packed.k;
@@ -3644,7 +3644,7 @@ namespace llaminar2
                         {
                             adopted.cpu_destination =
                                 source.engine
-                                    ->exportRetiredCPUNativeVNNIStorage();
+                                    ->exportRetiredCPUNativeQuantisedStorage();
                             if (!source.cpu_packed ||
                                 adopted.cpu_destination.empty() ||
                                 adopted.cpu_destination.data() !=
@@ -3653,7 +3653,7 @@ namespace llaminar2
                                     source.cpu_packed->native_interleaved.size())
                             {
                                 throw std::runtime_error(
-                                    "ExpertOverlay initial CPU NativeVNNI engine cannot expose its exact recyclable final storage");
+                                    "ExpertOverlay initial CPU NativeQuantised engine cannot expose its exact recyclable final storage");
                             }
                         }
                     }
@@ -3669,7 +3669,7 @@ namespace llaminar2
                                 .format = source.format,
                             };
                             projection_slot.slot = {
-                                .d_native_vnni_payload =
+                                .d_native_quantised_payload =
                                     static_cast<std::uint8_t *>(
                                         const_cast<void *>(
                                             source.floating.data)),
@@ -3683,9 +3683,9 @@ namespace llaminar2
                             continue;
                         }
                         const auto *source_format =
-                            native_vnni_formats::forSourceIdentity(
-                                source.format.native_vnni.codebook_id,
-                                source.format.native_vnni.is_superblock);
+                            native_quantised_formats::forSourceIdentity(
+                                source.format.native_quantised.codebook_id,
+                                source.format.native_quantised.is_superblock);
                         if (!source_format)
                         {
                             throw std::runtime_error(
@@ -3708,7 +3708,7 @@ namespace llaminar2
                                 " expert=" + std::to_string(expert) +
                                 " projection=" + projectionName(projection) +
                                 " source_codebook=" +
-                                std::to_string(source.format.native_vnni.codebook_id) +
+                                std::to_string(source.format.native_quantised.codebook_id) +
                                 " observed_payload_bytes_per_block=" +
                                 std::to_string(source.gpu_packed.allocation_payload_bytes_per_block) +
                                 " expected_payload_bytes_per_block=" +
@@ -3737,13 +3737,13 @@ namespace llaminar2
                             .format = source.format,
                         };
                         projection_slot.slot = {
-                            .d_native_vnni_payload =
+                            .d_native_quantised_payload =
                                 source.gpu_packed.ptrs.d_vnni,
-                            .d_native_vnni_scales =
+                            .d_native_quantised_scales =
                                 source.gpu_packed.ptrs.d_scales,
-                            .d_native_vnni_mins =
+                            .d_native_quantised_mins =
                                 source.gpu_packed.ptrs.d_mins,
-                            .d_native_vnni_emins =
+                            .d_native_quantised_emins =
                                 source.gpu_packed.ptrs.d_emins,
                             .payload_bytes =
                                 source.gpu_packed.allocationPayloadBytes(),
@@ -3771,7 +3771,7 @@ namespace llaminar2
             std::span<const std::uint8_t>,
             kMoEOverlayRemoteProjectionRegionCount>
         remoteCpuSourceRegions(
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &packed)
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &packed)
         {
             return {
                 std::span<const std::uint8_t>(
@@ -4310,7 +4310,7 @@ namespace llaminar2
                                 .K = signature.K,
                                 .format = signature.format,
                             };
-                            if (signature.format.isNativeVnni())
+                            if (signature.format.isNativeQuantised())
                             {
                                 /*
                                  * Expanded CPU arrivals need 32 payload bytes;
@@ -4322,7 +4322,7 @@ namespace llaminar2
                                 spec.is_asymmetric = true;
                                 spec.has_emins = true;
                                 spec.codebook_id =
-                                    canonicalDeviceVnniCodebookId(signature.format.native_vnni);
+                                    canonicalDeviceVnniCodebookId(signature.format.native_quantised);
                             }
                             specs.push_back(std::move(spec));
                         }
@@ -5986,7 +5986,7 @@ namespace llaminar2
                                 else if (!source.cpu_packed)
                                 {
                                     throw std::runtime_error(
-                                        "ExpertOverlay remote CPU source lost final NativeVNNI storage");
+                                        "ExpertOverlay remote CPU source lost final NativeQuantised storage");
                                 }
                                 else if (destination_participant.device.is_cpu())
                                 {
@@ -6076,10 +6076,10 @@ namespace llaminar2
                                 else if (destination_participant.device.is_cpu())
                                 {
                                     const auto *source_format =
-                                        native_vnni_formats::forSourceIdentity(
-                                            source.format.native_vnni
+                                        native_quantised_formats::forSourceIdentity(
+                                            source.format.native_quantised
                                                 .codebook_id,
-                                            source.format.native_vnni
+                                            source.format.native_quantised
                                                 .is_superblock);
                                     if (!source_format)
                                         throw std::runtime_error(
@@ -6120,7 +6120,7 @@ namespace llaminar2
                                         makeMoEOverlayRemoteGpuProjectionManifest(
                                             identity,
                                             source.gpu_packed,
-                                            source.format.native_vnni,
+                                            source.format.native_quantised,
                                             static_cast<std::uint32_t>(
                                                 config_.staging_capacity_bytes));
                                     ++local_remote_gpu_blob_operations;
@@ -6169,7 +6169,7 @@ namespace llaminar2
                                             destination_floating);
                                 const auto *destination_packed =
                                     destination_engine
-                                        ->exportCPUNativeVNNIPackedWeights();
+                                        ->exportCPUNativeQuantisedPackedWeights();
                                 if (destination_is_floating ==
                                     (destination_packed != nullptr))
                                 {
@@ -6225,7 +6225,7 @@ namespace llaminar2
                                 else
                                 {
                                     const auto *source_format =
-                                        native_vnni_formats::forSourceIdentity(
+                                        native_quantised_formats::forSourceIdentity(
                                             destination_packed->codebook_id,
                                             destination_packed->is_superblock);
                                     if (!source_format)
@@ -6356,7 +6356,7 @@ namespace llaminar2
                                     }
 
                                     const auto source_identity =
-                                        destination_format.native_vnni;
+                                        destination_format.native_quantised;
                                     auto descriptor =
                                         makeGpuDestinationDescriptor(
                                             destination_slot,
@@ -6512,7 +6512,7 @@ namespace llaminar2
                         {
                         const auto *destination_packed =
                             destination_engine
-                                ->exportCPUNativeVNNIPackedWeights();
+                                ->exportCPUNativeQuantisedPackedWeights();
                         if (!destination_packed)
                             throw std::runtime_error(
                                 "ExpertOverlay CPU destination engine cannot export final storage");
@@ -6543,9 +6543,9 @@ namespace llaminar2
                         else
                         {
                             const auto *source_format =
-                                native_vnni_formats::forSourceIdentity(
-                                    source.format.native_vnni.codebook_id,
-                                    source.format.native_vnni.is_superblock);
+                                native_quantised_formats::forSourceIdentity(
+                                    source.format.native_quantised.codebook_id,
+                                    source.format.native_quantised.is_superblock);
                             if (!source_format)
                                 throw std::runtime_error(
                                     "ExpertOverlay GPU source lost catalogued provenance");
@@ -6706,10 +6706,10 @@ namespace llaminar2
                                     layout.gpu_payload_bytes_per_block,
                                     layout.gpu_is_asymmetric != 0,
                                     layout.gpu_has_emins != 0,
-                                    source.format.native_vnni);
+                                    source.format.native_quantised);
                             destination_engine = retainNativeGpuDestination(*destination_group->storage,
                                 destination_participant.device, destination_descriptor, lease.lifetime,
-                                source.format.native_vnni);
+                                source.format.native_quantised);
                             const auto lane = impl_->weight_lanes.find(edge);
                             if (lane == impl_->weight_lanes.end())
                                 throw std::runtime_error(
@@ -6746,10 +6746,10 @@ namespace llaminar2
                                         .payload_bytes_per_block,
                                     source.gpu_packed.is_asymmetric,
                                     source.gpu_packed.has_emins,
-                                    source.format.native_vnni);
+                                    source.format.native_quantised);
                             destination_engine = retainNativeGpuDestination(*destination_group->storage,
                                 destination_participant.device, destination_descriptor, lease.lifetime,
-                                source.format.native_vnni);
+                                source.format.native_quantised);
 
                             if (const auto peer_lane =
                                     impl_->peer_lanes.find(edge);
@@ -7701,7 +7701,7 @@ namespace llaminar2
                                 CPUCopyGeometry copy_geometry = CompleteCPUCopy{};
                                 if (source.cpu_packed)
                                 {
-                                    const auto *packed = target.engine->exportCPUNativeVNNIPackedWeights();
+                                    const auto *packed = target.engine->exportCPUNativeQuantisedPackedWeights();
                                     if (!packed) return fail("Canonical CPU compaction changed original native storage");
                                     const auto owned = layer.cpu_fragment_family
                                         ? layer.cpu_fragment_family->cohort()->ownership(layer.cpu_fragment_family->participantIndex())
@@ -7795,12 +7795,12 @@ namespace llaminar2
                                                 .payload_bytes_per_block,
                                             source.gpu_packed.is_asymmetric,
                                             source.gpu_packed.has_emins,
-                                            source.format.native_vnni);
+                                            source.format.native_quantised);
                                     target_engine = makeGpuDestinationEngine(
                                         bank.device,
                                         descriptor,
                                         destination->lifetime,
-                                        source.format.native_vnni);
+                                        source.format.native_quantised);
                                     operations.push_back(
                                         std::make_unique<
                                             AdmittedPeerOperation>(

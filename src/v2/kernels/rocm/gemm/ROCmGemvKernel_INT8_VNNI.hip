@@ -17,7 +17,7 @@
  * in ROCmGemvKernel.hip (the main file).
  *
  * @see ROCmGemvKernel.hip for shared constants and GemvBatchArgs
- * @see ROCmGemvKernel_native_VNNI.hip for native-VNNI 4-bit kernels
+ * @see ROCmGemvKernel_native_quantised.hip for native-quantised 4-bit kernels
  * Native signed INT8 dot products share the exact unsaturated arithmetic
  * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */

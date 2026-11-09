@@ -74,7 +74,7 @@ namespace
         ROCmMoEProjectionBoundaryFixture fixture(format, width, intermediate,
             *std::max_element(row_counts.begin(), row_counts.end()));
         constexpr std::array degrees{1, 2, 4, 8};
-        std::array<std::vector<llaminar2::DeviceNativeVNNIMatrixDesc *>, degrees.size()> slices;
+        std::array<std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc *>, degrees.size()> slices;
         std::array<std::vector<float *>, degrees.size()> shard_outputs;
         for (size_t degree_index = 0; degree_index < degrees.size(); ++degree_index)
             for (int shard = 0; shard < degrees[degree_index]; ++shard)

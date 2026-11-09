@@ -73,7 +73,7 @@ struct WorkspaceMemoryGeometry
     /**
      * @brief Whether backend dispatch may be queried on this local device.
      *
-     * CUDA NativeVNNI prefill scratch depends on the launch policy selected
+     * CUDA NativeQuantised prefill scratch depends on the launch policy selected
      * for the concrete GPU. Metadata-only and remote-device estimates leave
      * this false and retain the conservative device-free envelope. Runtime
      * admission sets it only after the local backend context exists, allowing

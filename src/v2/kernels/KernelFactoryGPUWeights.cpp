@@ -94,7 +94,7 @@ namespace llaminar::v2::kernels
         if (floating)
         {
             const size_t row_bytes = product(static_cast<size_t>(k), type == TensorType::FP32 ? 4 : 2);
-            auto *payload = region(slot->d_native_vnni_payload, slot->payload_bytes,
+            auto *payload = region(slot->d_native_quantised_payload, slot->payload_bytes,
                 product(row_offset, row_bytes), product(static_cast<size_t>(n), row_bytes), slot_name, "floating payload");
 #ifdef HAVE_CUDA
             if (device.is_cuda())
@@ -120,28 +120,28 @@ namespace llaminar::v2::kernels
             const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(&tensor);
             const auto *source = unpackable ? unpackable->vnniFormatInfo() : nullptr;
             if (!source || k % 32 != 0)
-                throw std::invalid_argument("GPU weight-pool GEMM requires a supported complete NativeVNNI matrix");
+                throw std::invalid_argument("GPU weight-pool GEMM requires a supported complete NativeQuantised matrix");
             const auto allocation = gpuPreparedWeightPoolAllocation(*source, layout);
             const auto reusable = layout == GPUPreparedWeightPoolLayout::MigrationReusable
-                ? allocation : NativeVnniReusableDeviceAllocationFormat{};
+                ? allocation : NativeQuantisedReusableDeviceAllocationFormat{};
             const auto blocks_per_row = static_cast<size_t>(k / 32);
             const auto offset_blocks = product(row_offset, blocks_per_row);
             const auto length_blocks = product(static_cast<size_t>(n), blocks_per_row);
             // Offsets and bounds use the exact admitted layout. A reusable
             // slot retains metadata planes for future migration; an immutable
             // slot contains only the original source's canonical planes.
-            auto *payload = static_cast<uint8_t *>(region(slot->d_native_vnni_payload, slot->payload_bytes,
+            auto *payload = static_cast<uint8_t *>(region(slot->d_native_quantised_payload, slot->payload_bytes,
                 product(offset_blocks, allocation.payload_bytes_per_block), product(length_blocks, allocation.payload_bytes_per_block),
                 slot_name, "quantized payload"));
-            auto *scales = static_cast<uint16_t *>(region(slot->d_native_vnni_scales, slot->scales_bytes,
+            auto *scales = static_cast<uint16_t *>(region(slot->d_native_quantised_scales, slot->scales_bytes,
                 product(offset_blocks, sizeof(uint16_t)), product(length_blocks, sizeof(uint16_t)), slot_name, "scales"));
-            auto *mins = static_cast<uint16_t *>(region(slot->d_native_vnni_mins, slot->mins_bytes,
+            auto *mins = static_cast<uint16_t *>(region(slot->d_native_quantised_mins, slot->mins_bytes,
                 allocation.has_mins ? product(offset_blocks, sizeof(uint16_t)) : 0,
                 allocation.has_mins ? product(length_blocks, sizeof(uint16_t)) : 0, slot_name, "minima"));
-            auto *emins = static_cast<uint32_t *>(region(slot->d_native_vnni_emins, slot->emins_bytes,
+            auto *emins = static_cast<uint32_t *>(region(slot->d_native_quantised_emins, slot->emins_bytes,
                 allocation.has_emins ? product(offset_blocks, sizeof(uint32_t)) : 0,
                 allocation.has_emins ? product(length_blocks, sizeof(uint32_t)) : 0, slot_name, "embedded minima"));
-            const NativeVnniSourceIdentity identity{source->codebook_id, source->is_superblock, true};
+            const NativeQuantisedSourceIdentity identity{source->codebook_id, source->is_superblock, true};
             const auto codebook = canonicalDeviceVnniCodebookId(*source);
 #ifdef HAVE_CUDA
             if (device.is_cuda())

@@ -9,14 +9,14 @@
 namespace llaminar2 {
 namespace {
 /** @return Physical traits from the canonical existing native format inventory. */
-ExpertTierWeightCPUStorageLayout directCPUFormat(const NativeVnniFormatInfo &format, unsigned quantum)
+ExpertTierWeightCPUStorageLayout directCPUFormat(const NativeQuantisedFormatInfo &format, unsigned quantum)
 {
-    const auto encoding = cpu::native_vnni::preparedEncodingForSource(format);
+    const auto encoding = cpu::native_quantised::preparedEncodingForSource(format);
     return {.cpu_codebook_id = format.codebook_id,
         .cpu_is_asymmetric = uint8_t(format.is_asymmetric),
         .cpu_is_superblock = uint8_t(format.is_superblock), .cpu_encoding = encoding,
-        .cpu_data_stride = uint32_t(cpu::native_vnni::preparedDataStride(encoding)),
-        .cpu_block_stride = uint32_t(cpu::native_vnni::preparedInterleavedBlockStride(encoding, format.is_asymmetric)),
+        .cpu_data_stride = uint32_t(cpu::native_quantised::preparedDataStride(encoding)),
+        .cpu_block_stride = uint32_t(cpu::native_quantised::preparedInterleavedBlockStride(encoding, format.is_asymmetric)),
         .wire_columns_per_unit = quantum};
 }
 
@@ -27,7 +27,7 @@ TEST(ExpertTierWeightStream, DirectCPUOriginalRootsAllFormatsPreserveIndependent
     const P from{R::ParticipantOutputSlice, 256, 256, 13, 128, 32, 96};
     const P to{R::ParticipantInputSlice, 256, 256, 72, 160, 64, 128};
     const auto overlap = ExpertTierWeightProjectionIntersection::between(from, to);
-    for (const auto &format : native_vnni_formats::kAllSourceFormats)
+    for (const auto &format : native_quantised_formats::kAllSourceFormats)
         for (const unsigned quantum : {1u, 3u, 17u, 64u})
         {
             SCOPED_TRACE(format.quant_type);
@@ -76,7 +76,7 @@ TEST(ExpertTierWeightStream, DirectCPUParallelPiecesPreserveSharedQ6WordsAcrossR
     const P target{R::ParticipantOutputSlice, 128, 256, 15, 79, 0, 256};
     const auto first = ExpertTierWeightProjectionIntersection::between(a, target);
     const auto second = ExpertTierWeightProjectionIntersection::between(b, target);
-    for (const auto &format : native_vnni_formats::kAllSourceFormats)
+    for (const auto &format : native_quantised_formats::kAllSourceFormats)
     {
         SCOPED_TRACE(format.quant_type);
         const auto traits = directCPUFormat(*format.metadata, 1);

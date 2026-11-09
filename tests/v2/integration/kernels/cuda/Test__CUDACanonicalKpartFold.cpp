@@ -19,7 +19,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/cuda/gemm/CUDACanonicalKpartFold.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <array>
 #include <bit>
@@ -31,17 +31,17 @@
 
 extern "C"
 {
-    bool cudaNativeVNNIInitIQGridTables_tuned();
-    void cudaNativeVNNIGemvSweep_setConfig(int, int, int, int, int, int, int, int);
-    void cudaNativeVNNIGemvSweep_clearConfig();
-    void cudaNativeVNNIGemvSweep_setGroupedRows(int);
-    void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int);
-    bool cudaNativeVNNIGemvTuned_small_m_fp32(
+    bool cudaNativeQuantisedInitIQGridTables_tuned();
+    void cudaNativeQuantisedGemvSweep_setConfig(int, int, int, int, int, int, int, int);
+    void cudaNativeQuantisedGemvSweep_clearConfig();
+    void cudaNativeQuantisedGemvSweep_setGroupedRows(int);
+    void cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(int);
+    bool cudaNativeQuantisedGemvTuned_small_m_fp32(
         const int8_t *, const uint8_t *, const uint16_t *, const uint16_t *,
         const uint32_t *, float *, const float *, int, int, int, float, float,
         const float *, const float *, uint8_t, int, void *, CUDAGemvContext *,
         CUDARowMajorWeights **);
-    bool cudaNativeVNNIGemvTuned_fp32(
+    bool cudaNativeQuantisedGemvTuned_fp32(
         const int8_t *, const uint8_t *, const uint16_t *, const uint16_t *,
         const uint32_t *, float *, const float *, int, int, float, float,
         const float *, const float *, uint8_t, int, void *, CUDAGemvContext *,
@@ -112,20 +112,20 @@ public:
     explicit OraclePolicy(int partitions, int path, int columns)
     {
         if (path < 3)
-            cudaNativeVNNIGemvSweep_setConfig(1, 64, 1, 1, 1, partitions, partitions, 1);
+            cudaNativeQuantisedGemvSweep_setConfig(1, 64, 1, 1, 1, partitions, partitions, 1);
         else
-            cudaNativeVNNIGemvSweep_setConfig(6, columns, 1, 0, 0, 0, partitions, 1);
+            cudaNativeQuantisedGemvSweep_setConfig(6, columns, 1, 0, 0, 0, partitions, 1);
         if (path >= 5)
         {
-            cudaNativeVNNIGemvSweep_setGroupedRows(4);
-            cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
+            cudaNativeQuantisedGemvSweep_setGroupedRows(4);
+            cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(1);
         }
     }
     /** @brief Restore automatic dispatch on every return/exception. */
     ~OraclePolicy()
     {
-        cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(0);
-        cudaNativeVNNIGemvSweep_clearConfig();
+        cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(0);
+        cudaNativeQuantisedGemvSweep_clearConfig();
     }
     OraclePolicy(const OraclePolicy &) = delete;
     OraclePolicy &operator=(const OraclePolicy &) = delete;
@@ -182,7 +182,7 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
             scales[i] = static_cast<uint16_t>(0x1000U + (mixed(source_index + 31) & 0x1fffU));
             secondary[i] = static_cast<uint8_t>(mixed(i + 77));
         }
-        if (codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
+        if (codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook)
         {
             // Independently valid original half base + encoded6 source word.
             const size_t source_index = i % n + static_cast<size_t>(n) * ((i / n) / 8);
@@ -226,7 +226,7 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
         if (path)
         {
             llaminar2::CUDACanonicalKpartFoldResources resources;
-            ASSERT_TRUE(cudaNativeVNNIGemvTuned_fusedKpar_resources(codebook, *plan, resources));
+            ASSERT_TRUE(cudaNativeQuantisedGemvTuned_fusedKpar_resources(codebook, *plan, resources));
             ASSERT_EQ(resources.local_bytes, 0U);
             ASSERT_GE(resources.maximum_threads, plan->threads());
             ASSERT_GT(resources.active_blocks_per_sm, 0);
@@ -244,7 +244,7 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
         {
             // One real grouped launch inherits the fused serial schedule; it
             // must not become a row-replay implementation under this policy.
-            ASSERT_TRUE(cudaNativeVNNIGemvTuned_small_m_fp32(
+            ASSERT_TRUE(cudaNativeQuantisedGemvTuned_small_m_fp32(
                 a.data, p.data, s.data, secondary_s.data, em.data, output.data,
                 sa.data, m, n, k, alpha, beta,
                 affine ? (in_place ? output.data : old.data) : nullptr,
@@ -258,12 +258,12 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
             const auto *activation = a.data + static_cast<size_t>(row) * k;
             const auto *row_scales = sa.data + static_cast<size_t>(row) * (k / 32);
             if (path == 0 || path >= 3)
-                ASSERT_TRUE(cudaNativeVNNIGemvTuned_fp32(
+                ASSERT_TRUE(cudaNativeQuantisedGemvTuned_fp32(
                     activation, p.data, s.data, secondary_s.data, em.data, output.data + offset,
                     row_scales, n, k, alpha, beta, existing, affine ? b.data : nullptr,
                     codebook, 0, stream, execution.context.get(), nullptr));
             else
-                ASSERT_TRUE(cudaNativeVNNIGemvTuned_fusedKpar_fp32(
+                ASSERT_TRUE(cudaNativeQuantisedGemvTuned_fusedKpar_fp32(
                     activation, p.data, s.data, secondary_s.data, em.data, output.data + offset,
                     row_scales, n, alpha, beta, existing, affine ? b.data : nullptr,
                     codebook, 0, stream, *plan));
@@ -289,7 +289,7 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
 std::map<int, int> formats()
 {
     std::map<int, int> result;
-    for (const auto &source : llaminar2::native_vnni_formats::kAllSourceFormats)
+    for (const auto &source : llaminar2::native_quantised_formats::kAllSourceFormats)
     {
         const auto &f = *source.metadata;
         result.emplace(llaminar2::canonicalDeviceVnniCodebookId(f), f.payload_bytes);
@@ -307,7 +307,7 @@ TEST(CUDACanonicalKpartFold, CapturedAllCodebooksRowsAndEpilogues)
     // Admit physical facts explicitly before any production planner or capture.
     llaminar2::initializeCUDAHardwareMetadata();
     checked(cudaSetDevice(0));
-    ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned());
+    ASSERT_TRUE(cudaNativeQuantisedInitIQGridTables_tuned());
     for (const auto &[codebook, bytes] : formats())
         for (int m : {1, 2, 3, 16, 31})
             for (const auto geometry : {std::array{1, 32, 1}, std::array{33, 160, 3},
@@ -329,7 +329,7 @@ TEST(CUDACanonicalKpartFold, CapturedCapacityAndInPlacePublication)
     // Admit physical facts explicitly before any production planner or capture.
     llaminar2::initializeCUDAHardwareMetadata();
     checked(cudaSetDevice(0));
-    ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned());
+    ASSERT_TRUE(cudaNativeQuantisedInitIQGridTables_tuned());
     for (const auto &[codebook, bytes] : formats())
         for (int partitions : {31, 32, 33, 63, 64})
         {
@@ -355,7 +355,7 @@ TEST(CUDACanonicalKpartFold, RejectsInvalidBindingsBeforeSubmission)
     const auto plan = *CUDACanonicalKpartFoldPlan::create(CUDACanonicalKpartColumns::Sixteen, 1, 32);
     const auto submit = [&](uint8_t cb, void *stream, int device, const int8_t *activation,
                             float beta, const uint16_t *primary) {
-        return cudaNativeVNNIGemvTuned_fusedKpar_fp32(activation, p.data, primary, nullptr,
+        return cudaNativeQuantisedGemvTuned_fusedKpar_fp32(activation, p.data, primary, nullptr,
             nullptr, out.data, scales.data, 1, 1.0f, beta, nullptr, nullptr, cb, device, stream, plan);
     };
     // Admission failures must leave a live recording usable. In particular,

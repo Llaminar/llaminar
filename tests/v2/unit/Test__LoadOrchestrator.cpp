@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include "loaders/gpu_pipeline/LoadOrchestrator.h"
 #include "loaders/GPUVramPreflight.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "../mocks/MockBackend.h"
 
 /**
@@ -369,7 +369,7 @@ namespace llaminar2
         const auto slot = orch.getPool(0)->getSlot("converted");
         ASSERT_TRUE(slot.has_value());
         for (size_t i = 0; i < output_bytes; ++i)
-            ASSERT_EQ(slot->d_native_vnni_payload[i], (prefix_bytes + i) % 251u) << i;
+            ASSERT_EQ(slot->d_native_quantised_payload[i], (prefix_bytes + i) % 251u) << i;
         std::sort(reads->ranges.begin(), reads->ranges.end());
         ASSERT_EQ(reads->ranges.size(), 5u);
         for (size_t i = 0; i < reads->ranges.size(); ++i)
@@ -651,20 +651,20 @@ namespace llaminar2
         }
     }
 
-    TEST(Test__LoadOrchestrator, NativeVnniExpertSubregionsAreGapFreeForEveryCodebook)
+    TEST(Test__LoadOrchestrator, NativeQuantisedExpertSubregionsAreGapFreeForEveryCodebook)
     {
-        constexpr std::array<const NativeVnniFormatInfo *, 21> formats = {
-            &native_vnni_formats::IQ4_NL, &native_vnni_formats::Q8_0,
-            &native_vnni_formats::Q8_1, &native_vnni_formats::Q4_0,
-            &native_vnni_formats::Q4_1, &native_vnni_formats::Q5_0,
-            &native_vnni_formats::Q5_1, &native_vnni_formats::Q6_K,
-            &native_vnni_formats::Q2_K, &native_vnni_formats::Q5_K,
-            &native_vnni_formats::Q3_K, &native_vnni_formats::Q4_K,
-            &native_vnni_formats::Q8_K, &native_vnni_formats::IQ4_XS,
-            &native_vnni_formats::IQ2_XXS, &native_vnni_formats::IQ2_XS,
-            &native_vnni_formats::IQ3_XXS, &native_vnni_formats::IQ2_S,
-            &native_vnni_formats::IQ3_S, &native_vnni_formats::IQ1_S,
-            &native_vnni_formats::IQ1_M,
+        constexpr std::array<const NativeQuantisedFormatInfo *, 21> formats = {
+            &native_quantised_formats::IQ4_NL, &native_quantised_formats::Q8_0,
+            &native_quantised_formats::Q8_1, &native_quantised_formats::Q4_0,
+            &native_quantised_formats::Q4_1, &native_quantised_formats::Q5_0,
+            &native_quantised_formats::Q5_1, &native_quantised_formats::Q6_K,
+            &native_quantised_formats::Q2_K, &native_quantised_formats::Q5_K,
+            &native_quantised_formats::Q3_K, &native_quantised_formats::Q4_K,
+            &native_quantised_formats::Q8_K, &native_quantised_formats::IQ4_XS,
+            &native_quantised_formats::IQ2_XXS, &native_quantised_formats::IQ2_XS,
+            &native_quantised_formats::IQ3_XXS, &native_quantised_formats::IQ2_S,
+            &native_quantised_formats::IQ3_S, &native_quantised_formats::IQ1_S,
+            &native_quantised_formats::IQ1_M,
         };
         constexpr size_t expert_count = 15;
         constexpr size_t rows_per_expert = 7;
@@ -673,14 +673,14 @@ namespace llaminar2
         for (const auto *format : formats)
         {
             ASSERT_NE(format, nullptr);
-            const auto slab = nativeVnniPackedRegionSizes(
+            const auto slab = nativeQuantisedPackedRegionSizes(
                 expert_count * rows_per_expert, columns, *format);
-            const auto expert = nativeVnniPackedRegionSizes(
+            const auto expert = nativeQuantisedPackedRegionSizes(
                 rows_per_expert, columns, *format);
 
             for (size_t expert_index = 0; expert_index < expert_count; ++expert_index)
             {
-                const auto offset = nativeVnniPackedRegionSizes(
+                const auto offset = nativeQuantisedPackedRegionSizes(
                     expert_index * rows_per_expert, columns, *format);
                 EXPECT_EQ(offset.payload_bytes, expert_index * expert.payload_bytes);
                 EXPECT_EQ(offset.scales_bytes, expert_index * expert.scales_bytes);
@@ -862,8 +862,8 @@ namespace llaminar2
         ASSERT_NE(pool, nullptr);
         auto slot_before = pool->getSlot("large_raw_weight");
         ASSERT_TRUE(slot_before.has_value());
-        ASSERT_NE(slot_before->d_native_vnni_payload, nullptr);
-        auto *payload_before = slot_before->d_native_vnni_payload;
+        ASSERT_NE(slot_before->d_native_quantised_payload, nullptr);
+        auto *payload_before = slot_before->d_native_quantised_payload;
         EXPECT_NE(pool->getStagingSlot(0), nullptr);
         EXPECT_EQ(
             authority->claimedBytes(
@@ -886,7 +886,7 @@ namespace llaminar2
         EXPECT_EQ(backend.getAllocationCount(), 1u);
         auto slot_after = pool->getSlot("large_raw_weight");
         ASSERT_TRUE(slot_after.has_value());
-        EXPECT_EQ(slot_after->d_native_vnni_payload, payload_before);
+        EXPECT_EQ(slot_after->d_native_quantised_payload, payload_before);
         EXPECT_EQ(
             authority->claimedBytes(
                 DeviceId::rocm(0),

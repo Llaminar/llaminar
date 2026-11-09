@@ -1,6 +1,6 @@
 /**
  * @file ROCmGroupedVerifierLaunch.h
- * @brief Typed launch boundary for ordered, device-counted NativeVNNI rows.
+ * @brief Typed launch boundary for ordered, device-counted NativeQuantised rows.
  *
  * The physical matrix width determines grid and scratch strides. An optional
  * row descriptor borrows the device controller's live count; kernels skip
@@ -37,7 +37,7 @@ extern "C"
      *        its device count must be published before this stream consumes it.
      * @return False for invalid arguments or failed launch, never another route.
      */
-    bool rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
+    bool rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
         const int8_t *d_A_int8, const uint8_t *d_payload,
         const void *d_block_scales, const void *d_block_mins,
         const void *d_block_emins, float *d_C_fp32,
@@ -59,7 +59,7 @@ extern "C"
      * sum producer for every fused decoder, including symmetric-format bundles.
      * @return False on invalid bindings or a failed launch, without replay.
      */
-    bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy(
+    bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy(
         const int8_t *d_A_int8,
         const uint8_t *const *d_payloads,
         const uint16_t *const *d_block_scales,
@@ -87,7 +87,7 @@ extern "C"
      * compatible serial-M1 partition schedules into one launch.
      * @return False on an invalid format, binding, geometry, or launch.
      */
-    bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy(
+    bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy(
         const int8_t *d_A_int8,
         const uint8_t *const *d_payloads,
         const uint16_t *const *d_block_scales,

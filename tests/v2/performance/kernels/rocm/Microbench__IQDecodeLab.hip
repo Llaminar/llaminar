@@ -8,7 +8,7 @@
  * head-to-head without affecting the production kernel.
  *
  * ARCHITECTURE: Each "strategy" is a separate __device__ function that decodes
- * one 32-element block from native-VNNI payload → 8 × int32_t packed groups.
+ * one 32-element block from native-quantised payload → 8 × int32_t packed groups.
  * The benchmark kernel calls the decode function in a tight loop across N rows,
  * writing results to a sink buffer to prevent dead-code elimination.
  *

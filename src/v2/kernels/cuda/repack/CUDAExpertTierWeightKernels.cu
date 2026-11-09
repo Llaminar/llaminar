@@ -15,7 +15,7 @@
  */
 
 #include "kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
-#include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
+#include "kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh"
 #include "backends/cuda/MappedTransferServiceCUDA.h"
 #include "backends/cuda/MappedTransferServiceDevice.cuh"
 #include "transfer/MappedTransferPackedWork.h"
@@ -126,7 +126,7 @@ namespace llaminar2
         {
             if constexpr (Codebook == 0)
                 return static_cast<int>(value) - 8;
-            if constexpr (Codebook == 4 || Codebook == kNativeVnniIQ4XSSourceScaleCodebook)
+            if constexpr (Codebook == 4 || Codebook == kNativeQuantisedIQ4XSSourceScaleCodebook)
             {
                 // Divergent constant-memory indices serialize each warp by
                 // distinct index. Read four warp-uniform words, then select
@@ -268,7 +268,7 @@ namespace llaminar2
                 static_cast<std::int16_t>(compensation);
             reinterpret_cast<std::uint16_t *>(unit + (1152u/64)*columns)[local_column] =
                 scales[linear];
-            if constexpr (Asymmetric || Codebook == kNativeVnniIQ4XSSourceScaleCodebook)
+            if constexpr (Asymmetric || Codebook == kNativeQuantisedIQ4XSSourceScaleCodebook)
             {
                 reinterpret_cast<std::uint16_t *>(unit + (1280u/64)*columns)[local_column] =
                     mins[linear];
@@ -291,7 +291,7 @@ namespace llaminar2
 
         /**
          * @brief Extract one signed decoded byte from eight packed DP4A groups.
-         * @param groups NativeVNNI decoder output, four values per group.
+         * @param groups NativeQuantised decoder output, four values per group.
          * @param value_index Logical value in the 32-element execution block.
          * @return Sign-extended quantized value.
          */
@@ -348,16 +348,16 @@ namespace llaminar2
             const std::size_t linear =
                 static_cast<size_t>(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
             constexpr int payload_bytes =
-                cuda_native_vnni::CodebookTraits<Codebook>::payload_bytes;
+                cuda_native_quantised::CodebookTraits<Codebook>::payload_bytes;
             const std::uint8_t *source =
                 payload + linear * static_cast<std::size_t>(payload_bytes);
             std::int32_t decoded_groups[8]{};
-            cuda_native_vnni::decode_groups<Codebook>(
+            cuda_native_quantised::decode_groups<Codebook>(
                 source, decoded_groups);
 
             static_assert(Codebook == 6 || Codebook == 7 || Codebook == 11 ||
                           Codebook == 12 || Codebook == 15 || Codebook == 16 ||
-                          Codebook == 19 || Codebook == kNativeVnniExpandedInt8MinCodebook);
+                          Codebook == 19 || Codebook == kNativeQuantisedExpandedInt8MinCodebook);
             // These single-scale formats retain their exact integer domain.
             // Multi-scale sources use the native transposition kernel instead.
             for (int group = 0; group < 8; ++group)
@@ -379,7 +379,7 @@ namespace llaminar2
                 scales[linear];
             if constexpr (
                 Codebook == 7 || Codebook == 11 || Codebook == 16 ||
-                Codebook == kNativeVnniExpandedInt8MinCodebook)
+                Codebook == kNativeQuantisedExpandedInt8MinCodebook)
             {
                 reinterpret_cast<std::uint16_t *>(unit + (2304u/64)*columns)[local_column] =
                     mins[linear];
@@ -555,14 +555,14 @@ namespace llaminar2
             {
                 // Exact cold movement inverse; no re-quantization/normalized19.
                 const uint16_t secondary=reinterpret_cast<const uint16_t*>(unit+(2304u/64)*columns)[local_column];
-                if (!native_vnni_iq3s_scale::valid(secondary)) { __trap(); return; }
+                if (!native_quantised_iq3s_scale::valid(secondary)) { __trap(); return; }
                 uint32_t low_words[2]{},sign_word=0;uint8_t high=0;
                 for (int group = 0; group < 8; ++group)
                 {
                     int8_t values[4];
                     for (int lane = 0; lane < 4; ++lane)
                         values[lane] = static_cast<int8_t>(unit[interleavedValueOffset(local_column,group*4+lane,columns)]);
-                    const auto encoded = native_vnni_iq3s_scale::encodeGridQuartet(values,cuda_native_vnni::d_iq3s_grid);
+                    const auto encoded = native_quantised_iq3s_scale::encodeGridQuartet(values,cuda_native_quantised::d_iq3s_grid);
                     if (!encoded.valid()) { __trap(); return; }
                     low_words[group/4] |= uint32_t{static_cast<uint8_t>(encoded.index)} << (8*(group%4));
                     high |= static_cast<uint8_t>((encoded.index >> 8) << group);
@@ -718,7 +718,7 @@ namespace llaminar2
                     return false;
                 // This is dispatch totality, not a second footprint authority.
                 // Never acknowledge bytes for a codebook with no device branch.
-                using Encoding = cpu::native_vnni::CPUNativeVNNIEncoding;
+                using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
                 switch (layout.cpu_encoding)
                 {
                 case Encoding::NibbleLUT:
@@ -727,7 +727,7 @@ namespace llaminar2
                 case Encoding::IQ3SExpandedSourceScale:
                     return layout.gpu_codebook_id == 11;
                 case Encoding::NibbleLUTSourceScale:
-                    return layout.gpu_codebook_id == kNativeVnniIQ4XSSourceScaleCodebook;
+                    return layout.gpu_codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook;
                 case Encoding::Q6KNativeDualScale:
                     return layout.gpu_codebook_id == 8;
                 case Encoding::CompactMultiScale:
@@ -737,11 +737,11 @@ namespace llaminar2
                 case Encoding::ExpandedInt8:
                     if (!to_cpu)
                         return layout.gpu_codebook_id == 19 ||
-                            layout.gpu_codebook_id == kNativeVnniExpandedInt8MinCodebook;
+                            layout.gpu_codebook_id == kNativeQuantisedExpandedInt8MinCodebook;
                     switch (layout.gpu_codebook_id)
                     {
                     case 6: case 7: case 11: case 12: case 15: case 16: case 19:
-                    case kNativeVnniExpandedInt8MinCodebook:
+                    case kNativeQuantisedExpandedInt8MinCodebook:
                         return true;
                     default:
                         return false;
@@ -801,7 +801,7 @@ namespace llaminar2
                 destination.scales = reinterpret_cast<std::uint16_t *>(description.scales);
                 destination.mins = reinterpret_cast<std::uint16_t *>(description.mins);
                 destination.emins = reinterpret_cast<std::uint32_t *>(description.emins);
-                using Encoding = cpu::native_vnni::CPUNativeVNNIEncoding;
+                using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
                 if (layout.cpu_encoding == Encoding::CompactMultiScale)
                 {
                     if (to_cpu)
@@ -828,7 +828,7 @@ namespace llaminar2
                     else if (layout.cpu_encoding == Encoding::NibbleLUTSourceScale)
                     {
                         LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit,
-                            kNativeVnniIQ4XSSourceScaleCodebook, false);
+                            kNativeQuantisedIQ4XSSourceScaleCodebook, false);
                     }
                     else if (layout.cpu_encoding == Encoding::ExpandedInt8 || layout.cpu_encoding == Encoding::IQ3SExpandedSourceScale)
                     {
@@ -844,7 +844,7 @@ namespace llaminar2
                         LLAMINAR_TRANSFER_DECODED_UNIT(15);
                         LLAMINAR_TRANSFER_DECODED_UNIT(16);
                         LLAMINAR_TRANSFER_DECODED_UNIT(19);
-                        LLAMINAR_TRANSFER_DECODED_UNIT(kNativeVnniExpandedInt8MinCodebook);
+                        LLAMINAR_TRANSFER_DECODED_UNIT(kNativeQuantisedExpandedInt8MinCodebook);
                         }
 #undef LLAMINAR_TRANSFER_DECODED_UNIT
                     }
@@ -1015,14 +1015,14 @@ namespace llaminar2
         const dim3 grid(unit_count);
         const dim3 block(kColumnsPerUnit);
         auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale)
         {
             compactMultiScaleUnitsCUDA<true><<<grid, block, 0, cuda_stream>>>(
                 source, {}, nullptr, device_cpu_chunk, layout, first_unit);
             return cudaPeekAtLastError() == cudaSuccess;
         }
         if (layout.cpu_encoding ==
-            cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
         {
             if (layout.gpu_codebook_id == 0)
             {
@@ -1044,16 +1044,16 @@ namespace llaminar2
             }
         }
         else if (layout.cpu_encoding ==
-                 cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUTSourceScale)
+                 cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
         {
-            gpuToCpuNibbleUnitsCUDA<kNativeVnniIQ4XSSourceScaleCodebook, false>
+            gpuToCpuNibbleUnitsCUDA<kNativeQuantisedIQ4XSSourceScaleCodebook, false>
                 <<<grid, block, 0, cuda_stream>>>(
                     source.payload, source.scales, source.mins, layout, first_unit,
                     device_cpu_chunk);
         }
         else if (layout.cpu_encoding ==
-                 cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8 ||
-                 layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale)
+                 cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8 ||
+                 layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
         {
 #define LLAMINAR_LAUNCH_DECODED_SOURCE(CODEBOOK)                         \
     gpuToCpuDecodedUnitsCUDA<CODEBOOK><<<grid, block, 0, cuda_stream>>>( \
@@ -1082,9 +1082,9 @@ namespace llaminar2
             case 19:
                 LLAMINAR_LAUNCH_DECODED_SOURCE(19);
                 break;
-            case kNativeVnniExpandedInt8MinCodebook:
+            case kNativeQuantisedExpandedInt8MinCodebook:
                 LLAMINAR_LAUNCH_DECODED_SOURCE(
-                    kNativeVnniExpandedInt8MinCodebook);
+                    kNativeQuantisedExpandedInt8MinCodebook);
                 break;
             default:
                 return false;
@@ -1124,14 +1124,14 @@ namespace llaminar2
         const dim3 block(kColumnsPerUnit);
         auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
         if (layout.cpu_encoding ==
-            cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale)
         {
             compactMultiScaleUnitsCUDA<false><<<grid, block, 0, cuda_stream>>>(
                 {}, destination, device_cpu_chunk, nullptr, layout, first_unit);
             return cudaPeekAtLastError() == cudaSuccess;
         }
         if (layout.cpu_encoding ==
-            cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
         {
             if (layout.cpu_is_asymmetric != 0)
             {
@@ -1147,20 +1147,20 @@ namespace llaminar2
             }
         }
         else if (layout.cpu_encoding ==
-                 cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUTSourceScale)
+                 cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
         {
             // Raw source coefficient words share the existing secondary slot.
             cpuToGpuNibbleUnitsCUDA<true><<<grid, block, 0, cuda_stream>>>(
                 device_cpu_chunk, layout, first_unit, destination.payload,
                 destination.scales, destination.mins);
         }
-        else if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale)
+        else if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
         {
             cpuToGpuExpandedUnitsCUDA<false,11><<<grid,block,0,cuda_stream>>>(
                 device_cpu_chunk,layout, first_unit,destination.payload,destination.scales,destination.mins);
         }
         else if (layout.cpu_encoding ==
-                 cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)
+                 cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
         {
             if (layout.cpu_is_asymmetric != 0)
             {

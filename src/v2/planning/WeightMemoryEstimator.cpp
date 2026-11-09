@@ -20,7 +20,7 @@
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "utils/DebugEnv.h"
 #include "tensors/BlockStructures.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <algorithm>
 #include <limits>
@@ -33,7 +33,7 @@
  * @brief Estimates native and prepared weight memory across CPU and GPU devices.
  *
  * Native estimates mirror GGUF block layouts from BlockStructures.h. GPU estimates
- * mirror the separated native-VNNI layout used by WeightVRAMPool/CUDA/ROCm packers:
+ * mirror the separated native-quantised layout used by WeightVRAMPool/CUDA/ROCm packers:
  * per-32-value payload bytes plus FP16 scales and optional FP16 mins/Q2_K emins.
  * CPU estimates preserve each actual matrix instance and the canonical final allocator footprint.
  */
@@ -154,10 +154,10 @@ namespace llaminar2
         size_t exactGpuPackedMatrixBytes(
             size_t rows,
             size_t columns,
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
-            const NativeVnniPackedRegionSizes regions =
-                nativeVnniPackedRegionSizes(rows, columns, format);
+            const NativeQuantisedPackedRegionSizes regions =
+                nativeQuantisedPackedRegionSizes(rows, columns, format);
 
             /*
              * WeightVRAMPool starts every independently-addressable region at
@@ -342,7 +342,7 @@ namespace llaminar2
             return 4.0f;
 
         if (const auto *format =
-                native_vnni_formats::forQuantType(quant_type))
+                native_quantised_formats::forQuantType(quant_type))
         {
             const size_t metadata_bytes =
                 sizeof(uint16_t) +
@@ -609,7 +609,7 @@ namespace llaminar2
                 else
                 {
                     if (const auto *format =
-                            native_vnni_formats::forQuantType(t.quant_type);
+                            native_quantised_formats::forQuantType(t.quant_type);
                         format && t.K > 0)
                     {
                         // Packing is a function of N and K, not merely N*K.

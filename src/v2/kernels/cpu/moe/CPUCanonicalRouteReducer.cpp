@@ -286,9 +286,16 @@ namespace llaminar2::cpu::moe
                 if (args.route_weights[slot]==0.0f) continue;
                 const auto offset=slot*columns+static_cast<size_t>(first);
                 float *const destination=args.combined_route_rows.data()+offset;
-                std::copy_n(partialRow(0,slot,static_cast<size_t>(first)),count,destination);
-                // Separate explicit vector additions retain every participant rounding point.
-                for (size_t participant=1;participant<args.ordered_participants.size();++participant)
+                // Degree is already validated as 2..8. Add the first two
+                // immutable rows directly: copying participant 0 into scratch
+                // first would write and reread the same live columns before
+                // this identical vec_add. Both operand order and its FP32
+                // rounding point are unchanged, including scalar tails.
+                primitives::vec_add(destination,
+                    partialRow(0,slot,static_cast<size_t>(first)),
+                    partialRow(1,slot,static_cast<size_t>(first)),count);
+                // Later participants retain their original ordered additions.
+                for (size_t participant=2;participant<args.ordered_participants.size();++participant)
                     primitives::vec_add(destination,destination,
                         partialRow(participant,slot,static_cast<size_t>(first)),count);
             }

@@ -6,7 +6,7 @@
 namespace llaminar2::test {
 TEST(TargetMigrationLedger, AllFormatsAndCutsRetainEveryPieceAndRobustWaveMedian) {
     std::vector<ExpertWeightFormat> formats;
-    for(const auto &entry:native_vnni_formats::kAllSourceFormats)formats.push_back(ExpertWeightFormat::nativeVnni(
+    for(const auto &entry:native_quantised_formats::kAllSourceFormats)formats.push_back(ExpertWeightFormat::nativeQuantised(
         {.codebook_id=entry.metadata->codebook_id,.is_superblock=entry.metadata->is_superblock,.present=true}));
     for(auto type:{TensorType::FP16,TensorType::BF16,TensorType::FP32})formats.push_back(ExpertWeightFormat::floating(type));
     std::vector<std::pair<int,int>> populations{{2,3}};

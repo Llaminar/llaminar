@@ -1245,7 +1245,7 @@ on both backends. Current-source full prerequisites and model reruns remain requ
 
 A bounded current-core CPU control now reproduces the saved HC-TwoTerm run's
 layer 0/row 3 and layer 1/row 3 routed expert outputs byte for byte. It uses the real
-prepared NativeVNNI transaction, original quantized expert planes, saved native
+prepared NativeQuantised transaction, original quantized expert planes, saved native
 inputs/IDs/weights and the production route-slot FMA fold. Changing only the
 layer 1 cutoff expert from 143 to 369 in the same slot, with unchanged input and
 weights, reduces relative L2 against the independent reference from 0.15189409
@@ -2893,7 +2893,7 @@ performance/accuracy trade-off and requested TwoTerm support for every required
 source format before promotion.
 
 The implementation now stages a source-owned HC-up policy: all 21 canonical
-NativeVNNI quantized formats apply two independently quantized activation banks
+NativeQuantised quantized formats apply two independently quantized activation banks
 to the same original prepared weights. Floating FP32/FP16/BF16 sources retain
 their native floating operation and reserve no residual-Q8 buffers. Generic
 GEMM, HC-down and the independent GDN/attention/router defaults remain separate.

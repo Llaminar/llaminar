@@ -147,10 +147,10 @@ public:
                 "Source format or default floating preparation changed");
             if (i < 2)
             {
-                NativeVnniSourceIdentity source;
-                const auto *expected_source = native_vnni_formats::forQuantType(tensorTypeName(expected_type));
+                NativeQuantisedSourceIdentity source;
+                const auto *expected_source = native_quantised_formats::forQuantType(tensorTypeName(expected_type));
                 const size_t block_bytes = expected_type == TensorType::Q4_0 ? sizeof(Q4_0Block) : sizeof(Q8_0Block);
-                requireGDNBundle(expected_source && kernels_[i]->exportNativeVNNISourceIdentity(source) &&
+                requireGDNBundle(expected_source && kernels_[i]->exportNativeQuantisedSourceIdentity(source) &&
                     source.present && !source.is_superblock && source.codebook_id == expected_source->codebook_id &&
                     source_bytes_[i].size() == size_t(columns_[i]) * (k_ / 32) * block_bytes,
                     "Original quantized source must retain its exact native prepared provenance");

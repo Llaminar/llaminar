@@ -197,7 +197,7 @@ TEST(CapturedComputeIsolation, GDNBundleOriginalDimensionsRetainTP1PackedSource)
 /** @brief Immutable pool descriptors use implicit capacity, unlike reusable slots. */
 TEST(CapturedComputeIsolation,GDNBundleQ8AllocationRetainsImmutablePoolContract)
 {
-    DeviceNativeVNNIMatrixDesc native{};
+    DeviceNativeQuantisedMatrixDesc native{};
     native.payload=reinterpret_cast<const std::uint8_t *>(0x10000);
     native.scales=reinterpret_cast<const void *>(0x20000);
     native.n=640;native.k=640;native.blocks_per_row=20;

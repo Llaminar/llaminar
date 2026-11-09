@@ -1054,18 +1054,18 @@ namespace llaminar2::test
         }
 
         /** @brief Build deterministic final CPU projection bytes for MPI traffic. */
-        cpu::native_vnni::CPUNativeVNNIPackedWeights remoteCpuProjection(
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights remoteCpuProjection(
             std::uint8_t seed)
         {
-            using namespace cpu::native_vnni;
-            CPUNativeVNNIPackedWeights packed;
+            using namespace cpu::native_quantised;
+            CPUNativeQuantisedPackedWeights packed;
             packed.N = 32;
             packed.K = 64;
             packed.N_padded = 64;
             packed.blocks_per_row = 2;
-            packed.codebook_id = native_vnni_formats::Q4_0.codebook_id;
+            packed.codebook_id = native_quantised_formats::Q4_0.codebook_id;
             packed.payload_bytes = 16;
-            packed.encoding = CPUNativeVNNIEncoding::NibbleLUT;
+            packed.encoding = CPUNativeQuantisedEncoding::NibbleLUT;
             packed.is_asymmetric = false;
             packed.is_superblock = false;
             packed.data_stride = static_cast<int>(
@@ -1093,7 +1093,7 @@ namespace llaminar2::test
          * @param packed Actual original native root whose format/strides are retained.
          * @return Whole logical projection layout; resident N padding is excluded from wire bytes.
          */
-        ExpertTierWeightCPUStorageLayout cpuLiveWireLayout(const cpu::native_vnni::CPUNativeVNNIPackedWeights& packed)
+        ExpertTierWeightCPUStorageLayout cpuLiveWireLayout(const cpu::native_quantised::CPUNativeQuantisedPackedWeights& packed)
         {
             ExpertTierWeightCPUStorageLayout layout{
                 .N=packed.N,.K=packed.K,.blocks_per_row=packed.blocks_per_row,
@@ -1112,7 +1112,7 @@ namespace llaminar2::test
          * @param packed Actual original native root.
          * @return Exact encoded payload/metadata planes, independent of storage padding.
          */
-        std::vector<uint8_t> cpuLiveWireOracle(const cpu::native_vnni::CPUNativeVNNIPackedWeights& packed)
+        std::vector<uint8_t> cpuLiveWireOracle(const cpu::native_quantised::CPUNativeQuantisedPackedWeights& packed)
         {
             const auto layout=cpuLiveWireLayout(packed);
             std::vector<uint8_t> result(layout.chunkBytes(layout.unit_count));
@@ -1133,10 +1133,10 @@ namespace llaminar2::test
          * resident stride; comparing a compact prefix of the raw root is incorrect.
          */
         std::vector<uint8_t> expectedCpuRecipientImage(
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights& packed,std::span<const uint8_t> initial)
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights& packed,std::span<const uint8_t> initial)
         {
-            if(packed.codebook_id!=native_vnni_formats::Q4_0.codebook_id || packed.is_superblock ||
-               packed.encoding!=cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT || initial.size()!=packed.native_interleaved.size())
+            if(packed.codebook_id!=native_quantised_formats::Q4_0.codebook_id || packed.is_superblock ||
+               packed.encoding!=cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT || initial.size()!=packed.native_interleaved.size())
                 throw std::logic_error("Independent MPI recipient oracle requires its declared Q4_0 fixture");
             std::vector<uint8_t> expected(initial.begin(),initial.end());
             for(int n=0;n<packed.N;++n)for(int kb=0;kb<packed.blocks_per_row;++kb) {
@@ -1184,7 +1184,7 @@ namespace llaminar2::test
 
         /** @brief Present one CPU packed allocation as a four-region source. */
         std::array<std::span<const std::uint8_t>, 4> cpuSourceRegions(
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &packed)
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &packed)
         {
             return {
                 std::span<const std::uint8_t>(
@@ -1215,7 +1215,7 @@ namespace llaminar2::test
             std::size_t lane_index,
             const MoEOverlayRemoteProjectionIdentity &identity,
             const MoEOverlayRemoteProjectionManifest &manifest,
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &source,
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &source,
             std::vector<std::uint8_t> &destination,
             const std::shared_ptr<void> &source_lifetime,
             const std::shared_ptr<void> &destination_lifetime)
@@ -1283,10 +1283,10 @@ namespace llaminar2::test
         std::vector<CpuExpertSlotPool::ProjectionSpec>
         distributedCpuProjectionSpecs()
         {
-            const NativeVnniSourceIdentity source_identity{
-                .codebook_id = native_vnni_formats::Q4_0.codebook_id,
+            const NativeQuantisedSourceIdentity source_identity{
+                .codebook_id = native_quantised_formats::Q4_0.codebook_id,
                 .is_superblock =
-                    native_vnni_formats::Q4_0.is_superblock,
+                    native_quantised_formats::Q4_0.is_superblock,
                 .present = true,
             };
             return {
@@ -1295,21 +1295,21 @@ namespace llaminar2::test
                     .N = 32,
                     .K = 64,
                     .format =
-                        ExpertWeightFormat::nativeVnni(source_identity),
+                        ExpertWeightFormat::nativeQuantised(source_identity),
                 },
                 {
                     .projection = ExpertTierWeightProjection::Up,
                     .N = 32,
                     .K = 64,
                     .format =
-                        ExpertWeightFormat::nativeVnni(source_identity),
+                        ExpertWeightFormat::nativeQuantised(source_identity),
                 },
                 {
                     .projection = ExpertTierWeightProjection::Down,
                     .N = 64,
                     .K = 32,
                     .format =
-                        ExpertWeightFormat::nativeVnni(source_identity),
+                        ExpertWeightFormat::nativeQuantised(source_identity),
                 },
             };
         }
@@ -1404,10 +1404,10 @@ namespace llaminar2::test
         std::vector<MoEOverlayLayerWeightManifest>
         distributedCpuLayerManifest()
         {
-            const NativeVnniSourceIdentity source_identity{
-                .codebook_id = native_vnni_formats::Q4_0.codebook_id,
+            const NativeQuantisedSourceIdentity source_identity{
+                .codebook_id = native_quantised_formats::Q4_0.codebook_id,
                 .is_superblock =
-                    native_vnni_formats::Q4_0.is_superblock,
+                    native_quantised_formats::Q4_0.is_superblock,
                 .present = true,
             };
             return {{
@@ -1418,21 +1418,21 @@ namespace llaminar2::test
                         .N = 32,
                         .K = 64,
                         .format =
-                            ExpertWeightFormat::nativeVnni(source_identity),
+                            ExpertWeightFormat::nativeQuantised(source_identity),
                     },
                     {
                         .projection = ExpertTierWeightProjection::Up,
                         .N = 32,
                         .K = 64,
                         .format =
-                            ExpertWeightFormat::nativeVnni(source_identity),
+                            ExpertWeightFormat::nativeQuantised(source_identity),
                     },
                     {
                         .projection = ExpertTierWeightProjection::Down,
                         .N = 64,
                         .K = 32,
                         .format =
-                            ExpertWeightFormat::nativeVnni(source_identity),
+                            ExpertWeightFormat::nativeQuantised(source_identity),
                     },
                 }},
             }};
@@ -1499,10 +1499,10 @@ namespace llaminar2::test
             const auto original_specs=distributedCpuProjectionSpecs();
             for(size_t role=0;role<engines.size();++role) {
                 const auto& engine=engines[role];
-                const auto* packed=engine?engine->exportCPUNativeVNNIPackedWeights():nullptr;
+                const auto* packed=engine?engine->exportCPUNativeQuantisedPackedWeights():nullptr;
                 if(!packed || packed->N!=original_specs[role].N || packed->K!=original_specs[role].K ||
-                   packed->codebook_id!=native_vnni_formats::Q4_0.codebook_id || packed->is_superblock ||
-                   packed->encoding!=cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT)return false;
+                   packed->codebook_id!=native_quantised_formats::Q4_0.codebook_id || packed->is_superblock ||
+                   packed->encoding!=cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)return false;
                 std::vector<uint8_t> original(packed->native_interleaved.size());
                 for(size_t byte=0;byte<original.size();++byte)original[byte]=uint8_t(seed+uint8_t(byte*13u));
                 const auto layout=cpuLiveWireLayout(*packed);
@@ -2587,7 +2587,7 @@ namespace llaminar2::test
         EXPECT_EQ(projection_stats.operations_completed, 6u);
         size_t live_expert_bytes=0;
         for(const auto& engine:{arrived.gate(),arrived.up(),arrived.down()}) {
-            const auto* packed=engine->exportCPUNativeVNNIPackedWeights();ASSERT_NE(packed,nullptr);
+            const auto* packed=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_NE(packed,nullptr);
             live_expert_bytes+=cpuLiveWireOracle(*packed).size();
         }
         EXPECT_EQ(live_expert_bytes,3840u); //1280 live bytes per Gate/Up/Down projection.

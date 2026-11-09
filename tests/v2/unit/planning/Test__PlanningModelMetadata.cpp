@@ -82,7 +82,7 @@ TEST(PlanningModelMetadata, TerminalHeadProvenanceSurvivesDescriptorPublication)
     const auto source = metadata.executionModelConfig().terminal_head_source;
     EXPECT_TRUE(source.present);
     EXPECT_TRUE(source.is_superblock);
-    EXPECT_EQ(source.codebook_id, native_vnni_formats::Q6_K.codebook_id);
+    EXPECT_EQ(source.codebook_id, native_quantised_formats::Q6_K.codebook_id);
     for (const auto format : {"F32", "F16", "BF16"})
     {
         profile.tensors.back().quant_type = format;

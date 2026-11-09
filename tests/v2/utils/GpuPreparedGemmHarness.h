@@ -15,7 +15,7 @@
  *
  * This helper drives the real production path shared with `WeightManager.cpp`:
  *   1. Plan the weight in a per-device `WeightVRAMPool` (via `LoadOrchestrator`).
- *   2. Upload + GPU-repack the raw GGUF blocks into native-VNNI layout.
+ *   2. Upload + GPU-repack the raw GGUF blocks into native-quantised layout.
  *   3. Bind the matrix through `KernelFactory::createGemmFromGPUWeightPool`,
  *      which validates backend/region identity and retains the pool owner.
  *   4. Register the kernel handle in a `PreparedWeightStore` via
@@ -224,9 +224,9 @@ namespace llaminar2::test
             throw std::runtime_error("registerGpuPreparedGemmInStore: null lifetime vector");
 
         auto *unpackable = dynamic_cast<IINT8Unpackable *>(weights);
-        const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        const NativeQuantisedFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
         if (!vnni)
-            throw std::runtime_error("registerGpuPreparedGemmInStore: weight is not a quantized native-VNNI tensor");
+            throw std::runtime_error("registerGpuPreparedGemmInStore: weight is not a quantized native-quantised tensor");
 
         const int N = static_cast<int>(weights->rows());
         const int K = static_cast<int>(weights->cols());
@@ -432,11 +432,11 @@ namespace llaminar2::test
             throw std::runtime_error("makeGpuPreparedGemm: device must be CUDA or ROCm");
 
         // The pipeline reads raw GGUF block data straight from host and uploads it
-        // itself, so the weight must expose intrinsic native-VNNI format metadata.
+        // itself, so the weight must expose intrinsic native-quantised format metadata.
         auto *unpackable = dynamic_cast<IINT8Unpackable *>(weights);
-        const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        const NativeQuantisedFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
         if (!vnni)
-            throw std::runtime_error("makeGpuPreparedGemm: weight is not a quantized native-VNNI tensor");
+            throw std::runtime_error("makeGpuPreparedGemm: weight is not a quantized native-quantised tensor");
 
         const int N = static_cast<int>(weights->rows());
         const int K = static_cast<int>(weights->cols());

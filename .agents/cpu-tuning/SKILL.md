@@ -32,8 +32,8 @@ placement; GPU capture and native-event requirements do not apply.
 - Keep profiler collection separate from canonical latency samples. Never use
   `perf` overhead, sampling runs, or hardware-counter collection as dispatch
   labels.
-- For NativeVNNI corpus collection, policy fitting, certification, or install,
-  also read [nativevnni-gemm-tuning](../nativevnni-gemm-tuning/SKILL.md). Its
+- For NativeQuantised exact-overlay collection, selection, qualification, or install,
+  also read [nativequantised-gemm-tuning](../nativequantised-gemm-tuning/SKILL.md). Its
   trainer-owned `perf_event_open` protocol is the production evidence
   authority; use its existing collector/driver rather than inventing profiler
   environment variables. The system-wide `perf` workflow below is for
@@ -95,7 +95,7 @@ include:
 
 ```bash
 cmake --build build_v2_release --parallel --target \
-  v2_perf_cpu_native_vnni_thread_scaling
+  v2_perf_cpu_native_quantised_thread_scaling
 cmake --build build_v2_release --parallel --target \
   v2_perf_cpu_flash_attention_sweep
 cmake --build build_v2_release --parallel --target \
@@ -314,10 +314,10 @@ compute-bound candidate, and a repeated latency win over serial decode. A
 lower register count that loses cross-row reuse or changes FP accumulation is
 not an optimization.
 
-### Tune NativeVNNI cache tiles from the prepared execution layout
+### Tune NativeQuantised cache tiles from the prepared execution layout
 
 Cache policy must model the bytes consumed by the production kernel, not the
-compact source GGUF block. Use `NativeVNNIPreparedFootprint` and include all
+compact source GGUF block. Use `NativeQuantisedPreparedFootprint` and include all
 live data owned by one physical microkernel tile:
 
 - the exact interleaved weight stride, including compensation, scales, and
@@ -353,24 +353,24 @@ Treat cache residency as a tournament parameter, not as a folklore percentage:
    count. A raw timing fluctuation without a mechanism is not enough to encode
    a new generic policy.
 
-The focused NativeVNNI cache-tile tournament is
-`v2_perf_cpu_native_vnni_dispatch_sweep`, test
+The focused NativeQuantised cache-tile tournament is
+`v2_perf_cpu_native_quantised_dispatch_sweep`, test
 `CacheKTilesCoverAllPreparedFootprints`. Select geometry with
-`LLAMINAR_CPU_NVNNI_CACHE_TILE_M`, `_N`, and `_K`; select one exact profiler
+`LLAMINAR_CPU_NATIVE_QUANTISED_CACHE_TILE_M`, `_N`, and `_K`; select one exact profiler
 launch with `_FORMAT`, `_CANDIDATE`,
-`LLAMINAR_NATIVE_VNNI_PROFILE_REQUEST_ID`, and
-`LLAMINAR_NATIVE_VNNI_PERF_STATS_PATH`. Pin one physical socket and set
+`LLAMINAR_NATIVE_QUANTISED_PROFILE_REQUEST_ID`, and
+`LLAMINAR_NATIVE_QUANTISED_PERF_STATS_PATH`. Pin one physical socket and set
 `OMP_NUM_THREADS`, `OMP_PLACES=cores`, and `OMP_PROC_BIND=close` explicitly so
 NUMA or SMT movement cannot masquerade as a tile result.
 
-One 32-element K block is already the NativeVNNI SIMD/decode unit. Do not round
+One 32-element K block is already the NativeQuantised SIMD/decode unit. Do not round
 cache tiles to a larger block multiple unless annotated assembly and repeated
 measurements prove a real alignment requirement; odd tile lengths are valid
 and can win. Likewise, do not assume one residency regime fits every M: shallow
 grouped verification and deeper prefill may have materially different reuse.
 
 Every cache-policy change must keep the AVX-512 and forced-AVX2
-`V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_*` gates green. Those gates
+`V2_Integration_CPU_NativeQuantised_PrefillCacheKTile_*` gates green. Those gates
 compare every K-tiled production result byte-for-byte with independent serial
 rows across all formats, odd/even M values, tail N, and tile boundaries. A
 faster tile that changes FP parenthesization is ineligible.

@@ -2,16 +2,16 @@
  * @file CUDAQ8ResidualGrouped.cuh
  * @brief Cooperative original-native matrix tiles with two exact integer MMA terms.
  *
- * This borrows the installed NativeVNNI ldmatrix/MMA mapping and float contribution
+ * This borrows the installed NativeQuantised ldmatrix/MMA mapping and float contribution
  * authority. One CTA stages unchanged B once for64 real rows and both terms.
  * Each K32 group completes independently, then joins two separate ascending
  * FP32 folds. Local zero fill covers only shared-memory arithmetic padding;
  * inactive global input, scratch and output bytes are never accessed.
  */
 #pragma once
-#include "kernels/cuda/gemm/CUDANativeVNNIPrefillDevice.cuh"
+#include "kernels/cuda/gemm/CUDANativeQuantisedPrefillDevice.cuh"
 #include "kernels/common/Q8ResidualCorrection.h"
-#include "kernels/common/DeviceNativeVNNIContributionContract.h"
+#include "kernels/common/DeviceNativeQuantisedContributionContract.h"
 #include "kernels/common/Q8ResidualGroupedGeometry.h"
 namespace llaminar2::cuda_q8_residual {
 /**
@@ -73,9 +73,9 @@ __global__ __launch_bounds__(256,2) void projectGrouped(GPUQ8ResidualCorrectionA
     const int row=warpRow+cuda::prefill::frag_row(lane,element);
     const int column=firstColumn+cuda::prefill::frag_col(lane,element);
     sum0[fragment][element]=device_fp32_contract::add(sum0[fragment][element],
-     device_native_vnni_contract::singleScaleBlock(dot0[element],weightScale[column],primaryScale[row]));
+     device_native_quantised_contract::singleScaleBlock(dot0[element],weightScale[column],primaryScale[row]));
     sum1[fragment][element]=device_fp32_contract::add(sum1[fragment][element],
-     device_native_vnni_contract::singleScaleBlock(dot1[element],weightScale[column],residualScale[row]));
+     device_native_quantised_contract::singleScaleBlock(dot1[element],weightScale[column],residualScale[row]));
    }
   }
   __syncthreads();

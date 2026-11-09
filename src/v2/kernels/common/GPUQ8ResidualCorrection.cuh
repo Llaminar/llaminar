@@ -43,7 +43,7 @@
 #include "Q8ResidualCorrection.h"
 #include "utils/PerfStatsCollector.h"
 #include "DeviceFP32NumericalContract.h"
-#include "DeviceNativeVNNIContributionContract.h"
+#include "DeviceNativeQuantisedContributionContract.h"
 #include "Q8ResidualGroupedGeometry.h"
 #include "Q8ResidualShortKGeometry.h"
 #include "GPUQ8ResidualNative.h"
@@ -175,8 +175,8 @@ template<int Rows>__global__ __launch_bounds__(128,2) void project(GPUQ8Residual
    int dot0=0,dot1=0;
 #pragma unroll
    for(int group=0;group<8;++group){dot0=dot4(p0[group],weights[group],dot0);dot1=dot4(p1[group],weights[group],dot1);}
-   primary[r]=device_fp32_contract::add(primary[r],device_native_vnni_contract::singleScaleBlock(dot0,weightScale,a.primaryScales[activationBlock]));
-   residual[r]=device_fp32_contract::add(residual[r],device_native_vnni_contract::singleScaleBlock(dot1,weightScale,a.residualScales[activationBlock]));
+   primary[r]=device_fp32_contract::add(primary[r],device_native_quantised_contract::singleScaleBlock(dot0,weightScale,a.primaryScales[activationBlock]));
+   residual[r]=device_fp32_contract::add(residual[r],device_native_quantised_contract::singleScaleBlock(dot1,weightScale,a.residualScales[activationBlock]));
   }
  }
 #pragma unroll
@@ -219,8 +219,8 @@ __global__ __launch_bounds__(Groups*kQ8ResidualShortKColumns,1) void projectShor
    dot0=dot4(p0[word],weights[word],dot0);
    dot1=dot4(p1[word],weights[word],dot1);
   }
-  p=device_native_vnni_contract::singleScaleBlock(dot0,weightScale,a.primaryScales[group]);
-  q=device_native_vnni_contract::singleScaleBlock(dot1,weightScale,a.residualScales[group]);
+  p=device_native_quantised_contract::singleScaleBlock(dot0,weightScale,a.primaryScales[group]);
+  q=device_native_quantised_contract::singleScaleBlock(dot1,weightScale,a.residualScales[group]);
  }
  primary[group][localColumn]=p;
  residual[group][localColumn]=q;

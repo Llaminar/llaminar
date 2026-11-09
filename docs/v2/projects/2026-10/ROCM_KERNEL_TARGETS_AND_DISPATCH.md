@@ -27,7 +27,7 @@ Legacy precision booleans preserve caller semantics without qualifying native
 instructions, wave width or matrix arithmetic.
 
 CUDA follows the same explicit startup contract. Backend public getters,
-enumeration, attention, router preparation and NativeVNNI scheduling borrow one
+enumeration, attention, router preparation and NativeQuantised scheduling borrow one
 inventory. No ordinal masking, fixed device-count cache or invented SM count is
 permitted. Distinct CUDA UUIDs may share a parent PCI endpoint; this identity
 rule alone does not qualify execution on partitioned hardware. Router and

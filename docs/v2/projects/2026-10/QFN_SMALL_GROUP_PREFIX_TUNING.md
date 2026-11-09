@@ -137,7 +137,7 @@ run. The repair batch includes:
   unsupported BF16 gate to the CPU reference instead of decoding the actual
   stored BF16 values into its supported FP32 representation.
 - One CUDA descriptor fixture reserves 4 KB for arrays that require 147,968 B
-  of NativeVNNI payload and 18,496 B of scales. The repair derives capacities
+  of NativeQuantised payload and 18,496 B of scales. The repair derives capacities
   from the actual format and retains the host upload source through completion.
 - One ROCm IQ3_S descriptor omits its required secondary source-nibble plane.
   Eleven serial-reference cases omit the canonical fused-projection partial

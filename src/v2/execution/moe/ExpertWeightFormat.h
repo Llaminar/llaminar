@@ -4,14 +4,14 @@
  *
  * ExpertOverlay must preserve the checkpoint's arithmetic contract while an
  * expert moves between execution tiers. Quantized tensors retain their exact
- * NativeVNNI source identity, while floating tensors retain their IEEE storage
+ * NativeQuantised source identity, while floating tensors retain their IEEE storage
  * precision. Keeping the distinction in one tagged value prevents a floating
  * projection from being mistaken for an absent quantized codebook.
  */
 
 #pragma once
 
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/TensorType.h"
 
 #include <cstddef>
@@ -24,7 +24,7 @@ namespace llaminar2
     enum class ExpertWeightFormatKind : std::uint8_t
     {
         Invalid = 0,
-        NativeVnni = 1,
+        NativeQuantised = 1,
         FP16 = 2,
         BF16 = 3,
         FP32 = 4,
@@ -33,22 +33,22 @@ namespace llaminar2
     /**
      * @brief Exact checkpoint-level format identity for one expert projection.
      *
-     * `native_vnni` is populated only for @ref ExpertWeightFormatKind::NativeVnni.
+     * `native_quantised` is populated only for @ref ExpertWeightFormatKind::NativeQuantised.
      * Floating formats carry no codebook because their raw row-major bytes are
      * already the common CPU/CUDA/ROCm transfer representation.
      */
     struct ExpertWeightFormat
     {
         ExpertWeightFormatKind kind = ExpertWeightFormatKind::Invalid;
-        NativeVnniSourceIdentity native_vnni;
+        NativeQuantisedSourceIdentity native_quantised;
 
         /** @brief Construct a validated quantized source-format identity. */
-        [[nodiscard]] static ExpertWeightFormat nativeVnni(
-            NativeVnniSourceIdentity identity) noexcept
+        [[nodiscard]] static ExpertWeightFormat nativeQuantised(
+            NativeQuantisedSourceIdentity identity) noexcept
         {
             return {
-                .kind = ExpertWeightFormatKind::NativeVnni,
-                .native_vnni = identity,
+                .kind = ExpertWeightFormatKind::NativeQuantised,
+                .native_quantised = identity,
             };
         }
 
@@ -76,14 +76,14 @@ namespace llaminar2
         /** @return Whether this identity names one supported source format. */
         [[nodiscard]] bool valid() const noexcept
         {
-            if (kind == ExpertWeightFormatKind::NativeVnni)
+            if (kind == ExpertWeightFormatKind::NativeQuantised)
             {
-                return native_vnni.present &&
-                       native_vnni_formats::forSourceIdentity(
-                           native_vnni.codebook_id,
-                           native_vnni.is_superblock) != nullptr;
+                return native_quantised.present &&
+                       native_quantised_formats::forSourceIdentity(
+                           native_quantised.codebook_id,
+                           native_quantised.is_superblock) != nullptr;
             }
-            return isFloating() && !native_vnni.present;
+            return isFloating() && !native_quantised.present;
         }
 
         /** @return Whether raw floating bytes are the execution representation. */
@@ -94,10 +94,10 @@ namespace llaminar2
                    kind == ExpertWeightFormatKind::FP32;
         }
 
-        /** @return Whether the format uses prepared NativeVNNI representations. */
-        [[nodiscard]] bool isNativeVnni() const noexcept
+        /** @return Whether the format uses prepared NativeQuantised representations. */
+        [[nodiscard]] bool isNativeQuantised() const noexcept
         {
-            return kind == ExpertWeightFormatKind::NativeVnni;
+            return kind == ExpertWeightFormatKind::NativeQuantised;
         }
 
         /** @return Floating tensor type, or no value for quantized/invalid data. */

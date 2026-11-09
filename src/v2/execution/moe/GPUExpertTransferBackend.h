@@ -39,7 +39,7 @@ namespace llaminar2::detail
         const DeviceId &source,
         const DeviceId &destination) noexcept;
 
-    /** Submit one separated NativeVNNI expert copy on a CUDA stream. */
+    /** Submit one separated NativeQuantised expert copy on a CUDA stream. */
     bool transferExpertCUDABackend(
         const GPUExpertPointers &src_ptrs,
         const GPUExpertPointers &dst_ptrs,
@@ -77,7 +77,7 @@ namespace llaminar2::detail
         const DeviceId &source,
         const DeviceId &destination) noexcept;
 
-    /** Submit one separated NativeVNNI expert copy on a ROCm stream. */
+    /** Submit one separated NativeQuantised expert copy on a ROCm stream. */
     bool transferExpertROCmBackend(
         const GPUExpertPointers &src_ptrs,
         const GPUExpertPointers &dst_ptrs,

@@ -8,7 +8,7 @@
 
 #include "TensorClasses.h"
 #include "VnniPackContext.h"
-#include "NativeVnniIQ4XSScale.h"
+#include "NativeQuantisedIQ4XSScale.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
@@ -507,7 +507,7 @@ namespace llaminar2
         const int ls = ((blk->scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf) |
                        (((blk->scales_h >> (2 * sub_idx)) & 3) << 4);
         ctx.scales_array[linear] = blk->d;
-        ctx.mins_array[linear] = native_vnni_iq4xs_scale::encodeSourceCoefficient(
+        ctx.mins_array[linear] = native_quantised_iq4xs_scale::encodeSourceCoefficient(
             static_cast<uint8_t>(ls));
     }
 

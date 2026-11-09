@@ -13,9 +13,9 @@
 namespace llaminar2 {
 namespace {
 ExpertWeightFormat serialSourceFormat(const char* name) {
- const auto* source=native_vnni_formats::forQuantType(name);
+ const auto* source=native_quantised_formats::forQuantType(name);
  if(!source)throw std::invalid_argument("Missing original source format");
- return ExpertWeightFormat::nativeVnni({source->codebook_id,source->is_superblock,true});
+ return ExpertWeightFormat::nativeQuantised({source->codebook_id,source->is_superblock,true});
 }
 MoEOverlayLayerWeightManifest serialSourceLayer(int layer,const char* gate,const char* down,int intermediate=640) {
  return {.layer_idx=layer,.projections={{{ExpertTierWeightProjection::Gate,intermediate,2560,serialSourceFormat(gate)},
@@ -67,8 +67,8 @@ TEST(CPUJointSerialGeometry, ActualMixedClassesRetainNativeUnequalPiecesAndNUMAR
 }
 TEST(CPUJointSerialGeometry, EveryNativeCodebookUsesOriginalBlockAuthorityAtFourAndEight) {
  std::vector<ExpertWeightFormat> formats;
- for(const auto& format:native_vnni_formats::kAllSourceFormats)
-  formats.push_back(ExpertWeightFormat::nativeVnni({format.metadata->codebook_id,format.metadata->is_superblock,true}));
+ for(const auto& format:native_quantised_formats::kAllSourceFormats)
+  formats.push_back(ExpertWeightFormat::nativeQuantised({format.metadata->codebook_id,format.metadata->is_superblock,true}));
  for(const auto type:{TensorType::FP16,TensorType::BF16,TensorType::FP32})formats.push_back(ExpertWeightFormat::floating(type));
  for(const auto& f:formats)for(const int count:{2,4,8}) {
   const MoEOverlayLayerWeightManifest source{.layer_idx=4,.projections={{{ExpertTierWeightProjection::Gate,2048,2560,f},
@@ -333,8 +333,8 @@ namespace llaminar2 {
 TEST(CPUJointSerialGeometry, DynamicShadowBOMUsesOriginalMemberCutsForEveryFormat)
 {
     std::vector<ExpertWeightFormat> formats;
-    for (const auto &source : native_vnni_formats::kAllSourceFormats)
-        formats.push_back(ExpertWeightFormat::nativeVnni(
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
+        formats.push_back(ExpertWeightFormat::nativeQuantised(
             {source.metadata->codebook_id, source.metadata->is_superblock, true}));
     for (const auto floating : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
         formats.push_back(ExpertWeightFormat::floating(floating));

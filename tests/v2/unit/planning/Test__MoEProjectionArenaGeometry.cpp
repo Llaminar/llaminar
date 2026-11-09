@@ -15,7 +15,7 @@
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "planning/ActivationMemoryEstimator.h"
 #include "collective/DeviceCountedAllGather.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
 #include "../models/qwen4exp/Qwen4ExpSidecarFixture.h"
 #include "../../mocks/MockLocalTPContext.h"
@@ -110,7 +110,7 @@ TEST(MoEProjectionArenaGeometry, IntegralOutputPartitionIsSharedBySearchAndAdmis
 TEST(MoEProjectionArenaGeometry, EveryFormatReplacesWholeExpertStorageExactly)
 {
     std::vector<std::string> formats{"F16", "BF16", "F32"};
-    for (const auto &format : native_vnni_formats::kAllSourceFormats)
+    for (const auto &format : native_quantised_formats::kAllSourceFormats)
         formats.emplace_back(format.quant_type);
     for (const auto &format : formats)
     for (const int degree : {2, 4, 8})

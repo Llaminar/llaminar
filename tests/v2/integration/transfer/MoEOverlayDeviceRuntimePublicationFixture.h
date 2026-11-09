@@ -664,7 +664,7 @@ namespace llaminar2::test
             std::int32_t local_slot) const
         {
             DeviceMoEExpertDescriptor descriptor;
-            const DeviceNativeVNNIMatrixDesc gate_up{
+            const DeviceNativeQuantisedMatrixDesc gate_up{
                 .payload =
                     static_cast<const std::uint8_t *>(dummy_payload_),
                 .scales = dummy_scales_,
@@ -672,7 +672,7 @@ namespace llaminar2::test
                 .k = 32,
                 .blocks_per_row = 1u,
             };
-            const DeviceNativeVNNIMatrixDesc down{
+            const DeviceNativeQuantisedMatrixDesc down{
                 .payload =
                     static_cast<const std::uint8_t *>(dummy_payload_),
                 .scales = dummy_scales_,

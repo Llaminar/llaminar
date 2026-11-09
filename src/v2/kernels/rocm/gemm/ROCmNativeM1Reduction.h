@@ -21,7 +21,7 @@
 #include <utility>
 #include <exception>
 #include <cstdio>
-#include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
+#include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 
 namespace llaminar2::rocm
 {
@@ -57,7 +57,7 @@ inline NativeM1ReductionGrid nativeM1ReductionGrid(std::span<const NativeM1Reduc
         throw std::invalid_argument("M1 reducer geometry has no compiled original specialization");
     for(const auto &s:shapes)
     {
-        if(s.columns<=0 || s.partitions<=1 || s.partitions>NativeVNNIGroupedDecodePolicy::maximum_k_partitions ||
+        if(s.columns<=0 || s.partitions<=1 || s.partitions>NativeQuantisedGroupedDecodePolicy::maximum_k_partitions ||
            s.tile_columns!=geometry.tile_columns || s.columns_per_thread!=geometry.columns_per_thread)
             throw std::invalid_argument("M1 reducer group changes an original geometry or partition count");
         const int tiles=1+(s.columns-1)/s.tile_columns;

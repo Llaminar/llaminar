@@ -25,7 +25,7 @@
 #include "../../loaders/ExpertGemmRegistry.h"
 #include "loaders/ModelContext.h"
 #include "loaders/WeightManager.h"
-#include "../../tensors/NativeVnniFormatInfo.h"
+#include "../../tensors/NativeQuantisedFormatInfo.h"
 
 #include <algorithm>
 #include <iterator>
@@ -338,16 +338,16 @@ namespace llaminar2
                     " on " + device().to_string() + ": " + reason);
             };
             auto &engine = *engines_[expert];
-            DeviceNativeVNNIMatrixDesc native{};
-            if (engine.exportNativeVNNIMatrixDesc(native))
+            DeviceNativeQuantisedMatrixDesc native{};
+            if (engine.exportNativeQuantisedMatrixDesc(native))
             {
                 if (!native.valid() || native.n != projection.rows || native.k != projection.source_columns ||
                     native.k % 32 != 0 || native.blocks_per_row != static_cast<uint32_t>(native.k / 32))
                     fail("prepared geometry differs from the fixed full-K slice");
-                NativeVnniSourceIdentity source{};
-                NativeVnniExecutionFormatEnvelope envelope;
-                if (!engine.exportNativeVNNISourceIdentity(source) || !source.present ||
-                    !addNativeVnniExecutionFormat(envelope, native.codebook_id, source, false) ||
+                NativeQuantisedSourceIdentity source{};
+                NativeQuantisedExecutionFormatEnvelope envelope;
+                if (!engine.exportNativeQuantisedSourceIdentity(source) || !source.present ||
+                    !addNativeQuantisedExecutionFormat(envelope, native.codebook_id, source, false) ||
                     (native.source_identity_present &&
                      (native.source_codebook_id != source.codebook_id ||
                       static_cast<bool>(native.source_is_superblock) != source.is_superblock)))

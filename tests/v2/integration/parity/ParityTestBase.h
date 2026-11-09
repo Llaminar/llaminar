@@ -2287,7 +2287,7 @@ namespace llaminar2::test::parity
 
         /// Model path override. If non-empty, overrides ParityConfig::model_path.
         /// Use this to test different quantization formats (e.g., Q4_0 vs Q8_0)
-        /// which exercise different GEMM code paths (native-VNNI vs INT8-VNNI).
+        /// which exercise different GEMM code paths (native-quantised vs INT8-VNNI).
         std::string model_path;
 
         /** Exact optional predictor source; never inferred from the main filename. */

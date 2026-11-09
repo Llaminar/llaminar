@@ -12,7 +12,7 @@
 #include <cstdlib>
 #include <set>
 #include "loaders/PreparedWeightStore.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "execution/compute_stages/stages/FusedQKVGEMMStage.h"
 #include "tensors/Tensors.h"
 #include "execution/local_execution/device/DeviceContext.h"
@@ -28,21 +28,21 @@
 namespace
 {
 using namespace llaminar2;
-using namespace llaminar2::cpu::native_vnni;
+using namespace llaminar2::cpu::native_quantised;
 using Factory = llaminar::v2::kernels::KernelFactory;
 
 /** @brief Retain source, actual packed engine, handle and store through every invocation. */
 struct Matrix
 {
     std::shared_ptr<TensorBase> source;
-    std::shared_ptr<CPUNativeVNNIGemmKernel> engine;
+    std::shared_ptr<CPUNativeQuantisedGemmKernel> engine;
     PreparedWeightStore store{ModelContextId{9917}};
     WeightBinding binding;
     PreparedWeightRef ref;
 
     /** @brief Publish real native execution with the requested immutable source interval. */
     Matrix(std::shared_ptr<TensorBase> tensor, WeightSliceSpec slice)
-        : source(std::move(tensor)), engine(std::make_shared<CPUNativeVNNIGemmKernel>(source.get()))
+        : source(std::move(tensor)), engine(std::make_shared<CPUNativeQuantisedGemmKernel>(source.get()))
     {
         binding = test::makePreparedWeightTestBinding(source.get(), DeviceId::cpu(),
             "original.output.weight", ModelContextId{9917});
@@ -143,7 +143,7 @@ TEST(OriginalOutputSlice, InvalidSourceGeometryAndLegacyDirection)
     matrix.binding=original;
     auto original_engine=matrix.engine;
     auto foreign_source=test::TestTensorFactory::createQ4_0Random({256,256},29);
-    matrix.engine=std::make_shared<CPUNativeVNNIGemmKernel>(foreign_source.get());
+    matrix.engine=std::make_shared<CPUNativeQuantisedGemmKernel>(foreign_source.get());
     matrix.publish();
     EXPECT_THROW(matrix.slice(),std::invalid_argument);
     matrix.engine=original_engine; matrix.publish();
@@ -151,21 +151,21 @@ TEST(OriginalOutputSlice, InvalidSourceGeometryAndLegacyDirection)
     EXPECT_THROW(matrix.engine->beginOutputPartitionEquivalenceScope(256,512),std::invalid_argument);
     {
         auto outer=matrix.engine->beginOutputPartitionEquivalenceScope(256,7);
-        EXPECT_EQ(cpuNativeVNNISerialEquivalentPolicyN(256),7);
+        EXPECT_EQ(cpuNativeQuantisedSerialEquivalentPolicyN(256),7);
         {
             auto scope=matrix.engine->beginOriginalOutputSliceScope(fact);
-            EXPECT_EQ(cpuNativeVNNISerialEquivalentPolicyN(256),512);
+            EXPECT_EQ(cpuNativeQuantisedSerialEquivalentPolicyN(256),512);
             EXPECT_THROW(fact.require(matrix.engine.get(),256,288),std::invalid_argument);
         }
-        EXPECT_EQ(cpuNativeVNNISerialEquivalentPolicyN(256),7);
+        EXPECT_EQ(cpuNativeQuantisedSerialEquivalentPolicyN(256),7);
     }
-    EXPECT_EQ(cpuNativeVNNISerialEquivalentPolicyN(256),256);
+    EXPECT_EQ(cpuNativeQuantisedSerialEquivalentPolicyN(256),256);
 }
 
 /** @test All registered native sources retain Q and exact original K/V bytes in ordinary/grouped bundles. */
 TEST(OriginalOutputSlice, AllSourcesFusedQUnchangedOrdinaryAndGrouped)
 {
-    ASSERT_EQ(test::quantizedVerifierFormats().size(),native_vnni_formats::kAllSourceFormats.size());
+    ASSERT_EQ(test::quantizedVerifierFormats().size(),native_quantised_formats::kAllSourceFormats.size());
     for (int threads : {1, 2, 3})
     for(const auto &format:test::quantizedVerifierFormats())
     {
@@ -202,16 +202,16 @@ TEST(OriginalOutputSlice, AllSourcesFusedQUnchangedOrdinaryAndGrouped)
             if (grouped || rows == 1)
             {
                 const std::array<FusedVerifierRowsDesc,3> descriptors{{
-                    {.packed=q.engine->exportCPUNativeVNNIPackedWeights(), .N=128, .ldc=128},
-                    {.packed=ks.engine->exportCPUNativeVNNIPackedWeights(), .N=256, .ldc=256, .policy_n=kfact.policyColumns()},
-                    {.packed=vs.engine->exportCPUNativeVNNIPackedWeights(), .N=256, .ldc=256, .policy_n=vfact.policyColumns()}}};
-                const auto plan=planNativeVNNIFusedRows(descriptors,rows,2);
+                    {.packed=q.engine->exportCPUNativeQuantisedPackedWeights(), .N=128, .ldc=128},
+                    {.packed=ks.engine->exportCPUNativeQuantisedPackedWeights(), .N=256, .ldc=256, .policy_n=kfact.policyColumns()},
+                    {.packed=vs.engine->exportCPUNativeQuantisedPackedWeights(), .N=256, .ldc=256, .policy_n=vfact.policyColumns()}}};
+                const auto plan=planNativeQuantisedFusedRows(descriptors,rows,2);
                 EXPECT_EQ(plan.projections[0].policy_n,128);
                 EXPECT_EQ(plan.projections[1].policy_n,512);
                 EXPECT_EQ(plan.projections[2].policy_n,512);
                 EXPECT_EQ(plan.projections[1].n_chunks,4);
                 EXPECT_EQ(plan.projections[1].k_tiles,
-                    serialTileConfigForPackedMatrix(*k.engine->exportCPUNativeVNNIPackedWeights(),512,512,2).k_tiles);
+                    serialTileConfigForPackedMatrix(*k.engine->exportCPUNativeQuantisedPackedWeights(),512,512,2).k_tiles);
             }
             const auto invoke=[&](const auto &projections){return grouped
                 ? q.engine->multiply_fused_verifier_rows_decode_equivalent(input.get(),projections,rows,512,nullptr,workspace.get())
@@ -223,8 +223,8 @@ TEST(OriginalOutputSlice, AllSourcesFusedQUnchangedOrdinaryAndGrouped)
                 EXPECT_EQ(std::memcmp(fullk->data()+row*512,localk->data()+row*256,256*sizeof(float)),0);
                 EXPECT_EQ(std::memcmp(fullv->data()+row*512+256,localv->data()+row*256,256*sizeof(float)),0);
             }
-            EXPECT_EQ(cpuNativeVNNISerialEquivalentPolicyN(128),128);
-            EXPECT_EQ(cpuNativeVNNISerialEquivalentPolicyN(256),256);
+            EXPECT_EQ(cpuNativeQuantisedSerialEquivalentPolicyN(128),128);
+            EXPECT_EQ(cpuNativeQuantisedSerialEquivalentPolicyN(256),256);
         }
     }
 }
@@ -253,7 +253,7 @@ TEST(OriginalOutputSlice, RealStageRejectsForeignBindingAndKeepsQ)
     EXPECT_NE(candidate.graphCaptureVariantSignature(),0u);
     { test::CPUStageTestWorkspace workspace(candidate); ASSERT_TRUE(candidate.execute(&context)); }
     EXPECT_EQ(std::memcmp(q->data(),expected.data(),expected.size()*sizeof(float)),0);
-    EXPECT_EQ(cpuNativeVNNISerialEquivalentPolicyN(256),256);
+    EXPECT_EQ(cpuNativeQuantisedSerialEquivalentPolicyN(256),256);
     params.prepared_ref_k->binding_id++;
     FusedQKVGEMMStage foreign(params);
     EXPECT_THROW(foreign.getWorkspaceRequirements(3,256,512),std::invalid_argument);
@@ -267,7 +267,7 @@ TEST(OriginalOutputSlice, RejectsMissingOrMismatchedPublicationOwners)
 {
     Matrix matrix(test::TestTensorFactory::createQ8_0Random({256,512},61),interval(512,256,256,512));
     std::shared_ptr<TensorBase> other(test::TestTensorFactory::createQ8_0Random({256,512},63));
-    auto other_engine=std::make_shared<CPUNativeVNNIGemmKernel>(other.get());
+    auto other_engine=std::make_shared<CPUNativeQuantisedGemmKernel>(other.get());
     const auto publish=[&](auto handle)
     {
         matrix.ref=matrix.store.registerPreparedGemmHandle(matrix.binding,
@@ -326,7 +326,7 @@ TEST(OriginalOutputSlice, ReplacementAndClearRetainOnlyResolvedPublication)
     // Publish a distinct source/engine under the very same reference. Owner
     // snapshots must not follow either mutable wrapper or the store index.
     matrix.source=test::TestTensorFactory::createQ8_0Random({256,512},71);
-    matrix.engine=std::make_shared<CPUNativeVNNIGemmKernel>(matrix.source.get());
+    matrix.engine=std::make_shared<CPUNativeQuantisedGemmKernel>(matrix.source.get());
     matrix.binding.tensor=matrix.source.get(); matrix.binding.tensor_owner=matrix.source;
     matrix.publish();
     const auto replacement=matrix.slice();

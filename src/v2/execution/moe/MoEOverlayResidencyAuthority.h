@@ -55,7 +55,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief Exact source and destination for one layer/expert weight triplet.
+     * @brief Exact source/destination for one expert's original movable projection family.
      *
      * Tier priority is a compute-capacity ordering: a smaller numeric priority
      * is hotter.  Keeping both resolved owners in the record lets transports
@@ -67,6 +67,7 @@ namespace llaminar2
         int layer_idx = -1;
         int expert_id = -1;
         uint64_t activation_count = 0;
+        /** Source-format planning estimate; actual transfers use original physical-piece operation quotes. */
         size_t estimated_weight_bytes = 0;
         MoEOverlayTierMigrationDirection direction =
             MoEOverlayTierMigrationDirection::SamePriority;
@@ -193,9 +194,10 @@ namespace llaminar2
 
     /**
      * @brief Decompose the canonical whole/cohort edges into closed placement cycles.
-     * @param migrations Complete capacity-preserving edges; each cycle receives
-     * its aggregate movement axis. Cohort members are never separate movements.
-     * @return Deterministic cycle cover with every edge represented exactly once.
+     * @param migrations Complete capacity-preserving edges whose original command
+     * axes remain unchanged. Cohort members are never separate movements.
+     * @return Deterministic cycle cover with every edge represented exactly once;
+     * consumers derive an aggregate cycle axis without rewriting the commands.
      * @throws std::logic_error For malformed targets or an open capacity flow.
      */
     [[nodiscard]] std::vector<MoEOverlayTierMigrationCycle> buildMoEOverlayMigrationCycles(
@@ -1622,6 +1624,7 @@ namespace llaminar2
          * @param expected_live Exact current snapshot retained by the real transition caller.
          * @param expected_epoch Exact live epoch carried by that caller.
          * @param placements Complete candidate tier assignments; all other policies stay original.
+         * @param whole_owner_changes Checked paired whole-owner corrections after canonical tier projection.
          * @return Closed source-authenticated live placement, without physical
          * readiness/publication.
          * @throws std::logic_error For ordinary ownership or an unavailable original source
@@ -1632,13 +1635,15 @@ namespace llaminar2
          */
         std::shared_ptr<const MoEOverlayResidencySnapshot> prepareCPUJointPlacementCandidate(
             const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
-            uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements) const;
+            uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements,
+            std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes = {}) const;
 
         /**
          * @brief Author complete physical edges from a genuine fixed-cohort placement proposal.
          * @param expected_live Exact current publication retained by the transition caller.
          * @param expected_epoch Current publication epoch, never an unpublished candidate.
          * @param placements Complete tier assignments with unchanged per-member capacities.
+         * @param whole_owner_changes Checked whole-owner corrections, never CPU cohort members.
          * @return Source-authenticated placement transaction with complete cycles and shadows.
          * @throws std::logic_error For a stale source, invalid transaction or changed capacity.
          * @throws std::invalid_argument For foreign topology, source geometry or fixed cuts.
@@ -1647,7 +1652,8 @@ namespace llaminar2
          */
         MoEOverlayResidencyTransaction prepareCPUJointPlacementTransaction(
             const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
-            uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements) const;
+            uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements,
+            std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes = {}) const;
 
         /**
          * @brief Compose source-bound restoration without granting maintenance or readiness.
@@ -1701,7 +1707,7 @@ namespace llaminar2
          * @param candidate Proposed next immutable placement.
          * @param histogram_window Optional authenticated demand view for edge
          *        evidence. The borrowed window must outlive this call.
-         * @param estimated_weight_bytes Complete packed expert payload size.
+         * @param estimated_weight_bytes Source-format planning estimate, never a wire extent.
          * @param participant_changes Exact participant-planner destinations;
          *        entries absent from a bounded candidate are ignored.
          * @return Canonically ordered physical movement edges.

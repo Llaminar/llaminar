@@ -419,7 +419,7 @@ TEST(Test__DeterministicMode, CudaMoEGroupedImmaPolicyIsMTotal)
     };
     constexpr std::array<ExactRegime, 5> exact_regimes{{
         {13, 4, 768, false},
-        {13, llaminar2::kNativeVnniIQ4XSSourceScaleCodebook, 768, false},
+        {13, llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook, 768, false},
         {13, 8, 600, false},
         {11, 8, 0, true},
         {13, 11, 768, false},

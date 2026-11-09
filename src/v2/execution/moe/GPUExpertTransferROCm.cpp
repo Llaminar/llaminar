@@ -63,6 +63,17 @@ namespace llaminar2::detail
             return source == destination && source.is_rocm();
         }
 
+        // Setup owns only its own AlreadyEnabled status. Never overwrite or
+        // consume an unrelated error left by an earlier owner on this thread.
+        const hipError_t previous_error = hipPeekAtLastError();
+        if (previous_error != hipSuccess)
+        {
+            LOG_ERROR("[GPUExpertTransfer] Direct-peer setup found an unconsumed ROCm error: "
+                      << hipGetErrorString(previous_error)
+                      << " status=" << static_cast<int>(previous_error));
+            return false;
+        }
+
         int original_device = -1;
         if (hipGetDevice(&original_device) != hipSuccess)
             return false;
@@ -82,8 +93,27 @@ namespace llaminar2::detail
             {
                 const hipError_t enable =
                     hipDeviceEnablePeerAccess(source_ordinal, 0);
-                prepared = enable == hipSuccess ||
-                           enable == hipErrorPeerAccessAlreadyEnabled;
+                prepared = enable == hipSuccess;
+                if (enable == hipErrorPeerAccessAlreadyEnabled)
+                {
+                    // Successful native APIs do not retire this expected
+                    // status. Prove it is precisely ours before consuming it;
+                    // a different error remains visible and rejects setup.
+                    const auto owned_error = hipPeekAtLastError();
+                    if (owned_error == hipErrorPeerAccessAlreadyEnabled)
+                    {
+                        const auto retired = hipGetLastError();
+                        prepared = retired == hipErrorPeerAccessAlreadyEnabled;
+                        if (!prepared)
+                            LOG_ERROR("[GPUExpertTransfer] Expected peer-access status changed during retirement: "
+                                      << hipGetErrorString(retired));
+                    }
+                    else
+                    {
+                        LOG_ERROR("[GPUExpertTransfer] Peer-access setup cannot consume unrelated ROCm error: "
+                                  << hipGetErrorString(owned_error));
+                    }
+                }
             }
         }
 

@@ -705,3 +705,21 @@ python3 scripts/ci/run_production_parity_campaigns.py \
 Keep `.githooks/pre-commit`, `.github/workflows/ci.yml`, this skill,
 `tests/v2/integration/parity/README.md`, and the short parity references in
 `AGENTS.md` synchronized when the canonical command or gate changes.
+
+
+## Explicit native tests against a Release owner
+
+Release keeps performance-only test selection by default. To qualify an existing
+native test against the exact serving core, reconfigure that same Release tree
+with `-DLLAMINAR_RELEASE_NATIVE_TEST_TARGETS='targetA;targetB'`, naming the
+original CMake test executable owners. Preserve its original compiler, SDK,
+architecture and snapshot settings. Unknown, imported and non-test targets fail
+configuration. Only aliases referencing a selected owner are admitted; script
+drivers retain the same explicit target dependency rules.
+
+Build selected owners explicitly with
+`cmake --build <build> --parallel --target <owner>` and use their existing
+registered CTest aliases. Selected native owners remain excluded from the
+default `all` build. This option neither enables
+snapshots nor changes core/test compile definitions or substitutes an Integration
+binary for the production Release owner.

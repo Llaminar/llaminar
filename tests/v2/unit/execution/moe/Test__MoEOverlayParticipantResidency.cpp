@@ -968,7 +968,7 @@ TEST(MoEOverlayPreparedPayload, FixedDownRequiresCompleteExactIdentity)
 TEST(MoEOverlayPreparedPayload, RuntimeResetAndPrefixRestoreRetainFixedDownBindings)
 {
     for (const auto device : {DeviceId::cuda(3), DeviceId::rocm(3)})
-    for (const auto format : {DeviceMoEWeightFormat::NativeVNNI, DeviceMoEWeightFormat::FP16,
+    for (const auto format : {DeviceMoEWeightFormat::NativeQuantised, DeviceMoEWeightFormat::FP16,
                              DeviceMoEWeightFormat::BF16, DeviceMoEWeightFormat::FP32})
     {
         // These are metadata-only device tables. No GPU driver or engine is invoked.
@@ -1013,7 +1013,7 @@ TEST(MoEOverlayPreparedPayload, RuntimeResetAndPrefixRestoreRetainFixedDownBindi
         local.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
             DeviceMoEExpertFlags::Resident | DeviceMoEExpertFlags::LocalCompute);
         local.weight_format = format;
-        if (format == DeviceMoEWeightFormat::NativeVNNI)
+        if (format == DeviceMoEWeightFormat::NativeQuantised)
         {
             local.gate.payload = reinterpret_cast<const uint8_t *>(0x1000u);
             local.gate.scales = reinterpret_cast<const void *>(0x2000u);

@@ -65,7 +65,7 @@ struct CPUFixture {
         values(q8_all_formats::input(m, k, tile)) {
     if (!kernel)
       throw std::runtime_error("Actual prepared CPU engine absent");
-    const auto *packed = kernel->exportCPUNativeVNNIPackedWeights();
+    const auto *packed = kernel->exportCPUNativeQuantisedPackedWeights();
     if (!packed)
       throw std::runtime_error("Actual CPU native source export absent");
     prepared = cpuWeights(*packed);
@@ -175,14 +175,14 @@ inline void proveCPUThreads(const QuantizedVerifierFormatCase &format, int m,
       std::all_of(teams.begin(), teams.end(), [](int n) { return n > 0; }));
   Threads capacity(*std::max_element(teams.begin(), teams.end()));
   CPUFixture f(format, m, n, k, tile);
-  const auto *packed = f.kernel->exportCPUNativeVNNIPackedWeights();
+  const auto *packed = f.kernel->exportCPUNativeQuantisedPackedWeights();
   ASSERT_NE(packed, nullptr);
   EXPECT_EQ(packed->codebook_id, format.source_codebook_id);
   EXPECT_EQ(packed->is_superblock, format.source_is_superblock);
   const auto *sourcePointer = packed->interleavedBase();
   const std::vector<uint8_t> nativeBefore(
       sourcePointer,
-      sourcePointer + cpu::native_vnni::interleavedWorkspaceSize(*packed));
+      sourcePointer + cpu::native_quantised::interleavedWorkspaceSize(*packed));
   const auto signature = f.stage->graphCaptureVariantSignature();
   ASSERT_TRUE(f.kernel->multiply_tensor(&f.input, &f.baseline, m, n, k, true, 1,
                                         0, nullptr, nullptr, -1,

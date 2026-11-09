@@ -372,10 +372,10 @@ inline std::size_t qwen4ExpSourcePreparedPredictorExpertRecords(const ModelConte
                 EXPECT_TRUE(engine->hasWeights());
                 if(device.is_cpu())
                 {
-                    NativeVnniSourceIdentity original;
+                    NativeQuantisedSourceIdentity original;
                     EXPECT_TRUE(engine->weights_converted());
-                    EXPECT_TRUE(engine->exportNativeVNNISourceIdentity(original));
-                    EXPECT_EQ(ExpertWeightFormat::nativeVnni(original), projection.format);
+                    EXPECT_TRUE(engine->exportNativeQuantisedSourceIdentity(original));
+                    EXPECT_EQ(ExpertWeightFormat::nativeQuantised(original), projection.format);
                 }
                 ++count;
             }

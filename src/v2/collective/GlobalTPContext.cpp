@@ -6,6 +6,8 @@
  * tensor parallelism across multiple MPI ranks using UPI/MPI.
  * Parent rank numbers and the resolved local CPU endpoint are construction
  * inputs. Neither a WORLD query nor a fabricated CPU node supplies identity.
+ * Replicated CPU prefill uses original packet/source authority for live-size
+ * transport choice without adding a count exchange or changing generic gathers.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -16,6 +18,8 @@
 #include "DeviceGroup.h"
 #include "backends/ShmemSpinBackend.h"
 #include "execution/runner/RankInitializationLifecycle.h"
+#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/MoEOverlaySparseCollective.h"
 #include "../tensors/Tensors.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
@@ -1005,6 +1009,60 @@ namespace llaminar2
                                                    root_index,gathered,stage,ranges);
     }
 
+    bool GlobalTPContext::gatherReplicatedCPUExpertPrefillRoutesToRoot(
+        const CPUExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
+        const std::shared_ptr<IGlobalTPContext>& owner,const float* local,float* root,
+        size_t capacity,int root_index,size_t& gathered,const std::string& stage,
+        std::span<RootedFloatRecordRange> ranges,CPURootedPublicationTransport& selected)
+    {
+        gathered=0;
+        selected=CPURootedPublicationTransport::MPIBandwidth;
+        const auto& cohort=source.cohort();
+        const size_t maximum=std::numeric_limits<size_t>::max();
+        const auto reject=[&](const char* reason) {
+            LOG_ERROR("GlobalTPContext replicated CPU prefill rejected: reason="<<reason
+                <<" domain="<<domain_id_<<" member="<<my_rank_in_domain_
+                <<" stage="<<stage<<" layer="<<source.layer()
+                <<" live_records="<<packet.live_entry_count);
+            return false;
+        };
+        if(!authenticatesOriginalCPUExpertBorrow(owner) || !cohort ||
+           scope()!=TPScope::NODE_LOCAL || domain_size_<=1 || my_rank_in_domain_<0 ||
+           my_rank_in_domain_>=domain_size_ || root_index<0 || root_index>=domain_size_ ||
+           (my_rank_in_domain_==root_index && local!=root) ||
+           source.participantIndex()!=static_cast<size_t>(my_rank_in_domain_) ||
+           cohort->participants().size()!=static_cast<size_t>(domain_size_) ||
+           world_ranks_.size()!=cohort->participants().size() ||
+           packet.key.histogram_source!=ExpertHistogramSource::PrefillChunk ||
+           !packet.key.isValid() || packet.key.layer_idx!=source.layer() ||
+           !packet.residency_epoch || packet.target_participant!=source.participant().participant_id ||
+           packet.d_model<=0 || packet.d_model!=source.ownership().geometry().model_columns ||
+           packet.top_k<=0 || packet.live_entry_count>packet.entry_capacity ||
+           packet.live_entry_count>capacity/static_cast<size_t>(domain_size_))
+            return reject("original_source_packet_authority");
+        for(size_t member=0;member<cohort->participants().size();++member)
+            if(world_ranks_[member]!=cohort->participants()[member].world_rank)
+                return reject("original_cohort_rank_order");
+        const size_t width=static_cast<size_t>(packet.d_model)+1u;
+        if(width>maximum/sizeof(float) || capacity>maximum/(width*sizeof(float)))
+            return reject("original_byte_geometry_overflow");
+        const size_t declared_bytes=capacity*width*sizeof(float);
+        const size_t per_member_bytes=packet.live_entry_count*width*sizeof(float);
+        // All members' producer lanes resolve the SAME acquired cohort target
+        // from the SAME pinned routing ledger. Their exact nonzero slot set is
+        // replicated; only down-projection channels differ. The canonical shard
+        // combiner independently requires this same slot set for every source.
+        // Thus every member selects identically before sending, without adding
+        // a shared header round to the original MPI message-envelope protocol.
+        if(dynamic_cast<ShmemSpinBackend*>(backend_.get()))
+            selected=CPURootedPublicationTransportPolicy::selectReplicatedPrefillGather(
+                declared_bytes,per_member_bytes);
+        static_assert(CPURootedPublicationTransportPolicy::kReplicatedParallelGatherMinMemberBytes==
+            ShmemSpinArena::CHUNK_CAPACITY*sizeof(float));
+        return gatherVariableFloatRecordsToRootImpl(local,packet.live_entry_count,root,capacity,width,
+            root_index,gathered,stage,ranges,selected);
+    }
+
     bool GlobalTPContext::gatherVariableFloatRecordsToRootImpl(
         const float *local_records,
         size_t local_record_count,
@@ -1014,7 +1072,8 @@ namespace llaminar2
         int root_index,
         size_t &gathered_record_count,
         const std::string &stage_name,
-        std::span<RootedFloatRecordRange> source_ranges)
+        std::span<RootedFloatRecordRange> source_ranges,
+        std::optional<CPURootedPublicationTransport> original_selection)
     {
         gathered_record_count = 0u;
         for (auto &range:source_ranges) range={};
@@ -1067,8 +1126,10 @@ namespace llaminar2
         /*
          * Same-node UPI has two first-class rooted transports. The typed policy
          * selects shared memory in the measured latency regime and the private
-         * MPI message lane once copy bandwidth dominates. Selection is complete
-         * before the transaction starts; a runtime failure is fatal and never
+         * MPI message lane through the original intermediate-size regime. The
+         * private replicated-prefill entry may select parallel shared copies for
+         * proven full remote chunks. Selection is complete before communication;
+         * a runtime failure is fatal and never
          * causes a retry through the other transport. Cross-node and explicitly
          * selected MPI domains always use the private message lane below.
          */
@@ -1077,10 +1138,9 @@ namespace llaminar2
         if (auto *const shmem_backend =
                 dynamic_cast<ShmemSpinBackend *>(backend_.get());
             shmem_backend &&
-            CPURootedPublicationTransportPolicy::select(
+            original_selection.value_or(CPURootedPublicationTransportPolicy::select(
                 CPURootedPublicationOperation::PackedRecordGather,
-                packed_transaction_bytes) ==
-                CPURootedPublicationTransport::SharedMemoryLatency)
+                packed_transaction_bytes)) != CPURootedPublicationTransport::MPIBandwidth)
         {
             if (!shmem_backend->gatherVariableFloatRecordsToRoot(
                     local_records,

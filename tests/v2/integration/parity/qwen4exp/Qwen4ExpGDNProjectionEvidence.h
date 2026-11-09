@@ -9,7 +9,7 @@
 #pragma once
 #include "models/qwen4exp/Qwen4ExpConfig.h"
 #include "utils/PerfStatsCollector.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <charconv>
 #include <cmath>
 #include <set>
@@ -64,7 +64,7 @@ inline void requireQwen4ExpGDNQKVRouteEvidence(std::span<const PerfStatRecord> r
         int m = 0;
         const auto parsed = std::from_chars(rows.data(), rows.data() + rows.size(), m);
         if (parsed.ec != std::errc{} || parsed.ptr != rows.data() + rows.size() || m <= 0 ||
-            tag("projections") != "1" || tag("names") != "qkv" || tag("codebooks") != std::to_string(native_vnni_formats::Q8_0.codebook_id) ||
+            tag("projections") != "1" || tag("names") != "qkv" || tag("codebooks") != std::to_string(native_quantised_formats::Q8_0.codebook_id) ||
             !original_shapes.contains({tag("n"), tag("k")}))
             throw std::invalid_argument("Selected QFN QKV route does not match its original native operation/source N/K");
         selected = true;

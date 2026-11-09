@@ -82,6 +82,9 @@ namespace llaminar2
             return true;
         }
 
+        /** @brief Enable one advertised direct edge and retire only its owned expected status. */
+        bool hipEnablePeerAccessDevice(int peer_device);
+
         bool hipEnablePeerAccessForDevices(const std::vector<int> &device_ordinals, std::string &error_out)
         {
             // Enable bidirectional peer access between all devices in the list
@@ -121,9 +124,10 @@ namespace llaminar2
                     err = hipDeviceCanAccessPeer(&can_access, from_dev, to_dev);
                     if (err != hipSuccess)
                     {
-                        LOG_WARN("[PeerAccess] hipDeviceCanAccessPeer(from=" << from_dev << ", to=" << to_dev
-                                                                             << ") failed: " << hipGetErrorString(err));
-                        continue;
+                        error_out = "hipDeviceCanAccessPeer failed for an advertised direct edge: " +
+                                    std::string(hipGetErrorString(err));
+                        LOG_ERROR(error_out);
+                        return false;
                     }
 
                     if (!can_access)
@@ -132,20 +136,15 @@ namespace llaminar2
                         continue;
                     }
 
-                    // Enable peer access
-                    err = hipDeviceEnablePeerAccess(to_dev, 0);
-                    if (err == hipSuccess)
+                    // The capability query succeeded. Keep an unavailable
+                    // edge above legitimate; fail only an actual setup error.
+                    if (!hipEnablePeerAccessDevice(to_dev))
                     {
-                        LOG_DEBUG("[PeerAccess] Enabled P2P access: GPU " << from_dev << " -> GPU " << to_dev);
-                    }
-                    else if (err == hipErrorPeerAccessAlreadyEnabled)
-                    {
-                        LOG_DEBUG("[PeerAccess] P2P already enabled: GPU " << from_dev << " -> GPU " << to_dev);
-                    }
-                    else
-                    {
-                        LOG_WARN("[PeerAccess] hipDeviceEnablePeerAccess(from=" << from_dev << ", to=" << to_dev
-                                                                                << ") failed: " << hipGetErrorString(err));
+                        const auto error = hipPeekAtLastError();
+                        error_out = "hipDeviceEnablePeerAccess failed for an advertised direct edge: " +
+                                    std::string(hipGetErrorString(error));
+                        LOG_ERROR(error_out);
+                        return false;
                     }
                 }
             }
@@ -260,10 +259,16 @@ namespace llaminar2
 
         bool hipEnablePeerAccessDevice(int peer_device)
         {
-            // hipDeviceEnablePeerAccess may return hipErrorPeerAccessAlreadyEnabled
-            // which is OK - it means P2P was already set up
-            hipError_t err = hipDeviceEnablePeerAccess(peer_device, 0);
-            return (err == hipSuccess || err == hipErrorPeerAccessAlreadyEnabled);
+            // An existing unrelated failure belongs to its original owner.
+            // Only this invocation's exact expected status may be consumed.
+            if (hipPeekAtLastError() != hipSuccess)
+                return false;
+            const auto err = hipDeviceEnablePeerAccess(peer_device, 0);
+            if (err != hipErrorPeerAccessAlreadyEnabled)
+                return err == hipSuccess;
+            if (hipPeekAtLastError() != hipErrorPeerAccessAlreadyEnabled)
+                return false;
+            return hipGetLastError() == hipErrorPeerAccessAlreadyEnabled;
         }
 
         // =========================================================================
@@ -370,7 +375,8 @@ namespace llaminar2
                 std::string peer_error;
                 if (!hipEnablePeerAccessForDevices(device_ordinals, peer_error))
                 {
-                    LOG_WARN("[RCCLBackend] Failed to enable peer access: " << peer_error << " (continuing anyway)");
+                    LOG_ERROR("[RCCLBackend] Failed to enable advertised direct peer access: " << peer_error);
+                    return false;
                 }
             }
 

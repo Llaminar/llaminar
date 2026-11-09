@@ -24,7 +24,7 @@
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/Tensors.h"
 
 #include "backends/BackendManager.h"
@@ -58,7 +58,7 @@
 #include "../moe/ActiveExpertCompactionTestOracle.h"
 #include "../moe/CanonicalMoEPublicationTestOracle.h"
 #include "../moe/MoETransferStateMachineTestModel.h"
-#include "../moe/NativeVNNIExpertTransferParityTest.h"
+#include "../moe/NativeQuantisedExpertTransferParityTest.h"
 #include "../moe/SmallFloatGroupingTestOracle.h"
 #include "../moe/SharedSmallFloatGroupingCapturedRegression.h"
 
@@ -216,18 +216,18 @@ extern "C" bool cudaMoE_softmax_topk(
 
 extern "C" bool cudaMoE_materialize_runtime_prefill_descriptor_tables(
     const void *runtime,
-    llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-    llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-    llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
     int num_experts,
     int device_idx,
     void *stream);
 
 extern "C" bool cudaMoE_materialize_runtime_prefill_plan(
     const void *runtime,
-    llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-    llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-    llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
     int *active_expert_ids,
     int num_experts,
     int max_active_experts,
@@ -265,9 +265,9 @@ extern "C" bool cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
     const float *routing_weights,
     void *runtime,
     int *original_to_grouped,
-    llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-    llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-    llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
     int *active_expert_ids,
     int current_slots,
     int max_slots,
@@ -339,9 +339,9 @@ namespace
         return value;
     }
 
-    llaminar2::DeviceNativeVNNIMatrixDesc fakeNativeVNNIDesc(uintptr_t base)
+    llaminar2::DeviceNativeQuantisedMatrixDesc fakeNativeQuantisedDesc(uintptr_t base)
     {
-        llaminar2::DeviceNativeVNNIMatrixDesc desc;
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x100u);
         desc.mins = reinterpret_cast<const void *>(base + 0x200u);
@@ -433,9 +433,9 @@ namespace
             slot.descriptor.owner_participant =
                 static_cast<int32_t>(config.participant_id);
             slot.descriptor.local_slot = static_cast<int32_t>(slot_index);
-            slot.descriptor.gate = fakeNativeVNNIDesc(base + 0x100u);
-            slot.descriptor.up = fakeNativeVNNIDesc(base + 0x200u);
-            slot.descriptor.down = fakeNativeVNNIDesc(base + 0x300u);
+            slot.descriptor.gate = fakeNativeQuantisedDesc(base + 0x100u);
+            slot.descriptor.up = fakeNativeQuantisedDesc(base + 0x200u);
+            slot.descriptor.down = fakeNativeQuantisedDesc(base + 0x300u);
             slot.descriptor.flags =
                 llaminar2::toMoEExpertFlags(
                     llaminar2::DeviceMoEExpertFlags::Valid |
@@ -449,13 +449,13 @@ namespace
         return slots;
     }
 
-    llaminar2::DeviceNativeVNNIMatrixDesc makePrefillRuntimeDesc(
+    llaminar2::DeviceNativeQuantisedMatrixDesc makePrefillRuntimeDesc(
         uintptr_t base,
         int rows,
         int cols,
         uint8_t codebook_id)
     {
-        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x100u);
         desc.mins = reinterpret_cast<const void *>(base + 0x200u);
@@ -487,9 +487,9 @@ namespace
                 : static_cast<uint8_t>(llaminar2::DeviceMoEReplicaRole::None);
         if (local_ready)
         {
-            desc.gate = fakeNativeVNNIDesc(base + 0x10u);
-            desc.up = fakeNativeVNNIDesc(base + 0x20u);
-            desc.down = fakeNativeVNNIDesc(base + 0x30u);
+            desc.gate = fakeNativeQuantisedDesc(base + 0x10u);
+            desc.up = fakeNativeQuantisedDesc(base + 0x20u);
+            desc.down = fakeNativeQuantisedDesc(base + 0x30u);
             desc.flags |= llaminar2::toMoEExpertFlags(
                 llaminar2::DeviceMoEExpertFlags::LocalCompute);
         }
@@ -527,9 +527,9 @@ namespace
         status.transaction_command_count = command_count;
     }
 
-    void expectSameNativeVNNIDesc(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &actual,
-        const llaminar2::DeviceNativeVNNIMatrixDesc &expected)
+    void expectSameNativeQuantisedDesc(
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &actual,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &expected)
     {
         EXPECT_EQ(reinterpret_cast<uintptr_t>(actual.payload),
                   reinterpret_cast<uintptr_t>(expected.payload));
@@ -583,9 +583,9 @@ namespace
             desc.logical_expert_id = expert;
             desc.owner_participant = 0;
             desc.local_slot = expert;
-            desc.gate = fakeNativeVNNIDesc(base + 0x10u);
-            desc.up = fakeNativeVNNIDesc(base + 0x20u);
-            desc.down = fakeNativeVNNIDesc(base + 0x30u);
+            desc.gate = fakeNativeQuantisedDesc(base + 0x10u);
+            desc.up = fakeNativeQuantisedDesc(base + 0x20u);
+            desc.down = fakeNativeQuantisedDesc(base + 0x30u);
             desc.flags = llaminar2::toMoEExpertFlags(llaminar2::DeviceMoEExpertFlags::Valid |
                                                      llaminar2::DeviceMoEExpertFlags::Resident |
                                                      llaminar2::DeviceMoEExpertFlags::PreferredOwner |
@@ -618,9 +618,9 @@ namespace
             desc.logical_expert_id = expert;
             desc.owner_participant = owners[expert];
             desc.local_slot = expert;
-            desc.gate = fakeNativeVNNIDesc(base + 0x10u);
-            desc.up = fakeNativeVNNIDesc(base + 0x20u);
-            desc.down = fakeNativeVNNIDesc(base + 0x30u);
+            desc.gate = fakeNativeQuantisedDesc(base + 0x10u);
+            desc.up = fakeNativeQuantisedDesc(base + 0x20u);
+            desc.down = fakeNativeQuantisedDesc(base + 0x30u);
             desc.flags = llaminar2::toMoEExpertFlags(llaminar2::DeviceMoEExpertFlags::Valid |
                                                      llaminar2::DeviceMoEExpertFlags::Resident |
                                                      llaminar2::DeviceMoEExpertFlags::PreferredOwner);
@@ -1632,14 +1632,14 @@ namespace
             << " cosine=" << cosineSimilarity(actual, expected, count);
     }
 
-    /// @brief Build a minimal native-VNNI descriptor backed by CUDA device pointers.
-    llaminar2::DeviceNativeVNNIMatrixDesc makeCudaNativeDesc(
+    /// @brief Build a minimal native-quantised descriptor backed by CUDA device pointers.
+    llaminar2::DeviceNativeQuantisedMatrixDesc makeCudaNativeDesc(
         const CudaAllocation &payload,
         const CudaAllocation &scales,
         int rows,
         int cols)
     {
-        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
         desc.payload = static_cast<const uint8_t *>(payload.get());
         desc.scales = scales.get();
         desc.n = rows;
@@ -1657,9 +1657,9 @@ namespace
     /**
      * @brief One tensor-format entry for CUDA grouped MoE verifier coverage.
      *
-     * The grouped CUDA MoE kernels dispatch by native-VNNI codebook id, but the
+     * The grouped CUDA MoE kernels dispatch by native-quantised codebook id, but the
      * descriptor metadata still differs across source tensor formats that share a
-     * codebook.  This table is intentionally format-complete for the NativeVNNI
+     * codebook.  This table is intentionally format-complete for the NativeQuantised
      * tensors that can reach grouped verifier prefill.
      */
     struct CUDAMoEFormatCase
@@ -1687,18 +1687,18 @@ namespace
     /**
      * @brief Own a compact production descriptor copied from a prepared row range.
      *
-     * This test-only owner preserves NativeVNNI's block-major storage contract
+     * This test-only owner preserves NativeQuantised's block-major storage contract
      * while allowing one combined preparation to seed several distinct expert
      * matrices.  Its allocations remain alive for every descriptor-table upload,
      * captured launch, and replay that consumes @ref descriptor().
      */
-    class CudaNativeVNNIMatrixRowSlice
+    class CudaNativeQuantisedMatrixRowSlice
     {
     public:
         /**
          * @brief Materialize one compact row range from a block-major matrix.
          *
-         * NativeVNNI preparation stores each side array as
+         * NativeQuantised preparation stores each side array as
          * `[k_block][output_row]`.  Merely advancing the base pointer cannot
          * describe a row range because the stride between K blocks remains the
          * source matrix's full N.  The runtime descriptor intentionally has no
@@ -1707,8 +1707,8 @@ namespace
          * Copies are enqueued on @p stream and remain ordered before descriptor
          * publication and graph capture without a host synchronization.
          */
-        CudaNativeVNNIMatrixRowSlice(
-            const llaminar2::DeviceNativeVNNIMatrixDesc &matrix,
+        CudaNativeQuantisedMatrixRowSlice(
+            const llaminar2::DeviceNativeQuantisedMatrixDesc &matrix,
             int first_row,
             int row_count,
             int device_ordinal,
@@ -1718,7 +1718,7 @@ namespace
                 first_row + row_count > matrix.n || !stream)
             {
                 throw std::invalid_argument(
-                    "CudaNativeVNNIMatrixRowSlice received invalid geometry or stream");
+                    "CudaNativeQuantisedMatrixRowSlice received invalid geometry or stream");
             }
 
             uint8_t payload_bytes_per_block = 0;
@@ -1732,7 +1732,7 @@ namespace
                 payload_bytes_per_block == 0u)
             {
                 throw std::invalid_argument(
-                    "CudaNativeVNNIMatrixRowSlice received an unsupported codebook");
+                    "CudaNativeQuantisedMatrixRowSlice received an unsupported codebook");
             }
 
             int previous_device = -1;
@@ -1794,7 +1794,7 @@ namespace
             descriptor_.n = row_count;
         }
 
-        const llaminar2::DeviceNativeVNNIMatrixDesc &descriptor() const
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &descriptor() const
         {
             return descriptor_;
         }
@@ -1805,7 +1805,7 @@ namespace
             if (status != cudaSuccess)
             {
                 throw std::runtime_error(
-                    std::string("CUDA NativeVNNI row compaction failed to ") +
+                    std::string("CUDA NativeQuantised row compaction failed to ") +
                     operation + ": " + cudaGetErrorString(status));
             }
         }
@@ -1813,7 +1813,7 @@ namespace
         static std::unique_ptr<CudaAllocation> compactPlane(
             const void *source,
             size_t element_bytes,
-            const llaminar2::DeviceNativeVNNIMatrixDesc &matrix,
+            const llaminar2::DeviceNativeQuantisedMatrixDesc &matrix,
             int first_row,
             int row_count,
             cudaStream_t stream,
@@ -1822,7 +1822,7 @@ namespace
             if (!source)
             {
                 throw std::invalid_argument(
-                    std::string("NativeVNNI matrix has no ") + plane_name + " plane");
+                    std::string("NativeQuantised matrix has no ") + plane_name + " plane");
             }
 
             const size_t source_pitch =
@@ -1852,18 +1852,18 @@ namespace
         std::unique_ptr<CudaAllocation> scales_;
         std::unique_ptr<CudaAllocation> mins_;
         std::unique_ptr<CudaAllocation> emins_;
-        llaminar2::DeviceNativeVNNIMatrixDesc descriptor_{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc descriptor_{};
     };
 
     /**
-     * @brief Host observation of one complete prepared NativeVNNI matrix.
+     * @brief Host observation of one complete prepared NativeQuantised matrix.
      *
      * This structure exists only in the integration harness.  Production keeps
      * these arrays device resident; the terminal copies below prove that two
      * independently prepared CUDA participants received byte-identical weights
      * before their captured executions are compared.
      */
-    struct CUDANativeVNNIHostImage
+    struct CUDANativeQuantisedHostImage
     {
         std::vector<uint8_t> payload;
         std::vector<uint16_t> scales;
@@ -1879,8 +1879,8 @@ namespace
      * with the CUDA runtime diagnostic so an incomplete fixture cannot silently
      * turn the cross-device execution comparison into a shared-zero test.
      */
-    CUDANativeVNNIHostImage copyCudaNativeVNNIMatrixToHost(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &matrix,
+    CUDANativeQuantisedHostImage copyCudaNativeQuantisedMatrixToHost(
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &matrix,
         int device_ordinal,
         cudaStream_t stream)
     {
@@ -1904,12 +1904,12 @@ namespace
                 has_emins))
         {
             throw std::invalid_argument(
-                "copyCudaNativeVNNIMatrixToHost received an invalid descriptor");
+                "copyCudaNativeQuantisedMatrixToHost received an invalid descriptor");
         }
 
         const size_t block_count =
             static_cast<size_t>(matrix.n) * matrix.blocks_per_row;
-        CUDANativeVNNIHostImage image;
+        CUDANativeQuantisedHostImage image;
         image.payload.resize(block_count * payload_bytes_per_block);
         image.scales.resize(block_count);
         if (is_asymmetric != 0u)
@@ -1925,7 +1925,7 @@ namespace
                 image.payload.size(),
                 cudaMemcpyDeviceToHost,
                 stream),
-            "copy NativeVNNI payload");
+            "copy NativeQuantised payload");
         require_cuda(
             cudaMemcpyAsync(
                 image.scales.data(),
@@ -1933,7 +1933,7 @@ namespace
                 image.scales.size() * sizeof(uint16_t),
                 cudaMemcpyDeviceToHost,
                 stream),
-            "copy NativeVNNI scales");
+            "copy NativeQuantised scales");
         if (!image.mins.empty())
         {
             require_cuda(
@@ -1943,7 +1943,7 @@ namespace
                     image.mins.size() * sizeof(uint16_t),
                     cudaMemcpyDeviceToHost,
                     stream),
-                "copy NativeVNNI minimums");
+                "copy NativeQuantised minimums");
         }
         if (!image.emins.empty())
         {
@@ -1954,21 +1954,21 @@ namespace
                     image.emins.size() * sizeof(uint32_t),
                     cudaMemcpyDeviceToHost,
                     stream),
-                "copy NativeVNNI extended minimums");
+                "copy NativeQuantised extended minimums");
         }
         require_cuda(
             cudaStreamSynchronize(stream),
-            "synchronize NativeVNNI fixture observation");
+            "synchronize NativeQuantised fixture observation");
         return image;
     }
 
     /**
      * @brief Require two device-local matrix preparations to be byte-identical.
      */
-    void expectCudaNativeVNNIMatrixReplicasEqual(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &participant0,
+    void expectCudaNativeQuantisedMatrixReplicasEqual(
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &participant0,
         cudaStream_t participant0_stream,
-        const llaminar2::DeviceNativeVNNIMatrixDesc &participant1,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &participant1,
         cudaStream_t participant1_stream)
     {
         ASSERT_TRUE(participant0.valid());
@@ -1987,9 +1987,9 @@ namespace
             participant0.allocation_has_emins,
             participant1.allocation_has_emins);
 
-        const auto image0 = copyCudaNativeVNNIMatrixToHost(
+        const auto image0 = copyCudaNativeQuantisedMatrixToHost(
             participant0, 0, participant0_stream);
-        const auto image1 = copyCudaNativeVNNIMatrixToHost(
+        const auto image1 = copyCudaNativeQuantisedMatrixToHost(
             participant1, 1, participant1_stream);
         ASSERT_EQ(image0.payload, image1.payload);
         ASSERT_EQ(image0.scales, image1.scales);
@@ -4605,9 +4605,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedMaterializerLeavesPhysicalS
         auto &descriptor = bank.experts[expert];
         const uintptr_t base =
             0x3b000000u + static_cast<uintptr_t>(expert) * 0x10000u;
-        descriptor.gate = fakeNativeVNNIDesc(base + 0x10u);
-        descriptor.up = fakeNativeVNNIDesc(base + 0x20u);
-        descriptor.down = fakeNativeVNNIDesc(base + 0x30u);
+        descriptor.gate = fakeNativeQuantisedDesc(base + 0x10u);
+        descriptor.up = fakeNativeQuantisedDesc(base + 0x20u);
+        descriptor.down = fakeNativeQuantisedDesc(base + 0x30u);
         descriptor.logical_expert_id = expert;
         descriptor.owner_participant = expert == 0 ? 0 : 1;
         descriptor.local_slot = expert;
@@ -6976,13 +6976,13 @@ TEST_F(Test__CUDAMoEKernel, PrefillLLEPProjectionUsesFullPhysicalDirectoryBeyond
             descriptor.logical_expert_id = static_cast<int32_t>(expert);
             descriptor.owner_participant = expert < 2 ? 0 : 1;
             descriptor.local_slot = static_cast<int32_t>(expert);
-            descriptor.gate = fakeNativeVNNIDesc(
+            descriptor.gate = fakeNativeQuantisedDesc(
                 0x41000000u + static_cast<uintptr_t>(layer) * 0x100000u +
                 static_cast<uintptr_t>(expert) * 0x10000u + 0x10u);
-            descriptor.up = fakeNativeVNNIDesc(
+            descriptor.up = fakeNativeQuantisedDesc(
                 0x41000000u + static_cast<uintptr_t>(layer) * 0x100000u +
                 static_cast<uintptr_t>(expert) * 0x10000u + 0x20u);
-            descriptor.down = fakeNativeVNNIDesc(
+            descriptor.down = fakeNativeQuantisedDesc(
                 0x41000000u + static_cast<uintptr_t>(layer) * 0x100000u +
                 static_cast<uintptr_t>(expert) * 0x10000u + 0x30u);
             descriptor.flags = llaminar2::toMoEExpertFlags(
@@ -7032,11 +7032,11 @@ TEST_F(Test__CUDAMoEKernel, PrefillLLEPProjectionUsesFullPhysicalDirectoryBeyond
         slot.descriptor.owner_participant = participant_id;
         slot.descriptor.local_slot = static_cast<int32_t>(slot_index);
         slot.descriptor.gate =
-            fakeNativeVNNIDesc(0x42000000u + slot_index * 0x10000u + 0x10u);
+            fakeNativeQuantisedDesc(0x42000000u + slot_index * 0x10000u + 0x10u);
         slot.descriptor.up =
-            fakeNativeVNNIDesc(0x42000000u + slot_index * 0x10000u + 0x20u);
+            fakeNativeQuantisedDesc(0x42000000u + slot_index * 0x10000u + 0x20u);
         slot.descriptor.down =
-            fakeNativeVNNIDesc(0x42000000u + slot_index * 0x10000u + 0x30u);
+            fakeNativeQuantisedDesc(0x42000000u + slot_index * 0x10000u + 0x30u);
         slot.descriptor.flags = llaminar2::toMoEExpertFlags(
             llaminar2::DeviceMoEExpertFlags::Valid |
             llaminar2::DeviceMoEExpertFlags::TransferSlot);
@@ -7057,13 +7057,13 @@ TEST_F(Test__CUDAMoEKernel, PrefillLLEPProjectionUsesFullPhysicalDirectoryBeyond
         slot.descriptor.logical_expert_id = static_cast<int32_t>(slot_index);
         slot.descriptor.owner_participant = 0;
         slot.descriptor.gate =
-            fakeNativeVNNIDesc(
+            fakeNativeQuantisedDesc(
                 0x41000000u + slot_index * 0x10000u + 0x10u);
         slot.descriptor.up =
-            fakeNativeVNNIDesc(
+            fakeNativeQuantisedDesc(
                 0x41000000u + slot_index * 0x10000u + 0x20u);
         slot.descriptor.down =
-            fakeNativeVNNIDesc(
+            fakeNativeQuantisedDesc(
                 0x41000000u + slot_index * 0x10000u + 0x30u);
         slot.descriptor.flags |= llaminar2::toMoEExpertFlags(
             llaminar2::DeviceMoEExpertFlags::Resident |
@@ -8482,13 +8482,13 @@ TEST_F(Test__CUDAMoEKernel,
         static_cast<std::size_t>(kPrefillSlots) * sizeof(int));
     CudaAllocation gate_descs(
         static_cast<std::size_t>(kNumExperts) *
-        sizeof(llaminar2::DeviceNativeVNNIMatrixDesc));
+        sizeof(llaminar2::DeviceNativeQuantisedMatrixDesc));
     CudaAllocation up_descs(
         static_cast<std::size_t>(kNumExperts) *
-        sizeof(llaminar2::DeviceNativeVNNIMatrixDesc));
+        sizeof(llaminar2::DeviceNativeQuantisedMatrixDesc));
     CudaAllocation down_descs(
         static_cast<std::size_t>(kNumExperts) *
-        sizeof(llaminar2::DeviceNativeVNNIMatrixDesc));
+        sizeof(llaminar2::DeviceNativeQuantisedMatrixDesc));
     CudaAllocation active_expert_ids(
         static_cast<std::size_t>(kNumExperts) * sizeof(int));
 
@@ -8500,9 +8500,9 @@ TEST_F(Test__CUDAMoEKernel,
         static_cast<const float *>(prefill_weights->gpu_data_ptr()),
         table.deviceLayerState(0),
         static_cast<int *>(original_to_grouped.get()),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(gate_descs.get()),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(up_descs.get()),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(down_descs.get()),
+        static_cast<llaminar2::DeviceNativeQuantisedMatrixDesc *>(gate_descs.get()),
+        static_cast<llaminar2::DeviceNativeQuantisedMatrixDesc *>(up_descs.get()),
+        static_cast<llaminar2::DeviceNativeQuantisedMatrixDesc *>(down_descs.get()),
         static_cast<int *>(active_expert_ids.get()),
         kPrefillSlots,
         kPrefillSlots,
@@ -8511,7 +8511,7 @@ TEST_F(Test__CUDAMoEKernel,
         kNumExperts,
         /*filter_to_local_runtime_experts=*/1,
         /*retain_routes_for_deferred_commit=*/0,
-        llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+        llaminar2::DeviceMoEWeightFormat::NativeQuantised,
         /*device_idx=*/0,
         stream_,
         llaminar2::DeviceMoEProjectionSet::CompleteExpert));
@@ -13114,7 +13114,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCompactPayloadRejectsResidentSourceWi
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_src_payload), projection_payload_bytes), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_src_scales, projection_scales_bytes), cudaSuccess);
 
-    llaminar2::DeviceNativeVNNIMatrixDesc projection_desc;
+    llaminar2::DeviceNativeQuantisedMatrixDesc projection_desc;
     projection_desc.payload = d_src_payload;
     projection_desc.scales = d_src_scales;
     projection_desc.n = n;
@@ -13319,7 +13319,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
 
     auto matrix_desc = [](const ProjectionBuffers &projection, bool destination)
     {
-        llaminar2::DeviceNativeVNNIMatrixDesc desc;
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = destination ? projection.dst_payload : projection.src_payload;
         desc.scales = destination ? projection.dst_scales : projection.src_scales;
         desc.n = n;
@@ -14099,9 +14099,9 @@ TEST_F(Test__CUDAMoEKernel,
     header.participant_count = config.participant_count;
 
     llaminar2::DeviceMoEExpertDirectoryEntry slot;
-    slot.descriptor.gate = fakeNativeVNNIDesc(0x3e001000u);
-    slot.descriptor.up = fakeNativeVNNIDesc(0x3e002000u);
-    slot.descriptor.down = fakeNativeVNNIDesc(0x3e003000u);
+    slot.descriptor.gate = fakeNativeQuantisedDesc(0x3e001000u);
+    slot.descriptor.up = fakeNativeQuantisedDesc(0x3e002000u);
+    slot.descriptor.down = fakeNativeQuantisedDesc(0x3e003000u);
     slot.descriptor.logical_expert_id = 0;
     slot.descriptor.owner_participant = 0;
     slot.descriptor.local_slot = 7;
@@ -14188,9 +14188,9 @@ TEST_F(Test__CUDAMoEKernel,
     EXPECT_EQ(slot.resident_mask, original_slot.resident_mask);
     EXPECT_EQ(slot.descriptor.logical_expert_id,
               original_slot.descriptor.logical_expert_id);
-    expectSameNativeVNNIDesc(slot.descriptor.gate, original_slot.descriptor.gate);
-    expectSameNativeVNNIDesc(slot.descriptor.up, original_slot.descriptor.up);
-    expectSameNativeVNNIDesc(slot.descriptor.down, original_slot.descriptor.down);
+    expectSameNativeQuantisedDesc(slot.descriptor.gate, original_slot.descriptor.gate);
+    expectSameNativeQuantisedDesc(slot.descriptor.up, original_slot.descriptor.up);
+    expectSameNativeQuantisedDesc(slot.descriptor.down, original_slot.descriptor.down);
 #endif
 }
 
@@ -14299,9 +14299,9 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceTransferSlotReuseRetiresPreviousRepli
         llaminar2::DeviceMoEExpertDirectoryEntry slot;
         const uintptr_t base =
             0x3a000000u + static_cast<uintptr_t>(expert) * 0x10000u;
-        slot.descriptor.gate = fakeNativeVNNIDesc(base + 0x10u);
-        slot.descriptor.up = fakeNativeVNNIDesc(base + 0x20u);
-        slot.descriptor.down = fakeNativeVNNIDesc(base + 0x30u);
+        slot.descriptor.gate = fakeNativeQuantisedDesc(base + 0x10u);
+        slot.descriptor.up = fakeNativeQuantisedDesc(base + 0x20u);
+        slot.descriptor.down = fakeNativeQuantisedDesc(base + 0x30u);
         slot.descriptor.logical_expert_id = static_cast<int32_t>(expert);
         slot.descriptor.owner_participant = 0;
         slot.descriptor.local_slot = stable_local_slot;
@@ -14554,9 +14554,9 @@ TEST_F(Test__CUDAMoEKernel,
     wave.payload_bucket_slots = 1;
 
     DeviceMoEExpertDirectoryEntry slot;
-    slot.descriptor.gate = fakeNativeVNNIDesc(0x41000010u);
-    slot.descriptor.up = fakeNativeVNNIDesc(0x41000020u);
-    slot.descriptor.down = fakeNativeVNNIDesc(0x41000030u);
+    slot.descriptor.gate = fakeNativeQuantisedDesc(0x41000010u);
+    slot.descriptor.up = fakeNativeQuantisedDesc(0x41000020u);
+    slot.descriptor.down = fakeNativeQuantisedDesc(0x41000030u);
     slot.descriptor.logical_expert_id =
         static_cast<int32_t>(new_expert);
     slot.descriptor.owner_participant = 0;
@@ -16366,7 +16366,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossPar
     using llaminar2::DeviceMoELayerRuntime;
     using llaminar2::DeviceMoEReplicaRole;
     using llaminar2::DeviceMoERuntimeTable;
-    using llaminar2::DeviceNativeVNNIMatrixDesc;
+    using llaminar2::DeviceNativeQuantisedMatrixDesc;
     using llaminar2::MoEPlacementUpdate;
 
     constexpr int num_layers = 1;
@@ -16377,7 +16377,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossPar
 
     auto fake_desc = [](uintptr_t base, int n, int k)
     {
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x100u);
         desc.n = n;
@@ -16560,7 +16560,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeRecordsHotCacheBalanceImprov
     using llaminar2::DeviceMoELayerRuntime;
     using llaminar2::DeviceMoEReplicaRole;
     using llaminar2::DeviceMoERuntimeTable;
-    using llaminar2::DeviceNativeVNNIMatrixDesc;
+    using llaminar2::DeviceNativeQuantisedMatrixDesc;
     using llaminar2::MoEPlacementUpdate;
 
     constexpr int num_layers = 1;
@@ -16571,7 +16571,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeRecordsHotCacheBalanceImprov
 
     auto fake_desc = [](uintptr_t base, int n, int k)
     {
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x100u);
         desc.n = n;
@@ -19516,7 +19516,7 @@ TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerial
  * rows with ordinary one-token serial decode.  The shared expert has only one
  * always-active route, but production CUDA verifier rows still use the same MoE
  * grouped descriptor-table family as ordinary one-token decode.  This test
- * exercises every NativeVNNI tensor format through the complete production
+ * exercises every NativeQuantised tensor format through the complete production
  * transaction: grouped Q8 routing, routed expert execution, shared expert
  * execution, and graph capture/replay.  Repeated M=1 table decode remains the
  * serial oracle, while exact layer-31 activation words make Q8 rounding drift
@@ -19747,14 +19747,14 @@ void Test__CUDAMoEKernel::proveSharedVerifierRouterPublication(
             ASSERT_NE(shared_workspace_consumer, nullptr);
             shared_workspace_consumer->bindWorkspace(stage_workspace.get());
 
-            llaminar2::DeviceNativeVNNIMatrixDesc serial_gate_desc{};
-            llaminar2::DeviceNativeVNNIMatrixDesc serial_up_desc{};
-            llaminar2::DeviceNativeVNNIMatrixDesc serial_down_desc{};
-            llaminar2::DeviceNativeVNNIMatrixDesc routed_probe_down_desc{};
-            ASSERT_TRUE(prepared.gate_kernel->exportNativeVNNIMatrixDesc(serial_gate_desc));
-            ASSERT_TRUE(prepared.up_kernel->exportNativeVNNIMatrixDesc(serial_up_desc));
-            ASSERT_TRUE(prepared.down_kernel->exportNativeVNNIMatrixDesc(serial_down_desc));
-            ASSERT_TRUE(descriptor_probe_down_prepared.kernel->exportNativeVNNIMatrixDesc(
+            llaminar2::DeviceNativeQuantisedMatrixDesc serial_gate_desc{};
+            llaminar2::DeviceNativeQuantisedMatrixDesc serial_up_desc{};
+            llaminar2::DeviceNativeQuantisedMatrixDesc serial_down_desc{};
+            llaminar2::DeviceNativeQuantisedMatrixDesc routed_probe_down_desc{};
+            ASSERT_TRUE(prepared.gate_kernel->exportNativeQuantisedMatrixDesc(serial_gate_desc));
+            ASSERT_TRUE(prepared.up_kernel->exportNativeQuantisedMatrixDesc(serial_up_desc));
+            ASSERT_TRUE(prepared.down_kernel->exportNativeQuantisedMatrixDesc(serial_down_desc));
+            ASSERT_TRUE(descriptor_probe_down_prepared.kernel->exportNativeQuantisedMatrixDesc(
                 routed_probe_down_desc));
             ASSERT_NE(routed_probe_down_desc.payload, serial_down_desc.payload)
                 << "The routed down-table isolation probe needs a distinct valid descriptor";
@@ -19767,10 +19767,10 @@ void Test__CUDAMoEKernel::proveSharedVerifierRouterPublication(
              * in this loop extends that isolation proof to every CUDA-native
              * codebook in the canonical grouped sweep.
              */
-            std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> routed_gate_descs(
+            std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> routed_gate_descs(
                 routed_experts,
                 serial_gate_desc);
-            std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> routed_up_descs(
+            std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> routed_up_descs(
                 routed_experts,
                 serial_up_desc);
             constexpr int descriptor_probe_expert = 1;
@@ -19785,7 +19785,7 @@ void Test__CUDAMoEKernel::proveSharedVerifierRouterPublication(
                     intermediate);
             ASSERT_GE(routed_gateup_table, 0)
                 << "routed descriptor probe rejected format=" << format.label;
-            std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> routed_down_descs(
+            std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> routed_down_descs(
                 routed_experts,
                 serial_down_desc);
             routed_down_descs[descriptor_probe_expert] = routed_probe_down_desc;
@@ -21021,9 +21021,9 @@ TEST_F(Test__CUDAMoEKernel, UploadGroupedDescriptorTablesAcceptValidCudaDescript
         return makeCudaNativeDesc(payloads.back(), scales.back(), rows, cols);
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
     down_descs.reserve(num_experts);
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
@@ -21062,7 +21062,7 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
     using llaminar2::DeviceMoELayerRuntime;
-    using llaminar2::DeviceNativeVNNIMatrixDesc;
+    using llaminar2::DeviceNativeQuantisedMatrixDesc;
     using llaminar2::DeviceMoEExpertFlags;
     using llaminar2::toMoEExpertFlags;
     using llaminar2::isGraphCaptureActive;
@@ -21076,9 +21076,9 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
     host_runtime.active_bank = 1;
     host_runtime.active_epoch = active_epoch;
 
-    std::vector<DeviceNativeVNNIMatrixDesc> expected_gate(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> expected_up(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> expected_down(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> expected_gate(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> expected_up(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> expected_down(num_experts);
 
     for (int expert = 0; expert < num_experts; ++expert)
     {
@@ -21114,14 +21114,14 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
     ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
 
     DeviceMoELayerRuntime *device_runtime = nullptr;
-    DeviceNativeVNNIMatrixDesc *device_gate = nullptr;
-    DeviceNativeVNNIMatrixDesc *device_up = nullptr;
-    DeviceNativeVNNIMatrixDesc *device_down = nullptr;
+    DeviceNativeQuantisedMatrixDesc *device_gate = nullptr;
+    DeviceNativeQuantisedMatrixDesc *device_up = nullptr;
+    DeviceNativeQuantisedMatrixDesc *device_down = nullptr;
     int32_t *device_counts = nullptr;
     int32_t *device_active = nullptr;
-    std::vector<DeviceNativeVNNIMatrixDesc> actual_gate(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> actual_up(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> actual_down(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> actual_gate(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> actual_up(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> actual_down(num_experts);
     std::array<int32_t, num_experts> actual_active{};
     std::array<int32_t, num_experts> expert_counts{};
     std::array<int32_t, num_experts> expected_active{};
@@ -21166,13 +21166,13 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)),
               cudaSuccess);
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_gate),
-                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
+                        num_experts * sizeof(DeviceNativeQuantisedMatrixDesc)),
               cudaSuccess);
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_up),
-                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
+                        num_experts * sizeof(DeviceNativeQuantisedMatrixDesc)),
               cudaSuccess);
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_down),
-                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
+                        num_experts * sizeof(DeviceNativeQuantisedMatrixDesc)),
               cudaSuccess);
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_counts), num_experts * sizeof(int32_t)),
               cudaSuccess);
@@ -21196,13 +21196,13 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
     // Poison all admitted slots before replay. The capture must overwrite every
     // descriptor/list byte; the negative control never launches expert compute.
     ASSERT_EQ(
-        cudaMemsetAsync(device_gate, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        cudaMemsetAsync(device_gate, 0xa5, num_experts * sizeof(DeviceNativeQuantisedMatrixDesc), stream),
         cudaSuccess);
     ASSERT_EQ(
-        cudaMemsetAsync(device_up, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        cudaMemsetAsync(device_up, 0xa5, num_experts * sizeof(DeviceNativeQuantisedMatrixDesc), stream),
         cudaSuccess);
     ASSERT_EQ(
-        cudaMemsetAsync(device_down, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        cudaMemsetAsync(device_down, 0xa5, num_experts * sizeof(DeviceNativeQuantisedMatrixDesc), stream),
         cudaSuccess);
     ASSERT_EQ(cudaMemsetAsync(device_active, 0xa5, num_experts * sizeof(int32_t), stream),
               cudaSuccess);
@@ -21214,15 +21214,15 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
         device_runtime, device_gate, device_up, device_down, num_experts, 0, nullptr));
 
     ASSERT_EQ(cudaMemcpyAsync(actual_gate.data(), device_gate,
-                             actual_gate.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             actual_gate.size() * sizeof(DeviceNativeQuantisedMatrixDesc),
                              cudaMemcpyDeviceToHost, stream),
               cudaSuccess);
     ASSERT_EQ(cudaMemcpyAsync(actual_up.data(), device_up,
-                             actual_up.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             actual_up.size() * sizeof(DeviceNativeQuantisedMatrixDesc),
                              cudaMemcpyDeviceToHost, stream),
               cudaSuccess);
     ASSERT_EQ(cudaMemcpyAsync(actual_down.data(), device_down,
-                             actual_down.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             actual_down.size() * sizeof(DeviceNativeQuantisedMatrixDesc),
                              cudaMemcpyDeviceToHost, stream),
               cudaSuccess);
     ASSERT_EQ(cudaMemcpyAsync(actual_active.data(), device_active, sizeof(actual_active),
@@ -21234,11 +21234,11 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
     for (int expert = 0; expert < num_experts; ++expert)
     {
         SCOPED_TRACE(expert);
-        expectSameNativeVNNIDesc(actual_gate[static_cast<size_t>(expert)],
+        expectSameNativeQuantisedDesc(actual_gate[static_cast<size_t>(expert)],
                                  expected_gate[static_cast<size_t>(expert)]);
-        expectSameNativeVNNIDesc(actual_up[static_cast<size_t>(expert)],
+        expectSameNativeQuantisedDesc(actual_up[static_cast<size_t>(expert)],
                                  expected_up[static_cast<size_t>(expert)]);
-        expectSameNativeVNNIDesc(actual_down[static_cast<size_t>(expert)],
+        expectSameNativeQuantisedDesc(actual_down[static_cast<size_t>(expert)],
                                  expected_down[static_cast<size_t>(expert)]);
     }
 
@@ -21324,7 +21324,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeFloatingDescriptorPublication512ExpertsCaptur
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
     using llaminar2::DeviceMoELayerRuntime;
-    using llaminar2::DeviceNativeVNNIMatrixDesc;
+    using llaminar2::DeviceNativeQuantisedMatrixDesc;
     using llaminar2::DeviceMoEExpertFlags;
     using llaminar2::DeviceMoEWeightFormat;
     using llaminar2::DeviceMoEFloatingMatrixDesc;
@@ -21476,9 +21476,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
     constexpr int num_experts = 16;
     constexpr int d_model = 544;
     constexpr int intermediate = 544;
-    // This fixture uses real Q4_0 NativeVNNI block capacities, including tails
+    // This fixture uses real Q4_0 NativeQuantised block capacities, including tails
     // beyond the former anonymous 4096-byte reservation.
-    llaminar2::DeviceNativeVNNIMatrixDesc format{};
+    llaminar2::DeviceNativeQuantisedMatrixDesc format{};
     format.codebook_id = 0;
     uint8_t payload_bytes_per_block = 0;
     uint8_t is_asymmetric = 0;
@@ -21513,9 +21513,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
         return makeCudaNativeDesc(payloads.back(), scales.back(), rows, cols);
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
     down_descs.reserve(num_experts);
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
@@ -21960,8 +21960,8 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
             std::string("test.cuda_moe.") + role + "." + std::to_string(seed),
             llaminar2::ModelContextId{123000 + static_cast<uint64_t>(seed)}));
 
-        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeQuantisedMatrixDesc(desc))
             << "failed to export native descriptor for " << role;
         EXPECT_EQ(desc.n, rows);
         EXPECT_EQ(desc.k, cols);
@@ -21969,9 +21969,9 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
         return desc;
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
     down_descs.reserve(num_experts);
@@ -22132,8 +22132,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
             std::string("test.cuda_moe.runtime_fused.") + role + "." + std::to_string(seed),
             llaminar2::ModelContextId{620000 + static_cast<uint64_t>(seed)}));
 
-        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeQuantisedMatrixDesc(desc))
             << "failed to export native descriptor for " << role;
         EXPECT_EQ(desc.n, rows);
         EXPECT_EQ(desc.k, cols);
@@ -22141,9 +22141,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
         return desc;
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
     down_descs.reserve(num_experts);
@@ -22394,9 +22394,9 @@ TEST_F(Test__CUDAMoEKernel, ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByt
                                  llaminar2::test::GpuPreparedGemm &prepared,
                                  const char *role)
     {
-        llaminar2::DeviceNativeVNNIMatrixDesc descriptor{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc descriptor{};
         if (!prepared.kernel ||
-            !prepared.kernel->exportNativeVNNIMatrixDesc(descriptor))
+            !prepared.kernel->exportNativeQuantisedMatrixDesc(descriptor))
         {
             throw std::runtime_error(
                 std::string("failed to export prepared CUDA descriptor for ") + role);
@@ -22534,24 +22534,24 @@ TEST_F(Test__CUDAMoEKernel, ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByt
         ASSERT_EQ(combined_down0.codebook_id, format.codebook_id);
         ASSERT_EQ(combined_down1.codebook_id, format.codebook_id);
 
-        expectCudaNativeVNNIMatrixReplicasEqual(
+        expectCudaNativeQuantisedMatrixReplicasEqual(
             combined_gate0, stream_, combined_gate1, stream1.get());
-        expectCudaNativeVNNIMatrixReplicasEqual(
+        expectCudaNativeQuantisedMatrixReplicasEqual(
             combined_up0, stream_, combined_up1, stream1.get());
-        expectCudaNativeVNNIMatrixReplicasEqual(
+        expectCudaNativeQuantisedMatrixReplicasEqual(
             combined_down0, stream_, combined_down1, stream1.get());
 
-        std::array<std::vector<llaminar2::DeviceNativeVNNIMatrixDesc>, 2>
+        std::array<std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc>, 2>
             gate_descriptors;
-        std::array<std::vector<llaminar2::DeviceNativeVNNIMatrixDesc>, 2>
+        std::array<std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc>, 2>
             up_descriptors;
-        std::array<std::vector<llaminar2::DeviceNativeVNNIMatrixDesc>, 2>
+        std::array<std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc>, 2>
             down_descriptors;
-        std::array<std::vector<std::unique_ptr<CudaNativeVNNIMatrixRowSlice>>, 2>
+        std::array<std::vector<std::unique_ptr<CudaNativeQuantisedMatrixRowSlice>>, 2>
             gate_slices;
-        std::array<std::vector<std::unique_ptr<CudaNativeVNNIMatrixRowSlice>>, 2>
+        std::array<std::vector<std::unique_ptr<CudaNativeQuantisedMatrixRowSlice>>, 2>
             up_slices;
-        std::array<std::vector<std::unique_ptr<CudaNativeVNNIMatrixRowSlice>>, 2>
+        std::array<std::vector<std::unique_ptr<CudaNativeQuantisedMatrixRowSlice>>, 2>
             down_slices;
         for (auto *table : {
                  &gate_descriptors[0], &gate_descriptors[1],
@@ -22573,22 +22573,22 @@ TEST_F(Test__CUDAMoEKernel, ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByt
             const int gateup_first_row = variant * intermediate;
             const int down_first_row = variant * d_model;
             gate_slices[0].push_back(
-                std::make_unique<CudaNativeVNNIMatrixRowSlice>(
+                std::make_unique<CudaNativeQuantisedMatrixRowSlice>(
                     combined_gate0, gateup_first_row, intermediate, 0, stream_));
             gate_slices[1].push_back(
-                std::make_unique<CudaNativeVNNIMatrixRowSlice>(
+                std::make_unique<CudaNativeQuantisedMatrixRowSlice>(
                     combined_gate1, gateup_first_row, intermediate, 1, stream1.get()));
             up_slices[0].push_back(
-                std::make_unique<CudaNativeVNNIMatrixRowSlice>(
+                std::make_unique<CudaNativeQuantisedMatrixRowSlice>(
                     combined_up0, gateup_first_row, intermediate, 0, stream_));
             up_slices[1].push_back(
-                std::make_unique<CudaNativeVNNIMatrixRowSlice>(
+                std::make_unique<CudaNativeQuantisedMatrixRowSlice>(
                     combined_up1, gateup_first_row, intermediate, 1, stream1.get()));
             down_slices[0].push_back(
-                std::make_unique<CudaNativeVNNIMatrixRowSlice>(
+                std::make_unique<CudaNativeQuantisedMatrixRowSlice>(
                     combined_down0, down_first_row, d_model, 0, stream_));
             down_slices[1].push_back(
-                std::make_unique<CudaNativeVNNIMatrixRowSlice>(
+                std::make_unique<CudaNativeQuantisedMatrixRowSlice>(
                     combined_down1, down_first_row, d_model, 1, stream1.get()));
         }
 
@@ -22657,9 +22657,9 @@ TEST_F(Test__CUDAMoEKernel, ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByt
 
         auto make_update = [&](
                                int participant,
-                               const std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> &gate,
-                               const std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> &up,
-                               const std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> &down)
+                               const std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> &gate,
+                               const std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> &up,
+                               const std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> &down)
         {
             llaminar2::MoEPlacementUpdate update;
             update.epoch = 1;
@@ -22955,9 +22955,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpe
         return makeCudaNativeDesc(payloads.back(), scales.back(), rows, cols);
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
     down_descs.reserve(num_experts);
@@ -23107,8 +23107,8 @@ void Test__CUDAMoEKernel::proveRuntimeDecodeGraphReplayCompleteDescriptors()
                 std::to_string(seed),
             llaminar2::ModelContextId{710000 + static_cast<uint64_t>(seed)}));
 
-        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeQuantisedMatrixDesc(desc))
             << "failed to export native descriptor for " << role;
         EXPECT_EQ(desc.n, rows);
         EXPECT_EQ(desc.k, cols);
@@ -23116,15 +23116,15 @@ void Test__CUDAMoEKernel::proveRuntimeDecodeGraphReplayCompleteDescriptors()
         return desc;
     };
 
-    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> gate_descs = {
+    std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> gate_descs = {
         add_prepared_desc(intermediate, d_model, 6100, "gate"),
         add_prepared_desc(intermediate, d_model, 6101, "gate"),
     };
-    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> up_descs = {
+    std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> up_descs = {
         add_prepared_desc(intermediate, d_model, 6200, "up"),
         add_prepared_desc(intermediate, d_model, 6201, "up"),
     };
-    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> down_descs = {
+    std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> down_descs = {
         add_prepared_desc(d_model, intermediate, 6300, "down"),
         add_prepared_desc(d_model, intermediate, 6301, "down"),
     };
@@ -23135,9 +23135,9 @@ void Test__CUDAMoEKernel::proveRuntimeDecodeGraphReplayCompleteDescriptors()
         up_descs[expert] = up_descs[1];
         down_descs[expert] = down_descs[1];
     }
-    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> stale_gate_descs{};
-    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> stale_up_descs{};
-    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> stale_down_descs{};
+    std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> stale_gate_descs{};
+    std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> stale_up_descs{};
+    std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> stale_down_descs{};
     stale_gate_descs.fill(gate_descs[0]);
     stale_up_descs.fill(up_descs[0]);
     stale_down_descs.fill(down_descs[0]);
@@ -23218,9 +23218,9 @@ void Test__CUDAMoEKernel::proveRuntimeDecodeGraphReplayCompleteDescriptors()
     ASSERT_GT(relativeL2Error(stale_values.data(), fresh_values.data(), fresh_values.size()), 0.01)
         << "descriptor-table A/B reference must be distinguishable for this regression";
 
-    auto make_runtime = [&](const llaminar2::DeviceNativeVNNIMatrixDesc &gate,
-                            const llaminar2::DeviceNativeVNNIMatrixDesc &up,
-                            const llaminar2::DeviceNativeVNNIMatrixDesc &down)
+    auto make_runtime = [&](const llaminar2::DeviceNativeQuantisedMatrixDesc &gate,
+                            const llaminar2::DeviceNativeQuantisedMatrixDesc &up,
+                            const llaminar2::DeviceNativeQuantisedMatrixDesc &down)
     {
         llaminar2::DeviceMoELayerRuntime runtime{};
         runtime.active_bank = 0;
@@ -23416,8 +23416,8 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
             std::string("test.cuda_moe.verifier.") + role + "." + std::to_string(seed),
             llaminar2::ModelContextId{240000 + static_cast<uint64_t>(seed)}));
 
-        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeQuantisedMatrixDesc(desc))
             << "failed to export native descriptor for " << role;
         EXPECT_EQ(desc.n, rows);
         EXPECT_EQ(desc.k, cols);
@@ -23425,9 +23425,9 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
         return desc;
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
     down_descs.reserve(num_experts);
@@ -23437,7 +23437,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
         up_descs.push_back(add_prepared_desc(intermediate, d_model, 4200 + expert, "up", 13));
         down_descs.push_back(add_prepared_desc(
             d_model, intermediate, 4300 + expert, "down",
-            llaminar2::kNativeVnniIQ4XSSourceScaleCodebook));
+            llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook));
     }
 
     const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
@@ -23911,8 +23911,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
             if (auto *tensor_kernel = dynamic_cast<llaminar2::ITensorKernel *>(kernel))
                 tensor_kernel->setGPUStream(stream_);
 
-            llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-            EXPECT_TRUE(kernel->exportNativeVNNIMatrixDesc(desc))
+            llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+            EXPECT_TRUE(kernel->exportNativeQuantisedMatrixDesc(desc))
                 << format.label << " descriptor export for " << role;
             EXPECT_EQ(desc.codebook_id, format.codebook_id)
                 << format.label << " must exercise the expected runtime grouped MoE codebook";
@@ -23921,9 +23921,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
             return desc;
         };
 
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs(num_experts);
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs(num_experts);
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs(num_experts);
         for (int expert = 0; expert < num_experts; ++expert)
         {
             gate_descs[static_cast<size_t>(expert)] =
@@ -24262,8 +24262,8 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
             std::string("test.cuda_moe.shared_verifier.") + role,
             llaminar2::ModelContextId{250000 + static_cast<uint64_t>(seed)}));
 
-        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeQuantisedMatrixDesc(desc))
             << "failed to export native descriptor for shared " << role;
         EXPECT_EQ(desc.n, rows);
         EXPECT_EQ(desc.k, cols);
@@ -24271,13 +24271,13 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
         return desc;
     };
 
-    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> gate_descs = {
+    std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> gate_descs = {
         add_prepared_desc(intermediate, d_model, 5100, "gate", 13)};
-    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> up_descs = {
+    std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> up_descs = {
         add_prepared_desc(intermediate, d_model, 5200, "up", 13)};
-    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> down_descs = {
+    std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> down_descs = {
         add_prepared_desc(d_model, intermediate, 5300, "down",
-                          llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)};
+                          llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook)};
 
     const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
         gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
@@ -24420,7 +24420,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
  * can amplify a single layer-0 ULP mismatch into a logits failure after many
  * layers, so this focused regression keeps the exact production shape
  * (`d_model=2048`, `intermediate=512`) and requires each runtime-M boundary
- * row's byte stream to equal row-by-row M=1 decode for every NativeVNNI tensor
+ * row's byte stream to equal row-by-row M=1 decode for every NativeQuantised tensor
  * format.
  */
 TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsRuntimeMBoundariesMatchRowDecode)
@@ -24470,7 +24470,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsRun
         auto add_prepared_desc =
             [&](const std::vector<size_t> &shape,
                 uint32_t seed,
-                const char *role) -> llaminar2::DeviceNativeVNNIMatrixDesc
+                const char *role) -> llaminar2::DeviceNativeQuantisedMatrixDesc
         {
             auto weight = format.create(shape, seed);
             auto *weight_ptr = weight.get();
@@ -24490,33 +24490,33 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsRun
             {
                 ADD_FAILURE()
                     << "prepared CUDA shared expert GEMM must expose ITensorKernel";
-                return llaminar2::DeviceNativeVNNIMatrixDesc{};
+                return llaminar2::DeviceNativeQuantisedMatrixDesc{};
             }
             tensor_kernel->setGPUStream(stream_);
 
-            llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-            if (!prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+            llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+            if (!prepared_weights.back().kernel->exportNativeQuantisedMatrixDesc(desc))
             {
                 ADD_FAILURE()
                     << "failed to export native descriptor for shared " << role
                     << " format=" << format.label;
-                return llaminar2::DeviceNativeVNNIMatrixDesc{};
+                return llaminar2::DeviceNativeQuantisedMatrixDesc{};
             }
             EXPECT_EQ(desc.codebook_id, format.codebook_id);
             return desc;
         };
 
-        std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> gate_descs = {
+        std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> gate_descs = {
             add_prepared_desc(
                 {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)},
                 static_cast<uint32_t>(7610 + format_index),
                 "gate")};
-        std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> up_descs = {
+        std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> up_descs = {
             add_prepared_desc(
                 {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)},
                 static_cast<uint32_t>(7620 + format_index),
                 "up")};
-        std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> down_descs = {
+        std::array<llaminar2::DeviceNativeQuantisedMatrixDesc, num_experts> down_descs = {
             add_prepared_desc(
                 {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)},
                 static_cast<uint32_t>(7630 + format_index),
@@ -24719,20 +24719,20 @@ TEST_F(Test__CUDAMoEKernel,
         return static_cast<size_t>(expert_id % routed_variants);
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs(
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs(
         static_cast<size_t>(num_experts));
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs(
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs(
         static_cast<size_t>(num_experts));
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs(
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs(
         static_cast<size_t>(num_experts));
     for (int expert = 0; expert < num_experts; ++expert)
     {
         const GemmTriplet &triplet = routed[variant_for_expert(expert)];
-        ASSERT_TRUE(triplet.gate->exportNativeVNNIMatrixDesc(
+        ASSERT_TRUE(triplet.gate->exportNativeQuantisedMatrixDesc(
             gate_descs[static_cast<size_t>(expert)]));
-        ASSERT_TRUE(triplet.up->exportNativeVNNIMatrixDesc(
+        ASSERT_TRUE(triplet.up->exportNativeQuantisedMatrixDesc(
             up_descs[static_cast<size_t>(expert)]));
-        ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(
+        ASSERT_TRUE(triplet.down->exportNativeQuantisedMatrixDesc(
             down_descs[static_cast<size_t>(expert)]));
     }
 
@@ -25115,7 +25115,7 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
 
     /*
      * This is the CUDA counterpart to the ROCm all-codegroup MoE sweep.  It runs
-     * every NativeVNNI tensor format that can publish through grouped routed MoE
+     * every NativeQuantised tensor format that can publish through grouped routed MoE
      * verifier prefill, including format aliases that share a codebook but carry
      * different min/scale descriptor metadata.  Each gate/up x down format pair
      * executes both the all-local route and the masked LocalTP route.  Their
@@ -25224,8 +25224,8 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
             if (auto *tensor_kernel = dynamic_cast<llaminar2::ITensorKernel *>(kernel))
                 tensor_kernel->setGPUStream(stream_);
 
-            llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-            const bool exported = kernel->exportNativeVNNIMatrixDesc(desc);
+            llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+            const bool exported = kernel->exportNativeQuantisedMatrixDesc(desc);
             EXPECT_TRUE(exported) << format.label << " descriptor export for " << role;
             if (!exported)
                 return nullptr;
@@ -25268,15 +25268,15 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
             ASSERT_NE(experts[static_cast<size_t>(expert)].down, nullptr);
         }
 
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
-        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs(num_experts);
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs(num_experts);
+        std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs(num_experts);
         for (int expert = 0; expert < num_experts; ++expert)
         {
             const auto &triplet = experts[static_cast<size_t>(expert)];
-            ASSERT_TRUE(triplet.gate->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
-            ASSERT_TRUE(triplet.up->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(expert)]));
-            ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(expert)]));
+            ASSERT_TRUE(triplet.gate->exportNativeQuantisedMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
+            ASSERT_TRUE(triplet.up->exportNativeQuantisedMatrixDesc(up_descs[static_cast<size_t>(expert)]));
+            ASSERT_TRUE(triplet.down->exportNativeQuantisedMatrixDesc(down_descs[static_cast<size_t>(expert)]));
         }
 
         const int gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
@@ -25841,9 +25841,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillLargeAllExpertPath
         return makeCudaNativeDesc(payloads.back(), scales.back(), rows, cols);
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
     down_descs.reserve(num_experts);
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
@@ -25967,9 +25967,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillGraphReplayClearsI
         return makeCudaNativeDesc(payloads.back(), scales.back(), rows, cols);
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
     down_descs.reserve(num_experts);
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
@@ -26156,7 +26156,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ4KM39MatchesSeria
         [&](int rows,
             int cols,
             uint32_t seed,
-            const char *role) -> llaminar2::DeviceNativeVNNIMatrixDesc
+            const char *role) -> llaminar2::DeviceNativeQuantisedMatrixDesc
     {
         auto weight = llaminar2::test::TestTensorFactory::createQ4_KRandom(
             {static_cast<size_t>(rows), static_cast<size_t>(cols)}, seed);
@@ -26178,8 +26178,8 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ4KM39MatchesSeria
         }
         tensor_kernel->setGPUStream(stream_);
 
-        llaminar2::DeviceNativeVNNIMatrixDesc descriptor{};
-        if (!prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(
+        llaminar2::DeviceNativeQuantisedMatrixDesc descriptor{};
+        if (!prepared_weights.back().kernel->exportNativeQuantisedMatrixDesc(
                 descriptor))
         {
             throw std::runtime_error(
@@ -26193,9 +26193,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ4KM39MatchesSeria
 
     struct ExpertTriplet
     {
-        llaminar2::DeviceNativeVNNIMatrixDesc gate{};
-        llaminar2::DeviceNativeVNNIMatrixDesc up{};
-        llaminar2::DeviceNativeVNNIMatrixDesc down{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc gate{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc up{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc down{};
     };
 
     std::array<ExpertTriplet, expert_variants> variants{};
@@ -26212,9 +26212,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ4KM39MatchesSeria
                 d_model, intermediate, 940300u + static_cast<uint32_t>(variant), "down");
     }
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descriptors;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descriptors;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descriptors;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descriptors;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descriptors;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descriptors;
     gate_descriptors.reserve(num_experts);
     up_descriptors.reserve(num_experts);
     down_descriptors.reserve(num_experts);
@@ -26716,8 +26716,8 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ8FusedMatchesSpli
             std::string("test.cuda_moe.large_q8_prefill.") + role + "." + std::to_string(seed),
             llaminar2::ModelContextId{910000 + static_cast<uint64_t>(seed)}));
 
-        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeQuantisedMatrixDesc(desc))
             << "failed to export Q8_0 native descriptor for " << role;
         EXPECT_EQ(desc.n, rows);
         EXPECT_EQ(desc.k, cols);
@@ -26725,9 +26725,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ8FusedMatchesSpli
         return desc;
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
     down_descs.reserve(num_experts);
@@ -26881,7 +26881,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
     auto add_prepared_iq3_desc = [&](int rows,
                                      int cols,
                                      int seed,
-                                     const char *role) -> llaminar2::DeviceNativeVNNIMatrixDesc
+                                     const char *role) -> llaminar2::DeviceNativeQuantisedMatrixDesc
     {
         auto weight = llaminar2::test::TestTensorFactory::createIQ3_SRandom(
             {static_cast<size_t>(rows), static_cast<size_t>(cols)},
@@ -26901,8 +26901,8 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
         }
         tensor_kernel->setGPUStream(stream_);
 
-        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-        if (!prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+        if (!prepared_weights.back().kernel->exportNativeQuantisedMatrixDesc(desc))
         {
             throw std::runtime_error(std::string("failed to export IQ3_S native descriptor for ") + role);
         }
@@ -26914,9 +26914,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
 
     struct ExpertTriplet
     {
-        llaminar2::DeviceNativeVNNIMatrixDesc gate{};
-        llaminar2::DeviceNativeVNNIMatrixDesc up{};
-        llaminar2::DeviceNativeVNNIMatrixDesc down{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc gate{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc up{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc down{};
     };
 
     std::array<ExpertTriplet, expert_variants> variants{};
@@ -26930,9 +26930,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
             add_prepared_iq3_desc(d_model, intermediate, 6300 + variant, "down");
     }
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
     down_descs.reserve(num_experts);
@@ -27120,7 +27120,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
     auto add_prepared_q6k_desc = [&](int rows,
                                      int cols,
                                      int seed,
-                                     const char *role) -> llaminar2::DeviceNativeVNNIMatrixDesc
+                                     const char *role) -> llaminar2::DeviceNativeQuantisedMatrixDesc
     {
         auto weight = llaminar2::test::TestTensorFactory::createQ6_KRandom(
             {static_cast<size_t>(rows), static_cast<size_t>(cols)},
@@ -27140,8 +27140,8 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
         }
         tensor_kernel->setGPUStream(stream_);
 
-        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
-        if (!prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+        llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+        if (!prepared_weights.back().kernel->exportNativeQuantisedMatrixDesc(desc))
         {
             throw std::runtime_error(std::string("failed to export Q6_K native descriptor for ") + role);
         }
@@ -27153,9 +27153,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
 
     struct ExpertTriplet
     {
-        llaminar2::DeviceNativeVNNIMatrixDesc gate{};
-        llaminar2::DeviceNativeVNNIMatrixDesc up{};
-        llaminar2::DeviceNativeVNNIMatrixDesc down{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc gate{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc up{};
+        llaminar2::DeviceNativeQuantisedMatrixDesc down{};
     };
 
     std::array<ExpertTriplet, expert_variants> variants{};
@@ -27169,9 +27169,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
             add_prepared_q6k_desc(d_model, intermediate, 7300 + variant, "down");
     }
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
     down_descs.reserve(num_experts);
@@ -27368,9 +27368,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeDescriptorPathCapturesAfterWarmu
         return makeCudaNativeDesc(payloads.back(), scales.back(), rows, cols);
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
     down_descs.reserve(num_experts);
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
@@ -27530,9 +27530,9 @@ TEST_F(Test__CUDAMoEKernel, StaticGroupedDecodeDescriptorPathCapturesAfterWarmup
         return makeCudaNativeDesc(payloads.back(), scales.back(), rows, cols);
     };
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeQuantisedMatrixDesc> up_descs;
     down_descs.push_back(add_desc(d_model, intermediate));
     gate_descs.push_back(add_desc(intermediate, d_model));
     up_descs.push_back(add_desc(intermediate, d_model));
@@ -27631,7 +27631,7 @@ TEST_F(Test__CUDAMoEKernel, StaticGroupedDecodeDescriptorPathCapturesAfterWarmup
  *
  * Qwen3.5 stores its shared expert as floating-point weights even when routed
  * experts are quantized. The production stage publishes those weights through
- * the same fixed-table API used by NativeVNNI. This regression therefore uses
+ * the same fixed-table API used by NativeQuantised. This regression therefore uses
  * real production-prepared FP16, BF16, and FP32 GEMM allocations, uploads the
  * resulting typed descriptor triple, captures the two-stage gate/up then
  * SwiGLU/down transaction, and compares every checkpoint with a CPU reference
@@ -28033,8 +28033,8 @@ TEST(Test__CUDAMoERequestReset,
                 .is_asymmetric = false,
                 .has_emins = false,
                 .codebook_id = 0,
-                .format = llaminar2::ExpertWeightFormat::nativeVnni(
-                    llaminar2::NativeVnniSourceIdentity{
+                .format = llaminar2::ExpertWeightFormat::nativeQuantised(
+                    llaminar2::NativeQuantisedSourceIdentity{
                         .codebook_id = 0,
                         .is_superblock = false,
                         .present = true,
@@ -28048,8 +28048,8 @@ TEST(Test__CUDAMoERequestReset,
                 .is_asymmetric = false,
                 .has_emins = false,
                 .codebook_id = 0,
-                .format = llaminar2::ExpertWeightFormat::nativeVnni(
-                    llaminar2::NativeVnniSourceIdentity{
+                .format = llaminar2::ExpertWeightFormat::nativeQuantised(
+                    llaminar2::NativeQuantisedSourceIdentity{
                         .codebook_id = 0,
                         .is_superblock = false,
                         .present = true,
@@ -28063,8 +28063,8 @@ TEST(Test__CUDAMoERequestReset,
                 .is_asymmetric = false,
                 .has_emins = false,
                 .codebook_id = 0,
-                .format = llaminar2::ExpertWeightFormat::nativeVnni(
-                    llaminar2::NativeVnniSourceIdentity{
+                .format = llaminar2::ExpertWeightFormat::nativeQuantised(
+                    llaminar2::NativeQuantisedSourceIdentity{
                         .codebook_id = 0,
                         .is_superblock = false,
                         .present = true,
@@ -28178,7 +28178,7 @@ TEST(Test__CUDAMoERequestReset,
  * @brief Prove every quantized GPU-aligned expert is CPU/CUDA byte-identical.
  *
  * This is the cross-tier arithmetic proof, rather than a transfer-only proof:
- * identical source weights execute through the CPU NativeVNNI and CUDA sparse
+ * identical source weights execute through the CPU NativeQuantised and CUDA sparse
  * MoE implementations at decode, verifier, and prefill row counts. No
  * dequantized reference or residency-specific tolerance can hide a mismatch.
  */
@@ -28207,7 +28207,7 @@ TEST_F(Test__CUDAMoEKernel, TransferredCurrentBatchAllNativeFormatsPublishExactB
 #else
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
-    llaminar2::test::runNativeVNNIExpertTransferGroupedParity(
+    llaminar2::test::runNativeQuantisedExpertTransferGroupedParity(
         "CUDA", llaminar2::DeviceId::cuda(0), stream_,
         llaminar2::test::NativeExpertTransferProofScope::CopyPublication);
 #endif
@@ -28254,7 +28254,7 @@ TEST_F(
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
 
-    llaminar2::test::runNativeVNNIExpertTransferGroupedParity(
+    llaminar2::test::runNativeQuantisedExpertTransferGroupedParity(
         "CUDA",
         llaminar2::DeviceId::cuda(0),
         stream_);

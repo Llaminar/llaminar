@@ -6,7 +6,7 @@
  * Sweep every serialized enum byte, packed block width and owner boundary so
  * unsupported codebooks or tiles cannot quietly select another schedule.
  */
-#include "kernels/cuda/gemm/CUDANativeVNNIPrefillSchedule.h"
+#include "kernels/cuda/gemm/CUDANativeQuantisedPrefillSchedule.h"
 #include <gtest/gtest.h>
 #include <climits>
 

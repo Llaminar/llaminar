@@ -317,7 +317,7 @@ namespace llaminar2
                params_.A==norm.gate||params_.A==norm.gamma||params_.C==norm.gate||params_.C==norm.gamma||
                params_.A->native_type()!=TensorType::FP32||params_.C->native_type()!=TensorType::FP32||
                norm.gate->native_type()!=TensorType::FP32||norm.gamma->native_type()!=TensorType::FP32||
-               !native_vnni_formats::forQuantType(tensorTypeName(params_.B->native_type()))||
+               !native_quantised_formats::forQuantType(tensorTypeName(params_.B->native_type()))||
                !params_.a_buffer_id||!params_.c_buffer_id||*params_.a_buffer_id==*params_.c_buffer_id||
                norm.gate_buffer==*params_.a_buffer_id||norm.gate_buffer==*params_.c_buffer_id||
                params_.alpha!=1.f||params_.beta!=0.f||params_.transpose_B||!params_.output_range.empty()||
@@ -392,8 +392,8 @@ namespace llaminar2
         // lookup cannot populate the generic sliced-kernel cache.
         result.engine=params_.prepared_store->gemmKernel(*params_.prepared_ref);
         if(!result.engine)throw std::logic_error("HC native binding lost its prepared engine");
-        DeviceNativeVNNIMatrixDesc weights;
-        if(!result.engine->inspectPreparedNativeVNNIMatrixDesc(weights))
+        DeviceNativeQuantisedMatrixDesc weights;
+        if(!result.engine->inspectPreparedNativeQuantisedMatrixDesc(weights))
             throw std::logic_error("HC native binding requires already prepared native source planes");
         const int columns=params_.output_range.empty()?params_.n:static_cast<int>(params_.output_range.size());
         (void)requireQ8ResidualNativeMatrix(weights,params_.m,columns,params_.k);
@@ -465,8 +465,8 @@ namespace llaminar2
             throw std::logic_error("Gated-norm binding lost its original immutable prepared source");
         GatedNormIdentity result;result.workspace_id=workspace->id();
         result.engine=params_.prepared_store->gemmKernel(*params_.prepared_ref);
-        DeviceNativeVNNIMatrixDesc weights;
-        if(!result.engine||!result.engine->inspectPreparedNativeVNNIMatrixDesc(weights))
+        DeviceNativeQuantisedMatrixDesc weights;
+        if(!result.engine||!result.engine->inspectPreparedNativeQuantisedMatrixDesc(weights))
             throw std::logic_error("Gated-norm binding requires original prepared native source planes");
         (void)requireQ8ResidualNativeMatrix(weights,1,params_.n,params_.k);
         result.weight_planes={weights.payload,weights.scales,weights.mins,weights.emins};
@@ -1043,7 +1043,7 @@ namespace llaminar2
         }
 
         // Primary path: use tensor-aware multiply_tensor for type-aware dispatch.
-        // Works for CPU (NativeVNNI, FloatingPointGemm) and GPU (CUDA/ROCm) kernels.
+        // Works for CPU (NativeQuantised, FloatingPointGemm) and GPU (CUDA/ROCm) kernels.
         {
             auto *A_base = requireTensorBase(params_.A, "input A");
             auto *C_base = asTensorBase(params_.C, "output C");

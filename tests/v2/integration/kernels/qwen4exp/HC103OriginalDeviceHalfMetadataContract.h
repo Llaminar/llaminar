@@ -2,7 +2,7 @@
  * @file HC103OriginalDeviceHalfMetadataContract.h
  * @brief Canonical binary16 publication for cross-backend prepared metadata.
  *
- * Movable NativeVNNI experts persist derived scales, offsets, and correction
+ * Movable NativeQuantised experts persist derived scales, offsets, and correction
  * terms as binary16 bit patterns. IEEE-754 permits both positive and negative
  * zero, but those encodings are arithmetically equivalent and CUDA and HIP may
  * choose different signs after an otherwise identical derived expression.
@@ -114,7 +114,7 @@ namespace llaminar2::test103_original_half
     /**
      * @brief Round one derived value through the canonical binary16 metadata ABI.
      *
-     * CPU NativeVNNI embeds Q8 activation scales in `Q8_1Block::d`, while GPU
+     * CPU NativeQuantised embeds Q8 activation scales in `Q8_1Block::d`, while GPU
      * kernels carry the same scale in a binary32 sidecar for coalesced loads.
      * Returning the widened canonical binary16 word makes those two physical
      * representations describe exactly the same arithmetic value.

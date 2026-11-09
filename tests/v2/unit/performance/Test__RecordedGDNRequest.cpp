@@ -26,7 +26,7 @@ json fixture(int degree=4,int rank=0,int rows=1)
     const std::array<int,4> widths={10240,6144,48,48};
     for(std::size_t i=0;i<4;++i)sources.push_back({{"source_tensor",names[i]},{"snapshot_key",keys[i]},
         {"original_n",widths[i]},{"source_gguf_type",i<2?8:0},{"source_format",i<2?"Q8_0":"F32"},
-        {"prepared_format",i<2?"NativeVNNI_Q8_0":"FP16"},{"source_execution_codebook",i<2?json(19):json(nullptr)},
+        {"prepared_format",i<2?"NativeQuantised_Q8_0":"FP16"},{"source_execution_codebook",i<2?json(19):json(nullptr)},
         {"oracle",file("/unrun/"+std::to_string(i)+".f32",std::uint64_t(rows)*widths[i]*4)}});
     return {{"schema","llaminar.recorded_gdn_projection.v1"},{"scope","local_shape"},{"operation_boundary","gdn_projection_bundle_compute"},
         {"input_origin","llaminar_captured_stage_output"},{"producer_stage","layer0_attn_norm"},{"semantic_tensor","layer0_ATTENTION_NORM"},
@@ -64,7 +64,7 @@ json receipt(const Request &r)
 TEST(RecordedGDNRequest,NativePreparedMetadataUsesSemanticBoolean)
 {
     // This is authored device-free descriptor metadata, never a native result.
-    DeviceNativeVNNIMatrixDesc descriptor{};
+    DeviceNativeQuantisedMatrixDesc descriptor{};
     descriptor.n=2560;descriptor.k=2560;descriptor.codebook_id=19;descriptor.source_codebook_id=19;
     for(const std::uint8_t flag:{std::uint8_t(0),std::uint8_t(1)})
     {

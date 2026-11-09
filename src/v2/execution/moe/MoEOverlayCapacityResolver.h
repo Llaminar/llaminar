@@ -238,7 +238,7 @@ namespace llaminar2
     /**
      * @brief Exact allocated bytes for one declared movable projection family.
      *
-     * CPU bytes are the final NativeVNNI interleaved representation. GPU live
+     * CPU bytes are the final NativeQuantised interleaved representation. GPU live
      * bytes are the migration-stable separated representation that can remain
      * resident after a CPU round trip. GPU shadow bytes match the deliberately
      * all-format-capable inactive slot allocated by the physical fabric.

@@ -12,7 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include "CUDANativeVNNIPrefillSchedule.h"
+#include "CUDANativeQuantisedPrefillSchedule.h"
 
 namespace llaminar2::cuda::generated
 {

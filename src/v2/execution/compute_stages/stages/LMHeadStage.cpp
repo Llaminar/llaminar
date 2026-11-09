@@ -147,7 +147,7 @@ namespace llaminar2
         }
 
         // Bias is passed directly to GEMM kernel for fused application.
-        // CPU NativeVNNI uses its runtime-row grouped path here for verifier rows;
+        // CPU NativeQuantised uses its runtime-row grouped path here for verifier rows;
         // parity tests compare these rows against serial one-token decode.
         bool success = false;
         if (params_.force_decode_equivalent_verifier_prefill &&

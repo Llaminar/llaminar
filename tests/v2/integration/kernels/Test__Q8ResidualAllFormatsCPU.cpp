@@ -12,7 +12,7 @@
 #include "../../utils/Q8ResidualAllFormatCPUHarness.h"
 #include "utils/MPIBootstrap.h"
 #include "../../utils/HC103CPUControlChain.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 
 /** @test All positive worker teams execute every format on a tiny complete
  * source. */
@@ -86,7 +86,7 @@ TEST(Q8ResidualAllFormatsCPU, HC103OriginalPreparedControlChain) {
  }
 }
 namespace {
-/** @brief Calibrate only real CPU primitive activation/read, without NativeVNNI admission. */
+/** @brief Calibrate only real CPU primitive activation/read, without NativeQuantised admission. */
 void hc103OriginalPrimitiveTails() {
  using namespace llaminar2;
  using namespace llaminar2::test;
@@ -141,7 +141,7 @@ TEST(Q8ResidualAllFormatsCPU, DISABLED_HC103OriginalScalarPrimitives) {
  ASSERT_EQ(llaminar2::activeISALevel(),llaminar2::ISALevel::Scalar);
  hc103OriginalPrimitiveTails();
 }
-/** @test Scalar is deliberately outside original NativeVNNI prepared-workspace geometry. */
+/** @test Scalar is deliberately outside original NativeQuantised prepared-workspace geometry. */
 TEST(Q8ResidualAllFormatsCPU, DISABLED_HC103ScalarRejectsNativePreparedGeometry) {
  using namespace llaminar2;
  using namespace llaminar2::test;
@@ -153,7 +153,7 @@ TEST(Q8ResidualAllFormatsCPU, DISABLED_HC103ScalarRejectsNativePreparedGeometry)
  ASSERT_NE(it,formats.end());
  try {
   q8_all_formats::CPUFixture unsupported(*it,3,256,256,false);
-  FAIL()<<"Scalar must not fabricate NativeVNNI workspace execution geometry";
+  FAIL()<<"Scalar must not fabricate NativeQuantised workspace execution geometry";
  } catch(const std::invalid_argument &error) {
   EXPECT_EQ(std::string(error.what()),"CPU projection workspace requires participant-owned worker/cache/ISA geometry");
  }
@@ -444,9 +444,9 @@ TEST(Q8ResidualAllFormatsCPU, CountedNativeVerifierRowGeometry) {
 /** @test Missing aggregate fused ordered-partial storage rejects before quantizer publication. */
 TEST(Q8ResidualAllFormatsCPU, CountedNativeVerifierFusedBankAdmission) {
  using namespace llaminar2;using namespace llaminar2::test;using namespace q8_all_formats;
- using namespace llaminar2::cpu::native_vnni;
+ using namespace llaminar2::cpu::native_quantised;
  Threads workers(3);
- ASSERT_EQ(nativeVNNIInvocationWorkerCount(),3);
+ ASSERT_EQ(nativeQuantisedInvocationWorkerCount(),3);
  // N64/K131072 exceeds the original 16M FLOP K-parallel threshold.
  // Each of two M1 members owns one N tile: two tasks < three workers,
  // so neither ISA can select the private output-tile-local bank route.
@@ -454,12 +454,12 @@ TEST(Q8ResidualAllFormatsCPU, CountedNativeVerifierFusedBankAdmission) {
  const auto found=std::find_if(formats.begin(),formats.end(),[](const auto& f){return f.tensor_type==TensorType::Q8_0;});
  ASSERT_NE(found,formats.end());CPUFixture fixture(*found,1,64,131072,false);
  FP32Tensor sibling({1,64},DeviceId::cpu());
- const auto* packed=fixture.kernel->exportCPUNativeVNNIPackedWeights();ASSERT_NE(packed,nullptr);
+ const auto* packed=fixture.kernel->exportCPUNativeQuantisedPackedWeights();ASSERT_NE(packed,nullptr);
  const std::array descriptors{FusedVerifierRowsDesc{packed,fixture.output.mutable_data(),nullptr,64,64},
   FusedVerifierRowsDesc{packed,sibling.mutable_data(),nullptr,64,64}};
- const auto plan=planNativeVNNIFusedRows(descriptors,1,3);
+ const auto plan=planNativeQuantisedFusedRows(descriptors,1,3);
  ASSERT_TRUE(plan.all_k_partitioned);
- ASSERT_EQ(plan.partial_route,NativeVNNIFusedPartialRoute::SharedBank);
+ ASSERT_EQ(plan.partial_route,NativeQuantisedFusedPartialRoute::SharedBank);
  ASSERT_GT(plan.sharedPartialFloats(),0u)<<"Chosen real K-partitioned bundle must require its shared ordered bank";
  // Deliberately admit one fewer float through the normal test arena authority.
  auto requirements=cpuProjectionQ8WorkspaceRequirements(1,131072);

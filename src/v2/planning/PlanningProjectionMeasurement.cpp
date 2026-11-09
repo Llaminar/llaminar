@@ -131,7 +131,7 @@ namespace llaminar2
             {
                 if (floating(plan))
                     return cuda::floating_gemm_workspace::projectionRequirements(rows, shape.n, shape.k, plan.operand_precision);
-                const auto *format = native_vnni_formats::forQuantType(plan.format);
+                const auto *format = native_quantised_formats::forQuantType(plan.format);
                 if (!format) throw std::invalid_argument("Unsupported CUDA projection source format");
                 const uint8_t codebook = canonicalDeviceVnniCodebookId(*format);
                 return cuda::quantized_gemm_workspace::projectionRequirements(rows, shape.n, shape.k,
@@ -145,7 +145,7 @@ namespace llaminar2
         void planGPUWeight(LoadOrchestrator &pool, const ProjectionGeometry &plan, DeviceId device)
         {
             pool.addDevice(device.gpu_ordinal());
-            if (const auto *format = native_vnni_formats::forQuantType(plan.format))
+            if (const auto *format = native_quantised_formats::forQuantType(plan.format))
                 pool.planWeightForOwner(device.gpu_ordinal(), plan.name, plan.n, plan.k,
                     format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric, format->has_emins, plan.payload_bytes, kWeightOwner);
             else if (floating(plan))
@@ -317,7 +317,7 @@ namespace llaminar2
                 gpu_pool = std::make_shared<LoadOrchestrator>(backend, memory, kWeightOwner);
                 planGPUWeight(*gpu_pool, plan, device);
                 gpu_pool->allocate(plan.payload_bytes, 3);
-                const auto *format = native_vnni_formats::forQuantType(plan.format);
+                const auto *format = native_quantised_formats::forQuantType(plan.format);
                 const auto repack = format ? codebookIdToRepackFormat(format->codebook_id, format->is_superblock) :
                     std::optional<RepackFormat>(RepackFormat::RAW_FP);
                 require(repack.has_value(), "source format has no native GPU repacker");

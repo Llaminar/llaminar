@@ -161,7 +161,7 @@ namespace llaminar2::moe_runtime_abi
 
     /*
      * Each of the two 512-expert placement banks owns a complete union-like
-     * descriptor record: three NativeVNNI views plus three compact contiguous
+     * descriptor record: three NativeQuantised views plus three compact contiguous
      * floating views and one format discriminator.  Both families retain
      * stable addresses because a captured runtime table may be republished by
      * asynchronous expert movement without changing its graph arguments.

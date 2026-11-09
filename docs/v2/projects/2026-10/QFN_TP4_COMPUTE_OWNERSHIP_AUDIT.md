@@ -1,7 +1,7 @@
 # QFN TP4 computation ownership audit
 
 Initial audit reviewed 2026-10-22 against source `77e17645b`, the retained L69
-per-device trace, and NativeVNNI82's construction observations. A1 uses one MPI
+per-device trace, and NativeQuantised82's construction observations. A1 uses one MPI
 rank with four MI50 participants, dense `TensorParallel`, routed
 `GateUpOwnedDownColumns`, RAM ngrams, 48 main layers and MTP disabled. Its
 initial accepted unprofiled baseline was **L80 785.303 prefill / 34.700 decode
@@ -33,13 +33,13 @@ The declarations and bindings are in
 [QwenGraphBase.cpp](../../../../src/v2/models/qwen/QwenGraphBase.cpp) and
 [MoEProjectionPipeline.cpp](../../../../src/v2/execution/compute_stages/stages/MoEProjectionPipeline.cpp).
 Original source dimensions/formats are retained in the
-[bounded descriptor inventory](../../../../parity-results/qwen-flash-next/nativevnni81-source-descriptors.json),
+[bounded descriptor inventory](../../../../parity-results/qwen-flash-next/nativequantised81-source-descriptors.json),
 which reads metadata without scanning or hashing tensor payloads.
 
 The [L69 trace](../../../../parity-results/qwen-flash-next/a1-control69-rocm-profile/result.json)
 authenticates 255 measured model-forward graphs on each of four native agents.
 All four execute 255 full-vocabulary producers and reducers. Current
-[construction observations](../../../../parity-results/qwen-flash-next/nativevnni82-release-accuracy/native-q8-physical-route-observation.json)
+[construction observations](../../../../parity-results/qwen-flash-next/nativequantised82-release-accuracy/native-q8-physical-route-observation.json)
 independently retain physical N248320, policy N62080 and K2560. Construction
 counters alone are not per-device execution proof; the retained per-agent trace
 establishes membership. Padded HC-down and K/V launches can share grid geometry,

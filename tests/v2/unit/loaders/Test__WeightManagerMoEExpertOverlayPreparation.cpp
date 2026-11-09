@@ -1566,7 +1566,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
         for(const auto& line:admitted->rankAttestation())if(line.owner==PhysicalMemoryOwner::WeightLoadStaging)startup_bytes=line.planned_new_bytes;
         ASSERT_TRUE(probe.prepareMoEExpertOverlayWeights(*runtime,DeviceId::cpu()));durable_bytes=liveRoutedBytes(*admitted);
         const auto engine=probe.expertGemmRegistry().getEngineLifetimeForParticipant("cpu_cold",DeviceId::cpu(),0,0,0,0,Role::GATE);
-        ASSERT_TRUE(engine);const auto* packed=engine->exportCPUNativeVNNIPackedWeights();ASSERT_NE(packed,nullptr);
+        ASSERT_TRUE(engine);const auto* packed=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_NE(packed,nullptr);
         packed_weights_serialization::PackedWeightsTransferDescriptor description;
         packed_weights_serialization::PackedWeightsConstSectionViews sections;
         ASSERT_TRUE(packed_weights_serialization::describeTransfer(*packed,description,sections));
@@ -1594,7 +1594,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
     auto engine = manager.expertGemmRegistry().getEngineLifetimeForParticipant(
         "cpu_cold", DeviceId::cpu(), 0, 0, 0, 0, Role::GATE);
     ASSERT_TRUE(engine);
-    const auto *source = engine->exportCPUNativeVNNIPackedWeights();
+    const auto *source = engine->exportCPUNativeQuantisedPackedWeights();
     ASSERT_NE(source, nullptr);
     const auto staging = CPUWeightStoragePlacement::accounted(authority, DeviceId::cpu(),
         PhysicalMemoryOwner::ExpertMigrationStaging, CPUWeightStoragePlacement::local());

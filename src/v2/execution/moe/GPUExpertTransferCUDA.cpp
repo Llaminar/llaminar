@@ -74,6 +74,17 @@ namespace llaminar2::detail
             return source == destination && source.is_cuda();
         }
 
+        // Setup owns only its own AlreadyEnabled status. Never overwrite or
+        // consume an unrelated error left by an earlier owner on this thread.
+        const cudaError_t previous_error = cudaPeekAtLastError();
+        if (previous_error != cudaSuccess)
+        {
+            LOG_ERROR("[GPUExpertTransfer] Direct-peer setup found an unconsumed CUDA error: "
+                      << cudaGetErrorString(previous_error)
+                      << " status=" << static_cast<int>(previous_error));
+            return false;
+        }
+
         int original_device = -1;
         if (cudaGetDevice(&original_device) != cudaSuccess)
             return false;
@@ -92,8 +103,27 @@ namespace llaminar2::detail
             {
                 const cudaError_t enable =
                     cudaDeviceEnablePeerAccess(source_ordinal, 0);
-                prepared = enable == cudaSuccess ||
-                           enable == cudaErrorPeerAccessAlreadyEnabled;
+                prepared = enable == cudaSuccess;
+                if (enable == cudaErrorPeerAccessAlreadyEnabled)
+                {
+                    // Successful native APIs do not retire this expected
+                    // status. Prove it is precisely ours before consuming it;
+                    // a different error remains visible and rejects setup.
+                    const auto owned_error = cudaPeekAtLastError();
+                    if (owned_error == cudaErrorPeerAccessAlreadyEnabled)
+                    {
+                        const auto retired = cudaGetLastError();
+                        prepared = retired == cudaErrorPeerAccessAlreadyEnabled;
+                        if (!prepared)
+                            LOG_ERROR("[GPUExpertTransfer] Expected peer-access status changed during retirement: "
+                                      << cudaGetErrorString(retired));
+                    }
+                    else
+                    {
+                        LOG_ERROR("[GPUExpertTransfer] Peer-access setup cannot consume unrelated CUDA error: "
+                                  << cudaGetErrorString(owned_error));
+                    }
+                }
             }
         }
 

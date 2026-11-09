@@ -363,7 +363,7 @@ Decoder7 uses 38/67, decoder16 26/68 and decoder23 30/67. Dynamic storage remain
 the exact 4 KiB original-partition bank at P16. Static instruction evidence does
 not substitute for model timing.
 
-The extension now compiles all eighteen physical NativeVNNI decoders and their
+The extension now compiles all eighteen physical NativeQuantised decoders and their
 original source envelopes with the spill guard enabled. The same range/commit
 arithmetic serves symmetric, corrected, dual-scale and IQ formats. IQ2_S uses a
 shared exact layout with an 8 KiB immutable codebook prefix followed by the

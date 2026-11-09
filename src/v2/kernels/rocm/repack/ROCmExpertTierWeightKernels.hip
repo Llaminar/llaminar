@@ -12,7 +12,7 @@
 
 #include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
 #include "backends/rocm/HipDeviceGuard.h"
-#include "tensors/NativeVnniIQ3SScale.h"
+#include "tensors/NativeQuantisedIQ3SScale.h"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -111,7 +111,7 @@ namespace llaminar2
 
         /**
          * @brief Compile-time properties of one accelerator source codebook.
-         * @tparam Codebook NativeVNNI codebook identifier stored in the stream
+         * @tparam Codebook NativeQuantised codebook identifier stored in the stream
          *         manifest.
          *
          * The stream kernel reads actual accelerator source blocks, not a
@@ -131,7 +131,7 @@ namespace llaminar2
             static constexpr bool is_iq1 = Codebook == 16 || Codebook == 17;
             static constexpr bool is_int8 =
                 Codebook == 19 ||
-                Codebook == kNativeVnniExpandedInt8MinCodebook;
+                Codebook == kNativeQuantisedExpandedInt8MinCodebook;
             static constexpr int payload_bytes =
                 is_int8                           ? 32
                 : is_5bit                        ? 20
@@ -157,7 +157,7 @@ namespace llaminar2
          * Multiplication scatters the four selector bits into byte-low bits.
          * Shift/subtract expands each selector to 0x00 or 0xff, after which
          * XOR-plus-carry is an independent two's-complement negate per byte.
-         * This is the same SWAR identity used by ROCm NativeVNNI inference.
+         * This is the same SWAR identity used by ROCm NativeQuantised inference.
          */
         __device__ __forceinline__ std::uint32_t applyTierIQSignsROCm(
             std::uint32_t grid4,
@@ -221,7 +221,7 @@ namespace llaminar2
          * @brief Decode one compact accelerator block into eight INT8x4 groups.
          * @tparam Codebook One of 6, 7, 9 through 17, raw-INT8 19, or
          *         normalized asymmetric INT8+minimum 23.
-         * @param payload Start of one production-packed NativeVNNI block.
+         * @param payload Start of one production-packed NativeQuantised block.
          * @param groups Receives 32 decoded integers in logical K order.
          *
          * This is the integer decode used by the production ROCm grouped MoE
@@ -435,7 +435,7 @@ namespace llaminar2
             {
                 static_assert(
                     Codebook == 19 ||
-                    Codebook == kNativeVnniExpandedInt8MinCodebook);
+                    Codebook == kNativeQuantisedExpandedInt8MinCodebook);
                 // Normalized symmetric and asymmetric INT8 share the same
                 // direct 32-byte payload.  Codebook 23's affine minimum is
                 // carried separately and is restored with metadata below.
@@ -636,7 +636,7 @@ namespace llaminar2
 
             static_assert(Codebook == 6 || Codebook == 7 || Codebook == 11 ||
                           Codebook == 12 || Codebook == 15 || Codebook == 16 ||
-                          Codebook == 19 || Codebook == kNativeVnniExpandedInt8MinCodebook);
+                          Codebook == 19 || Codebook == kNativeQuantisedExpandedInt8MinCodebook);
             // These single-scale formats retain their exact integer domain.
             // Multi-scale sources use the native transposition kernel instead.
             for (int value = 0; value < 32; ++value)
@@ -660,7 +660,7 @@ namespace llaminar2
                 scales[linear];
             if constexpr (
                 Codebook == 7 || Codebook == 11 || Codebook == 16 ||
-                Codebook == kNativeVnniExpandedInt8MinCodebook)
+                Codebook == kNativeQuantisedExpandedInt8MinCodebook)
             {
                 reinterpret_cast<std::uint16_t *>(
                     unit + (2304u/64)*columns)[local_column] =
@@ -826,7 +826,7 @@ namespace llaminar2
             {
                 static_assert(!Asymmetric, "IQ3_S raw source nibble is not an additive minimum");
                 const std::uint16_t raw = reinterpret_cast<const std::uint16_t *>(unit + (2304u/64)*columns)[local_column];
-                if (!native_vnni_iq3s_scale::valid(raw)) __builtin_trap();
+                if (!native_quantised_iq3s_scale::valid(raw)) __builtin_trap();
                 std::uint8_t low[8]{};
                 std::uint8_t high = 0;
                 std::uint8_t signs[4]{};
@@ -838,7 +838,7 @@ namespace llaminar2
                     for (unsigned lane = 0; lane < 4; ++lane)
                         values[lane] = static_cast<std::int8_t>(unit[
                             interleavedValueOffsetROCm(local_column, group * 4 + lane, columns)]);
-                    const auto encoded = native_vnni_iq3s_scale::encodeGridQuartet(values,kTierIQ3SGridROCm);
+                    const auto encoded = native_quantised_iq3s_scale::encodeGridQuartet(values,kTierIQ3SGridROCm);
                     if (!encoded.valid()) __builtin_trap();
                     low[group] = static_cast<std::uint8_t>(encoded.index);
                     high |= static_cast<std::uint8_t>((encoded.index >> 8) << group);
@@ -1024,27 +1024,27 @@ namespace llaminar2
         const dim3 grid(unit_count);
         const dim3 block(kColumnsPerUnit);
         auto hip_stream = reinterpret_cast<hipStream_t>(stream);
-        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale)
         {
             compactMultiScaleUnitsROCm<true><<<grid, block, 0, hip_stream>>>(
                 source, {}, nullptr, device_cpu_chunk, layout, first_unit);
             return hipPeekAtLastError() == hipSuccess;
         }
-        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
         {
             hipLaunchKernelGGL((gpuToCpuDecodedUnitsROCm<11>), grid, block, 0,
                 hip_stream, source.payload, source.scales, source.mins, source.emins,
                 layout, first_unit, device_cpu_chunk);
             return hipPeekAtLastError() == hipSuccess;
         }
-        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUTSourceScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
         {
             hipLaunchKernelGGL((gpuToCpuNibbleUnitsROCm<4, true>), grid, block, 0,
                 hip_stream, source.payload, source.scales, source.mins, layout, first_unit, device_cpu_chunk);
             return hipPeekAtLastError() == hipSuccess;
         }
         if (layout.cpu_encoding ==
-            cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
         {
             if (layout.gpu_codebook_id == 0)
             {
@@ -1069,7 +1069,7 @@ namespace llaminar2
             }
         }
         else if (layout.cpu_encoding ==
-                 cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)
+                 cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
         {
 #define LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(CODEBOOK)                    \
     hipLaunchKernelGGL(                                               \
@@ -1099,9 +1099,9 @@ namespace llaminar2
             case 19:
                 LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(19);
                 break;
-            case kNativeVnniExpandedInt8MinCodebook:
+            case kNativeQuantisedExpandedInt8MinCodebook:
                 LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(
-                    kNativeVnniExpandedInt8MinCodebook);
+                    kNativeQuantisedExpandedInt8MinCodebook);
                 break;
             default:
                 return false;
@@ -1146,26 +1146,26 @@ namespace llaminar2
         const dim3 block(kColumnsPerUnit);
         auto hip_stream = reinterpret_cast<hipStream_t>(stream);
         if (layout.cpu_encoding ==
-            cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale)
         {
             compactMultiScaleUnitsROCm<false><<<grid, block, 0, hip_stream>>>(
                 {}, destination, device_cpu_chunk, nullptr, layout, first_unit);
             return hipPeekAtLastError() == hipSuccess;
         }
-        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
         {
             hipLaunchKernelGGL((cpuToGpuExpandedUnitsROCm<false,11>), grid, block, 0,
                 hip_stream, device_cpu_chunk, layout, first_unit, destination.payload, destination.scales, destination.mins);
             return hipPeekAtLastError() == hipSuccess;
         }
-        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUTSourceScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
         {
             hipLaunchKernelGGL((cpuToGpuNibbleUnitsROCm<true>), grid, block, 0,
                 hip_stream, device_cpu_chunk, layout, first_unit, destination.payload, destination.scales, destination.mins);
             return hipPeekAtLastError() == hipSuccess;
         }
         if (layout.cpu_encoding ==
-            cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
         {
             if (layout.cpu_is_asymmetric != 0)
             {
@@ -1183,7 +1183,7 @@ namespace llaminar2
             }
         }
         else if (layout.cpu_encoding ==
-                 cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)
+                 cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
         {
             if (layout.cpu_is_asymmetric != 0)
             {

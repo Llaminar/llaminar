@@ -96,10 +96,10 @@ void authenticate(const std::vector<std::uint8_t>&raw,const std::vector<std::uin
 /** @brief Use actual production native packing and preuploaded prepared-engine construction. */
 std::shared_ptr<ITensorGemm> prepare(Q8_0Tensor&source,const std::vector<std::uint8_t>&raw,Storage&s,int n,int k){
 #ifdef HAVE_CUDA
- if(s.device.is_cuda()){cuda::CUDAPackedWeights packed;require(cuda::packWeightsToCUDA(&source,packed),"Production CUDA native pack failed");authenticate(raw,packed.native_vnni,packed.native_scales,n,k);return std::make_shared<cuda::CUDAQuantisedGemmKernel>(n,k,s.device.ordinal,s.input(packed.native_vnni),s.input(packed.native_scales),nullptr,nullptr,packed.native_codebook_id,packed.native_blocks_per_row,s.owners,packed.native_source_identity);}
+ if(s.device.is_cuda()){cuda::CUDAPackedWeights packed;require(cuda::packWeightsToCUDA(&source,packed),"Production CUDA native pack failed");authenticate(raw,packed.native_quantised,packed.native_scales,n,k);return std::make_shared<cuda::CUDAQuantisedGemmKernel>(n,k,s.device.ordinal,s.input(packed.native_quantised),s.input(packed.native_scales),nullptr,nullptr,packed.native_codebook_id,packed.native_blocks_per_row,s.owners,packed.native_source_identity);}
 #endif
 #ifdef HAVE_ROCM
- if(s.device.is_rocm()){rocm::ROCmPackedWeights packed;require(rocm::packNativeVNNI(&source,packed),"Production HIP native pack failed");authenticate(raw,packed.native_vnni_payload,packed.native_vnni_scales,n,k);return std::make_shared<rocm::ROCmQuantisedGemmKernel>(n,k,s.device.ordinal,s.input(packed.native_vnni_payload),s.input(packed.native_vnni_scales),nullptr,nullptr,packed.native_vnni_codebook_id,packed.native_vnni_blocks_per_row,s.owners,packed.native_source_identity);}
+ if(s.device.is_rocm()){rocm::ROCmPackedWeights packed;require(rocm::packNativeQuantised(&source,packed),"Production HIP native pack failed");authenticate(raw,packed.native_quantised_payload,packed.native_quantised_scales,n,k);return std::make_shared<rocm::ROCmQuantisedGemmKernel>(n,k,s.device.ordinal,s.input(packed.native_quantised_payload),s.input(packed.native_quantised_scales),nullptr,nullptr,packed.native_quantised_codebook_id,packed.native_quantised_blocks_per_row,s.owners,packed.native_source_identity);}
 #endif
  throw std::runtime_error("Correction fixture selected unavailable native backend");}
 /**
@@ -114,7 +114,7 @@ std::shared_ptr<ITensorGemm> prepare(Q8_0Tensor&source,const std::vector<std::ui
 WeightBinding registerEngine(PreparedWeightStore&store,Q8_0Tensor&source,DeviceId device,std::shared_ptr<ITensorGemm>engine,const char *sourceName="hc.attn_up.weight"){auto binding=test::makePreparedWeightTestBinding(&source,device,sourceName,store.modelId());auto handle=std::make_shared<Factory::PreparedGemmHandle>();handle->tensor=&source;handle->device_id=device;handle->kind=device.is_cuda()?Factory::GemmPreparationKind::CUDA_INT8_PACKED:Factory::GemmPreparationKind::ROCM_INT8_PACKED;handle->variant=static_cast<int>(TensorType::Q8_0);handle->prepared_weights=std::make_shared<Factory::PreparedGemmWeights>();handle->prepared_weights->kind=handle->kind;handle->prepared_weights->owned_kernel=std::move(engine);handle->prepared_weights->kernel=handle->prepared_weights->owned_kernel.get();binding.prepared=store.registerPreparedGemmHandle(binding,test::preparedKindForDevice(device),device,std::move(handle));return binding;}
 /** @brief Prove retained native execution and exact actual production primary quantization. */
 void prove(DeviceId device){auto*backend=getBackendFor(device);require(backend&&backend->deviceCount()>device.ordinal,"Requested native correction backend unavailable");auto&worker=GPUDeviceContextPool::instance().getContext(device);auto context=IDeviceContext::create(device,1);worker.submitAsync([&]{
- for(auto geometry:std::array{std::array{1,65},std::array{15,127},std::array{512,64},std::array{1024,64},std::array{1,10240},std::array{15,10240},std::array{512,10240},std::array{1024,10240}}){const int m=geometry[0],n=geometry[1],k=320;SCOPED_TRACE(::testing::Message()<<device.toString()<<" M="<<m<<" N="<<n);Storage s{device,backend,ExplicitGPUStream(worker.defaultStream()).get()};auto raw=nativeWeights(n,k);Q8_0Tensor source({std::size_t(n),std::size_t(k)},raw);PreparedWeightStore store{ModelContextId{801944}};auto binding=registerEngine(store,source,device,prepare(source,raw,s,n,k));auto*kernel=store.gemmKernel(*binding.prepared);kernel->setGPUStream(s.stream);DeviceNativeVNNIMatrixDesc before;require(kernel->exportNativeVNNIMatrixDesc(before),"Prepared source export failed");
+ for(auto geometry:std::array{std::array{1,65},std::array{15,127},std::array{512,64},std::array{1024,64},std::array{1,10240},std::array{15,10240},std::array{512,10240},std::array{1024,10240}}){const int m=geometry[0],n=geometry[1],k=320;SCOPED_TRACE(::testing::Message()<<device.toString()<<" M="<<m<<" N="<<n);Storage s{device,backend,ExplicitGPUStream(worker.defaultStream()).get()};auto raw=nativeWeights(n,k);Q8_0Tensor source({std::size_t(n),std::size_t(k)},raw);PreparedWeightStore store{ModelContextId{801944}};auto binding=registerEngine(store,source,device,prepare(source,raw,s,n,k));auto*kernel=store.gemmKernel(*binding.prepared);kernel->setGPUStream(s.stream);DeviceNativeQuantisedMatrixDesc before;require(kernel->exportNativeQuantisedMatrixDesc(before),"Prepared source export failed");
   auto input=std::make_shared<FP32Tensor>(std::vector<std::size_t>{std::size_t(m),std::size_t(k)},DeviceId::cpu());auto output=std::make_shared<FP32Tensor>(std::vector<std::size_t>{std::size_t(m),std::size_t(n)},DeviceId::cpu());FP32Tensor baseline({std::size_t(m),std::size_t(n)},DeviceId::cpu());
   for(int row=0;row<m;++row)for(int c=0;c<k;++c){float value=c%32==0?float((row%7)+1)*17.25f:std::sin(float(c*7+row*11))*.31f;if(row%17==0&&c<32)value=0;if(row%17==1&&c<32)value=std::numeric_limits<float>::denorm_min()*float(c+1);if(row%17==2&&c<32)value=c==0?127.f:float(c%11-5)+.5f;if(row%17==3&&c<32)value=c==0?1e9f:float(c-16)*1e6f;input->mutable_data()[std::size_t(row)*k+c]=value;}
   const std::vector<float>fixtureInput(input->data(),input->data()+input->numel());
@@ -155,7 +155,7 @@ void prove(DeviceId device){auto*backend=getBackendFor(device);require(backend&&
     require(backend->deviceToDevice(serialResult+std::size_t(row)*n,outputRows[row]->gpu_data_ptr(),std::size_t(n)*4,device.ordinal,s.stream),"Independent serial output gather failed");}
    auto expected=s.download(serialResult,std::size_t(live)*n);if(live){EXPECT_EQ(std::memcmp(actual.data(),expected.data(),expected.size()*4),0);}for(std::size_t i=std::size_t(live)*n;i<actual.size();++i)ASSERT_EQ(actual[i],-12345.f);
   }
-  DeviceNativeVNNIMatrixDesc after;require(kernel->exportNativeVNNIMatrixDesc(after),"Prepared source re-export failed");EXPECT_EQ(before.payload,after.payload);EXPECT_EQ(before.scales,after.scales);EXPECT_EQ(before.source_codebook_id,after.source_codebook_id);s.retire();stage.unbindWorkspace();
+  DeviceNativeQuantisedMatrixDesc after;require(kernel->exportNativeQuantisedMatrixDesc(after),"Prepared source re-export failed");EXPECT_EQ(before.payload,after.payload);EXPECT_EQ(before.scales,after.scales);EXPECT_EQ(before.source_codebook_id,after.source_codebook_id);s.retire();stage.unbindWorkspace();
  }
  }).get();}
 /**
@@ -194,7 +194,7 @@ void proveGDN(DeviceId device, bool fa_output = false)
    }
    auto *kernel=store.gemmKernel(*binding.prepared);require(kernel,"GDN prepared source missing");
    kernel->setGPUStream(s.stream);
-   DeviceNativeVNNIMatrixDesc before;require(kernel->exportNativeVNNIMatrixDesc(before),"GDN source export failed");
+   DeviceNativeQuantisedMatrixDesc before;require(kernel->exportNativeQuantisedMatrixDesc(before),"GDN source export failed");
    FP32Tensor input({std::size_t(m),std::size_t(k)},DeviceId::cpu());
    FP32Tensor output({std::size_t(m),std::size_t(n)},DeviceId::cpu());
    FP32Tensor baseline({std::size_t(m),std::size_t(n)},DeviceId::cpu());
@@ -372,7 +372,7 @@ void proveGDN(DeviceId device, bool fa_output = false)
     EXPECT_EQ(stage.graphCaptureVariantSignature(),signature);EXPECT_EQ(s.owners->size(),ownerCount);
     EXPECT_EQ(correction.value->used(),used);EXPECT_EQ(correction.value->getBuffer(kGPUProjectionPrimaryQ8),primary);
    }
-   DeviceNativeVNNIMatrixDesc after;require(kernel->exportNativeVNNIMatrixDesc(after),"GDN final source export failed");
+   DeviceNativeQuantisedMatrixDesc after;require(kernel->exportNativeQuantisedMatrixDesc(after),"GDN final source export failed");
    EXPECT_EQ(before.payload,after.payload);EXPECT_EQ(before.scales,after.scales);EXPECT_EQ(before.source_codebook_id,after.source_codebook_id);
    EXPECT_EQ(std::memcmp(raw.data(),source.raw_data(),raw.size()),0);
    s.retire();stage.unbindWorkspace();
@@ -413,8 +413,8 @@ void proveCancellationRead(DeviceId device)
             auto *kernel = store.gemmKernel(*binding.prepared);
             require(kernel,"HC cancellation prepared engine missing");
             kernel->setGPUStream(storage.stream);
-            DeviceNativeVNNIMatrixDesc original;
-            require(kernel->exportNativeVNNIMatrixDesc(original),"HC cancellation original native descriptor missing");
+            DeviceNativeQuantisedMatrixDesc original;
+            require(kernel->exportNativeQuantisedMatrixDesc(original),"HC cancellation original native descriptor missing");
             FP32Tensor input({std::size_t(m),std::size_t(k)},DeviceId::cpu());
             FP32Tensor normalized({std::size_t(m),std::size_t(n)},DeviceId::cpu());
             FP32Tensor singleLogits({std::size_t(m),std::size_t(n)},DeviceId::cpu());
@@ -537,8 +537,8 @@ void proveCancellationRead(DeviceId device)
                 EXPECT_EQ(residual.value->getBuffer(kGPUProjectionPrimaryQ8),primary);
                 EXPECT_EQ(residual.value->getBuffer(kGPUProjectionResidualQ8),residualBank);
             }
-            DeviceNativeVNNIMatrixDesc after;
-            require(kernel->exportNativeVNNIMatrixDesc(after),"HC cancellation final source descriptor missing");
+            DeviceNativeQuantisedMatrixDesc after;
+            require(kernel->exportNativeQuantisedMatrixDesc(after),"HC cancellation final source descriptor missing");
             EXPECT_EQ(original.payload,after.payload);
             EXPECT_EQ(original.scales,after.scales);
             EXPECT_EQ(original.source_codebook_id,after.source_codebook_id);
@@ -598,7 +598,7 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
   auto downPrepared=test::makeGpuPreparedGemm(downSource.get(),device,"hc103.down.weight",ModelContextId{803103});
   auto upPrepared=test::makeGpuPreparedGemm(upSource.get(),device,"hc103.up.weight",ModelContextId{803104});
   auto *downEngine=downPrepared.kernel,*upEngine=upPrepared.kernel;
-  DeviceNativeVNNIMatrixDesc originalUp;require(upEngine->exportNativeVNNIMatrixDesc(originalUp),"HC103 original prepared source missing");
+  DeviceNativeQuantisedMatrixDesc originalUp;require(upEngine->exportNativeQuantisedMatrixDesc(originalUp),"HC103 original prepared source missing");
   FP32Tensor normalized({std::size_t(m+1),std::size_t(trunk)},DeviceId::cpu());
   std::array<std::unique_ptr<FP32Tensor>,2> rawDown,activated,up,read;
   FP32Tensor branchInput({std::size_t(m+1),std::size_t(trunk)},DeviceId::cpu());
@@ -912,7 +912,7 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
     EXPECT_EQ(actualUp[side]->graphCaptureVariantSignature(),upSignatures[side]);
    }
    EXPECT_EQ(s.owners->size(),retainedOwners);
-   DeviceNativeVNNIMatrixDesc after;require(upEngine->exportNativeVNNIMatrixDesc(after),"HC103 original source vanished");
+   DeviceNativeQuantisedMatrixDesc after;require(upEngine->exportNativeQuantisedMatrixDesc(after),"HC103 original source vanished");
    EXPECT_EQ(after.payload,originalUp.payload);EXPECT_EQ(after.scales,originalUp.scales);
    EXPECT_EQ(after.source_codebook_id,originalUp.source_codebook_id);
    ASSERT_FALSE(::testing::Test::HasFailure());

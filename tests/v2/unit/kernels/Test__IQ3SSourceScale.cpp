@@ -14,8 +14,8 @@
 #include <omp.h>
 #include "tensors/TensorClasses.h"
 #include "tensors/IQQuantTables.h"
-#include "tensors/NativeVnniIQ3SScale.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "tensors/NativeQuantisedIQ3SScale.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 #include "kernels/cpu/gemm/CPUNativeAVX2Gemv.h"
 #include "../../utils/IQ3SOriginalEquationSource.h"
 #include "kernels/PackedWeightsSerialization.h"
@@ -23,7 +23,7 @@
 #include "execution/moe/ExpertTierWeightDeviceLayout.h"
 
 namespace llaminar2::test {
-namespace scale=native_vnni_iq3s_scale;
+namespace scale=native_quantised_iq3s_scale;
 /** @brief All source grid entries are strictly sorted and uniquely invertible. */
 TEST(IQ3SSourceScale, AllGridSignsAndLanesRoundTrip)
 {
@@ -68,7 +68,7 @@ TEST(IQ3SSourceScale, MandatoryTupleMetadataAndOldGenerationsRejected)
     auto old=header;old.version=3;EXPECT_FALSE(validateGpuPackedHeader(old,total));
     auto absent=header;absent.is_asymmetric=0;absent.mins_size=0;EXPECT_FALSE(validateGpuPackedHeader(absent,total));
     auto wrong=header;wrong.payload_bytes=32;EXPECT_FALSE(validateGpuPackedHeader(wrong,total));
-    PackedWeightsHeader cpu_header{};using Encoding=cpu::native_vnni::CPUNativeVNNIEncoding;
+    PackedWeightsHeader cpu_header{};using Encoding=cpu::native_quantised::CPUNativeQuantisedEncoding;
     cpu_header.codebook_id=11;cpu_header.is_superblock=1;cpu_header.payload_bytes=13;
     cpu_header.prepared_encoding=static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale);
     cpu_header.data_stride=2048;cpu_header.interleaved_block_stride=2432;
@@ -79,11 +79,11 @@ TEST(IQ3SSourceScale, MandatoryTupleMetadataAndOldGenerationsRejected)
 /** @brief Keep explicit rotation encoding separate from ordinary source-factor preservation. */
 TEST(IQ3SSourceScale, OrdinaryAndExplicitRotationEncodingBoundaries)
 {
-    using namespace cpu::native_vnni;
-    EXPECT_EQ(preparedEncodingForCodebook(11,false),CPUNativeVNNIEncoding::IQ3SExpandedSourceScale);
-    EXPECT_EQ(preparedEncodingForCodebook(11,true),CPUNativeVNNIEncoding::ExpandedInt8);
+    using namespace cpu::native_quantised;
+    EXPECT_EQ(preparedEncodingForCodebook(11,false),CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
+    EXPECT_EQ(preparedEncodingForCodebook(11,true),CPUNativeQuantisedEncoding::ExpandedInt8);
     PackedWeightsHeader header{};header.codebook_id=11;header.is_superblock=1;
-    header.prepared_encoding=static_cast<uint8_t>(CPUNativeVNNIEncoding::ExpandedInt8);
+    header.prepared_encoding=static_cast<uint8_t>(CPUNativeQuantisedEncoding::ExpandedInt8);
     header.payload_bytes=32;header.data_stride=2048;header.interleaved_block_stride=2304;
     // This checks encoding validity only; archive metadata does not restore the
     // separately owned activation-rotation basis (an existing distinct concern).
@@ -92,12 +92,12 @@ TEST(IQ3SSourceScale, OrdinaryAndExplicitRotationEncodingBoundaries)
 /** @brief Raw source tuple bytes roundtrip in V7 and reject earlier V6 metadata. */
 TEST(IQ3SSourceScale, ArchiveRoundTripRejectsV6BeforeAdoption)
 {
-    using namespace cpu::native_vnni;using namespace packed_weights_serialization;
+    using namespace cpu::native_quantised;using namespace packed_weights_serialization;
     IQ3_SBlock original{};original.d=0x3c01;original.scales[0]=1;
     std::vector<uint8_t> raw(sizeof(original));std::memcpy(raw.data(),&original,sizeof(original));
-    IQ3_STensor tensor({1,32},raw);CPUNativeVNNIPackedWeights packed;
+    IQ3_STensor tensor({1,32},raw);CPUNativeQuantisedPackedWeights packed;
     const int threads=omp_get_max_threads();omp_set_num_threads(1);
-    const bool prepared=packWeightsCPUNativeVNNI(&tensor,packed);omp_set_num_threads(threads);
+    const bool prepared=packWeightsCPUNativeQuantised(&tensor,packed);omp_set_num_threads(threads);
     ASSERT_TRUE(prepared);CPUPackedWeights owner(std::move(packed));
     auto blob=serialize(owner);auto restored=deserialize(blob.data(),blob.size());
     ASSERT_NE(restored,nullptr);const auto *native=dynamic_cast<const CPUPackedWeights*>(restored.get());

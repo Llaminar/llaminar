@@ -8,7 +8,7 @@
  */
 #pragma once
 #if defined(Q8_RESIDUAL_CUDA)
-#include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
+#include "kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh"
 namespace llaminar2::cuda_q8_residual
 {
     /** @brief Compile-time adapter to the unchanged installed CUDA native primitives. */
@@ -23,7 +23,7 @@ namespace llaminar2::cuda_q8_residual
               d_iq2xxs_grid(tables.iq2xxs), d_iq1s_grid(tables.iq1s)
         {
         }
-#include "kernels/common/DeviceNativeVNNIDecodeBody.cuh"
+#include "kernels/common/DeviceNativeQuantisedDecodeBody.cuh"
     };
 } // namespace llaminar2::cuda_q8_residual
 #else
@@ -40,7 +40,7 @@ namespace llaminar2::Q8R_NAMESPACE
         /** @brief Explicit inactive local tile metadata; no global source access. */
         __device__ NativeBlock() : scale(0), secondary(0), qh(0), emin(0) {}
         /** @brief Load exact original scale/raw-factor planes and IQ1_M delta signs. */
-        __device__ NativeBlock(const DeviceNativeVNNIMatrixDesc &w, std::uint64_t block,
+        __device__ NativeBlock(const DeviceNativeQuantisedMatrixDesc &w, std::uint64_t block,
                                const std::uint8_t *payload)
             : scale(static_cast<const std::uint16_t *>(w.scales)[block]), secondary(0), qh(0), emin(0)
         {
@@ -58,7 +58,7 @@ namespace llaminar2::Q8R_NAMESPACE
                                                         int lo, int hi, float activation, const int (&s)[4])
     {
         const int low = s[0] + s[1], high = s[2] + s[3];
-        return decoder.native_vnni_block_contribution_from_reduced_terms_rn<C>(
+        return decoder.native_quantised_block_contribution_from_reduced_terms_rn<C>(
             lo, hi, activation, b.scale, b.secondary, b.emin, low + high, low, high, b.qh, s[0], s[1], s[2], s[3]);
     }
 } // namespace llaminar2::Q8R_NAMESPACE

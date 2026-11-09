@@ -25,7 +25,7 @@
 #include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/IMoEKernel.h"
-#include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
+#include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "kernels/KernelFactory.h"
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/QuantizedVerifierFormats.h"
@@ -61,7 +61,7 @@ namespace
     {
         std::vector<WeightCase> cases;
         for (const auto &format : quantizedMoEVerifierFormats())
-            cases.push_back({format.label, DeviceMoEWeightFormat::NativeVNNI, format.create});
+            cases.push_back({format.label, DeviceMoEWeightFormat::NativeQuantised, format.create});
         cases.push_back({"FP16", DeviceMoEWeightFormat::FP16,
             [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
             { return TestTensorFactory::createFP16Random(shape, -0.125f, 0.125f, seed); }});
@@ -221,7 +221,7 @@ namespace
                             {.kind = MoERouteLaunchKind::DecodeEquivalentVerifier, .physical_rows = rows,
                              .d_model = hidden_size, .num_experts = experts, .top_k = top_k}));
                     }
-                    std::vector<DeviceNativeVNNIMatrixDesc> gates(experts), ups(experts), downs(experts);
+                    std::vector<DeviceNativeQuantisedMatrixDesc> gates(experts), ups(experts), downs(experts);
                     std::vector<DeviceMoEFloatingMatrixDesc> fp_gates(experts), fp_ups(experts), fp_downs(experts);
                     for (int expert = 0; expert < experts; ++expert)
                     {
@@ -554,7 +554,7 @@ namespace
                         ASSERT_NE(canonical->function_identity, 0u);
                         ASSERT_EQ(canonical->block_x, workers ? 256u : 64u);
                         ASSERT_EQ(canonical->static_shared_memory_bytes,
-                            workers ? size_t(NativeVNNIGroupedDecodePolicy::maximum_k_partitions) * 64 * sizeof(float) : 0u);
+                            workers ? size_t(NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) * 64 * sizeof(float) : 0u);
                         ASSERT_EQ(canonical->dynamic_shared_memory_bytes, 0u);
                         ASSERT_EQ(canonical->local_memory_bytes_per_thread, 0u);
                         ASSERT_EQ(canonical->block_y, 1u);

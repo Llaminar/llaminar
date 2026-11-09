@@ -11,6 +11,14 @@ user-selectable mode is a first-class implementation with its own correctness
 and economy gates; no mode may be entered automatically to hide a missing,
 broken, or uneconomical implementation.
 
+Missing GPU tuning records are not missing hardware support. NativeQuantised
+dispatch prefers the actual architecture's exact records, then the nearest
+compatible measured architecture within that backend. Actual device identity,
+compiled kernel support and launch/resource limits remain authoritative; the
+selected tuning architecture never replaces them. If no compatible exact key
+exists, the complete general dispatcher still covers supported shapes. Missing
+tuning data alone must never prevent inference.
+
 ### Architecture and Ownership
 
 1. **Implement the target state directly.** Do not add serial replay, host
@@ -320,9 +328,10 @@ single-source.
 - `.agents/llaminar-testing/SKILL.md`: Unit and production-preflight gates,
   generation regressions, real-weight HF/CSV diagnostics, canonical matrix
   extension, HTTP/remote-MPI E2E, and image/benchmark certification.
-- `.agents/nativevnni-gemm-tuning/SKILL.md`: cross-backend NativeVNNI
-  GEMV/GEMM candidate tuning, evidence collection, dispatch installation, and
-  corpus certification.
+- `.agents/nativequantised-gemm-tuning/SKILL.md`: cross-backend NativeQuantised
+  GEMV/GEMM exact-overlay tuning, evidence collection, dispatch installation,
+  and numerical/performance qualification. Generic fitting is retired; existing
+  runtime rules continue to cover unmeasured shapes.
 - `.agents/llama-cpp-comparison/SKILL.md`: matched Release comparisons against
   llama.cpp, exact bucket-aligned prompts, paired phase/kernel attribution, and
   overlap-aware performance evidence.

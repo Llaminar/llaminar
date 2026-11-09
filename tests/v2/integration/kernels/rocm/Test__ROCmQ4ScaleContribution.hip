@@ -11,7 +11,7 @@
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include "backends/rocm/ROCmRuntimeStartup.h"
-#include "kernels/rocm/gemm/ROCmNativeVNNIDecodeEquivalentMath.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedDecodeEquivalentMath.h"
 #include <array>
 #include <bit>
 #include <cfenv>
@@ -55,13 +55,13 @@ template <bool Boundary> __global__ void replayScale(const Inputs *in, Result *o
     unsigned i = threadIdx.x;
     if (i >= in->live)
         return;
-    float weight = rocm_native_vnni_load_single_weight_scale<0>(in->half[i], 0);
+    float weight = rocm_native_quantised_load_single_weight_scale<0>(in->half[i], 0);
     if constexpr (Boundary)
         weight = device_fp32_contract::persistRounded(weight);
     out[i] = {
         weight, device_fp32_contract::multiply(in->activation[i], weight),
-        device_native_vnni_contract::singleScaleBlock(in->dot[i], weight, in->activation[i]),
-        rocm_native_vnni_commit_single_scale_block(in->initial[i], in->dot[i], weight, in->activation[i])};
+        device_native_quantised_contract::singleScaleBlock(in->dot[i], weight, in->activation[i]),
+        rocm_native_quantised_commit_single_scale_block(in->initial[i], in->dot[i], weight, in->activation[i])};
 }
 /** @brief Decode every finite binary16 word using exact integer
  * exponent/significand arithmetic.

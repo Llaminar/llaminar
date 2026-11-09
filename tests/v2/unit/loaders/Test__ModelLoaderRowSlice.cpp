@@ -1054,8 +1054,8 @@ namespace llaminar2
                 for (const auto &format:quantizedVerifierFormats())
                     if (format.tensor_type==binding.tensor->native_type())
                     {
-                        NativeVnniSourceIdentity original;
-                        ASSERT_TRUE(kernel->exportNativeVNNISourceIdentity(original));
+                        NativeQuantisedSourceIdentity original;
+                        ASSERT_TRUE(kernel->exportNativeQuantisedSourceIdentity(original));
                         EXPECT_TRUE(original.present);
                         EXPECT_EQ(original.codebook_id,format.source_codebook_id);
                         EXPECT_EQ(original.is_superblock,format.source_is_superblock);

@@ -179,7 +179,7 @@ private:
     static int sourceBlock(const ExpertWeightFormat& format){
         if(!format.valid())throw std::invalid_argument("Unknown expert shard source format");
         if(format.isFloating())return 1; // Ordinary IEEE scalars have no encoded group dependency.
-        const auto* original=native_vnni_formats::forSourceIdentity(format.native_vnni.codebook_id,format.native_vnni.is_superblock);
+        const auto* original=native_quantised_formats::forSourceIdentity(format.native_quantised.codebook_id,format.native_quantised.is_superblock);
         if(!original)throw std::invalid_argument("Unknown original expert source codebook");
         // The canonical source catalog declares two block families. Their POD
         // source traits own the widths; no shard codec/size table is maintained.

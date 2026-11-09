@@ -100,7 +100,7 @@ namespace llaminar2::rocm
         kROCmMoEGroupedPrefillExactRoutePolicies{{
             {
                 .key = {
-                    .gateup_codebook = 19, // NativeVNNI Q8_0 execution id.
+                    .gateup_codebook = 19, // NativeQuantised Q8_0 execution id.
                     .down_codebook = 19,
                     .hidden_size = 3072,
                     .expert_width = 1024,
@@ -113,7 +113,7 @@ namespace llaminar2::rocm
             },
             {
                 .key = {
-                    .gateup_codebook = 19, // NativeVNNI Q8_0 execution id.
+                    .gateup_codebook = 19, // NativeQuantised Q8_0 execution id.
                     .down_codebook = 19,
                     .hidden_size = 3072,
                     .expert_width = 1024,

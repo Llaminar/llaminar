@@ -30,10 +30,10 @@
 #include <vector>
 
 #ifdef HAVE_CUDA
-extern "C" int cudaNativeVNNIGemvTuned_getSerialPartitionN();
+extern "C" int cudaNativeQuantisedGemvTuned_getSerialPartitionN();
 #endif
 #ifdef HAVE_ROCM
-extern "C" int rocmGemv_native_vnni_get_serial_partition_n();
+extern "C" int rocmGemv_native_quantised_get_serial_partition_n();
 #endif
 
 namespace llaminar2::test::original_output_slice_native
@@ -48,10 +48,10 @@ inline void require(bool condition, const std::string &message)
 inline int currentPolicy(DeviceId device)
 {
 #ifdef HAVE_CUDA
-    if (device.is_cuda()) return cudaNativeVNNIGemvTuned_getSerialPartitionN();
+    if (device.is_cuda()) return cudaNativeQuantisedGemvTuned_getSerialPartitionN();
 #endif
 #ifdef HAVE_ROCM
-    if (device.is_rocm()) return rocmGemv_native_vnni_get_serial_partition_n();
+    if (device.is_rocm()) return rocmGemv_native_quantised_get_serial_partition_n();
 #endif
     throw std::invalid_argument("Original-output slice requires a compiled GPU backend");
 }
@@ -142,8 +142,8 @@ struct State
         prepared=makeGpuPreparedGemmBatch(raw,device,"test.original_output_slice",ModelContextId{950086},bindings);
         for (size_t index=0;index<prepared.size();++index)
         {
-            DeviceNativeVNNIMatrixDesc actual_descriptor{};
-            require(prepared[index].kernel->exportNativeVNNIMatrixDesc(actual_descriptor) &&
+            DeviceNativeQuantisedMatrixDesc actual_descriptor{};
+            require(prepared[index].kernel->exportNativeQuantisedMatrixDesc(actual_descriptor) &&
                 actual_descriptor.valid(),"actual native prepared descriptor missing");
             require(prepared[index].kernel->get_n()==actual_descriptor.n &&
                 prepared[index].kernel->get_k()==actual_descriptor.k,
@@ -343,10 +343,10 @@ struct State
             for (const auto &node:nodes)
             {
                 const bool producer=device.is_cuda()
-                    ? node.name.find("nativeVnniTC_BK64")!=std::string::npos ||
-                      node.name.find("nativeVnniTC_BK256")!=std::string::npos
-                    : node.name.find("native_vnni_gemm_kernel")!=std::string::npos;
-                require(node.name.find("gemv_native_vnni")==std::string::npos,
+                    ? node.name.find("nativeQuantisedTC_BK64")!=std::string::npos ||
+                      node.name.find("nativeQuantisedTC_BK256")!=std::string::npos
+                    : node.name.find("native_quantised_gemm_kernel")!=std::string::npos;
+                require(node.name.find("gemv_native_quantised")==std::string::npos,
                     "ordinary bulk graph contains a native GEMV/verifier producer");
                 if (!producer) continue;
                 ++prefill_producers;
@@ -409,7 +409,7 @@ void prove(DeviceId device)
     auto &context=GPUDeviceContextPool::instance().getContext(device);
     context.submitAndWait([&] {
         ScopedGemmContext attention_context(GemmContext::ATTN);
-        require(quantizedVerifierFormats().size()==native_vnni_formats::kAllSourceFormats.size(),
+        require(quantizedVerifierFormats().size()==native_quantised_formats::kAllSourceFormats.size(),
             "canonical source inventory incomplete");
         unsigned seed=950101;
         // Existing complete strengthened creators avoid degenerate IQ3_S and

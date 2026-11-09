@@ -25,7 +25,7 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
-#include "kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedDecodeDispatchGenerated.inc"
 #include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
 #include "kernels/common/DeviceHalfMetadataContract.h"
 #include <bit>
@@ -40,7 +40,7 @@
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/OriginalOutputSliceNativeFixture.h"
-#include "../../../utils/NativeVNNIEquivalenceInventory.h"
+#include "../../../utils/NativeQuantisedEquivalenceInventory.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/ScopedGPUStream.h"
 #include "../../../utils/TestTensorFactory.h"
@@ -76,16 +76,16 @@ extern "C" bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
     int rocm_device_id, void *stream,
     int block_size);
 
-extern "C" void rocmGemv_native_vnni_set_tuning_overrides(
+extern "C" void rocmGemv_native_quantised_set_tuning_overrides(
     int kb,
     int target_waves_per_cu);
 
-extern "C" void rocmGemv_native_vnni_reset_tuning_overrides();
+extern "C" void rocmGemv_native_quantised_reset_tuning_overrides();
 
-extern "C" void rocmGemv_native_vnni_set_serial_partition_n(int n);
-extern "C" int rocmGemv_native_vnni_get_serial_partition_n();
+extern "C" void rocmGemv_native_quantised_set_serial_partition_n(int n);
+extern "C" int rocmGemv_native_quantised_get_serial_partition_n();
 
-extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
+extern "C" bool rocmGemv_native_quantised_query_serial_m1_config(
     uint8_t codebook_id,
     int N,
     int K,
@@ -102,7 +102,7 @@ namespace
     enum class PackedPath
     {
         INT8VNNI,
-        NativeVNNI,
+        NativeQuantised,
     };
 
     using WeightCreator = std::function<std::unique_ptr<TensorBase>(
@@ -119,32 +119,32 @@ namespace
 
 #ifdef HAVE_ROCM
     /**
-     * @brief Apply one trainer-only NativeVNNI launch override for a test scope.
+     * @brief Apply one trainer-only NativeQuantised launch override for a test scope.
      *
      * The ROCm decode trainer evaluates explicit kernel schedules through the
      * same process-wide override API used below.  Always restoring automatic
      * dispatch is important because GoogleTest may continue with another test
      * in the same process after an expectation fails.
      */
-    class ScopedROCmNativeVNNITuningOverride final
+    class ScopedROCmNativeQuantisedTuningOverride final
     {
     public:
         /** Select the explicit K partition and target-wave candidate. */
-        ScopedROCmNativeVNNITuningOverride(int kb, int target_waves_per_cu)
+        ScopedROCmNativeQuantisedTuningOverride(int kb, int target_waves_per_cu)
         {
-            rocmGemv_native_vnni_set_tuning_overrides(kb, target_waves_per_cu);
+            rocmGemv_native_quantised_set_tuning_overrides(kb, target_waves_per_cu);
         }
 
         /** Restore generated production dispatch when the test scope ends. */
-        ~ScopedROCmNativeVNNITuningOverride()
+        ~ScopedROCmNativeQuantisedTuningOverride()
         {
-            rocmGemv_native_vnni_reset_tuning_overrides();
+            rocmGemv_native_quantised_reset_tuning_overrides();
         }
 
-        ScopedROCmNativeVNNITuningOverride(
-            const ScopedROCmNativeVNNITuningOverride &) = delete;
-        ScopedROCmNativeVNNITuningOverride &operator=(
-            const ScopedROCmNativeVNNITuningOverride &) = delete;
+        ScopedROCmNativeQuantisedTuningOverride(
+            const ScopedROCmNativeQuantisedTuningOverride &) = delete;
+        ScopedROCmNativeQuantisedTuningOverride &operator=(
+            const ScopedROCmNativeQuantisedTuningOverride &) = delete;
     };
 
     /**
@@ -190,14 +190,14 @@ namespace
     {
     public:
         explicit ScopedROCmSerialPartitionPolicy(int n)
-            : previous_(rocmGemv_native_vnni_get_serial_partition_n())
+            : previous_(rocmGemv_native_quantised_get_serial_partition_n())
         {
-            rocmGemv_native_vnni_set_serial_partition_n(n);
+            rocmGemv_native_quantised_set_serial_partition_n(n);
         }
 
         ~ScopedROCmSerialPartitionPolicy()
         {
-            rocmGemv_native_vnni_set_serial_partition_n(previous_);
+            rocmGemv_native_quantised_set_serial_partition_n(previous_);
         }
 
         ScopedROCmSerialPartitionPolicy(
@@ -211,9 +211,9 @@ namespace
 #endif
 
     /**
-     * @brief One production-weight representative for each ROCm MoE native-VNNI codegroup.
+     * @brief One production-weight representative for each ROCm MoE native-quantised codegroup.
      *
-     * Grouped MoE verifier prefill dispatches by native-VNNI codebook id, not by
+     * Grouped MoE verifier prefill dispatches by native-quantised codebook id, not by
      * the original GGUF tensor class.  Several GGUF formats collapse to the same
      * codegroup after GPU repack, so this table intentionally keeps exactly one
      * representative per advertised grouped-prefill codebook.  The test below
@@ -483,7 +483,7 @@ namespace
     /**
      * @brief CPU reference for ROCm Q8 blockwise activation quantization.
      *
-     * The ROCm small-M NativeVNNI path uses per-32-value activation scales and
+     * The ROCm small-M NativeQuantised path uses per-32-value activation scales and
      * quantized activation sums. This bounded normal-scale fixture independently
      * rounds the published scale through the existing tensor binary16 converter;
      * it does not call the device quantizer/scale implementation. Keeping an
@@ -603,11 +603,11 @@ namespace
         {
         case PackedPath::INT8VNNI:
             EXPECT_FALSE(packed.int8_data_vnni.empty());
-            EXPECT_TRUE(packed.native_vnni_payload.empty());
+            EXPECT_TRUE(packed.native_quantised_payload.empty());
             break;
-        case PackedPath::NativeVNNI:
-            EXPECT_FALSE(packed.native_vnni_payload.empty());
-            EXPECT_FALSE(packed.native_vnni_scales.empty());
+        case PackedPath::NativeQuantised:
+            EXPECT_FALSE(packed.native_quantised_payload.empty());
+            EXPECT_FALSE(packed.native_quantised_scales.empty());
             EXPECT_TRUE(packed.int8_data_vnni.empty());
             break;
         }
@@ -629,7 +629,7 @@ namespace
      * but low-entropy sign/high-bit fields.  That is fine for constructor smoke
      * tests, but it is too weak for the MoE grouped verifier sweep: we need every
      * codebook representative to drive nonzero gate, up, and down work through the
-     * native-VNNI repack and decode kernels.  This local fixture mirrors the ROCm
+     * native-quantised repack and decode kernels.  This local fixture mirrors the ROCm
      * repack test pattern with bounded scales so the regression remains focused on
      * grouped decode equivalence rather than on global test-data policy.
      */
@@ -731,7 +731,7 @@ namespace
     }
 
     /**
-     * @brief ROCm grouped-MoE NativeVNNI codegroups that claim verifier prefill support.
+     * @brief ROCm grouped-MoE NativeQuantised codegroups that claim verifier prefill support.
      *
      * Keep this table aligned with `groupedDecodeSupportsCodebook()` in
      * `ROCmMoEKernel.cpp` and the `LAUNCH_*_IF_PRESENT` macros in
@@ -744,7 +744,7 @@ namespace
         return {
             {"Q4_0", 0, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createQ4_0Random(shape, seed); }},
-            {"IQ4_XS", kNativeVnniIQ4XSSourceScaleCodebook, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+            {"IQ4_XS", kNativeQuantisedIQ4XSSourceScaleCodebook, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return createBoundedIQ4XSForGroupedMoE(shape, seed); }},
             {"Q4_K", 5, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createQ4_KRandom(shape, seed); }},
@@ -945,15 +945,15 @@ namespace
                                                            ModelContextId{970000 + static_cast<uint64_t>(seed)}));
 
             auto *kernel = prepared_weights.back().kernel;
-            DeviceNativeVNNIMatrixDesc desc{};
-            const bool exported = kernel->exportNativeVNNIMatrixDesc(desc);
+            DeviceNativeQuantisedMatrixDesc desc{};
+            const bool exported = kernel->exportNativeQuantisedMatrixDesc(desc);
             EXPECT_TRUE(exported) << gateup_format.label << "/" << down_format.label << " descriptor export for "
                                   << role;
             if (!exported)
                 return nullptr;
             EXPECT_EQ(desc.codebook_id, codegroup.codebook_id)
                 << gateup_format.label << "/" << down_format.label
-                << " must exercise the intended native-VNNI codegroup for " << role;
+                << " must exercise the intended native-quantised codegroup for " << role;
             if (desc.codebook_id != codegroup.codebook_id)
                 return nullptr;
             return kernel;
@@ -980,15 +980,15 @@ namespace
             ASSERT_NE(experts[static_cast<size_t>(expert)].down, nullptr);
         }
 
-        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
-        std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
-        std::vector<DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
+        std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(num_experts);
+        std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(num_experts);
+        std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(num_experts);
         for (int expert = 0; expert < num_experts; ++expert)
         {
             const auto &triplet = experts[static_cast<size_t>(expert)];
-            ASSERT_TRUE(triplet.gate->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
-            ASSERT_TRUE(triplet.up->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(expert)]));
-            ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(expert)]));
+            ASSERT_TRUE(triplet.gate->exportNativeQuantisedMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
+            ASSERT_TRUE(triplet.up->exportNativeQuantisedMatrixDesc(up_descs[static_cast<size_t>(expert)]));
+            ASSERT_TRUE(triplet.down->exportNativeQuantisedMatrixDesc(down_descs[static_cast<size_t>(expert)]));
         }
 
         const int gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
@@ -1203,7 +1203,7 @@ namespace
     /**
      * @brief Prove grouped verifier GEMV is equivalent to serial decode GEMV.
      *
-     * This intentionally compares ROCm NativeVNNI grouped runtime-M output
+     * This intentionally compares ROCm NativeQuantised grouped runtime-M output
      * against independent M=1 executions using the same packed weights. It does not use
      * a dequantized FP32 reference, because Phase 9.8 needs the grouped verifier
      * path to publish exactly the state/logits serial decode would have produced
@@ -3150,7 +3150,7 @@ namespace
             weights.push_back(createWeights[i]({static_cast<size_t>(Ns[i]), static_cast<size_t>(K)},
                                                static_cast<uint32_t>(700 + i)));
             ASSERT_TRUE(packWeightsToROCm(weights.back().get(), packed[i]));
-            expectPackedPath(packed[i], PackedPath::NativeVNNI);
+            expectPackedPath(packed[i], PackedPath::NativeQuantised);
             kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
 #ifdef HAVE_ROCM
             kernels.back()->setGPUStream(stream);
@@ -3310,7 +3310,7 @@ namespace
             weights.push_back(createWeights[i]({static_cast<size_t>(Ns[i]), static_cast<size_t>(K)},
                                                static_cast<uint32_t>(8100 + i)));
             ASSERT_TRUE(packWeightsToROCm(weights.back().get(), packed[i]));
-            expectPackedPath(packed[i], PackedPath::NativeVNNI);
+            expectPackedPath(packed[i], PackedPath::NativeQuantised);
             kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
 #ifdef HAVE_ROCM
             kernels.back()->setGPUStream(stream);
@@ -3480,7 +3480,7 @@ namespace
                 static_cast<uint32_t>(12100 + projection)));
             ASSERT_TRUE(packWeightsToROCm(
                 weights.back().get(), packed[projection]));
-            expectPackedPath(packed[projection], PackedPath::NativeVNNI);
+            expectPackedPath(packed[projection], PackedPath::NativeQuantised);
             kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(
                 &packed[projection], 0));
 #ifdef HAVE_ROCM
@@ -3621,7 +3621,7 @@ namespace
 
         ROCmPackedWeights packed;
         ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
-        expectPackedPath(packed, PackedPath::NativeVNNI);
+        expectPackedPath(packed, PackedPath::NativeQuantised);
 
         hipStream_t stream = nullptr;
         ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
@@ -3691,7 +3691,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ80M2MatchesReference)
 }
 
 /**
- * @test Prove ROCm NativeVNNI active rows are byte-invariant for the complete
+ * @test Prove ROCm NativeQuantised active rows are byte-invariant for the complete
  * finite M-totality witness inventory and every quantized format.
  *
  * This is the ROCm half of the cross-backend graph-bucket contract. The shared
@@ -3711,7 +3711,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ80M2MatchesReference)
  * the test sensitive to device arithmetic without making setup dominate the
  * integration gate.
  */
-TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets)
+TEST(Test__ROCmQuantisedGemmSmallM, NativeQuantisedPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets)
 {
     if (!hasROCmDevice())
         GTEST_SKIP() << "No ROCm device available";
@@ -3721,7 +3721,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
     uint64_t geometry_index = 0;
 
     for (const auto &geometry :
-         nativeVNNIPrefillAllFormatGeometryEquivalenceCases())
+         nativeQuantisedPrefillAllFormatGeometryEquivalenceCases())
     {
         SCOPED_TRACE(geometry.label);
         ASSERT_FALSE(geometry.row_cases.empty());
@@ -3890,7 +3890,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
                 expectBitwiseFP32RowsEqual(
-                    std::string("ROCm NativeVNNI active rows format=") +
+                    std::string("ROCm NativeQuantised active rows format=") +
                         format.label + " active M=" +
                         std::to_string(test_case.active_rows) +
                         " bucket M=" +
@@ -3900,7 +3900,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
                     active_values,
                     static_cast<size_t>(N));
                 expectBitwiseFP32RowsEqual(
-                    std::string("ROCm NativeVNNI exact M versus serial rows format=") +
+                    std::string("ROCm NativeQuantised exact M versus serial rows format=") +
                         format.label + " active M=" +
                         std::to_string(test_case.active_rows),
                     exact_host.data(),
@@ -3908,7 +3908,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
                     active_values,
                     static_cast<size_t>(N));
                 expectBitwiseFP32RowsEqual(
-                    std::string("ROCm NativeVNNI bucket active rows versus serial M=1 format=") +
+                    std::string("ROCm NativeQuantised bucket active rows versus serial M=1 format=") +
                         format.label + " active M=" +
                         std::to_string(test_case.active_rows),
                     bucket_host.data(),
@@ -4015,10 +4015,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, ProductionPreparedAllQuantizedFormatsRuntime
     uint64_t grouped_calls = 0;
     uint64_t canonical_raw_int8_calls = 0;
     for (const auto &record : PerfStatsCollector::snapshot(
-             {"kernel.rocm_native_vnni_small_m_calls"}))
+             {"kernel.rocm_native_quantised_small_m_calls"}))
     {
         if (record.domain != "kernel" ||
-            record.name != "rocm_native_vnni_small_m_calls" ||
+            record.name != "rocm_native_quantised_small_m_calls" ||
             record.kind != PerfStatRecord::Kind::Counter)
         {
             continue;
@@ -4039,7 +4039,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ProductionPreparedAllQuantizedFormatsRuntime
         << "Every canonical quantized format and certified runtime M must execute "
            "one economical ROCm grouped small-M kernel\n"
         << PerfStatsCollector::summaryString(
-               {"kernel.rocm_native_vnni_small_m_calls"}, 100);
+               {"kernel.rocm_native_quantised_small_m_calls"}, 100);
     EXPECT_EQ(
         canonical_raw_int8_calls,
         3u * kGroupedVerifierRuntimeRows.size())
@@ -4063,9 +4063,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, ProductionSerialM1RouteTelemetryMatchesResol
         GTEST_SKIP() << "No ROCm device available";
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
-    ScopedEnv automatic_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB", "-1");
-    ScopedEnv automatic_waves("LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES", "-1");
-    rocmGemv_native_vnni_reset_tuning_overrides();
+    ScopedEnv automatic_kb("LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_KB", "-1");
+    ScopedEnv automatic_waves("LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_TARGET_WAVES", "-1");
+    rocmGemv_native_quantised_reset_tuning_overrides();
     PerfStatsCollector::reset();
 
     constexpr uint8_t Q8_CODEBOOK = 19;
@@ -4074,7 +4074,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ProductionSerialM1RouteTelemetryMatchesResol
     constexpr int K = 2048;
     int expected_kb = 0;
     int expected_target_waves = 0;
-    ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
+    ASSERT_TRUE(rocmGemv_native_quantised_query_serial_m1_config(
         Q8_CODEBOOK,
         N,
         K,
@@ -4091,10 +4091,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, ProductionSerialM1RouteTelemetryMatchesResol
 
     uint64_t matching_serial_launches = 0;
     for (const auto &record : PerfStatsCollector::snapshot(
-             {"kernel.rocm_native_vnni_small_m_launch"}))
+             {"kernel.rocm_native_quantised_small_m_launch"}))
     {
         if (record.domain != "kernel" ||
-            record.name != "rocm_native_vnni_small_m_launch" ||
+            record.name != "rocm_native_quantised_small_m_launch" ||
             record.kind != PerfStatRecord::Kind::Counter ||
             record.tags.count("m") == 0 ||
             record.tags.at("m") != "1" ||
@@ -4121,7 +4121,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ProductionSerialM1RouteTelemetryMatchesResol
         << "Each independent production M=1 oracle row must publish the exact "
            "serial resolver route\n"
         << PerfStatsCollector::summaryString(
-               {"kernel.rocm_native_vnni_small_m_launch"}, 20);
+               {"kernel.rocm_native_quantised_small_m_launch"}, 20);
 
     PerfStatsCollector::reset();
 }
@@ -4145,7 +4145,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
 
     int serial_kb = 0;
     int serial_waves = 0;
-    ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
+    ASSERT_TRUE(rocmGemv_native_quantised_query_serial_m1_config(
         IQ3_S_CODEBOOK,
         SERIAL_PARTITION_N,
         K,
@@ -4157,7 +4157,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
     {
         ScopedROCmSerialPartitionPolicy serial_partition_scope(
             SERIAL_PARTITION_N);
-        ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
+        ASSERT_TRUE(rocmGemv_native_quantised_query_serial_m1_config(
             IQ3_S_CODEBOOK,
             FULL_N,
             K,
@@ -4167,7 +4167,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
 
     EXPECT_EQ(mirrored_kb, serial_kb);
     EXPECT_EQ(mirrored_waves, serial_waves);
-    EXPECT_EQ(rocmGemv_native_vnni_get_serial_partition_n(), 0);
+    EXPECT_EQ(rocmGemv_native_quantised_get_serial_partition_n(), 0);
 }
 
 /**
@@ -4185,9 +4185,9 @@ TEST(Test__ROCmQuantisedGemmSmallM,
     constexpr int FULL_N = 248320;
     constexpr int SERIAL_PARTITION_N = 124160;
     constexpr int K = 10240;
-    llaminar2::rocm::generated::ROCmNativeVNNIDecodeDispatchConfig raw_serial{},raw_full{};
-    ASSERT_TRUE(llaminar2::rocm::generated::selectROCmNativeVNNIDecodeGenerated(IQ3_S_CODEBOOK,1,SERIAL_PARTITION_N,K,raw_serial));
-    ASSERT_TRUE(llaminar2::rocm::generated::selectROCmNativeVNNIDecodeGenerated(IQ3_S_CODEBOOK,1,FULL_N,K,raw_full));
+    llaminar2::rocm::generated::ROCmNativeQuantisedDecodeDispatchConfig raw_serial{},raw_full{};
+    ASSERT_TRUE(llaminar2::rocm::generated::selectROCmNativeQuantisedDecodeGenerated(IQ3_S_CODEBOOK,1,SERIAL_PARTITION_N,K,raw_serial));
+    ASSERT_TRUE(llaminar2::rocm::generated::selectROCmNativeQuantisedDecodeGenerated(IQ3_S_CODEBOOK,1,FULL_N,K,raw_full));
     ASSERT_TRUE(raw_serial.kb!=raw_full.kb || raw_serial.target_waves_per_cu!=raw_full.target_waves_per_cu)
         << "The raw generated-policy witness must remain distinct before canonical arithmetic admission";
     ASSERT_TRUE(MoEProjectionNumericalContract::ownsOrderedKPartitionTree(IQ3_S_CODEBOOK));
@@ -4196,7 +4196,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
 
     int serial_kb = 0;
     int serial_waves = 0;
-    ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
+    ASSERT_TRUE(rocmGemv_native_quantised_query_serial_m1_config(
         IQ3_S_CODEBOOK,
         SERIAL_PARTITION_N,
         K,
@@ -4205,7 +4205,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
 
     int unconstrained_kb = 0;
     int unconstrained_waves = 0;
-    ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
+    ASSERT_TRUE(rocmGemv_native_quantised_query_serial_m1_config(
         IQ3_S_CODEBOOK,
         FULL_N,
         K,
@@ -4221,8 +4221,8 @@ TEST(Test__ROCmQuantisedGemmSmallM,
     {
         ScopedROCmSerialPartitionPolicy serial_partition_scope(
             SERIAL_PARTITION_N);
-        EXPECT_EQ(rocmGemv_native_vnni_get_serial_partition_n(),SERIAL_PARTITION_N);
-        ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config(
+        EXPECT_EQ(rocmGemv_native_quantised_get_serial_partition_n(),SERIAL_PARTITION_N);
+        ASSERT_TRUE(rocmGemv_native_quantised_query_serial_m1_config(
             IQ3_S_CODEBOOK,
             FULL_N,
             K,
@@ -4233,7 +4233,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
     EXPECT_EQ(mirrored_kb,canonical_kb);
     EXPECT_EQ(mirrored_kb, serial_kb);
     EXPECT_EQ(mirrored_waves, serial_waves);
-    EXPECT_EQ(rocmGemv_native_vnni_get_serial_partition_n(), 0);
+    EXPECT_EQ(rocmGemv_native_quantised_get_serial_partition_n(), 0);
 }
 
 /**
@@ -4261,7 +4261,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ExplicitIQGridTrainerCandidateControlsLDSRou
     constexpr int K = 6144;
     constexpr int FORCED_KB = 3;
     constexpr int FORCED_TARGET_WAVES = 12;
-    ScopedROCmNativeVNNITuningOverride tuning(
+    ScopedROCmNativeQuantisedTuningOverride tuning(
         FORCED_KB,
         FORCED_TARGET_WAVES);
 
@@ -4271,7 +4271,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ExplicitIQGridTrainerCandidateControlsLDSRou
     auto prepared = makeGpuPreparedGemm(
         weights.get(),
         DeviceId::rocm(0),
-        "test.rocm.native_vnni.iq_lds_explicit_candidate",
+        "test.rocm.native_quantised.iq_lds_explicit_candidate",
         ModelContextId{7319});
     auto *kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(prepared.kernel);
     ASSERT_NE(kernel, nullptr);
@@ -4301,10 +4301,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, ExplicitIQGridTrainerCandidateControlsLDSRou
 
     uint64_t matching_launches = 0;
     for (const auto &record : PerfStatsCollector::snapshot(
-             {"kernel.rocm_native_vnni_small_m_launch"}))
+             {"kernel.rocm_native_quantised_small_m_launch"}))
     {
         if (record.domain != "kernel" ||
-            record.name != "rocm_native_vnni_small_m_launch" ||
+            record.name != "rocm_native_quantised_small_m_launch" ||
             record.kind != PerfStatRecord::Kind::Counter ||
             record.tags.at("m") != std::to_string(M) ||
             record.tags.at("n") != std::to_string(N) ||
@@ -4327,7 +4327,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ExplicitIQGridTrainerCandidateControlsLDSRou
     EXPECT_EQ(matching_launches, 1u)
         << "The explicit IQ2_S candidate must produce one observable LDS launch\n"
         << PerfStatsCollector::summaryString(
-               {"kernel.rocm_native_vnni_small_m_launch"}, 20);
+               {"kernel.rocm_native_quantised_small_m_launch"}, 20);
 
     TransferEngine::publishDeviceWrite(output, DeviceId::rocm(0), stream);
     EXPECT_GT(l2Norm(output->data(), output->numel()), 1.0e-7)
@@ -4348,11 +4348,11 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2MatchesReference)
     const int N = 896;
     const int K = 1024;
     runDispatchSmallMMatchesReference(
-        "Q4_K native-VNNI",
+        "Q4_K native-quantised",
         2,
         N,
         K,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.985f);
@@ -4366,14 +4366,14 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KGroupedVerifierRowsMatchSerialDec
     /*
      * Qwen3.6 attention output projection shape. This catches grouped verifier
      * drift that loose FP32-reference checks can miss: grouped runtime-M must agree
-     * with the same packed ROCm native-VNNI path replayed one row at a time.
+     * with the same packed ROCm native-quantised path replayed one row at a time.
      */
     constexpr int N = 5120;
     constexpr int K = 5120;
     for (const int M : kGroupedVerifierBoundaryRows)
     {
         runGroupedSmallMMatchesSerialRows(
-            "Q4_K native-VNNI Qwen3.6 attention Wo",
+            "Q4_K native-quantised Qwen3.6 attention Wo",
             M,
             N,
             K,
@@ -4397,7 +4397,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ5KGroupedVerifierRowsMatchSerialDec
     for (const int M : kGroupedVerifierBoundaryRows)
     {
         runGroupedSmallMMatchesSerialRows(
-            "Q5_K native-VNNI Qwen3.6 GDN output",
+            "Q5_K native-quantised Qwen3.6 GDN output",
             M,
             N,
             K,
@@ -4414,14 +4414,14 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ6KGroupedVerifierRowsMatchSerialDec
     /*
      * Qwen3.6's LM head is Q6_K with K=d_model.  The production vocab dimension
      * is intentionally huge, so this regression keeps N bounded while still
-     * exercising the Q6_K grouped runtime-M NativeVNNI route with the real K.
+     * exercising the Q6_K grouped runtime-M NativeQuantised route with the real K.
      */
     constexpr int N = 16384;
     constexpr int K = 5120;
     for (const int M : kGroupedVerifierBoundaryRows)
     {
         runGroupedSmallMMatchesSerialRows(
-            "Q6_K native-VNNI Qwen3.6 LM-head-like",
+            "Q6_K native-quantised Qwen3.6 LM-head-like",
             M,
             N,
             K,
@@ -4472,7 +4472,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, LocalTPWoFloatingPointFormatsGroupedVerifier
 
     /*
      * Floating-point prepared GEMM goes through rocBLAS/hipBLAS-style kernels
-     * rather than the native-VNNI quantized dispatch.  Keep it in the same
+     * rather than the native-quantised quantized dispatch.  Keep it in the same
      * LocalTP reconstruction gate so FP32, FP16, and BF16 verifier rows cannot
      * silently drift from serial decode when models use floating-point weights.
      */
@@ -4557,7 +4557,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ReplicatedWoFloatingPointFormatsGroupedVerif
 /**
  * @test Prove every floating ROCm projection format uses grouped verifier math.
  *
- * FP32, FP16, and BF16 weights do not enter the NativeVNNI codebook kernels.
+ * FP32, FP16, and BF16 weights do not enter the NativeQuantised codebook kernels.
  * They are uploaded through the production RAW_FP weight path and dispatched to
  * the ROCm floating GEMM implementation.  The verifier API must still execute
  * both projections as one economical device-resident group and preserve the
@@ -5482,7 +5482,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchNativeSmallMAllCodebooksMatchReferen
                 K,
                 isInt8VnniFormat(format.tensor_type)
                     ? PackedPath::INT8VNNI
-                    : PackedPath::NativeVNNI,
+                    : PackedPath::NativeQuantised,
                 format.create,
                 format.min_cosine);
         }
@@ -5499,21 +5499,21 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchPlainAsymmetricNativeSmallMUsesFresh
     for (int M : {2, 4})
     {
         runDispatchSmallMMatchesReference(
-            "Q4_1 native-VNNI asymmetric min correction",
+            "Q4_1 native-quantised asymmetric min correction",
             M,
             N,
             K,
-            PackedPath::NativeVNNI,
+            PackedPath::NativeQuantised,
             [](const std::vector<size_t> &shape, uint32_t seed)
             { return TestTensorFactory::createQ4_1Random(shape, seed); },
             0.985f);
 
         runDispatchSmallMMatchesReference(
-            "Q5_1 native-VNNI asymmetric min correction",
+            "Q5_1 native-quantised asymmetric min correction",
             M,
             N,
             K,
-            PackedPath::NativeVNNI,
+            PackedPath::NativeQuantised,
             [](const std::vector<size_t> &shape, uint32_t seed)
             { return TestTensorFactory::createQ5_1Random(shape, seed); },
             0.985f);
@@ -5653,23 +5653,23 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KRuntimeM16RecordsNativeRouteCount
 
     const int N = 896;
     const int K = 1024;
-    constexpr int M = kDefaultNativeVNNIVerifierRowCapacity;
+    constexpr int M = kDefaultNativeQuantisedVerifierRowCapacity;
     runGroupedSmallMMatchesSerialRows(
-        "Q4_K native-VNNI counter",
+        "Q4_K native-quantised counter",
         M,
         N,
         K,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); });
 
-    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_quantised_small_m_calls"});
     auto route_record = std::find_if(
         records.begin(),
         records.end(),
         [M](const PerfStatRecord &record)
         {
             return record.domain == "kernel" &&
-                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.name == "rocm_native_quantised_small_m_calls" &&
                    record.kind == PerfStatRecord::Kind::Counter &&
                    record.tags.count("m") != 0 &&
                    record.tags.at("m") == std::to_string(M);
@@ -5698,21 +5698,21 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ5KSmallMRecordsNativeRouteCounter)
     const int N = 512;
     const int K = 1024;
     runGroupedSmallMMatchesSerialRows(
-        "Q5_K native-VNNI small-M counter",
+        "Q5_K native-quantised small-M counter",
         M,
         N,
         K,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ5_KRandom(shape, seed); });
 
-    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_quantised_small_m_calls"});
     auto route_record = std::find_if(
         records.begin(),
         records.end(),
         [M, N, K](const PerfStatRecord &record)
         {
             return record.domain == "kernel" &&
-                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.name == "rocm_native_quantised_small_m_calls" &&
                    record.kind == PerfStatRecord::Kind::Counter &&
                    record.tags.count("m") != 0 &&
                    record.tags.at("m") == std::to_string(M) &&
@@ -5743,24 +5743,24 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedSwiGLUDownQ4KM2RecordsNativeRouteCounte
     const int N = 512;
     const int K = 1024;
     runFusedSwiGLUDownSmallMMatchesSerialRows(
-        "Q4_K native-VNNI fused SwiGLU down counter",
+        "Q4_K native-quantised fused SwiGLU down counter",
         M,
         N,
         K,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         true,
         1);
 
-    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_quantised_small_m_calls"});
     auto route_record = std::find_if(
         records.begin(),
         records.end(),
         [M, N, K](const PerfStatRecord &record)
         {
             return record.domain == "kernel" &&
-                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.name == "rocm_native_quantised_small_m_calls" &&
                    record.kind == PerfStatRecord::Kind::Counter &&
                    record.tags.count("source") != 0 &&
                    record.tags.at("source") == "fused_swiglu" &&
@@ -5793,24 +5793,24 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedSwiGLUDownQ5KM4RecordsNativeRouteCounte
     const int N = 512;
     const int K = 1024;
     runFusedSwiGLUDownSmallMMatchesSerialRows(
-        "Q5_K native-VNNI fused SwiGLU down counter",
+        "Q5_K native-quantised fused SwiGLU down counter",
         M,
         N,
         K,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ5_KRandom(shape, seed); },
         true,
         1);
 
-    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_quantised_small_m_calls"});
     auto route_record = std::find_if(
         records.begin(),
         records.end(),
         [M, N, K](const PerfStatRecord &record)
         {
             return record.domain == "kernel" &&
-                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.name == "rocm_native_quantised_small_m_calls" &&
                    record.kind == PerfStatRecord::Kind::Counter &&
                    record.tags.count("source") != 0 &&
                    record.tags.at("source") == "fused_swiglu" &&
@@ -5843,11 +5843,11 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     constexpr int N = 5120;
     constexpr int K = 17408;
     runFusedSwiGLUDownSmallMMatchesSerialRows(
-        "Q4_K native-VNNI Qwen3.6 FFN down verifier shape",
+        "Q4_K native-quantised Qwen3.6 FFN down verifier shape",
         M,
         N,
         K,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         true,
@@ -5860,7 +5860,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
         [](const PerfStatRecord &record)
         {
             return record.domain == "kernel" &&
-                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.name == "rocm_native_quantised_small_m_calls" &&
                    record.kind == PerfStatRecord::Kind::Counter &&
                    record.tags.count("source") != 0 &&
                    record.tags.at("source") == "fused_swiglu" &&
@@ -5882,7 +5882,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     for (const auto &record : records)
     {
         if (record.domain != "kernel" ||
-            record.name != "rocm_native_vnni_small_m_launch" ||
+            record.name != "rocm_native_quantised_small_m_launch" ||
             record.kind != PerfStatRecord::Kind::Counter ||
             record.tags.count("m") == 0 ||
             record.tags.at("m") != "2" ||
@@ -5919,24 +5919,24 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     constexpr int N = 5120;
     constexpr int K = 17408;
     runFusedSwiGLUDownSmallMMatchesSerialRows(
-        "Q4_K native-VNNI Qwen3.6 FFN down verifier shape",
+        "Q4_K native-quantised Qwen3.6 FFN down verifier shape",
         M,
         N,
         K,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         true,
         4);
 
-    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_quantised_small_m_calls"});
     auto route_record = std::find_if(
         records.begin(),
         records.end(),
         [](const PerfStatRecord &record)
         {
             return record.domain == "kernel" &&
-                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.name == "rocm_native_quantised_small_m_calls" &&
                    record.kind == PerfStatRecord::Kind::Counter &&
                    record.tags.count("source") != 0 &&
                    record.tags.at("source") == "fused_swiglu" &&
@@ -5969,24 +5969,24 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     constexpr int N = 5120;
     constexpr int K = 17408;
     runFusedSwiGLUDownSmallMMatchesSerialRows(
-        "Q4_K native-VNNI Qwen3.6 FFN down shifted-prefill shape",
+        "Q4_K native-quantised Qwen3.6 FFN down shifted-prefill shape",
         M,
         N,
         K,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         true,
         4);
 
-    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_quantised_small_m_calls"});
     auto route_record = std::find_if(
         records.begin(),
         records.end(),
         [](const PerfStatRecord &record)
         {
             return record.domain == "kernel" &&
-                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.name == "rocm_native_quantised_small_m_calls" &&
                    record.kind == PerfStatRecord::Kind::Counter &&
                    record.tags.count("source") != 0 &&
                    record.tags.at("source") == "fused_swiglu" &&
@@ -6018,7 +6018,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedDispatchQ4KSmallMMatchesReferen
     for (int M : {2, 3, 4})
     {
         runGraphCapturedDispatchSmallMMatchesReference(
-            "Q4_K native-VNNI",
+            "Q4_K native-quantised",
             M,
             N,
             K,
@@ -6040,7 +6040,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedDispatchIQ3SSmallMMatchesRefere
     for (int M : {3, 4})
     {
         runGraphCapturedDispatchSmallMMatchesReference(
-            "IQ3_S native-VNNI",
+            "IQ3_S native-quantised",
             M,
             N,
             K,
@@ -6074,10 +6074,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2MatchesSeparate)
 
     const int K = 1024;
     runFusedQKVSmallMMatchesSeparate(
-        "Q4_K native-VNNI",
+        "Q4_K native-quantised",
         2,
         K,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.9999f);
@@ -6092,10 +6092,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVRuntimeMMatchesSerialM1DecodeRows
     for (const int M : kGroupedVerifierRuntimeRows)
     {
         runFusedQKVSmallMMatchesSerialM1DecodeRows(
-            "Q4_K native-VNNI fused QKV strict serial decode",
+            "Q4_K native-quantised fused QKV strict serial decode",
             M,
             K,
-            PackedPath::NativeVNNI,
+            PackedPath::NativeQuantised,
             [](const std::vector<size_t> &shape, uint32_t seed)
             { return TestTensorFactory::createQ4_KRandom(shape, seed); });
     }
@@ -6121,10 +6121,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedIQ3SQwen36QKVRuntimeMMatchesSerialM1Dec
     for (const int M : kGroupedVerifierBoundaryRows)
     {
         runFusedQKVSmallMMatchesSerialM1DecodeRows(
-            "IQ3_S native-VNNI Qwen3.6 fused QKV strict serial decode",
+            "IQ3_S native-quantised Qwen3.6 fused QKV strict serial decode",
             M,
             K,
-            PackedPath::NativeVNNI,
+            PackedPath::NativeQuantised,
             [](const std::vector<size_t> &shape, uint32_t seed)
             { return TestTensorFactory::createIQ3_SRandom(shape, seed); },
             Nq,
@@ -6142,10 +6142,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ5KQKVSmallMMatchesSeparate)
     for (int M : {3, 4})
     {
         runFusedQKVSmallMMatchesSeparate(
-            "Q5_K native-VNNI",
+            "Q5_K native-quantised",
             M,
             K,
-            PackedPath::NativeVNNI,
+            PackedPath::NativeQuantised,
             [](const std::vector<size_t> &shape, uint32_t seed)
             { return TestTensorFactory::createQ5_KRandom(shape, seed); },
             0.9999f);
@@ -6163,10 +6163,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ5KQKVSmallMRecordsSharedQuantizedNativ
     const int M = 4;
     const int K = 1024;
     runFusedQKVSmallMMatchesSeparate(
-        "Q5_K native-VNNI shared small-M quant counter",
+        "Q5_K native-quantised shared small-M quant counter",
         M,
         K,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ5_KRandom(shape, seed); },
         0.9999f);
@@ -6198,7 +6198,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ5KQKVSmallMRecordsSharedQuantizedNativ
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == std::to_string(M) &&
@@ -6210,7 +6210,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ5KQKVSmallMRecordsSharedQuantizedNativ
             batched_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_projection_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == std::to_string(M) &&
@@ -6225,7 +6225,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ5KQKVSmallMRecordsSharedQuantizedNativ
         for (const auto &record : records)
         {
             if (record.domain != "kernel" ||
-                (record.name.find("rocm_native_vnni") == std::string::npos &&
+                (record.name.find("rocm_native_quantised") == std::string::npos &&
                  record.name.find("rocm_fused") == std::string::npos))
             {
                 continue;
@@ -6261,10 +6261,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2RecordsSharedQuantizedNativeRou
 
     const int K = 1024;
     runFusedQKVSmallMMatchesSeparate(
-        "Q4_K native-VNNI shared quant counter",
+        "Q4_K native-quantised shared quant counter",
         2,
         K,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.9999f);
@@ -6294,7 +6294,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2RecordsSharedQuantizedNativeRou
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -6306,7 +6306,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2RecordsSharedQuantizedNativeRou
             batched_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_projection_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -6330,10 +6330,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36QKVM2MatchesSeparate)
         GTEST_SKIP() << "No ROCm device available";
 
     runFusedQKVSmallMMatchesSeparate(
-        "Q4_K native-VNNI Qwen3.6 QKV shape",
+        "Q4_K native-quantised Qwen3.6 QKV shape",
         2,
         5120,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.9999f,
@@ -6373,7 +6373,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
             {static_cast<size_t>(widths[i]), static_cast<size_t>(K)},
             static_cast<uint32_t>(2100 + i));
         ASSERT_TRUE(packWeightsToROCm(weights[i].get(), packed[i]));
-        expectPackedPath(packed[i], PackedPath::NativeVNNI);
+        expectPackedPath(packed[i], PackedPath::NativeQuantised);
         kernels[i] = std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0);
     }
 
@@ -6616,7 +6616,7 @@ TEST(Test__ROCmQuantisedGemmSmallM,
                 static_cast<uint32_t>(4100 + device * 10 + i));
             ASSERT_TRUE(packWeightsToROCm(
                 participant.weights[i].get(), participant.packed[i]));
-            expectPackedPath(participant.packed[i], PackedPath::NativeVNNI);
+            expectPackedPath(participant.packed[i], PackedPath::NativeQuantised);
             participant.kernels[i] =
                 std::make_unique<ROCmQuantisedGemmKernel>(
                     &participant.packed[i], device);
@@ -6831,10 +6831,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36FFNGateUpM2Matche
     PerfStatsCollector::reset();
 
     runFusedProjectionGroupSmallMMatchesSeparate(
-        "Q4_K native-VNNI Qwen3.6 FFN gate/up MTP verifier group",
+        "Q4_K native-quantised Qwen3.6 FFN gate/up MTP verifier group",
         2,
         5120,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.9999f,
@@ -6850,7 +6850,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36FFNGateUpM2Matche
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -6862,7 +6862,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36FFNGateUpM2Matche
             batched_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_projection_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -6890,10 +6890,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ5KQwen36FFNGateUpM2Matche
     PerfStatsCollector::reset();
 
     runFusedProjectionGroupSmallMMatchesSeparate(
-        "Q5_K native-VNNI Qwen3.6 FFN gate/up MTP verifier group",
+        "Q5_K native-quantised Qwen3.6 FFN gate/up MTP verifier group",
         2,
         5120,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ5_KRandom(shape, seed); },
         0.999f,
@@ -6909,7 +6909,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ5KQwen36FFNGateUpM2Matche
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -6921,7 +6921,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ5KQwen36FFNGateUpM2Matche
             batched_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_projection_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -6960,7 +6960,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2UsesCanonicalBatche
             {static_cast<size_t>(N), static_cast<size_t>(K)},
             static_cast<uint32_t>(501 + i)));
         ASSERT_TRUE(packWeightsToROCm(weights.back().get(), packed[i]));
-        expectPackedPath(packed[i], PackedPath::NativeVNNI);
+        expectPackedPath(packed[i], PackedPath::NativeQuantised);
         kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
         combined.merge(kernels.back()->getWorkspaceRequirements(M, N, K));
     }
@@ -7030,7 +7030,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2UsesCanonicalBatche
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -7070,7 +7070,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsUndersizedDe
             {static_cast<size_t>(N), static_cast<size_t>(K)},
             static_cast<uint32_t>(601 + i)));
         ASSERT_TRUE(packWeightsToROCm(weights.back().get(), packed[i]));
-        expectPackedPath(packed[i], PackedPath::NativeVNNI);
+        expectPackedPath(packed[i], PackedPath::NativeQuantised);
         kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
         combined.merge(kernels.back()->getWorkspaceRequirements(M, N, K));
     }
@@ -7126,11 +7126,11 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KQwen36GDNAlphaM1MatchesReference)
         GTEST_SKIP() << "No ROCm device available";
 
     runDispatchSmallMMatchesReference(
-        "Q4_K native-VNNI Qwen3.6 GDN alpha M=1",
+        "Q4_K native-quantised Qwen3.6 GDN alpha M=1",
         1,
         48,
         5120,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.985f);
@@ -7142,10 +7142,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNDecodeM1Matche
         GTEST_SKIP() << "No ROCm device available";
 
     runFusedProjectionGroupSmallMMatchesReference(
-        "Q4_K native-VNNI Qwen3.6 dense GDN decode projection group",
+        "Q4_K native-quantised Qwen3.6 dense GDN decode projection group",
         1,
         5120,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.985f,
@@ -7657,10 +7657,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM2MatchesS
     PerfStatsCollector::reset();
 
     runFusedProjectionGroupSmallMMatchesSeparate(
-        "Q4_K native-VNNI Qwen3.6 GDN projection group",
+        "Q4_K native-quantised Qwen3.6 GDN projection group",
         2,
         5120,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.9999f,
@@ -7676,7 +7676,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM2MatchesS
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -7688,7 +7688,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM2MatchesS
             batched_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_projection_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -7716,10 +7716,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM4MatchesS
     PerfStatsCollector::reset();
 
     runFusedProjectionGroupSmallMMatchesSeparate(
-        "Q4_K native-VNNI Qwen3.6 GDN projection shifted-prefill group",
+        "Q4_K native-quantised Qwen3.6 GDN projection shifted-prefill group",
         4,
         5120,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.9999f,
@@ -7735,7 +7735,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM4MatchesS
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "4" &&
@@ -7747,7 +7747,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM4MatchesS
             batched_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_projection_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "4" &&
@@ -7775,10 +7775,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
     PerfStatsCollector::reset();
 
     runFusedProjectionGroupSmallMMatchesSeparate(
-        "Q4_K native-VNNI Qwen3.6 GDN qkv/z heterogeneous-N pair",
+        "Q4_K native-quantised Qwen3.6 GDN qkv/z heterogeneous-N pair",
         2,
         5120,
-        PackedPath::NativeVNNI,
+        PackedPath::NativeQuantised,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.9999f,
@@ -7798,7 +7798,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -7810,7 +7810,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
             batched_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_bypasses" &&
+            record.name == "rocm_native_quantised_small_m_batched_bypasses" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("reason") != 0 &&
             record.tags.at("reason") == "heterogeneous_n_pair" &&
@@ -7832,7 +7832,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
             shared_quant_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_projection_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -7842,7 +7842,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
             batched_projection_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_launch" &&
+            record.name == "rocm_native_quantised_small_m_launch" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "2" &&
@@ -7897,7 +7897,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjection
         { return TestTensorFactory::createQ5_KRandom(shape, seed); }};
 
     runMixedProjectionGroupSmallMMatchesSeparate(
-        "mixed Q4_K/Q5_K native-VNNI Qwen3.6 GDN projection group",
+        "mixed Q4_K/Q5_K native-quantised Qwen3.6 GDN projection group",
         4,
         5120,
         creators,
@@ -7913,7 +7913,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjection
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "4" &&
@@ -7927,7 +7927,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjection
             mixed_batched_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_mixed_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_mixed_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "4" &&
@@ -7939,7 +7939,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjection
             mixed_batched_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_bypasses" &&
+            record.name == "rocm_native_quantised_small_m_batched_bypasses" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("reason") != 0 &&
             record.tags.at("reason") == "mixed_codebook" &&
@@ -7973,7 +7973,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedMixedCodebookQwen36GDNQkvZPairM
         { return TestTensorFactory::createQ4_KRandom(shape, seed); }};
 
     runMixedProjectionGroupSmallMMatchesSeparate(
-        "mixed Q5_K/Q4_K native-VNNI Qwen3.6 GDN qkv/z heterogeneous-N pair",
+        "mixed Q5_K/Q4_K native-quantised Qwen3.6 GDN qkv/z heterogeneous-N pair",
         4,
         5120,
         creators,
@@ -7990,7 +7990,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedMixedCodebookQwen36GDNQkvZPairM
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_bypasses" &&
+            record.name == "rocm_native_quantised_small_m_batched_bypasses" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("reason") != 0 &&
             record.tags.at("reason") == "mixed_codebook" &&
@@ -8002,7 +8002,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedMixedCodebookQwen36GDNQkvZPairM
             mixed_bypasses += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "4" &&
@@ -8014,7 +8014,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedMixedCodebookQwen36GDNQkvZPairM
             batched_calls += record.value;
         }
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_batched_mixed_calls" &&
+            record.name == "rocm_native_quantised_small_m_batched_mixed_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "4" &&
@@ -8082,7 +8082,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, MixedCodebookQwen36GDNQkvZPairRuntimeMMatche
     for (const int M : kGroupedVerifierBoundaryRows)
     {
         runMixedProjectionGroupSmallMMatchesSerialM1DecodeRows(
-            "mixed Q5_K/Q4_K native-VNNI Qwen3.6 GDN qkv/z strict serial decode",
+            "mixed Q5_K/Q4_K native-quantised Qwen3.6 GDN qkv/z strict serial decode",
             M,
             K,
             creators,
@@ -8141,7 +8141,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GDNIQ4XSQwen36MoEQkvZPairRuntimeMMatchesSeri
     for (const int M : kGroupedVerifierBoundaryRows)
     {
         runMixedProjectionGroupSmallMMatchesSerialM1DecodeRows(
-            "IQ4_XS native-VNNI Qwen3.6 MoE GDN qkv/z strict serial decode",
+            "IQ4_XS native-quantised Qwen3.6 MoE GDN qkv/z strict serial decode",
             M,
             K,
             creators,

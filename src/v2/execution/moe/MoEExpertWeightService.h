@@ -282,7 +282,7 @@ struct GpuDirectTransferSlotProjection
     bool is_asymmetric = false;
     bool has_emins = false;
     uint8_t codebook_id = 0;
-    NativeVnniSourceIdentity source_identity;
+    NativeQuantisedSourceIdentity source_identity;
     std::shared_ptr<void> transfer_slot_lifetime;
 
     bool valid() const;

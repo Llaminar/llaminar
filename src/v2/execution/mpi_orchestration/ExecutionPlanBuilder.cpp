@@ -194,7 +194,7 @@ namespace llaminar2
                 model.hidden_size == 5120 && model.intermediate_size == 17408 && model.vocab_size == 248320 &&
                 model.n_heads == 24 && model.n_kv_heads == 4 && model.head_dim == 256 &&
                 model.terminal_head_source.present && model.terminal_head_source.is_superblock &&
-                model.terminal_head_source.codebook_id == native_vnni_formats::Q6_K.codebook_id;
+                model.terminal_head_source.codebook_id == native_quantised_formats::Q6_K.codebook_id;
             const int graph_maximum = resolveMTPMaximumDraftDepth(mtp);
             const bool measured_verifier = (graph_maximum == 2 || graph_maximum == 15) &&
                 resolveMTPMaximumExecutionDraftDepth(mtp) == graph_maximum;
@@ -203,7 +203,7 @@ namespace llaminar2
                 model.hidden_size == 2560 && model.intermediate_size == 640 && model.vocab_size == 248320 &&
                 model.n_heads == 24 && model.n_kv_heads == 2 && model.head_dim == 256 &&
                 model.terminal_head_source.present && !model.terminal_head_source.is_superblock &&
-                model.terminal_head_source.codebook_id == native_vnni_formats::Q8_0.codebook_id;
+                model.terminal_head_source.codebook_id == native_quantised_formats::Q8_0.codebook_id;
             bool distinct_local_four = devices.size() == 4 && ranks.size() == 4;
             for (std::size_t index = 0; distinct_local_four && index < devices.size(); ++index)
                 distinct_local_four = devices[index].device_type == DeviceType::ROCm &&

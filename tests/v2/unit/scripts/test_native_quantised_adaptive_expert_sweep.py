@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Device-free admission of adaptive expert clocks and additive point scopes.
+
+Synthetic observations prove timing grades and original receipt identities;
+these tests make no claim of native timing, physical placement or model speed.
+"""
+from copy import deepcopy
+from dataclasses import replace
+import json
+from pathlib import Path
+import tempfile
+import sys
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+ROOT=Path(__file__).resolve().parents[4]
+sys.path.insert(0,str(ROOT / "tests/v2/performance/kernels"))
+
+from native_quantised_dispatch import cpu_exact_sweep as sweep
+from native_quantised_dispatch.adaptive_tournament import validate_fused_tournament, is_promotion_grade
+from native_quantised_dispatch.adapters.evidence import native_double_digest, summarize_sorted_timing
+from native_quantised_dispatch.corpus import ObservationCorpus
+import test_cpu_execution_exact as fixture
+
+
+def target_plan(**changes):
+    """Select roles through the shared model/TP catalog, with no numeric shapes."""
+    values=dict(expert_only=True, expert_scope=dict(model_family='qwen4exp',tp_degree=2,
+        layout='intermediate_shard',isa=('AVX512','AVX512'),purposes=('decode','mtp_verifier','prefill')),
+        expert_role_formats=(('gate_up','Q4_K'),('down','Q5_1')),
+        prefill_row_policy='two-anchor',tournament='adaptive_v1')
+    values.update(changes)
+    return sweep.build_plan(28,**values)
+
+
+def adaptive_payload(candidate='Pairwise', *, screened=False):
+    """Upgrade the existing native fixture to a complete synthetic v2 contest."""
+    p=fixture.CPUExecutionNativeEvidenceTest.payload();key=list(p['exact_key']);p['exact_key']=key
+    p['descriptor_policies']=[int(candidate=='WideRows')]*len(p['descriptor_keys'])
+    p.update(schema='cpu_execution_exact_native_v2',candidate=candidate,holdout=False,
+        timing_stage='screening' if screened else 'final',promotion_grade=not screened,
+        finalist_reason='screened_out' if screened else 'screen_winner|installed_baseline',
+        screen_samples_us=[10.,11.,12.],screen_repeat_count=1,
+        configured_full_sample_count=30,configured_full_repeat_count=8)
+    decisions=[]
+    for name in ('Pairwise','WideRows'):
+        final=name=='Pairwise'
+        decisions.append(dict(candidate_id=name,correctness_pass=True,
+            screen_samples_us=[10.,11.,12.],screen_sorted_native_digest=native_double_digest([10.,11.,12.]),
+            timing_stage='final' if final else 'screening',promotion_grade=final,
+            finalist_reason='screen_winner|installed_baseline' if final else 'screened_out',
+            final_sample_count=30 if final else 0))
+    p['tournament']=dict(schema='native_quantised_tournament_v1',backend='cpu',source_format=p['source_format'],
+        shape=p['shape'],purpose=p['purpose'],m=key[9],n=key[10],k=key[12],threads=key[8],
+        build_isa=key[6],runtime_isa=key[7],holdout=False,expert_rows=p['expert_rows'],
+        target_descriptor=0,exact_key=key,candidate_ids=['Pairwise','WideRows'],finalist_candidate_ids=['Pairwise'],
+        baseline_candidate_id='Pairwise',winner_candidate_id='Pairwise',baseline_auto_calls=1,
+        baseline_auto_route_records=[dict(count=2,tags=dict(m=str(key[9]),n=str(key[10]),policy_n=str(key[11]),
+            k=str(key[12]),codebook=str(key[2]),purpose=p['purpose'],isa='AVX512',
+            requested_verifier_policy='Auto',effective_verifier_policy='Pairwise'))],candidates=decisions)
+    samples=p['screen_samples_us'] if screened else [10.,11.,12.]*10
+    summary=summarize_sorted_timing(tuple(sorted(samples)))
+    p.update(raw_samples_us=samples,sorted_samples_us=sorted(samples))
+    p['timing']=dict(sample_count=len(samples),repeat_count=1 if screened else 8,warmup_count=0 if screened else 5,
+        min_us=summary.minimum,median_us=summary.median,p95_us=summary.p95,mad_us=summary.mad,cv=summary.cv,
+        sorted_native_digest=summary.digest)
+    p['correctness'].update(guard_replays=4,repeated_replay=True)
+    expected=(3+(0 if screened else 30*8))*len(p['descriptor_keys'])
+    p['counters'].update(projection_observations=expected,expected_projection_observations=expected,
+        sample_observation_basis='screen_and_final_timed_calls_only')
+    return p
+
+
+class AdaptiveExpertScopeTest(unittest.TestCase):
+    """The target is additive and old broad receipts keep their original scope."""
+    def test_two_actual_formats_use_catalog_only_and_publish_points(self):
+        plan=target_plan();jobs=list(sweep.iter_jobs(plan))
+        self.assertEqual(len(jobs),2);self.assertEqual(plan['broader_expert_job_count'],28)
+        self.assertFalse(plan['broader_inventory_in_this_transaction']);self.assertFalse(plan['legacy_shapes'])
+        self.assertEqual({(j['role'],j['source_format'],j['n'],j['k']) for j in jobs},
+            {('gate_up','Q4_K',320,2560),('down','Q5_1',2560,320)})
+        for job in jobs:
+            self.assertEqual({r['purpose'] for r in job['requests']},{'decode','mtp_verifier','prefill'})
+        self.assertTrue({128,256,512,1024}.issubset(plan['expert_prefill_m']))
+        self.assertIn('no interval',plan['prefill_publication'])
+
+    def test_complement_retains_twenty_six_admissible_batches(self):
+        plan=target_plan(expert_role_formats=(),exclude_expert_role_formats=(('gate_up','Q4_K'),('down','Q5_1')))
+        self.assertEqual(plan['total_jobs'],26)
+        self.assertEqual(len(plan['source_unadmitted']),14)
+
+    def test_default_plan_preserves_original_broad_identity(self):
+        plan=sweep.build_plan(28)
+        self.assertEqual(plan['schema'],'cpu-exact-sweep-v1');self.assertEqual(plan['total_jobs'],1269)
+        self.assertNotIn('tournament',plan);self.assertNotIn('prefill_row_policy',plan)
+
+    def test_scope_rejects_invalid_source_slice_and_legacy_adaptive(self):
+        with self.assertRaises(ValueError):target_plan(expert_role_formats=(('down','Q4_K'),))
+        with self.assertRaises(ValueError):sweep.build_plan(28,tournament='adaptive_v1')
+
+    def test_completed_same_producer_jobs_launch_nothing(self):
+        from test_native_quantised_cpu_sweep_reuse import original_completed
+        with tempfile.TemporaryDirectory() as directory:
+            output=Path(directory)/'output';output.mkdir()
+            job,producer,plan,contract=original_completed(Path(directory)/'provisional')
+            cell=output/'cells'/job['kind']/sweep.job_id(job)
+            job,producer,plan,contract=original_completed(cell)
+            args=SimpleNamespace(output_dir=output,emit_only=False,batch_limit=0)
+            with mock.patch.object(sweep,'iter_jobs',return_value=iter([job])),mock.patch.object(sweep.subprocess,'run',side_effect=AssertionError('unexpected native launch')):
+                self.assertEqual(sweep._collect_stage(args,plan,producer,'rows'),0)
+            foreign=deepcopy(producer);foreign['programs']['avx512_bin']['binary_sha256']='foreign-used-owner'
+            with mock.patch.object(sweep,'iter_jobs',return_value=iter([job])),mock.patch.object(sweep.subprocess,'run',side_effect=AssertionError('unexpected native launch')):
+                with self.assertRaises(ValueError):sweep._collect_stage(args,plan,foreign,'rows')
+
+    def test_incomplete_scope_stays_pending_and_no_automatic_relabel(self):
+        plan=target_plan()
+        with tempfile.TemporaryDirectory() as directory:
+            args=SimpleNamespace(output_dir=Path(directory),emit_only=True,batch_limit=0)
+            with mock.patch.object(sweep.subprocess,'run',side_effect=AssertionError('unexpected native launch')):
+                self.assertEqual(sweep._collect_stage(args,plan,{'digest':'producer'},'expert-only'),2)
+        other=target_plan(expert_scope={**plan['expert_scope'],'isa':('AVX512','AVX2')})
+        self.assertTrue({sweep.job_id(j) for j in sweep.iter_jobs(plan)}.isdisjoint(sweep.job_id(j) for j in sweep.iter_jobs(other)))
+
+
+class AdaptiveExpertEvidenceTest(unittest.TestCase):
+    """All byte proofs remain mandatory; screen clocks cannot win an overlay."""
+    def test_native_final_and_screening_have_distinct_timing_grade(self):
+        final=validate_fused_tournament(adaptive_payload(),minimum_samples=30)
+        screen=validate_fused_tournament(adaptive_payload('WideRows',screened=True),minimum_samples=30)
+        self.assertTrue(final.promotion_grade);self.assertFalse(screen.promotion_grade)
+
+    def test_missing_candidate_failed_bytes_or_underfloor_final_is_rejected(self):
+        for mutation in ('missing','bytes','floor','baseline','actual_m'):
+            p=adaptive_payload()
+            if mutation=='missing':p['tournament']['candidate_ids'].pop()
+            if mutation=='bytes':p['tournament']['candidates'][1]['correctness_pass']=False
+            if mutation=='floor':p['tournament']['candidates'][0]['final_sample_count']=3
+            if mutation=='baseline':p['tournament']['baseline_auto_route_records'][0]['tags']['requested_verifier_policy']='Pairwise'
+            if mutation=='actual_m':p['tournament']['m']+=1
+            with self.assertRaises(ValueError,msg=mutation):validate_fused_tournament(p,minimum_samples=30)
+
+    def test_final_credible_runner_up_is_not_an_extra_profile_obligation(self):
+        evidence=fixture.CPUExecutionNativeEvidenceTest()
+        payloads=[adaptive_payload(),adaptive_payload('WideRows')]
+        for p in payloads:
+            p['tournament']['finalist_candidate_ids']=['Pairwise','WideRows']
+            decision=p['tournament']['candidates'][1]
+            decision.update(timing_stage='final',promotion_grade=True,final_sample_count=30,
+                finalist_reason='credible_runner_up')
+        payloads[1]['finalist_reason']='credible_runner_up'
+        rows=[evidence.adapt(p) for p in payloads]
+        receipt={'entries':[dict(key=rows[0].physical_launch_evidence['key'],candidate_id=rows[0].candidate_id)]}
+        selected=sweep.expert_profile_observations(ObservationCorpus(rows),receipt)
+        self.assertEqual([r.candidate_id for r in selected],[rows[0].candidate_id])
+
+    def test_old_native_v1_behavior_remains_unchanged(self):
+        evidence=fixture.CPUExecutionNativeEvidenceTest()
+        self.assertEqual(evidence.adapt(evidence.payload()).median_us,11.)
+
+    def test_v2_screen_round_trip_is_ineligible_without_losing_correctness(self):
+        evidence=fixture.CPUExecutionNativeEvidenceTest()
+        final=evidence.adapt(adaptive_payload());screen=evidence.adapt(adaptive_payload('WideRows',screened=True))
+        self.assertTrue(is_promotion_grade(final));self.assertFalse(is_promotion_grade(screen))
+        self.assertTrue(screen.numerical_correctness);self.assertTrue(screen.repeat_equal)
+        receipt={'entries':[dict(key=final.physical_launch_evidence['key'],candidate_id=final.candidate_id)]}
+        profiles=sweep.expert_profile_observations(ObservationCorpus([final,screen]),receipt)
+        self.assertEqual([r.candidate_id for r in profiles],[final.candidate_id])
+
+if __name__=='__main__':unittest.main()

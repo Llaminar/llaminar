@@ -15,7 +15,7 @@
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEGroupedIntermediateExchangeABI.h"
 #include "transfer/CapturedTransferChannelProtocol.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -356,7 +356,7 @@ namespace llaminar2
             const auto geometry = first->projection_ownership->geometry();
             if (rows > std::numeric_limits<int>::max() / first->routes_per_token)
                 throw std::overflow_error("Projection live route geometry exceeds its packet ABI");
-            const bool floating = !native_vnni_formats::forQuantType(first->gate_up_down[2].executionFormat());
+            const bool floating = !native_quantised_formats::forQuantType(first->gate_up_down[2].executionFormat());
             const MoEGroupedIntermediateLayout layout{
                 floating ? MoEGroupedIntermediateEncoding::FP32 : MoEGroupedIntermediateEncoding::BlockQ8FP32Scales,
                 static_cast<uint32_t>(geometry.intermediate_columns),

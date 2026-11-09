@@ -4,7 +4,7 @@
  *
  * The stages in this file preserve the model's routing arithmetic while
  * selecting the backend-native execution contract.  In particular, CPU
- * NativeVNNI expert projections consume the canonical Q8_1 representation of
+ * NativeQuantised expert projections consume the canonical Q8_1 representation of
  * the hidden rows.  Ordinary CPU graphs receive that representation from the
  * router stage, whereas graph-native heterogeneous ExpertOverlay participants
  * receive FP32 rows through a sparse transport boundary and must explicitly
@@ -44,7 +44,7 @@
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../kernels/cpu/moe/CPUMoEKernel.h"
 #include "../../../kernels/cpu/moe/CPUCanonicalRouteReducer.h"
-#include "../../../kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "../../../kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "../../../kernels/cpu/primitives/VectorPrimitives.h"
 #include "../../../kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "../../../loaders/PreparedWeightStore.h"
@@ -87,7 +87,7 @@ namespace llaminar2
 {
     // Alias for fully-qualified KernelFactory access
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
-    using cpu::native_vnni::CPUNativeVNNIGemmKernel;
+    using cpu::native_quantised::CPUNativeQuantisedGemmKernel;
 
     namespace
     {
@@ -333,7 +333,7 @@ namespace llaminar2
                 hash = updateTraceHash(hash, &bank.replica_role[expert], sizeof(bank.replica_role[expert]));
                 hash = updateTraceHash(hash, &bank.resident_participant_mask[expert], sizeof(bank.resident_participant_mask[expert]));
 
-                const std::array<DeviceNativeVNNIMatrixDesc, 3> matrices = {
+                const std::array<DeviceNativeQuantisedMatrixDesc, 3> matrices = {
                     desc.gate, desc.up, desc.down};
                 for (const auto &matrix : matrices)
                 {
@@ -380,8 +380,8 @@ namespace llaminar2
                 if (!gemm)
                     return;
 
-                DeviceNativeVNNIMatrixDesc desc{};
-                const bool exported = gemm->exportNativeVNNIMatrixDesc(desc) && desc.valid();
+                DeviceNativeQuantisedMatrixDesc desc{};
+                const bool exported = gemm->exportNativeQuantisedMatrixDesc(desc) && desc.valid();
                 const uint8_t exported_byte = exported ? 1u : 0u;
                 hash = updateTraceHash(hash, &exported_byte, sizeof(exported_byte));
                 if (!exported)
@@ -3663,7 +3663,7 @@ namespace llaminar2
 
         // ---------------------------------------------------------------
         // Phase 1: Batch all experts' gate+up into ONE fused GEMV call.
-        // CPU NativeVNNI consumes the Q8_1 row already published by routing;
+        // CPU NativeQuantised consumes the Q8_1 row already published by routing;
         // GPU and floating CPU bundles retain their backend-native activation
         // preparation.  Every route still uses one parallel projection region.
         // ---------------------------------------------------------------
@@ -3797,7 +3797,7 @@ namespace llaminar2
             num_active++;
         }
 
-        // Single fused call: router-Q8 reuse on CPU NativeVNNI, then one
+        // Single fused call: router-Q8 reuse on CPU NativeQuantised, then one
         // projection region for every active expert's gate/up pair.
         if (num_active > 0)
         {
@@ -3809,14 +3809,14 @@ namespace llaminar2
                 for (const auto &projection : batch_projections_)
                 {
                     const bool native =
-                        dynamic_cast<CPUNativeVNNIGemmKernel *>(projection.kernel) != nullptr;
+                        dynamic_cast<CPUNativeQuantisedGemmKernel *>(projection.kernel) != nullptr;
                     any_native = any_native || native;
                     all_native = all_native && native;
                 }
                 if (any_native != all_native)
                 {
                     LOG_ERROR("[MoEExpertComputeStage] CPU decode cannot mix "
-                              "NativeVNNI and floating gate/up projection contracts in layer "
+                              "NativeQuantised and floating gate/up projection contracts in layer "
                               << params_.layer_idx);
                     return false;
                 }
@@ -3824,13 +3824,13 @@ namespace llaminar2
                 if (all_native)
                 {
                     auto *cpu_moe_kernel = dynamic_cast<CPUMoEKernel *>(kernel);
-                    auto *native_gate = dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                    auto *native_gate = dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                         batch_projections_[0].kernel);
                     const float *input_rows = input_tensor->data();
                     /*
                      * A graph-native ExpertOverlay participant receives this
                      * one compact row from sparse transport instead of from a
-                     * local router.  The NativeVNNI projection contract is
+                     * local router.  The NativeQuantised projection contract is
                      * still exactly the router's Q8_1 quantization, so publish
                      * it at the declared transport boundary before looking it
                      * up.  This mirrors the grouped-row path below; omitting
@@ -3872,7 +3872,7 @@ namespace llaminar2
                             : nullptr;
                     if (!native_gate || !published_router_q8)
                     {
-                        LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI decode is "
+                        LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised decode is "
                                   "missing its router Q8_1 publication for layer "
                                   << params_.layer_idx);
                         return false;
@@ -3949,7 +3949,7 @@ namespace llaminar2
                 ITensor *up_tensors[16] = {};
                 int grouped_expert_ids[16] = {};
                 float grouped_weights[16] = {};
-                DeviceNativeVNNIMatrixDesc down_descs[16] = {};
+                DeviceNativeQuantisedMatrixDesc down_descs[16] = {};
                 bool grouped_supported = true;
 
                 for (int i = 0; i < num_active; ++i)
@@ -3963,8 +3963,8 @@ namespace llaminar2
                         MPI_Abort(MPI_COMM_WORLD, 1);
                     }
 
-                    DeviceNativeVNNIMatrixDesc desc;
-                    if (!down_gemm->exportNativeVNNIMatrixDesc(desc) ||
+                    DeviceNativeQuantisedMatrixDesc desc;
+                    if (!down_gemm->exportNativeQuantisedMatrixDesc(desc) ||
                         desc.n != d_model || desc.k != intermediate)
                     {
                         grouped_supported = false;
@@ -4840,7 +4840,7 @@ namespace llaminar2
         }
 
         /*
-         * NativeVNNI gate/up/down projections share one activation contract.
+         * NativeQuantised gate/up/down projections share one activation contract.
          * Require the immediately preceding CPU router publication once for
          * the complete runtime batch, then gather canonical blocks for each
          * expert. Floating-point bundles retain their own grouped exact
@@ -4853,13 +4853,13 @@ namespace llaminar2
         for (int expert_id : cpu_grouped_active_experts_)
         {
             const bool native_gate =
-                dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                     cached_gate_gemm_[static_cast<size_t>(expert_id)]) != nullptr;
             const bool native_up =
-                dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                     cached_up_gemm_[static_cast<size_t>(expert_id)]) != nullptr;
             const bool native_down =
-                dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                     cached_down_gemm_[static_cast<size_t>(expert_id)]) != nullptr;
             const bool any_native = native_gate || native_up || native_down;
             const bool all_native = native_gate && native_up && native_down;
@@ -4876,7 +4876,7 @@ namespace llaminar2
         if (any_native_bundle != all_native_bundles)
         {
             LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row execution cannot mix "
-                      "NativeVNNI and floating expert bundles in layer "
+                      "NativeQuantised and floating expert bundles in layer "
                       << params_.layer_idx);
             return false;
         }
@@ -4900,7 +4900,7 @@ namespace llaminar2
                              : params_.input->data();
             if (!cpu_moe_kernel || !input_rows)
             {
-                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped-row execution "
+                LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised grouped-row execution "
                           "requires the production CPUMoEKernel router");
                 return false;
             }
@@ -4913,7 +4913,7 @@ namespace llaminar2
                         d_model);
                 if (!published_router_q8)
                 {
-                    LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped-row execution "
+                    LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised grouped-row execution "
                               "is missing the matching router Q8_1 publication for layer "
                               << params_.layer_idx << " seq_len=" << seq_len
                               << " d_model=" << d_model);
@@ -5068,7 +5068,7 @@ namespace llaminar2
              * An ordinary CPU graph instead consumes the row-major Q8_1 bytes
              * published by its router and performs the required permutation.
              * Both branches use the same source-row schedule and therefore
-             * produce byte-identical NativeVNNI inputs.
+             * produce byte-identical NativeQuantised inputs.
              */
             const auto router_q8_prepare_start =
                 record_cpu_moe_phase_timings
@@ -5174,23 +5174,31 @@ namespace llaminar2
             }
 
             using BatchedProjection =
-                CPUNativeVNNIGemmKernel::BatchedPrequantizedProjectionDesc;
+                CPUNativeQuantisedGemmKernel::BatchedPrequantizedProjectionDesc;
             std::array<
                 BatchedProjection,
-                CPUNativeVNNIGemmKernel::kMaxBatchedPrequantizedProjections>
+                CPUNativeQuantisedGemmKernel::kMaxBatchedPrequantizedProjections>
                 gate_up_projection_descriptors = {};
             std::array<
                 BatchedProjection,
-                CPUNativeVNNIGemmKernel::kMaxBatchedPrequantizedProjections>
+                CPUNativeQuantisedGemmKernel::kMaxBatchedPrequantizedProjections>
                 down_projection_descriptors = {};
             int gate_up_projection_count = 0;
             int down_projection_count = 0;
             // Routing may make a prompt batch as small as one row or an MTP
             // verifier batch unusually large. Carry the graph's typed purpose
             // rather than guessing scheduling intent from the expert's M.
-            const auto projection_purpose = purpose == CPUGroupedRowsPurpose::OrdinaryPrefill
-                ? cpu::native_vnni::ProjectionRowsPurpose::Prefill
-                : cpu::native_vnni::ProjectionRowsPurpose::Decode;
+            const auto projection_purpose = [&]()
+            {
+                using ProjectionPurpose = cpu::native_quantised::ProjectionRowsPurpose;
+                switch (purpose)
+                {
+                case CPUGroupedRowsPurpose::Decode: return ProjectionPurpose::Decode;
+                case CPUGroupedRowsPurpose::OrdinaryPrefill: return ProjectionPurpose::Prefill;
+                case CPUGroupedRowsPurpose::MTPVerifier: return ProjectionPurpose::MTPVerifier;
+                }
+                throw std::logic_error("CPU grouped expert execution has an unknown typed purpose");
+            }();
             float *gate_rows = grouped_scratch_gate->mutable_data();
             float *up_rows = grouped_scratch_up->mutable_data();
             float *down_rows = grouped_scratch_out->mutable_data();
@@ -5209,23 +5217,23 @@ namespace llaminar2
                         static_cast<size_t>(expert_id) + 1u];
                 const int expert_rows = expert_end - expert_begin;
                 auto *native_gate =
-                    dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                    dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                         cached_gate_gemm_[static_cast<size_t>(expert_id)]);
                 auto *native_up =
-                    dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                    dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                         cached_up_gemm_[static_cast<size_t>(expert_id)]);
                 auto *native_down =
-                    dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                    dynamic_cast<CPUNativeQuantisedGemmKernel *>(
                         cached_down_gemm_[static_cast<size_t>(expert_id)]);
                 if (!native_gate || !native_up || !native_down ||
                     gate_up_projection_count + 2 >
-                        CPUNativeVNNIGemmKernel::
+                        CPUNativeQuantisedGemmKernel::
                             kMaxBatchedPrequantizedProjections ||
                     down_projection_count >=
-                        CPUNativeVNNIGemmKernel::
+                        CPUNativeQuantisedGemmKernel::
                             kMaxBatchedPrequantizedProjections)
                 {
-                    LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI batched "
+                    LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised batched "
                               "FFN descriptor capacity exceeded in layer "
                               << params_.layer_idx);
                     return false;
@@ -5281,7 +5289,7 @@ namespace llaminar2
             const auto grouped_ffn_start = record_cpu_moe_phase_timings
                                                ? PerfStatsCollector::Clock::now()
                                                : PerfStatsCollector::Clock::time_point{};
-            if (!CPUNativeVNNIGemmKernel::
+            if (!CPUNativeQuantisedGemmKernel::
                     execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
                         gate_up_projection_descriptors.data(),
                         gate_up_projection_count,
@@ -5296,18 +5304,18 @@ namespace llaminar2
                         down_projection_count, CPUInvocationWorkspace::available<float>(
                             bound_workspace_, kCPUProjectionPartials)))
             {
-                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI layer-batched "
+                LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised layer-batched "
                           "grouped FFN transaction failed in layer "
                           << params_.layer_idx);
                 return false;
             }
             record_cpu_moe_phase(
-                "native_vnni_grouped_ffn_transaction",
+                "native_quantised_grouped_ffn_transaction",
                 grouped_ffn_start);
 
             PerfStatsCollector::addCounter(
                 "kernel",
-                "cpu_moe_native_vnni_layer_batched_expert_calls",
+                "cpu_moe_native_quantised_layer_batched_expert_calls",
                 1.0,
                 grouped_phase,
                 "cpu",
@@ -5936,9 +5944,9 @@ namespace llaminar2
             return false;
         }
 
-        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(
+        std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(
             static_cast<size_t>(params_.num_experts));
-        std::vector<DeviceNativeVNNIMatrixDesc> up_descs(
+        std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(
             static_cast<size_t>(params_.num_experts));
         std::vector<DeviceMoEFloatingMatrixDesc> floating_gate_descs(
             static_cast<size_t>(params_.num_experts));
@@ -5979,7 +5987,7 @@ namespace llaminar2
             }
             table_format = exported.weight_format;
 
-            if (exported.weight_format == DeviceMoEWeightFormat::NativeVNNI)
+            if (exported.weight_format == DeviceMoEWeightFormat::NativeQuantised)
             {
                 gate_descs[static_cast<size_t>(expert_id)] = exported.gate;
                 up_descs[static_cast<size_t>(expert_id)] = exported.up;
@@ -6005,7 +6013,7 @@ namespace llaminar2
             grouped_gateup_desc_table_weight_format_ == *table_format)
         {
             const bool updated =
-                *table_format == DeviceMoEWeightFormat::NativeVNNI
+                *table_format == DeviceMoEWeightFormat::NativeQuantised
                     ? kernel->updateGroupedExpertGateUpDescriptorTables(
                           table_id,
                           gate_descs.data(),
@@ -6029,7 +6037,7 @@ namespace llaminar2
             return true;
         }
 
-        table_id = *table_format == DeviceMoEWeightFormat::NativeVNNI
+        table_id = *table_format == DeviceMoEWeightFormat::NativeQuantised
                        ? kernel->uploadGroupedExpertGateUpDescriptorTables(
                              gate_descs.data(),
                              up_descs.data(),
@@ -6079,7 +6087,7 @@ namespace llaminar2
             return false;
         }
 
-        std::vector<DeviceNativeVNNIMatrixDesc> down_descs(
+        std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(
             static_cast<size_t>(params_.num_experts));
         std::vector<DeviceMoEFloatingMatrixDesc> floating_down_descs(
             static_cast<size_t>(params_.num_experts));
@@ -6118,7 +6126,7 @@ namespace llaminar2
             }
             table_format = exported.weight_format;
 
-            if (exported.weight_format == DeviceMoEWeightFormat::NativeVNNI)
+            if (exported.weight_format == DeviceMoEWeightFormat::NativeQuantised)
             {
                 down_descs[static_cast<size_t>(expert_id)] = exported.down;
             }
@@ -6141,7 +6149,7 @@ namespace llaminar2
             grouped_down_desc_table_weight_format_ == *table_format)
         {
             const bool updated =
-                *table_format == DeviceMoEWeightFormat::NativeVNNI
+                *table_format == DeviceMoEWeightFormat::NativeQuantised
                     ? kernel->updateGroupedExpertDownDescriptorTable(
                           table_id,
                           down_descs.data(),
@@ -6163,7 +6171,7 @@ namespace llaminar2
             return true;
         }
 
-        table_id = *table_format == DeviceMoEWeightFormat::NativeVNNI
+        table_id = *table_format == DeviceMoEWeightFormat::NativeQuantised
                        ? kernel->uploadGroupedExpertDownDescriptorTable(
                              down_descs.data(),
                              params_.num_experts,
@@ -6251,12 +6259,12 @@ namespace llaminar2
         bind_if_needed(shared_up);
         bind_if_needed(shared_down);
 
-        DeviceNativeVNNIMatrixDesc gate_desc;
-        DeviceNativeVNNIMatrixDesc up_desc;
-        DeviceNativeVNNIMatrixDesc down_desc;
-        if (!shared_gate->exportNativeVNNIMatrixDesc(gate_desc) ||
-            !shared_up->exportNativeVNNIMatrixDesc(up_desc) ||
-            !shared_down->exportNativeVNNIMatrixDesc(down_desc) ||
+        DeviceNativeQuantisedMatrixDesc gate_desc;
+        DeviceNativeQuantisedMatrixDesc up_desc;
+        DeviceNativeQuantisedMatrixDesc down_desc;
+        if (!shared_gate->exportNativeQuantisedMatrixDesc(gate_desc) ||
+            !shared_up->exportNativeQuantisedMatrixDesc(up_desc) ||
+            !shared_down->exportNativeQuantisedMatrixDesc(down_desc) ||
             gate_desc.n != intermediate || gate_desc.k != d_model ||
             up_desc.n != intermediate || up_desc.k != d_model ||
             down_desc.n != d_model || down_desc.k != intermediate)
@@ -6443,7 +6451,7 @@ namespace llaminar2
                     LOG_DEBUG("[MoEExpertComputeStage] Cannot initialize MoE runtime decode bank for layer "
                               << params_.layer_idx << " expert " << expert_id
                               << ": prepared GEMM engines did not export a uniform "
-                                 "NativeVNNI/FP16/BF16/FP32 descriptor family");
+                                 "NativeQuantised/FP16/BF16/FP32 descriptor family");
                     return false;
                 }
 
@@ -10092,7 +10100,7 @@ namespace llaminar2
          * A shared expert is simply an always-selected one-entry expert table.
          * Export the complete projection triple through the same typed boundary
          * as routed experts so floating model weights do not get mistaken for
-         * failed NativeVNNI preparation.  Validating down here as part of the
+         * failed NativeQuantised preparation.  Validating down here as part of the
          * triple also prevents gate/up and down tables from recording different
          * precision families in one captured launch.
          */
@@ -10120,7 +10128,7 @@ namespace llaminar2
         }
 
         const int table_id =
-            exported.weight_format == DeviceMoEWeightFormat::NativeVNNI
+            exported.weight_format == DeviceMoEWeightFormat::NativeQuantised
                 ? kernel->uploadGroupedExpertGateUpDescriptorTables(
                       &exported.gate,
                       &exported.up,
@@ -10198,7 +10206,7 @@ namespace llaminar2
         }
 
         const int table_id =
-            exported.weight_format == DeviceMoEWeightFormat::NativeVNNI
+            exported.weight_format == DeviceMoEWeightFormat::NativeQuantised
                 ? kernel->uploadGroupedExpertDownDescriptorTable(
                       &exported.down,
                       1,

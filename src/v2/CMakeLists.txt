@@ -250,7 +250,7 @@ if(HAVE_CUDA)
         endif()
     endif()
     
-    # CUDA compile flags. NativeVNNI prefill uses Ampere+ ldmatrix/mma.sync
+    # CUDA compile flags. NativeQuantised prefill uses Ampere+ ldmatrix/mma.sync
     # instructions guarded by __CUDA_ARCH__ >= 800, so a CUDA build must include
     # at least one SM80+ target. A stale pre-Ampere-only cache compiles the kernel
     # body to no-ops and returns all-zero GEMM outputs.
@@ -273,7 +273,7 @@ if(HAVE_CUDA)
     endforeach()
     if(NOT LLAMINAR_HAS_AMPERE_CUDA_ARCH)
         message(FATAL_ERROR
-            "V2: CUDA NativeVNNI requires compiling at least one SM80+ architecture. "
+            "V2: CUDA NativeQuantised requires compiling at least one SM80+ architecture. "
             "Current CMAKE_CUDA_ARCHITECTURES='${CMAKE_CUDA_ARCHITECTURES}'. "
             "Reconfigure with a local SM80+ value such as "
             "-DCMAKE_CUDA_ARCHITECTURES=86.")
@@ -386,21 +386,21 @@ if(HAVE_CUDA)
     set(CUDA_KERNEL_SOURCES
         kernels/cuda/gemm/CuBLASGemmKernel.cu              # cuBLAS wrapper for FP32/FP16/BF16 dense GEMM
         kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM + TC weight repacking
-        kernels/cuda/gemm/CUDANativeVNNIIQTables.cu    # shared IQ lookup table symbol definitions for native-vnni decode
-        # NativeVNNI decode/grouped GEMV is physically sharded by codebook pair.
+        kernels/cuda/gemm/CUDANativeQuantisedIQTables.cu    # shared IQ lookup table symbol definitions for native-quantised decode
+        # NativeQuantised decode/grouped GEMV is physically sharded by codebook pair.
         # Eight independent objects expose real Ninja parallelism; the dispatch
         # TU preserves the single public ABI and contains no device templates.
-        kernels/cuda/gemm/CUDANativeVNNIGemvDispatch.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard0.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard1.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard2.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard3.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard4.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard5.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard6.cu
-        kernels/cuda/gemm/CUDANativeVNNIGemvShard7.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvDispatch.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard0.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard1.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard2.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard3.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard4.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard5.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard6.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard7.cu
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
-        kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
+        kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu  # custom native-quantised prefill GEMM family (Q4_0 first)
         kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.cu   # device-planned byte-exact grouped MoE IMMA prefill
         kernels/cuda/moe/CUDAMoEGroupedIntermediateExchange.cu # lossless SwiGLU/scales exchange boundary
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
@@ -453,7 +453,7 @@ if(HAVE_CUDA)
     # oversubscribe eight already independent Ninja jobs.
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.3")
         set_source_files_properties(
-            kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu
+            kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu
             PROPERTIES COMPILE_OPTIONS "--split-compile=8"
         )
         # Attention owns one arithmetic body specialized across native formats,
@@ -686,18 +686,18 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmQuantisedGemmKernel_INT8_VNNI.hip # INT8 VNNI wide-tile V3+V7 kernels (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel.hip               # GEMV kernel suite documentation index (split into files below)
         kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI GEMV/GEMM kernels for decode + prefill (gfx906)
-        kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
-        # NativeVNNI prefill is physically sharded by codebook pair so LLVM can
+        kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip  # NativeQuantised 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
+        # NativeQuantised prefill is physically sharded by codebook pair so LLVM can
         # optimize all format families concurrently instead of serializing one
         # multi-minute translation unit.
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard0.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard1.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard2.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard3.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard4.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard5.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard6.hip
-        kernels/rocm/gemm/ROCmNativeVNNIGemmShard7.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard0.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard1.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard2.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard3.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard4.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard5.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard6.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmShard7.hip
         kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/moe/ROCmMoEGroupedIntermediateExchange.hip # lossless SwiGLU/scales exchange boundary
@@ -771,7 +771,7 @@ if(HAVE_ROCM)
         collective/backends/RCCLDynamicLoader.cpp            # Dynamic loader for RCCL (dlopen/dlsym)
         collective/backends/RCCLBackendHIP.cpp               # HIP runtime wrappers for RCCL backend
         collective/coordinators/RCCLCoordinator.cpp          # RCCL collective coordinator
-        kernels/rocm/gemm/ROCmNativeVNNIGemmDispatch.cpp     # Host-only public dispatcher for sharded NativeVNNI GEMM
+        kernels/rocm/gemm/ROCmNativeQuantisedGemmDispatch.cpp     # Host-only public dispatcher for sharded NativeQuantised GEMM
         kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.cpp # Typed common-generated exact prefill policy
         ${ROCM_KERNEL_SOURCES}
     )
@@ -1287,7 +1287,7 @@ if(USE_ONEDNN)
 
     # Keep one installed oneDNN tree per compiled ISA. AVX512 binaries are
     # intentionally also exercised with AVX2 runtime dispatch by the CPU
-    # NativeVNNI trainer, while AVX2-only release artifacts remain separately
+    # NativeQuantised trainer, while AVX2-only release artifacts remain separately
     # runnable. A shared `build/` directory made configuring either tree erase
     # and relink the other, invalidating both evidence provenance and Docker's
     # dual-runtime image build.
@@ -2378,7 +2378,7 @@ if(HAVE_ROCM)
     # Add ROCm kernel C++ adapter files (compiled with C++ compiler, NOT hipcc)
     # These implement ITensorGemm interface and can include MPI headers
     target_sources(llaminar2_core PRIVATE
-        kernels/rocm/gemm/ROCmWeightPacker.cpp               # Weight packing utilities (native-VNNI + INT8 conversion)
+        kernels/rocm/gemm/ROCmWeightPacker.cpp               # Weight packing utilities (native-quantised + INT8 conversion)
         kernels/rocm/gemm/ROCmFloatingPointGemmKernel.cpp
         kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp  # INT8 GEMM adapter (uses CK via extern "C")
         kernels/rocm/gemm/HipBLASGemmKernel.cpp        # hipBLAS GEMM for FP32/FP16 (compiled with g++, linked with hipBLAS)

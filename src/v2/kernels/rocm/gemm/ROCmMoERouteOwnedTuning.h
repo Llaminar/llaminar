@@ -20,8 +20,8 @@
 #pragma once
 
 #include "../../common/MoEPrefillProjectionExecution.h"
-#include "../../common/NativeVNNIGroupedDecodePolicy.h"
-#include "../../../tensors/NativeVnniFormatInfo.h"
+#include "../../common/NativeQuantisedGroupedDecodePolicy.h"
+#include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../backends/ComputeBackend.h"
 #include "../../../config/CollectiveBackendType.h"
 #include "../../../execution/moe/DeviceMoEOverlayServiceTelemetry.h"
@@ -65,14 +65,14 @@ inline constexpr int kMoERouteOwnedGateUpPartitionWorkers = 4;
 inline constexpr int kMoERouteOwnedGateUpPartitionColumns = 64;
 
 /**
- * @brief Identify every compiled physical NativeVNNI decoder for original-partition workers.
+ * @brief Identify every compiled physical NativeQuantised decoder for original-partition workers.
  * @param codebook Actual physical decoder, not the source arithmetic policy.
  * @return Whether this explicit partition-worker candidate is implemented for the decoder.
  * @note The cold symbol selector resolves the actual compiled decoder; ordinary serial coverage is unchanged.
  */
 [[nodiscard]] constexpr bool moeRouteOwnedGateUpPartitionCodebook(std::uint8_t codebook) noexcept
 {
-    for (const auto &source : native_vnni_formats::kAllSourceFormats)
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
         if (canonicalDeviceVnniFormat(*source.metadata).codebook_id == codebook ||
             migrationStableDeviceVnniFormat(*source.metadata).codebook_id == codebook)
             return true;
@@ -88,7 +88,7 @@ inline constexpr int kMoERouteOwnedGateUpPartitionColumns = 64;
  */
 [[nodiscard]] constexpr std::size_t moeRouteOwnedGateUpPartitionSharedBytes(int maximum_partitions)
 {
-    if (maximum_partitions <= 0 || maximum_partitions > NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+    if (maximum_partitions <= 0 || maximum_partitions > NativeQuantisedGroupedDecodePolicy::maximum_k_partitions)
         throw std::invalid_argument("route-owned partition bank requires an original resolved count");
     return static_cast<std::size_t>(maximum_partitions) * kMoERouteOwnedGateUpPartitionColumns * sizeof(float);
 }
@@ -173,8 +173,8 @@ struct MoERouteOwnedKernelResources
  */
 [[nodiscard]] constexpr std::uint32_t moeRouteOwnedGateUpLaunchCodebookMask(std::uint32_t mask) noexcept
 {
-    const auto tuple = nativeVnniCodebookMaskBit(kNativeVnniIQ4XSSourceScaleCodebook);
-    return mask & tuple ? mask & ~nativeVnniCodebookMaskBit(4) : mask;
+    const auto tuple = nativeQuantisedCodebookMaskBit(kNativeQuantisedIQ4XSSourceScaleCodebook);
+    return mask & tuple ? mask & ~nativeQuantisedCodebookMaskBit(4) : mask;
 }
 
 /**
@@ -184,14 +184,14 @@ struct MoERouteOwnedKernelResources
  * @note Supported identities come from the existing canonical source/migration catalog.
  */
 [[nodiscard]] constexpr bool moeRouteOwnedGateUpEnvelopeValid(
-    const NativeVnniExecutionFormatEnvelope &envelope) noexcept
+    const NativeQuantisedExecutionFormatEnvelope &envelope) noexcept
 {
     std::uint32_t known_execution = 0, known_policy = 0;
-    for (const auto &source : native_vnni_formats::kAllSourceFormats)
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
-        known_execution |= nativeVnniCodebookMaskBit(canonicalDeviceVnniFormat(*source.metadata).codebook_id);
-        known_execution |= nativeVnniCodebookMaskBit(migrationStableDeviceVnniFormat(*source.metadata).codebook_id);
-        known_policy |= nativeVnniCodebookMaskBit(canonicalDeviceVnniCodebookId(source.metadata->codebook_id));
+        known_execution |= nativeQuantisedCodebookMaskBit(canonicalDeviceVnniFormat(*source.metadata).codebook_id);
+        known_execution |= nativeQuantisedCodebookMaskBit(migrationStableDeviceVnniFormat(*source.metadata).codebook_id);
+        known_policy |= nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(source.metadata->codebook_id));
     }
     return envelope.valid() && !(envelope.execution_codebook_mask & ~known_execution) &&
         !(envelope.policy_codebook_mask & ~known_policy);
@@ -205,7 +205,7 @@ struct MoERouteOwnedKernelResources
  * @return Whether shape and all normalized decoders support this explicit execution mode.
  */
 [[nodiscard]] constexpr bool moeRouteOwnedGateUpPartitionExecutionValid(
-    MoERouteOwnedGateUpPartitionExecution execution, const NativeVnniExecutionFormatEnvelope &envelope,
+    MoERouteOwnedGateUpPartitionExecution execution, const NativeQuantisedExecutionFormatEnvelope &envelope,
     MoERouteOwnedProjectionShape shape) noexcept
 {
     const int reduction_width = shape.reduction_columns;
@@ -217,7 +217,7 @@ struct MoERouteOwnedKernelResources
     if (execution != MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes || reduction_width == 0) return false;
     const auto mask = moeRouteOwnedGateUpLaunchCodebookMask(envelope.execution_codebook_mask);
     for (std::uint8_t codebook = 0; codebook < 32; ++codebook)
-        if ((mask & nativeVnniCodebookMaskBit(codebook)) && !moeRouteOwnedGateUpPartitionCodebook(codebook)) return false;
+        if ((mask & nativeQuantisedCodebookMaskBit(codebook)) && !moeRouteOwnedGateUpPartitionCodebook(codebook)) return false;
     return true;
 }
 
@@ -230,7 +230,7 @@ struct MoERouteOwnedKernelResources
  * @note Nonowned entries must remain zero; no physical-decoder-to-source inference is made.
  */
 [[nodiscard]] constexpr int moeRouteOwnedGateUpMaximumKPartitions(
-    const NativeVnniExecutionFormatEnvelope &envelope, const std::array<std::uint8_t, 32> &partitions,
+    const NativeQuantisedExecutionFormatEnvelope &envelope, const std::array<std::uint8_t, 32> &partitions,
     int reduction_width) noexcept
 {
     if (!moeRouteOwnedGateUpEnvelopeValid(envelope) || reduction_width <= 0 || reduction_width % 32 != 0) return 0;
@@ -238,9 +238,9 @@ struct MoERouteOwnedKernelResources
     for (std::uint8_t codebook = 0; codebook < 32; ++codebook)
     {
         const int count = partitions[codebook];
-        if (envelope.policy_codebook_mask & nativeVnniCodebookMaskBit(codebook))
+        if (envelope.policy_codebook_mask & nativeQuantisedCodebookMaskBit(codebook))
         {
-            if (count <= 0 || count > reduction_width / 32 || count > NativeVNNIGroupedDecodePolicy::maximum_k_partitions) return 0;
+            if (count <= 0 || count > reduction_width / 32 || count > NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) return 0;
             if (count > maximum) maximum = count;
         }
         else if (count != 0) return 0;
@@ -261,7 +261,7 @@ struct MoERouteOwnedKernelResources
  * @note This identity confers no allocation, resource capability, hardware execution or graph ownership.
  */
 [[nodiscard]] constexpr std::uint64_t moeRouteOwnedGateUpPlanIdentity(
-    MoERouteOwnedGateUpGeometry geometry, const NativeVnniExecutionFormatEnvelope &envelope, int device,
+    MoERouteOwnedGateUpGeometry geometry, const NativeQuantisedExecutionFormatEnvelope &envelope, int device,
     MoERouteOwnedGateUpPartitionExecution execution, MoERouteOwnedProjectionShape shape,
     const std::array<std::uint8_t, 32> &partitions)
 {
@@ -299,7 +299,7 @@ class MoERouteOwnedGateUpPlan;
  * @note Performs only host metadata work; never native resource queries or allocation.
  */
 [[nodiscard]] MoERouteOwnedGateUpPlan planMoERouteOwnedGateUp(
-    MoERouteOwnedGateUpGeometry geometry, const NativeVnniExecutionFormatEnvelope &envelope, int device,
+    MoERouteOwnedGateUpGeometry geometry, const NativeQuantisedExecutionFormatEnvelope &envelope, int device,
     MoERouteOwnedGateUpPartitionExecution execution, MoERouteOwnedProjectionShape shape);
 
 /** @brief Immutable logical plan, distinct from a native resource capability. */
@@ -309,7 +309,7 @@ public:
     /** @return Exact independent-column width. */
     [[nodiscard]] MoERouteOwnedGateUpGeometry geometry() const noexcept { return geometry_; }
     /** @return Complete original masks; never a live descriptor/placement shadow. */
-    [[nodiscard]] const NativeVnniExecutionFormatEnvelope &executionEnvelope() const noexcept { return envelope_; }
+    [[nodiscard]] const NativeQuantisedExecutionFormatEnvelope &executionEnvelope() const noexcept { return envelope_; }
     /** @return Exact owner selected by graph declaration. */
     [[nodiscard]] int deviceOrdinal() const noexcept { return device_; }
     /** @return Explicit partition execution of the unchanged numerical program. */
@@ -324,7 +324,7 @@ public:
     [[nodiscard]] std::uint64_t identity() const { return moeRouteOwnedGateUpPlanIdentity(geometry_, envelope_, device_, execution_, shape_, partitions_); }
 private:
     friend MoERouteOwnedGateUpPlan planMoERouteOwnedGateUp(MoERouteOwnedGateUpGeometry,
-        const NativeVnniExecutionFormatEnvelope &, int, MoERouteOwnedGateUpPartitionExecution, MoERouteOwnedProjectionShape);
+        const NativeQuantisedExecutionFormatEnvelope &, int, MoERouteOwnedGateUpPartitionExecution, MoERouteOwnedProjectionShape);
     /**
      * @brief Publish the complete canonical resolver result; native admission remains separate.
      * @param geometry Exact independent-column width.
@@ -335,13 +335,13 @@ private:
      * @param partitions Original source-policy resolver result for those exact axes.
      * @param maximum Validated maximum over original source-policy members.
      */
-    MoERouteOwnedGateUpPlan(MoERouteOwnedGateUpGeometry geometry, NativeVnniExecutionFormatEnvelope envelope,
+    MoERouteOwnedGateUpPlan(MoERouteOwnedGateUpGeometry geometry, NativeQuantisedExecutionFormatEnvelope envelope,
         int device, MoERouteOwnedGateUpPartitionExecution execution, MoERouteOwnedProjectionShape shape,
         std::array<std::uint8_t, 32> partitions, int maximum)
         : geometry_(geometry), envelope_(envelope), device_(device), execution_(execution), shape_(shape),
           partitions_(partitions), maximum_(maximum) {}
     MoERouteOwnedGateUpGeometry geometry_;
-    NativeVnniExecutionFormatEnvelope envelope_;
+    NativeQuantisedExecutionFormatEnvelope envelope_;
     int device_;
     MoERouteOwnedGateUpPartitionExecution execution_;
     MoERouteOwnedProjectionShape shape_;
@@ -434,7 +434,7 @@ struct MoERouteOwnedModelOperation
     MoERouteOwnedModelPartitionPolicy policy, const MoERouteOwnedModelOperation &operation,
     std::span<const GlobalDeviceAddress> participants, std::span<const float> weights,
     CollectiveBackendType backend, std::span<const ComputeDevice> inventory,
-    std::span<const NativeVnniSourceIdentity> sources)
+    std::span<const NativeQuantisedSourceIdentity> sources)
 {
     using Execution = MoERouteOwnedGateUpPartitionExecution;
     if (policy == MoERouteOwnedModelPartitionPolicy::Serial) return Execution::Serial;
@@ -444,7 +444,7 @@ struct MoERouteOwnedModelOperation
     if (!moeRouteOwnedModelMeasuredDomain(operation, participants, weights, backend, inventory) || sources.empty())
         return Execution::Serial;
     const auto family = sources.front().codebook_id;
-    if (family != native_vnni_formats::Q4_K.codebook_id && family != native_vnni_formats::Q5_K.codebook_id)
+    if (family != native_quantised_formats::Q4_K.codebook_id && family != native_quantised_formats::Q5_K.codebook_id)
         return Execution::Serial;
     for (const auto &source : sources)
         if (!source.present || !source.is_superblock || source.codebook_id != family) return Execution::Serial;
@@ -471,7 +471,7 @@ class MoERouteOwnedGateUpAdmission;
 /**
  * @brief Seal every actual leaf in one original descriptor-table format envelope.
  * @param geometry Common independent-column width; four-plane execution admits TN64 only.
- * @param envelope Exact immutable setup envelope produced by addNativeVnniExecutionFormat.
+ * @param envelope Exact immutable setup envelope produced by addNativeQuantisedExecutionFormat.
  * @param device_ordinal Actual owner used for all cold inspections.
  * @param partition_execution Original serial execution or explicit four full worker planes.
  * @param shape Named physical gate/up N/K for original policy resolution and resource identity; default{} preserves serial compatibility.
@@ -481,7 +481,7 @@ class MoERouteOwnedGateUpAdmission;
  * @throws std::runtime_error When any exact native leaf is nonresident or uses private storage.
  */
 [[nodiscard]] MoERouteOwnedGateUpAdmission admitMoERouteOwnedGateUpGeometry(
-    MoERouteOwnedGateUpGeometry geometry, const NativeVnniExecutionFormatEnvelope &envelope, int device_ordinal,
+    MoERouteOwnedGateUpGeometry geometry, const NativeQuantisedExecutionFormatEnvelope &envelope, int device_ordinal,
     MoERouteOwnedGateUpPartitionExecution partition_execution = MoERouteOwnedGateUpPartitionExecution::Serial,
     MoERouteOwnedProjectionShape shape = {});
 
@@ -518,7 +518,7 @@ public:
     /** @return Exact maximum over required original source policies; never a new split-K choice. */
     [[nodiscard]] int maximumKPartitions() const noexcept { return maximum_k_partitions_; }
     /** @return Exact original execution and source-policy masks, before family normalization. */
-    [[nodiscard]] const NativeVnniExecutionFormatEnvelope &executionEnvelope() const noexcept { return envelope_; }
+    [[nodiscard]] const NativeQuantisedExecutionFormatEnvelope &executionEnvelope() const noexcept { return envelope_; }
     /** @return Original decoder families after the production IQ4 normalization. */
     [[nodiscard]] std::uint32_t launchCodebookMask() const noexcept
     { return moeRouteOwnedGateUpLaunchCodebookMask(envelope_.execution_codebook_mask); }
@@ -532,7 +532,7 @@ public:
      */
     [[nodiscard]] const MoERouteOwnedKernelResources &leafResources(std::uint8_t codebook) const
     {
-        if (codebook >= 32 || !(launchCodebookMask() & nativeVnniCodebookMaskBit(codebook)))
+        if (codebook >= 32 || !(launchCodebookMask() & nativeQuantisedCodebookMaskBit(codebook)))
             throw std::invalid_argument("route-owned resources requested for a foreign launch family");
         return resources_[codebook];
     }
@@ -566,7 +566,7 @@ private:
      * @param maximum_partitions Validated maximum across required original policies.
      */
     MoERouteOwnedGateUpAdmission(MoERouteOwnedGateUpGeometry geometry,
-        NativeVnniExecutionFormatEnvelope envelope, int device,
+        NativeQuantisedExecutionFormatEnvelope envelope, int device,
         std::array<MoERouteOwnedKernelResources, 32> resources,
         MoERouteOwnedGateUpPartitionExecution partition_execution, MoERouteOwnedProjectionShape shape,
         std::array<std::uint8_t, 32> partitions, int maximum_partitions)
@@ -574,7 +574,7 @@ private:
           partition_execution_(partition_execution), shape_(shape),
           arithmetic_partitions_(partitions), maximum_k_partitions_(maximum_partitions) {}
     MoERouteOwnedGateUpGeometry geometry_;
-    NativeVnniExecutionFormatEnvelope envelope_;
+    NativeQuantisedExecutionFormatEnvelope envelope_;
     int device_;
     std::array<MoERouteOwnedKernelResources, 32> resources_;
     MoERouteOwnedGateUpPartitionExecution partition_execution_;
@@ -666,7 +666,7 @@ struct MoERouteOwnedGateUpLaunch
  */
 struct MoERouteOwnedGateUpLaunchSet
 {
-    NativeVnniExecutionFormatEnvelope execution_envelope{}; ///< Original unnormalized masks.
+    NativeQuantisedExecutionFormatEnvelope execution_envelope{}; ///< Original unnormalized masks.
     std::array<MoERouteOwnedGateUpLaunch, 32> leaves{}; ///< Accepted leaves in original launch-loop order.
     std::size_t leaf_count = 0; ///< Host submissions, never active routes or replay work.
 };

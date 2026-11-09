@@ -24,7 +24,7 @@ using namespace llaminar2;
 
 TEST(Test__GPUExpertTransfer, PackedDescriptorContract)
 {
-    DeviceNativeVNNIMatrixDesc src{};
+    DeviceNativeQuantisedMatrixDesc src{};
     src.payload = reinterpret_cast<const uint8_t *>(0x1000);
     src.scales = reinterpret_cast<const void *>(0x2000);
     src.mins = reinterpret_cast<const void *>(0x3000);
@@ -34,7 +34,7 @@ TEST(Test__GPUExpertTransfer, PackedDescriptorContract)
     src.blocks_per_row = 2;
     src.codebook_id = 7;
 
-    DeviceNativeVNNIMatrixDesc dst = src;
+    DeviceNativeQuantisedMatrixDesc dst = src;
     dst.payload = reinterpret_cast<const uint8_t *>(0x5000);
     dst.scales = reinterpret_cast<const void *>(0x6000);
     dst.mins = reinterpret_cast<const void *>(0x7000);
@@ -59,7 +59,7 @@ TEST(Test__GPUExpertTransfer, PackedDescriptorContract)
 
 TEST(Test__GPUExpertTransfer, RejectsCrossBackendTransfer)
 {
-    DeviceNativeVNNIMatrixDesc matrix{};
+    DeviceNativeQuantisedMatrixDesc matrix{};
     matrix.payload = reinterpret_cast<const uint8_t *>(0x1000);
     matrix.scales = reinterpret_cast<const void *>(0x2000);
     matrix.n = 16;
@@ -92,7 +92,7 @@ TEST(Test__GPUExpertTransfer, RejectsNullStream)
 }
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-TEST(Test__GPUExpertTransfer, CUDAROCmHostPackersProduceBitwiseIdenticalNativeVNNI)
+TEST(Test__GPUExpertTransfer, CUDAROCmHostPackersProduceBitwiseIdenticalNativeQuantised)
 {
     struct Case
     {
@@ -119,13 +119,13 @@ TEST(Test__GPUExpertTransfer, CUDAROCmHostPackersProduceBitwiseIdenticalNativeVN
 
         EXPECT_EQ(cuda_packed.N, rocm_packed.N) << tc.name;
         EXPECT_EQ(cuda_packed.K, rocm_packed.K) << tc.name;
-        EXPECT_EQ(cuda_packed.native_codebook_id, rocm_packed.native_vnni_codebook_id) << tc.name;
-        EXPECT_EQ(cuda_packed.native_blocks_per_row, rocm_packed.native_vnni_blocks_per_row) << tc.name;
+        EXPECT_EQ(cuda_packed.native_codebook_id, rocm_packed.native_quantised_codebook_id) << tc.name;
+        EXPECT_EQ(cuda_packed.native_blocks_per_row, rocm_packed.native_quantised_blocks_per_row) << tc.name;
 
-        EXPECT_EQ(cuda_packed.native_vnni, rocm_packed.native_vnni_payload) << tc.name;
-        EXPECT_EQ(cuda_packed.native_scales, rocm_packed.native_vnni_scales) << tc.name;
-        EXPECT_EQ(cuda_packed.native_mins, rocm_packed.native_vnni_mins) << tc.name;
-        EXPECT_EQ(cuda_packed.native_emins, rocm_packed.native_vnni_emins) << tc.name;
+        EXPECT_EQ(cuda_packed.native_quantised, rocm_packed.native_quantised_payload) << tc.name;
+        EXPECT_EQ(cuda_packed.native_scales, rocm_packed.native_quantised_scales) << tc.name;
+        EXPECT_EQ(cuda_packed.native_mins, rocm_packed.native_quantised_mins) << tc.name;
+        EXPECT_EQ(cuda_packed.native_emins, rocm_packed.native_quantised_emins) << tc.name;
     }
 }
 #endif

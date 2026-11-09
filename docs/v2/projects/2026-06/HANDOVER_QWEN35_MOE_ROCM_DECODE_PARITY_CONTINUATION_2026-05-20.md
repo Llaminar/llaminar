@@ -36,28 +36,28 @@ layer0 avg_cosine=0.999923 min_cosine=0.999811 worst_stage=MOE_SHARED_EXPERT_OUT
 
 ## Changes Made In This Continuation
 
-### 1. Native-VNNI GEMV split-K regression coverage
+### 1. NativeQuantised GEMV split-K regression coverage
 
 File changed:
 
 ```text
-tests/v2/integration/kernels/rocm/Test__NativeVNNI_GEMV.cpp
+tests/v2/integration/kernels/rocm/Test__NativeQuantised_GEMV.cpp
 ```
 
 Added/changed:
 
-- Added Q8_0 to the native-VNNI GEMV format sweep by using direct `packNativeVNNI()` for Q8_0 instead of the default INT8-VNNI packing path.
-- Added `NativeVNNIGEMVTest.SplitK_KB8MatchesKB1_AllNativeCodebooks`.
-- The new regression forces `KB=1`, then `KB=8`, on the same packed native-VNNI weights and compares outputs for all native codebooks.
+- Added Q8_0 to the native-quantised GEMV format sweep by using direct `packNativeQuantised()` for Q8_0 instead of the default INT8-VNNI packing path.
+- Added `NativeQuantisedGEMVTest.SplitK_KB8MatchesKB1_AllNativeCodebooks`.
+- The new regression forces `KB=1`, then `KB=8`, on the same packed native-quantised weights and compares outputs for all native codebooks.
 
 Important result:
 
 ```text
-Standalone ROCm native-VNNI GEMV split-K does not reproduce the decode corruption.
+Standalone ROCm native-quantised GEMV split-K does not reproduce the decode corruption.
 KB=8 vs KB=1 passed for Q4/Q5/K/IQ/Q8 native codebooks with cosine=1.0 and tiny rel_l2.
 ```
 
-This means a future agent should not keep chasing the bare `rocmGemv_native_vnni_fp32()` split-K reduce path as the current layer-0 decode-cosine root cause unless new evidence appears.
+This means a future agent should not keep chasing the bare `rocmGemv_native_quantised_fp32()` split-K reduce path as the current layer-0 decode-cosine root cause unless new evidence appears.
 
 ### 2. GDN all-codebook projection regression coverage
 
@@ -70,8 +70,8 @@ tests/v2/unit/execution/Test__GDNKernels.cpp
 Added/changed:
 
 - Added `ROCmProjectionDecodeAllNativeCodebooksMatchesReference`.
-- The test builds GDN-shaped fused decode projections (`qkv`, `z`, `alpha`, `beta`) for every supported native-VNNI codebook, including Q8_0.
-- It forces `LLAMINAR_ROCM_NVNNI_GEMV_KB=8` and compares ROCm fused projection output against CPU dequantized reference.
+- The test builds GDN-shaped fused decode projections (`qkv`, `z`, `alpha`, `beta`) for every supported native-quantised codebook, including Q8_0.
+- It forces `LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_KB=8` and compares ROCm fused projection output against CPU dequantized reference.
 - Uses cosine, relative L2, and scale-normalized max absolute error (`max_abs_ratio`) so low-bit formats with large-magnitude outputs do not fail spuriously.
 
 Important result:
@@ -115,15 +115,15 @@ So the remaining full-model decode issue is not a generic ROCm GDN hidden-state 
 Builds:
 
 ```bash
-cmake --build build_v2_integration --config Integration --target v2_integration_rocm_native_vnni_gemv v2_test_gdn_kernels --parallel
+cmake --build build_v2_integration --config Integration --target v2_integration_rocm_native_quantised_gemv v2_test_gdn_kernels --parallel
 cmake --build build_v2_integration --config Integration --target v2_test_gdn_kernels --parallel
 ```
 
 Focused gtests:
 
 ```bash
-./build_v2_integration/tests/v2/v2_integration_rocm_native_vnni_gemv \
-  --gtest_filter='NativeVNNIGEMVTest.SplitK_KB8MatchesKB1_AllNativeCodebooks' \
+./build_v2_integration/tests/v2/v2_integration_rocm_native_quantised_gemv \
+  --gtest_filter='NativeQuantisedGEMVTest.SplitK_KB8MatchesKB1_AllNativeCodebooks' \
   --gtest_brief=1
 
 ./build_v2_integration/tests/v2/v2_test_gdn_kernels \
@@ -139,7 +139,7 @@ Focused CTest:
 
 ```bash
 ctest --test-dir build_v2_integration \
-  -R '^(V2_Integration_ROCm_NativeVNNI_GEMV|V2_Unit_GDNKernels)$' \
+  -R '^(V2_Integration_ROCm_NativeQuantised_GEMV|V2_Unit_GDNKernels)$' \
   --output-on-failure --parallel
 ```
 
@@ -167,7 +167,7 @@ Editor diagnostics:
 
 ```text
 get_errors reported no errors for:
-tests/v2/integration/kernels/rocm/Test__NativeVNNI_GEMV.cpp
+tests/v2/integration/kernels/rocm/Test__NativeQuantised_GEMV.cpp
 tests/v2/unit/execution/Test__GDNKernels.cpp
 ```
 
@@ -234,15 +234,15 @@ Interpretation:
 
 ## Current Worktree Notes
 
-The worktree is intentionally dirty and contains staged WIP from adjacent ROCm MoE/native-VNNI/prefill graph-capture work. Do not reset, checkout, stash, or revert unrelated changes unless explicitly asked.
+The worktree is intentionally dirty and contains staged WIP from adjacent ROCm MoE/native-quantised/prefill graph-capture work. Do not reset, checkout, stash, or revert unrelated changes unless explicitly asked.
 
 Focused status at handover time included:
 
 ```text
 MM src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp
-M  src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip
+M  src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip
 MM src/v2/kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip
- M tests/v2/integration/kernels/rocm/Test__NativeVNNI_GEMV.cpp
+ M tests/v2/integration/kernels/rocm/Test__NativeQuantised_GEMV.cpp
  M tests/v2/unit/execution/Test__GDNKernels.cpp
 ?? docs/v2/projects/2026-06/HANDOVER_QWEN35_MOE_ROCM_DECODE_PARITY_2026-05-20.md
 ```
@@ -250,7 +250,7 @@ MM src/v2/kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip
 Additional staged docs unrelated to this continuation were also present:
 
 ```text
-A  docs/v2/projects/2026-06/HANDOVER_ROCM_MOE_NATIVE_VNNI_FORMAT_SUPPORT_2026-05-19.md
+A  docs/v2/projects/2026-06/HANDOVER_ROCM_MOE_NATIVE_QUANTISED_FORMAT_SUPPORT_2026-05-19.md
 A  docs/v2/projects/2026-06/HANDOVER_ROCM_QWEN35_MOE_PREFILL_PARITY_ROOT_CAUSE_2026-05-19.md
 A  docs/v2/projects/2026-06/PREFILL_HIP_GRAPH_CAPTURE_PLAN.md
 ```
@@ -258,7 +258,7 @@ A  docs/v2/projects/2026-06/PREFILL_HIP_GRAPH_CAPTURE_PLAN.md
 Diff stat for this continuation's two regression test files before adding this handover document:
 
 ```text
-tests/v2/integration/kernels/rocm/Test__NativeVNNI_GEMV.cpp | 114 +++++-
+tests/v2/integration/kernels/rocm/Test__NativeQuantised_GEMV.cpp | 114 +++++-
 tests/v2/unit/execution/Test__GDNKernels.cpp               | 393 +++++++++++++++++++++
 2 files changed, 505 insertions(+), 2 deletions(-)
 ```
@@ -271,4 +271,4 @@ A repository memory was saved at:
 /memories/repo/qwen35-moe-rocm-decode-layer0.md
 ```
 
-It records the current invariant: standalone native-VNNI GEMV split-K now passes all-codebook coverage, while the remaining decode loss starts in full-model layer-0 decode after clean prefill.
+It records the current invariant: standalone native-quantised GEMV split-K now passes all-codebook coverage, while the remaining decode loss starts in full-model layer-0 decode after clean prefill.

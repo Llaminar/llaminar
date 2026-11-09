@@ -35,8 +35,9 @@ namespace llaminar2::test
              * @param layer_count Original contiguous layer count.
              * @param first Nonzero model-global layer origin when testing selected scopes.
              * @param permuted Swap two complete whole/cohort pairs before original preparation.
+             * @param whole_backend Original inert GPU metadata for the whole-owner domain.
              */
-            explicit JointPlacementOriginal(int members = 2, int whole_members = 1, int experts = 4, int layer_count = 1, int first = 0, bool permuted = false)
+            explicit JointPlacementOriginal(int members = 2, int whole_members = 1, int experts = 4, int layer_count = 1, int first = 0, bool permuted = false, DeviceType whole_backend = DeviceType::CUDA)
                 : expert_count(experts), layers(layer_count), first_layer(first),
                   file(true, false, GGUFTensorType::F32, 64, std::nullopt, 8,
                        PlanningGGUFFixture::Geometry::FullAttentionGraph, uint32_t(first + layer_count), uint32_t(experts))
@@ -53,8 +54,12 @@ namespace llaminar2::test
                 for (int layer = first_layer; layer < first_layer + layers; ++layer)
                     plan.placements.push_back({.layer = layer, .routed_expert_tier = tiers});
                 plan.domains[0].participants.clear();
+                if (whole_backend != DeviceType::CUDA && whole_backend != DeviceType::ROCm)
+                    throw std::invalid_argument("Joint fixture whole owners require explicit GPU backend metadata");
+                plan.domains[0].backend = whole_backend == DeviceType::CUDA
+                    ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
                 for (int owner = 0; owner < whole_members; ++owner)
-                    plan.domains[0].participants.push_back(GlobalDeviceAddress::cuda(owner));
+                    plan.domains[0].participants.push_back(GlobalDeviceAddress::fromLocalDeviceId({whole_backend, owner}));
                 auto &cohort = plan.domains[1];
                 cohort.participants.clear();
                 cohort.world_ranks.clear();

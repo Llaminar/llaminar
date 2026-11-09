@@ -111,9 +111,9 @@ namespace
         bool old_device_routed_;
     };
 
-    DeviceNativeVNNIMatrixDesc runtimeDesc(uintptr_t base, int n, int k)
+    DeviceNativeQuantisedMatrixDesc runtimeDesc(uintptr_t base, int n, int k)
     {
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x1000u);
         desc.mins = reinterpret_cast<const void *>(base + 0x2000u);

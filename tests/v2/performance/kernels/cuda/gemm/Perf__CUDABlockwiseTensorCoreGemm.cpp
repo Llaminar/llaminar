@@ -39,7 +39,7 @@ using namespace llaminar2::cuda;
 using namespace llaminar2::test;
 using llaminar::v2::kernels::KernelFactory;
 
-// TC tuning extern removed — NativeVNNI is the sole CUDA GEMM path
+// TC tuning extern removed — NativeQuantised is the sole CUDA GEMM path
 
 namespace
 {
@@ -191,14 +191,14 @@ namespace
         bool smoke = false;
         bool gemv_only = false;
         bool tuned_gemv_enabled = true;
-        bool native_vnni_enabled = true;
+        bool native_quantised_enabled = true;
         std::string gemm_dispatch = "auto";
     };
 
-    // KernelModeGuard is a no-op — NativeVNNI is always enabled, CUTLASS removed.
+    // KernelModeGuard is a no-op — NativeQuantised is always enabled, CUTLASS removed.
     struct KernelModeGuard
     {
-        KernelModeGuard(bool /*native_vnni_enabled*/, bool /*force_cutlass_fallback*/) {}
+        KernelModeGuard(bool /*native_quantised_enabled*/, bool /*force_cutlass_fallback*/) {}
         ~KernelModeGuard() = default;
     };
 
@@ -311,8 +311,8 @@ namespace
         cfg.gemv_only = getEnvFlag("LLAMINAR_CUDA_TC_GEMV_ONLY");
         if (const auto value = getEnvInt("LLAMINAR_CUDA_TC_TUNED_GEMV"))
             cfg.tuned_gemv_enabled = (*value != 0);
-        if (const auto value = getEnvInt("LLAMINAR_CUDA_TC_NATIVE_VNNI"))
-            cfg.native_vnni_enabled = (*value != 0);
+        if (const auto value = getEnvInt("LLAMINAR_CUDA_TC_NATIVE_QUANTISED"))
+            cfg.native_quantised_enabled = (*value != 0);
 
         const auto format_filters = getEnvCsvSet("LLAMINAR_CUDA_TC_FORMATS");
         if (!format_filters.empty())
@@ -333,7 +333,7 @@ namespace
         return cfg;
     }
 
-    // TC tuning overrides removed — NativeVNNI handles dispatch internally.
+    // TC tuning overrides removed — NativeQuantised handles dispatch internally.
     void applyGemmTuningOverride(const SweepConfig & /*cfg*/, int /*m*/)
     {
     }
@@ -446,7 +446,7 @@ namespace
             const SweepConfig &cfg)
         {
             applyGemmTuningOverride(cfg, m);
-            KernelModeGuard mode_guard(cfg.native_vnni_enabled, false);
+            KernelModeGuard mode_guard(cfg.native_quantised_enabled, false);
 
             // Create kernel via KernelFactory (same path as parity tests)
             EXPECT_TRUE(weights->ensureOnDevice(device_));
@@ -554,7 +554,7 @@ namespace
 
             result.min_us = *std::min_element(times_us.begin(), times_us.end());
             result.mean_us = std::accumulate(times_us.begin(), times_us.end(), 0.0) / static_cast<double>(times_us.size());
-            result.backend_family = "native_vnni_tc";
+            result.backend_family = "native_quantised_tc";
             return result;
         }
 
@@ -702,12 +702,12 @@ namespace
 
                     std::fprintf(stderr,
                                  "[CUDABlockwiseTC][GEMM] format=%s shape=%s M=%d N=%d K=%d warmup=%d bench=%d "
-                                 "gemm_dispatch=%s native_vnni=%d backend=%s split_k=%d "
+                                 "gemm_dispatch=%s native_quantised=%d backend=%s split_k=%d "
                                  "min_us=%.3f\n",
                                  format.name.c_str(), shape.name.c_str(), m, shape.n, shape.k,
                                  cfg.warmup_runs, cfg.bench_runs, cfg.gemm_dispatch.c_str(),
-                                 cfg.native_vnni_enabled ? 1 : 0,
-                                 gemm_result.backend_family.empty() ? "native_vnni" : gemm_result.backend_family.c_str(),
+                                 cfg.native_quantised_enabled ? 1 : 0,
+                                 gemm_result.backend_family.empty() ? "native_quantised" : gemm_result.backend_family.c_str(),
                                  gemm_result.split_k,
                                  gemm_result.min_us);
                 }

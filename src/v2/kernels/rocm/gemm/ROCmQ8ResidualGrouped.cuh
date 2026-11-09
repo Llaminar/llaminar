@@ -2,7 +2,7 @@
  * @file ROCmQ8ResidualGrouped.cuh
  * @brief gfx906 native grouped two-term dots with cooperative operand reuse.
  *
- * The installed NativeVNNI group maps four rows and adjacent columns to each
+ * The installed NativeQuantised group maps four rows and adjacent columns to each
  * worker. The retained Q8 fast specialization stages both original activation banks
  * and unchanged native weight words once per32-row tile. Independent integer
  * block dots feed the canonical K32 FP32 contribution/fold and one final sum.
@@ -13,7 +13,7 @@
 #pragma once
 #include "kernels/rocm/common/ROCmSignedDot4.h"
 #include "kernels/common/Q8ResidualCorrection.h"
-#include "kernels/common/DeviceNativeVNNIContributionContract.h"
+#include "kernels/common/DeviceNativeQuantisedContributionContract.h"
 namespace llaminar2::rocm_q8_residual {
 /**
  * @brief Compute one32×64 native-dot tile over the actual live rows only.
@@ -93,9 +93,9 @@ __global__ __launch_bounds__(256,2) void projectGrouped(GPUQ8ResidualCorrectionA
 #pragma unroll
    for(int column=0;column<2;++column) {
     sum0[row][column]=device_fp32_contract::add(sum0[row][column],
-     device_native_vnni_contract::singleScaleBlock(dot0[row][column],wScale[column],pScale[row]));
+     device_native_quantised_contract::singleScaleBlock(dot0[row][column],wScale[column],pScale[row]));
     sum1[row][column]=device_fp32_contract::add(sum1[row][column],
-     device_native_vnni_contract::singleScaleBlock(dot1[row][column],wScale[column],rScale[row]));
+     device_native_quantised_contract::singleScaleBlock(dot1[row][column],wScale[column],rScale[row]));
    }
   }
   __syncthreads();

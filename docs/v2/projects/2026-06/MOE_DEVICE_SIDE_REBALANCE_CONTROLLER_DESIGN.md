@@ -127,7 +127,7 @@ maintenance lanes.
    pre-captured payload bucket that can hold the planned arrivals. Request-time
    host observation or graph submission is forbidden; the complete same-backend
    execution is represented inside the captured device transaction.
-5. `StageArrivals`: sources pack only planned, non-empty NativeVNNI payloads
+5. `StageArrivals`: sources pack only planned, non-empty NativeQuantised payloads
    into compact staging slots. NCCL/RCCL grouped collectives move the selected
    bucket lane. Destinations unpack into local preallocated transfer slots.
 6. `RouteBoundaryApply`: the last local routed-expert dispatch polls ready wave
@@ -143,7 +143,7 @@ collectives.
 
 ## Transfer Contract
 
-The active GPU packed format is backend-neutral NativeVNNI for same-backend
+The active GPU packed format is backend-neutral NativeQuantised for same-backend
 domains: payload, scales, mins, emins, codebook/block metadata, and matrix
 dimensions. Same-backend GPU arrivals copy descriptor-described bytes directly;
 they do not serialize to CPU-native blobs and do not repack on arrival.
@@ -486,7 +486,7 @@ config import.
 
 Implemented or partially implemented:
 
-- GPU packed-format contract uses backend-neutral NativeVNNI descriptors for
+- GPU packed-format contract uses backend-neutral NativeQuantised descriptors for
   same-backend arrivals.
 - Production decode has a device-side rebalance ABI with command buffers, wave
   state, route-boundary apply, explicit streams, and graph-owned state.

@@ -2950,7 +2950,7 @@ public:
 
     bool supports_device(int) const override { return true; }
     bool supports_fused_projection() const override { return supports_fused_; }
-    bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+    bool exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) override
     {
         out = {};
         if (!native_codebook_.has_value())
@@ -5713,7 +5713,7 @@ TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
 
     ScopedEnvVar concurrent_decode("LLAMINAR_ROCM_CONCURRENT_DECODE");
     ScopedEnvVar gdn_concurrent_decode("LLAMINAR_ROCM_GDN_CONCURRENT_DECODE");
-    ScopedEnvVar forced_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB");
+    ScopedEnvVar forced_kb("LLAMINAR_ROCM_NATIVE_QUANTISED_GEMV_KB");
     concurrent_decode.set("0");
     gdn_concurrent_decode.set("0");
     forced_kb.set("8");
@@ -5745,10 +5745,10 @@ TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
             bundle->weights_fp32.resize(static_cast<size_t>(rows) * K);
             bundle->weights->to_fp32(bundle->weights_fp32.data());
 
-            ASSERT_TRUE(rocm::packNativeVNNI(bundle->weights.get(), bundle->packed))
-                << fmt.name << ": native-VNNI pack failed for projection " << projection;
-            ASSERT_FALSE(bundle->packed.native_vnni_payload.empty())
-                << fmt.name << ": native-VNNI payload missing for projection " << projection;
+            ASSERT_TRUE(rocm::packNativeQuantised(bundle->weights.get(), bundle->packed))
+                << fmt.name << ": native-quantised pack failed for projection " << projection;
+            ASSERT_FALSE(bundle->packed.native_quantised_payload.empty())
+                << fmt.name << ": native-quantised payload missing for projection " << projection;
 
             bundle->kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(&bundle->packed, 0);
             bundle->kernel->setGPUStream(stream.get());
@@ -5817,7 +5817,7 @@ TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
         const float max_ref_abs = vectorMaxAbsValue(expected);
         const float max_abs_ratio = max_abs / std::max(max_ref_abs, 1e-6f);
 
-        LOG_INFO("[GDNProjectionNativeVNNI] " << fmt.name
+        LOG_INFO("[GDNProjectionNativeQuantised] " << fmt.name
                                               << " cosine=" << cosine
                                               << " rel_l2=" << rel_l2
                                               << " max_abs=" << max_abs

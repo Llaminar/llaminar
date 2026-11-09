@@ -99,7 +99,7 @@ TEST(Test__GPUPackedWeightsStubs, CUDA_CompatibilityChecks)
     EXPECT_FALSE(pw.isCompatibleWith(DeviceType::ROCm));
 
     EXPECT_TRUE(pw.canTransferTo(PackedWeightsFormat::CUDA_INT8));
-    EXPECT_FALSE(pw.canTransferTo(PackedWeightsFormat::CPU_NATIVE_VNNI));
+    EXPECT_FALSE(pw.canTransferTo(PackedWeightsFormat::CPU_NATIVE_QUANTISED));
     EXPECT_FALSE(pw.canTransferTo(PackedWeightsFormat::ROCM_INT8));
 }
 
@@ -188,7 +188,7 @@ TEST(Test__GPUPackedWeightsStubs, ROCm_CompatibilityChecks)
     EXPECT_FALSE(pw.isCompatibleWith(DeviceType::CUDA));
 
     EXPECT_TRUE(pw.canTransferTo(PackedWeightsFormat::ROCM_INT8));
-    EXPECT_FALSE(pw.canTransferTo(PackedWeightsFormat::CPU_NATIVE_VNNI));
+    EXPECT_FALSE(pw.canTransferTo(PackedWeightsFormat::CPU_NATIVE_QUANTISED));
     EXPECT_FALSE(pw.canTransferTo(PackedWeightsFormat::CUDA_INT8));
 }
 

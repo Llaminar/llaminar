@@ -263,7 +263,7 @@ TEST(Qwen4ExpGDNQKVWorkspace, AllNativeSourceFormatsUseCanonicalCorrectionBanks)
     };
     for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
     for (const int rows : {1, 15, 512})
-    for (const auto &native : native_vnni_formats::kAllSourceFormats)
+    for (const auto &native : native_quantised_formats::kAllSourceFormats)
     {
         SCOPED_TRACE(::testing::Message() << native.quant_type << " " << device.toString() << " M=" << rows);
         const auto actual = Qwen4ExpProjectionWorkspace::requirements(device, single, single, true,

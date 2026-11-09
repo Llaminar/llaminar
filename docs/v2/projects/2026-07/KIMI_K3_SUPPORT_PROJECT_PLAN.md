@@ -5,7 +5,7 @@
 - **Status**: Proposed; the 2026-07-22 vLLM implementation preview and its already-public prerequisite code are incorporated, while the K3-specific vLLM release branch, checkpoint, and technical report were not yet public at the audit timestamp
 - **Scope**: Llaminar V2 model loading, graph construction, Kimi Delta Attention, Attention Residuals, Gated MLA, Stable LatentMoE, SiTU, native vision, MXFP4/MXFP8 execution, prefix caching, MTP, and first-party CPU/CUDA/ROCm kernels with distributed parity
 - **Primary upstream**: [MoonshotAI](https://github.com/MoonshotAI)
-- **Related Llaminar projects**: [vLLM-Style MTP](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md), [Multi-Domain Pipeline Execution](../2026-06/MULTI_DOMAIN_PIPELINE_EXECUTION_PLAN.md), and [Cross-Backend NativeVNNI Dispatch](NATIVE_VNNI_BATCH_INVARIANT_LEARNED_DISPATCH_POLICY.md)
+- **Related Llaminar projects**: [vLLM-Style MTP](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md), [Multi-Domain Pipeline Execution](../2026-06/MULTI_DOMAIN_PIPELINE_EXECUTION_PLAN.md), and [Cross-Backend NativeQuantised Dispatch](NATIVE_QUANTISED_BATCH_INVARIANT_LEARNED_DISPATCH_POLICY.md)
 - **Normative language**: `MUST`, `MUST NOT`, `SHOULD`, `SHOULD NOT`, and `MAY` are requirements levels.
 
 ---

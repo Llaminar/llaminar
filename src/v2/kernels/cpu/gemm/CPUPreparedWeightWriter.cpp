@@ -7,10 +7,10 @@
  * root. Failure is absorbing; unpublished partial roots retire by normal RAII.
  */
 #include "CPUPreparedWeightWriter.h"
-#include "CPUNativeVNNIGemmKernel.h"
+#include "CPUNativeQuantisedGemmKernel.h"
 #include "FloatingPointGemmKernel.h"
 #include "tensors/TensorFactory.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/NativeWeightSourceRange.h"
 #include <cstring>
 #include "tensors/FP16Utils.h"
@@ -57,7 +57,7 @@ struct CPUPreparedWeightWriter::Impl {
  CPUPreparedWeightSource spec;
  std::optional<NativeWeightLoadStagingRequest> quote;
  CPUWeightStoragePlacement placement;
- cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
+ cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
  std::shared_ptr<TensorBase> final;
  std::byte* final_bytes=nullptr;
  size_t native_group=0,native_group_bytes=0,row=0,column=0,matrix=0,logical_elements=0;
@@ -80,11 +80,11 @@ struct CPUPreparedWeightWriter::Impl {
    throw std::invalid_argument("CPU final writer requires exact original positive source geometry");
   if(spec.consumer==CPUWeightConsumer::PreparedGemm && g.original_shape.size()<2)
    throw std::invalid_argument("CPU GEMM source must be an actual matrix");
-  const auto* original_format=native_vnni_formats::forQuantType(tensorTypeName(g.original_type));
+  const auto* original_format=native_quantised_formats::forQuantType(tensorTypeName(g.original_type));
   const bool original_floating=g.original_type==TensorType::FP32 || g.original_type==TensorType::FP16 || g.original_type==TensorType::BF16;
   if(!original_format && !original_floating)throw std::invalid_argument("CPU source has no canonical native geometry");
   const size_t expected_group=original_format?(original_format->is_superblock?256:32):1;
-  const size_t expected_bytes=original_format?cpu::native_vnni::native_block_bytes_for_format(original_format->codebook_id,original_format->is_superblock):
+  const size_t expected_bytes=original_format?cpu::native_quantised::native_block_bytes_for_format(original_format->codebook_id,original_format->is_superblock):
     (g.original_type==TensorType::FP32?sizeof(float):sizeof(uint16_t));
   if(g.native_group_elements!=expected_group || g.native_group_bytes!=expected_bytes || g.original_shape[0]%expected_group)
    throw std::invalid_argument("CPU source geometry differs from its original canonical native encoding");
@@ -121,13 +121,13 @@ struct CPUPreparedWeightWriter::Impl {
    // useful stripe, rather than their sum, owns the simultaneous setup peak.
    quote->maximum_units=maximum_units;
   }
-  const auto* fmt=native_vnni_formats::forQuantType(tensorTypeName(g.original_type));
+  const auto* fmt=native_quantised_formats::forQuantType(tensorTypeName(g.original_type));
   q8_conversion=!fmt && spec.destination_precision==WeightPrecision::CONVERT_TO_INT8;
-  const auto* prepared_format=q8_conversion?native_vnni_formats::forQuantType("Q8_0"):fmt;
+  const auto* prepared_format=q8_conversion?native_quantised_formats::forQuantType("Q8_0"):fmt;
   native_packed=prepared_format && (spec.destination_precision==WeightPrecision::NATIVE || q8_conversion) && spec.consumer==CPUWeightConsumer::PreparedGemm;
   if(native_packed) {
    if(final_rows>size_t(std::numeric_limits<int>::max()) || final_columns>size_t(std::numeric_limits<int>::max()))throw std::overflow_error("CPU GEMM final dimensions exceed native ABI");
-   cpu::native_vnni::initializeNativeWindowOutput(*prepared_format,int(final_rows),int(final_columns),placement,packed);
+   cpu::native_quantised::initializeNativeWindowOutput(*prepared_format,int(final_rows),int(final_columns),placement,packed);
    return;
   }
   final_type=g.original_type;
@@ -232,10 +232,10 @@ void CPUPreparedWeightWriter::append(const NativeWeightSourceWindow& w,std::span
    }
    if(impl_->native_packed) {
     const size_t pack_offset=(count*sizeof(float)+encoded_bytes+63)&~size_t(63);
-    const auto* format=native_vnni_formats::forQuantType("Q8_0");
+    const auto* format=native_quantised_formats::forQuantType("Q8_0");
     TensorFactory::visitNativeWeightWindow(TensorType::Q8_0,w.rows,w.columns,{encoded,encoded_bytes},[&](const TensorBase& source){
      auto* codec=dynamic_cast<const IINT8Unpackable*>(&source);
-     cpu::native_vnni::appendNativeWeightGroups(*codec,*format,int(w.columns),0,0,int(w.rows),int(w.columns/32),
+     cpu::native_quantised::appendNativeWeightGroups(*codec,*format,int(w.columns),0,0,int(w.rows),int(w.columns/32),
        int(impl_->destinationRow()),int(impl_->destinationColumn()/32),scratch.subspan(pack_offset),impl_->packed);
     });
    }
@@ -310,11 +310,11 @@ void CPUPreparedWeightWriter::append(const NativeWeightSourceWindow& w,std::span
    if(invalid)throw std::invalid_argument("Prepared half weights decoded a nonfinite or half-overflowing source value");
    impl_->advance(w);return;
   }
-  const auto* format=native_vnni_formats::forQuantType(tensorTypeName(impl_->spec.original.original_type));
+  const auto* format=native_quantised_formats::forQuantType(tensorTypeName(impl_->spec.original.original_type));
   TensorFactory::visitNativeWeightWindow(impl_->spec.original.original_type,w.rows,w.columns,native,[&](const TensorBase& source){
    auto* codec=dynamic_cast<const IINT8Unpackable*>(&source);
    if(!codec)throw std::logic_error("Original native window has no canonical codec");
-   cpu::native_vnni::appendNativeWeightGroups(*codec,*format,int(w.columns),0,0,int(w.rows),int(w.columns/32),
+   cpu::native_quantised::appendNativeWeightGroups(*codec,*format,int(w.columns),0,0,int(w.rows),int(w.columns/32),
     int(impl_->destinationRow()),int(impl_->destinationColumn()/32),scratch,impl_->packed);
   });
   impl_->advance(w);
@@ -336,7 +336,7 @@ CPUPreparedWeightResult CPUPreparedWeightWriter::finish() {
   throw std::logic_error("CPU final weights cannot publish incomplete, failed or already-finished coverage");
  }
  CPUPreparedWeightResult result;
- if(impl_->native_packed)result.kernel=std::make_shared<cpu::native_vnni::CPUNativeVNNIGemmKernel>(std::move(impl_->packed),impl_->spec.numerical_policy);
+ if(impl_->native_packed)result.kernel=std::make_shared<cpu::native_quantised::CPUNativeQuantisedGemmKernel>(std::move(impl_->packed),impl_->spec.numerical_policy);
  else {
   result.final_tensor=impl_->final;
   if(impl_->spec.consumer==CPUWeightConsumer::PreparedGemm)

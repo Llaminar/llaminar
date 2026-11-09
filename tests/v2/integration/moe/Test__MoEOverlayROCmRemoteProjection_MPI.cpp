@@ -97,7 +97,7 @@ namespace llaminar2::test
 
         /** @brief Present the one final CPU allocation as immutable regions. */
         std::array<std::span<const std::uint8_t>, 4> cpuSourceRegions(
-            const cpu::native_vnni::CPUNativeVNNIPackedWeights &weights)
+            const cpu::native_quantised::CPUNativeQuantisedPackedWeights &weights)
         {
             return {
                 std::span<const std::uint8_t>(
@@ -353,7 +353,7 @@ namespace llaminar2::test
                 q8GpuProjection(1024, 3072, 73u),
                 q8GpuProjection(3072, 1024, 109u),
             };
-        std::array<cpu::native_vnni::CPUNativeVNNIPackedWeights,
+        std::array<cpu::native_quantised::CPUNativeQuantisedPackedWeights,
                    kProjectionCount>
             cpu_weights;
         std::string error;
@@ -480,7 +480,7 @@ namespace llaminar2::test
                     descriptor.codebook_id,
                     descriptor.blocks_per_row,
                     gpu_slot_lifetime,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id =
                             expected_gpu[projection].source_codebook_id,
                         .is_superblock =
@@ -516,7 +516,7 @@ namespace llaminar2::test
             {
                 const std::uint64_t epoch = 1000u + wave_index * 2u;
                 const auto *source_format =
-                    native_vnni_formats::forSourceIdentity(
+                    native_quantised_formats::forSourceIdentity(
                         expected_gpu.front().source_codebook_id,
                         expected_gpu.front().is_superblock);
                 ASSERT_NE(source_format, nullptr);

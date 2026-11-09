@@ -13,7 +13,7 @@
 #include "backends/BackendManager.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "loaders/PreparedWeightStore.h"
 #include "tensors/Tensors.h"
 #include "../../utils/PreparedWeightTestHarness.h"
@@ -69,7 +69,7 @@ struct StageWorkspaceBorrow final
 void provePreparedOutput(bool fa_output)
 {
  if(!hasCPUBackend())initCPUBackend(-1);
- // Direct NativeVNNI workshares use the canonical CTest OpenMP physical-core
+ // Direct NativeQuantised workshares use the canonical CTest OpenMP physical-core
  // budget. DeviceContext does not set that team; no fixture-local cap is applied.
  // Timing/scaling remains a separate clean-window experiment.
  auto context=IDeviceContext::create(DeviceId::cpu());
@@ -85,7 +85,7 @@ void provePreparedOutput(bool fa_output)
   // ordinary/corrected and serial/grouped replays within this retained shape.
   test::admitCPUPreparedStoreForTest(store, {&source});
   binding.prepared=store.prepareGemm(binding);auto *kernel=store.gemmKernel(*binding.prepared);ASSERT_NE(kernel,nullptr);
-  const auto *packed=kernel->exportCPUNativeVNNIPackedWeights();ASSERT_NE(packed,nullptr);
+  const auto *packed=kernel->exportCPUNativeQuantisedPackedWeights();ASSERT_NE(packed,nullptr);
   const auto *sourcePointer=packed->native_interleaved.data();
   const std::vector<uint8_t>packedBefore(packed->native_interleaved.begin(),packed->native_interleaved.end());
   FP32Tensor input({std::size_t(m),std::size_t(k)},DeviceId::cpu()),output({std::size_t(m),std::size_t(n)},DeviceId::cpu());

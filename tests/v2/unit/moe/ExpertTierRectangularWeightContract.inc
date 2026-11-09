@@ -42,7 +42,7 @@ TEST(ExpertTierWeightStream, RectangularEncodedColumnsAllFormatsPreserveNeighbou
     const auto intersection=ExpertTierWeightProjectionIntersection::between(
         P{R::ParticipantOutputSlice,256,256,13,128,32,96},
         P{R::ParticipantInputSlice,256,256,72,160,64,128});
-    for(const auto& format:native_vnni_formats::kAllSourceFormats) {
+    for(const auto& format:native_quantised_formats::kAllSourceFormats) {
         SCOPED_TRACE(format.quant_type);
         const auto full=makeGpuToCpuExpertTierWeightStreamManifest(*format.metadata,128,96,17,0,9,ExpertTierWeightProjection::Down,2);
         const auto manifest=full.forIntersection(intersection);
@@ -86,18 +86,18 @@ namespace llaminar2 {
 namespace {
 TEST(ExpertTierWeightStream, NativeCpuRectanglesUseOnlyLivePlanesAndIndependentRootStrides)
 {
-    for(const auto& format:native_vnni_formats::kAllSourceFormats)for(unsigned quantum:{1u,3u,17u,64u}) {
+    for(const auto& format:native_quantised_formats::kAllSourceFormats)for(unsigned quantum:{1u,3u,17u,64u}) {
         SCOPED_TRACE(format.quant_type);
         SCOPED_TRACE(quantum);
-        const auto encoding=cpu::native_vnni::preparedEncodingForSource(*format.metadata);
+        const auto encoding=cpu::native_quantised::preparedEncodingForSource(*format.metadata);
         ExpertTierWeightCPUStorageLayout source{
             .N=69,.K=64,.blocks_per_row=2,
             .cpu_codebook_id=format.metadata->codebook_id,
             .cpu_is_asymmetric=uint8_t(format.metadata->is_asymmetric),
             .cpu_is_superblock=uint8_t(format.metadata->is_superblock),
             .cpu_encoding=encoding,
-            .cpu_data_stride=uint32_t(cpu::native_vnni::preparedDataStride(encoding)),
-            .cpu_block_stride=uint32_t(cpu::native_vnni::preparedInterleavedBlockStride(encoding,format.metadata->is_asymmetric))};
+            .cpu_data_stride=uint32_t(cpu::native_quantised::preparedDataStride(encoding)),
+            .cpu_block_stride=uint32_t(cpu::native_quantised::preparedInterleavedBlockStride(encoding,format.metadata->is_asymmetric))};
         source.cpu_N=128;source.cpu_K=96;source.cpu_first_row=59;source.cpu_first_column=32;
         source.wire_columns_per_unit=quantum;source.unit_count=((69+quantum-1)/quantum)*2;
         source.maximum_units_per_chunk=std::min(2u,source.unit_count);

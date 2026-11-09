@@ -3918,7 +3918,7 @@ the 600-second watchdog in structured generation. No stale epoch through 127;
 throughput and pending-DMA diagnostic attribution remain open. Not an E2E pass.
 Command-local DMA age/throttle now passes Unit 633/633 and preflight 90/90;
 warnings retain severity and expose their exact command age. CPU sampling shows
-substantial OpenMP waiting and NativeVNNI projection work, not a proven tuning
+substantial OpenMP waiting and NativeQuantised projection work, not a proven tuning
 win. 122B ROCm4+CPU2 passes all eight behavioral checks unchanged, including
 2048-token generation and 7595/8192 context, but is not certified: file-size RAM
 heuristics and shutdown/rank-export defects lose final evidence. Canonical
@@ -4184,7 +4184,7 @@ are isolated; dynamic depth is tuned only after that baseline is sound.
   `2.72/2.890 us` for 256 threads; ISA evidence shows vectorized dwordx4
   loads/stores, 16 VGPRs, 52 logical SGPRs, and zero scratch, spills, LDS,
   barriers, or atomics.
-- The CUDA NativeVNNI grouped WIDE/DIRECT path now publishes its only K
+- The CUDA NativeQuantised grouped WIDE/DIRECT path now publishes its only K
   partition directly from the weight-reuse CTA. Explicit RN multiply/add
   operations preserve the former store/load publication boundary byte for byte,
   while the obsolete publication kernel and partials-workspace dependency are

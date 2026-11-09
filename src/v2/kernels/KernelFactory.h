@@ -30,7 +30,7 @@
  *
  * **CRITICAL**: Not all activation types work with all weight types!
  *
- * The NativeVNNI kernel uses INT8 VNNI instructions (vpdpbusd) which require:
+ * The NativeQuantised kernel uses INT8 VNNI instructions (vpdpbusd) which require:
  * - Activations quantized to Q8_1 format (8-bit with scale+sum)
  * - Weights in quantized format (Q8_0, Q4_0, IQ4_NL, etc.)
  *
@@ -434,7 +434,7 @@ namespace llaminar
                  * @brief Check if an activation type is compatible with a weight type for GEMM
                  *
                  * **Design Rationale**:
-                 * The NativeVNNI kernel uses INT8 VNNI instructions which require:
+                 * The NativeQuantised kernel uses INT8 VNNI instructions which require:
                  * - Activations in Q8_1 format (8-bit with scale+sum per block)
                  * - Weights in quantized format (Q8_0, Q4_0, IQ4_NL, etc.)
                  *
@@ -1509,7 +1509,7 @@ namespace llaminar
                 /**
                  * @brief Create a GEMM engine from a transferred (pre-packed) weight blob.
                  *
-                 * Deserializes the blob and constructs a CPUNativeVNNIGemmKernel directly
+                 * Deserializes the blob and constructs a CPUNativeQuantisedGemmKernel directly
                  * from the pre-packed representation. This avoids the expensive VNNI repack
                  * that prepareExpertGemmLocal() performs from raw tensor data.
                  *
@@ -1545,7 +1545,7 @@ namespace llaminar
                  * allocations owned by `packed_weights`; this factory moves those
                  * allocations into the kernel without a serialization round trip.
                  *
-                 * @param packed_weights Complete eager CPU NativeVNNI weights.
+                 * @param packed_weights Complete eager CPU NativeQuantised weights.
                  * @return Shared prepared engine, or `nullptr` for an incompatible
                  *         or incomplete packed representation.
                  */
@@ -1561,7 +1561,7 @@ namespace llaminar
                  * therefore receive a new execution handle over the identical
                  * immutable allocation, retained by the original engine. CPU
                  * kernels declare invocation-owned workspace: neither a shared
-                 * NativeVNNI engine nor a floating execution view can retain a
+                 * NativeQuantised engine nor a floating execution view can retain a
                  * mutable workspace binding. Each CPU stage supplies its own
                  * transform storage. No weights are copied, repacked,
                  * registered in a global cache, or admitted a second time.

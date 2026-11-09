@@ -1,6 +1,6 @@
 /**
  * @file PreparedCPUWeightTensor.cpp
- * @brief Preserve committed NativeVNNI engine lifetime without recreating raw tensor storage.
+ * @brief Preserve committed NativeQuantised engine lifetime without recreating raw tensor storage.
  *
  * The Store-only factory validates the engine's existing CPU/storage/dimension
  * contracts. Every operation requiring source bytes fails before mutation;
@@ -13,12 +13,12 @@
 
 namespace llaminar2 {
 namespace {
-/** @return The engine's actual independently retained CPU NativeVNNI storage state. */
+/** @return The engine's actual independently retained CPU NativeQuantised storage state. */
 bool committedCPUStorage(const std::shared_ptr<ITensorGemm>& engine)
 {
     return engine && engine->supports_device(-1) && engine->hasWeights() &&
         engine->canReleaseSourceWeightTensor() && engine->packedWeightBytes()!=0 &&
-        engine->exportCPUNativeVNNIPackedWeights()!=nullptr;
+        engine->exportCPUNativeQuantisedPackedWeights()!=nullptr;
 }
 }
 
@@ -30,10 +30,10 @@ std::shared_ptr<PreparedCPUWeightTensor> PreparedCPUWeightTensor::fromCommitted(
        shape[0]>std::numeric_limits<size_t>::max()/shape[1] || !committedCPUStorage(engine) ||
        engine->get_n()!=static_cast<int>(shape[0]) || engine->get_k()!=static_cast<int>(shape[1]))
         throw std::invalid_argument("Prepared CPU metadata requires its actual committed CPU matrix engine/root");
-    const auto* expected=native_vnni_formats::forQuantType(tensorTypeName(execution_type));
+    const auto* expected=native_quantised_formats::forQuantType(tensorTypeName(execution_type));
     if(expected) {
-        NativeVnniSourceIdentity actual;
-        if(!engine->exportNativeVNNISourceIdentity(actual) || !actual.present ||
+        NativeQuantisedSourceIdentity actual;
+        if(!engine->exportNativeQuantisedSourceIdentity(actual) || !actual.present ||
            actual.codebook_id!=expected->codebook_id || actual.is_superblock!=expected->is_superblock)
             throw std::invalid_argument("Prepared CPU metadata changed its published execution-native codebook");
     } else if(execution_type!=TensorType::FP32 && execution_type!=TensorType::FP16 && execution_type!=TensorType::BF16) {

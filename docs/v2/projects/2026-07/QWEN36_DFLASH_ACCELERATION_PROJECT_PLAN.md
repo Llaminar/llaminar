@@ -651,7 +651,7 @@ CUDA `sm_80+` lowering:
   `CachePlusInlineKV`, including the mixed causal/full masks and `B=16` query
   tile; and
 - route quantized shared-head and later quantized draft matrices through the
-  existing NativeVNNI IMMA candidate/training pipeline after adding the exact
+  existing NativeQuantised IMMA candidate/training pipeline after adding the exact
   DFlash shapes to the shared inventory.
 
 If cuBLASLt is not competitive at the exact small-`M` shapes, add CUTLASS or
@@ -1017,7 +1017,7 @@ Tasks:
 - Compare compact accepted-row context materialization with padded fixed-`B`
   Tensor Core execution and record useful/padded rows.
 - Add natural/padded DFlash LM-head and draft projection shapes to the shared
-  floating/NativeVNNI measurement inventory; train generated dispatch rather
+  floating/NativeQuantised measurement inventory; train generated dispatch rather
   than hardcoding backend/shape choices.
 - Capture block prep, draft graph, shared LM head, argmax, target verifier,
   sampling, and publication where backend APIs permit.
@@ -1206,9 +1206,9 @@ Keep FP32 reduction/accumulator boundaries explicit in every case.
 Then certify draft Q8_0 and selected Q4/IQ formats using the normal all-format
 evidence process. Add the DFlash exact shapes to the shared cross-backend shape
 inventory and generated-policy pipeline; do not create a DFlash-only hardcoded
-NativeVNNI table. The authoritative corpus, generic-fallback, exact-overlay,
+NativeQuantised table. The authoritative corpus, generic-fallback, exact-overlay,
 profiler-isolation, and installation rules remain those in the
-[`Cross-Backend Batch-Invariant NativeVNNI Learned Dispatch Policy`](NATIVE_VNNI_BATCH_INVARIANT_LEARNED_DISPATCH_POLICY.md).
+[`Cross-Backend Batch-Invariant NativeQuantised Learned Dispatch Policy`](NATIVE_QUANTISED_BATCH_INVARIANT_LEARNED_DISPATCH_POLICY.md).
 Keep feature FC, context norm, Q/K norms, and cache precision floating until
 evidence proves lower precision is acceptance-positive.
 

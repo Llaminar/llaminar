@@ -11,7 +11,7 @@
 #include "backends/CPUExecutionGeometry.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
-#include "CPUNativeVNNIPreparedFootprint.h"
+#include "CPUNativeQuantisedPreparedFootprint.h"
 #include "tensors/TensorType.h"
 #include <string_view>
 
@@ -57,7 +57,7 @@ namespace llaminar2
          * @return Checked named Q8 and ordered-partial envelope.
          * @throws std::invalid_argument For incomplete matrix, cache, ISA or worker geometry.
          */
-        static WorkspaceRequirements prepared(const cpu::native_vnni::NativeVNNIPreparedFootprint &footprint,
+        static WorkspaceRequirements prepared(const cpu::native_quantised::NativeQuantisedPreparedFootprint &footprint,
             std::uint8_t codebook, const CPUProjectionWorkspaceGeometry &geometry);
     };
 }

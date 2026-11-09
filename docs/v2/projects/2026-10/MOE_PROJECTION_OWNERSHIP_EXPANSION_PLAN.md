@@ -169,7 +169,7 @@ lossless representation adapter, including exact scale widening and auxiliary
 sum reconstruction where required. Never dequantize and requantize at exchange.
 See [the arithmetic contract](../../../../src/v2/kernels/common/MoEProjectionNumericalContract.h),
 [CPU Q8 publication](../../../../src/v2/kernels/cpu/primitives/GPUAlignedExpertQ8Primitives.h),
-and [CPU batched execution](../../../../src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h).
+and [CPU batched execution](../../../../src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h).
 
 Keep original router slot IDs through every packet. Down dots may run
 concurrently, but per-token contributions must fold in original top-k order.

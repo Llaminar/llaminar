@@ -109,22 +109,22 @@ std::vector<Format> formats()
 {
     std::vector<Format> result;
     for (const auto &format : quantizedMoEVerifierFormats())
-        result.push_back({format.label, DeviceMoEWeightFormat::NativeVNNI, format.create});
+        result.push_back({format.label, DeviceMoEWeightFormat::NativeQuantised, format.create});
     // The target model mixes gate/up and down codebooks. Equal-format sweeps
     // alone would not prove that the fixed bank retains its independent type.
-    result.push_back({"IQ2_S/IQ4_NL", DeviceMoEWeightFormat::NativeVNNI,
+    result.push_back({"IQ2_S/IQ4_NL", DeviceMoEWeightFormat::NativeQuantised,
         [](const auto &shape, uint32_t seed) { return TestTensorFactory::createIQ2_SRandom(shape, seed); },
         [](const auto &shape, uint32_t seed) { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }});
     // Upstream's metadata documentation for this exact UD-Q4_K_XL family
     // identifies Q4_K gate/up and Q5_1 down as the dominant original pair.
     // Keep the superblock gate source distinct from physical-ID-sharing Q4_1.
-    result.push_back({"Q4_K/Q5_1", DeviceMoEWeightFormat::NativeVNNI,
+    result.push_back({"Q4_K/Q5_1", DeviceMoEWeightFormat::NativeQuantised,
         [](const auto &shape, uint32_t seed) { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         [](const auto &shape, uint32_t seed) { return TestTensorFactory::createQ5_1Random(shape, seed); }});
     // Explicit representative original 32-column formats for measured physical
     // dispatch IDs 5/7. IDs alone do not authenticate a model's original GGUF
     // format: Q4_K/Q5_K share those IDs with distinct superblock metadata.
-    result.push_back({"Q4_1/Q5_1", DeviceMoEWeightFormat::NativeVNNI,
+    result.push_back({"Q4_1/Q5_1", DeviceMoEWeightFormat::NativeQuantised,
         [](const auto &shape, uint32_t seed) { return TestTensorFactory::createQ4_1Random(shape, seed); },
         [](const auto &shape, uint32_t seed) { return TestTensorFactory::createQ5_1Random(shape, seed); }});
     result.push_back({"FP16", DeviceMoEWeightFormat::FP16, [](const auto &shape, uint32_t seed) {
@@ -472,7 +472,7 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
         auto oracle = llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
         oracle->setGPUStream(stream);
         dynamic_cast<IWorkspaceConsumer *>(oracle.get())->bindWorkspace(&workspace);
-        std::vector<DeviceNativeVNNIMatrixDesc> gates(experts), ups(experts), downs(experts);
+        std::vector<DeviceNativeQuantisedMatrixDesc> gates(experts), ups(experts), downs(experts);
         std::vector<DeviceMoEFloatingMatrixDesc> fp_gates(experts), fp_ups(experts), fp_downs(experts);
         for (int expert = 0; expert < experts; ++expert)
         {

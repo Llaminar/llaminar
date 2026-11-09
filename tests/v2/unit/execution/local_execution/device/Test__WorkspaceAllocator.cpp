@@ -1373,7 +1373,7 @@ TEST(Test__WorkspaceAllocator, CompactRegimeDescriptorAliasesInsteadOfInflatingP
 /**
  * @brief Prefill-only scratch is absent from decode and grouped participants.
  *
- * A kernel object may expose both NativeVNNI prefill accumulators and grouped
+ * A kernel object may expose both NativeQuantised prefill accumulators and grouped
  * verifier KPAR storage. Device-event ordering makes those graph roles mutually
  * exclusive, so the compact arena must be able to occupy the prefill interval
  * rather than forcing the physical workspace to contain their union.

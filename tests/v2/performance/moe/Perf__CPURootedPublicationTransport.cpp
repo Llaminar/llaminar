@@ -15,10 +15,15 @@
  * The OriginalNUMAVariableRecordGatherReplay case additionally uses admitted
  * original physical socket domains, production matched-envelope MPI gather,
  * node-certified ordinary packed roots, root aliasing and live/empty replays.
+ * Its live-copy boundary cases cover native socket-team copies and single-caller
+ * entry from an existing OpenMP region without changing the production selector.
+ * The original admitted backend also replays absorbing abort publication and
+ * local-abort precedence without a callback, host hook, race or timing assumption.
  */
 
 #include <gtest/gtest.h>
 #include <mpi.h>
+#include <omp.h>
 
 #include "collective/DeviceGroup.h"
 #include "collective/GlobalTPContext.h"
@@ -46,6 +51,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <string_view>
@@ -60,6 +66,52 @@ namespace llaminar2::test
      */
     struct CPURootedPublicationTransportReplayAccess
     {
+        /**
+         * @brief Replay native epoch transitions on the same original admitted backend.
+         * @param context Original live CPU domain whose mapping remains owned here.
+         *
+         * All ranks first advance two healthy epochs. After an outside barrier,
+         * only rank zero injects the terminal shared witness representing abort
+         * between the old local precheck and normal publication. No peer worker
+         * or timing hook is needed: rank one retains its already-ready epoch.
+         * Repeated attempts must retain both the witness and local owner epoch;
+         * local abort must reject that ready peer rather than report completion.
+         */
+        static void replayEpochAbort(const std::shared_ptr<GlobalTPContext>& context)
+        {
+            ASSERT_TRUE(context);
+            ASSERT_TRUE(context->authenticatesOriginalCPUExpertBorrow(context));
+            auto* backend=dynamic_cast<ShmemSpinBackend*>(context->backend_.get());
+            ASSERT_NE(backend,nullptr);
+            ASSERT_EQ(backend->num_ranks_,2);
+            EXPECT_TRUE(backend->publishNextEpoch());
+            EXPECT_TRUE(backend->publishNextEpoch());
+            EXPECT_EQ(backend->currentEpoch(),2u);
+            ASSERT_EQ(MPI_Barrier(MPI_COMM_WORLD),MPI_SUCCESS);
+            if(backend->my_rank_!=0)return;
+            auto* slot=backend->arena()->epoch_at(0);
+            constexpr auto terminal=std::numeric_limits<uint64_t>::max();
+            const auto original_epoch=backend->currentEpoch();
+            // Exact shared witness of an abort that wins after the old precheck.
+            // The local flag deliberately remains clear until production rejects
+            // this first publication, so a flag-only check cannot satisfy replay.
+            slot->epoch.store(terminal,std::memory_order_release);
+            for(int replay=0;replay<20;++replay)
+            {
+                EXPECT_FALSE(backend->publishNextEpoch())<<replay;
+                EXPECT_EQ(slot->epoch.load(std::memory_order_acquire),terminal)<<replay;
+                EXPECT_EQ(backend->currentEpoch(),original_epoch)<<replay;
+            }
+            backend->abort();
+            // Rank one is paused at the outer barrier with a genuinely ready
+            // epoch. An observed local abort must beat its successful observation.
+            for(int replay=0;replay<20;++replay)
+            {
+                EXPECT_FALSE(backend->waitForPeerEpoch(1,2u,"replaying local abort with ready peer"))<<replay;
+                EXPECT_EQ(slot->epoch.load(std::memory_order_acquire),terminal)<<replay;
+            }
+        }
+
         /** @brief Invoke only the existing shared gather of a live admitted UPI context.
          * @param context Original retained domain; foreign, null and retired owners reject.
          * @param local Original NUMA-packed local prefix, aliased to receive storage on root.
@@ -212,6 +264,8 @@ namespace llaminar2::test
         constexpr size_t four_mib=(4u<<20)/record_bytes;
         constexpr size_t sixteen_mib=(16u<<20)/record_bytes;
         constexpr size_t capacity=2*sixteen_mib;
+        constexpr size_t parallel_threshold_records=(64u*1024u)/width;
+        constexpr size_t shape_count=16;
         constexpr int warmups=3,repetitions=12;
         const int rank=worldRank();
         ASSERT_EQ(worldSize(),2)<<"Requires two actual physical socket workers";
@@ -245,6 +299,8 @@ namespace llaminar2::test
         RecordProperty("actual_rank_numa_node",nodes[rank]);
         RecordProperty("actual_root_world_rank",root);
         RecordProperty("native_record_width_elements",width);
+        RecordProperty("original_omp_max_workers",omp_get_max_threads());
+        RecordProperty("original_omp_dynamic",omp_get_dynamic());
         const auto shared_program=NativeCPUCollectiveProgram::expertShardRoutePartials(
             73002,CollectiveBackendType::UPI,members);
         const auto mpi_program=NativeCPUCollectiveProgram::expertShardRoutePartials(
@@ -294,11 +350,16 @@ namespace llaminar2::test
         EXPECT_EQ(rejected,0u);EXPECT_FALSE(mpi->isAbortRequested());
 
         struct Shape {const char* name;size_t root_records,remote_records;};
-        const std::array<Shape,10> shapes={{{"equal_1MiB",one_mib,one_mib},
+        const std::array<Shape,shape_count> shapes={{{"equal_1MiB",one_mib,one_mib},
             {"equal_4MiB",four_mib,four_mib},{"equal_16MiB",sixteen_mib,sixteen_mib},
             {"small_after_large",1,7},{"all_empty",0,0},{"mixed_root_small",3,four_mib},
             {"remote_empty",four_mib,0},{"root_empty",0,four_mib},
-            {"equal_16MiB_replay",sixteen_mib,sixteen_mib},{"small_replay",1,7}}};
+            {"equal_16MiB_replay",sixteen_mib,sixteen_mib},{"small_replay",1,7},
+            {"parallel_below",parallel_threshold_records,parallel_threshold_records},
+            {"parallel_above",parallel_threshold_records+1,parallel_threshold_records+1},
+            {"chunk_plus_tail",four_mib,four_mib+1},
+            {"root_empty_chunk_tail",0,four_mib+1},
+            {"root_large_remote_small",sixteen_mib,1},{"small_after_parallel",1,1}}};
         const std::string stage_name="perf_original_numa_variable_records";
         /** Source-tagged exact FP32 bytes, with the native flat-slot coordinate last. */
         const auto valueAt=[](int source,size_t record,size_t column) {
@@ -308,7 +369,7 @@ namespace llaminar2::test
         for(const bool shared_arm:{true,false}) {
             // Small timing vectors only; payload and range roots remain the same
             // PMA-owned node-certified allocations throughout both native arms.
-            std::array<std::vector<double>,10> samples;
+            std::array<std::vector<double>,shape_count> samples;
             for(auto& sample:samples)sample.resize(repetitions);
             for(int iteration=-warmups;iteration<repetitions;++iteration) {
                 for(size_t index=0;index<shapes.size();++index) {
@@ -369,8 +430,13 @@ namespace llaminar2::test
             for(size_t index=0;index<shapes.size();++index) {
                 const auto slowest=summarizeSlowestRank(samples[index]);
                 if(rank!=root)continue;
-                auto& sample=samples[index];std::sort(sample.begin(),sample.end());
+                auto& sample=samples[index];
                 const auto& shape=shapes[index];
+                for(size_t iteration=0;iteration<sample.size();++iteration)
+                    std::cout<<"original_numa_gather_raw,"<<shape.name<<','
+                        <<(shared_arm?"shared_spin":"production_mpi_bandwidth")<<','<<iteration<<','
+                        <<std::fixed<<std::setprecision(3)<<sample[iteration]<<'\n';
+                std::sort(sample.begin(),sample.end());
                 const auto root_p50=percentile(sample,50),root_p95=percentile(sample,95);
                 const size_t remote_bytes=shape.remote_records*record_bytes;
                 std::cout<<"original_numa_gather,"<<shape.name<<','<<(shared_arm?"shared_spin":"production_mpi_bandwidth")
@@ -379,6 +445,39 @@ namespace llaminar2::test
                     <<','<<std::fixed<<std::setprecision(3)<<root_p50<<','<<root_p95<<','<<slowest.p50_us<<','<<slowest.p95_us
                     <<','<<(remote_bytes?double(remote_bytes)/slowest.p50_us/1000.0:0.0)<<'\n';
             }
+        }
+        // A backend may be entered by ONE member of an unrelated existing
+        // team. Only that original caller executes the protocol; it must not
+        // conscript absent siblings into a nested collective workshare.
+        {
+            const size_t count=four_mib+1u;
+            const float poison=-771.0f-float(rank);
+            std::fill_n(records.data(),records.size(),poison);
+            for(size_t record=0;record<count;++record)
+                for(size_t column=0;column<width;++column)
+                    records[record*width+column]=valueAt(rank,record,column);
+            size_t gathered=0;
+            bool success=false;
+            ASSERT_EQ(MPI_Barrier(MPI_COMM_WORLD),MPI_SUCCESS);
+#pragma omp parallel num_threads(2) shared(success,gathered)
+            {
+#pragma omp master
+                {
+                    success=CPURootedPublicationTransportReplayAccess::gatherSharedOriginal(shared,
+                        records.data(),count,rank==root?records.data():nullptr,capacity,width,root,gathered,range_span);
+                }
+            }
+            ASSERT_TRUE(success);
+            EXPECT_EQ(gathered,rank==root?2u*count:0u);
+            const size_t used=rank==root?2u*count:count;
+            if(rank==root)
+                for(const auto& range:range_span)
+                    for(size_t record=0;record<range.record_count;++record)
+                        for(size_t column=0;column<width;++column)
+                            ASSERT_EQ(std::bit_cast<uint32_t>(records[(range.first_record+record)*width+column]),
+                                std::bit_cast<uint32_t>(valueAt(range.participant,record,column)));
+            EXPECT_TRUE(std::all_of(records.data()+used*width,records.data()+records.size(),
+                [&](float value){return std::bit_cast<uint32_t>(value)==std::bit_cast<uint32_t>(poison);}));
         }
         // Retained original borrowers must prevent retirement BEFORE any
         // native unmap/acknowledgement; the same owner remains usable afterwards.
@@ -401,6 +500,51 @@ namespace llaminar2::test
         // No backend pointer escapes. Original session owns the process pool
         // until mpi_gtest_main performs its unchanged production finalization.
         shared.reset();mpi.reset();
+    }
+
+    /**
+     * @test NativeEpochAbortWitnessReplay
+     * Replay the original admitted CPU backend's terminal epoch and ready-peer
+     * boundaries. The same original mapping, PMA and communicator retire only
+     * after both ranks leave the replay; no payload or alternative owner is made.
+     */
+    TEST(Perf__CPURootedPublicationTransport,NativeEpochAbortWitnessReplay)
+    {
+        const int rank=worldRank();
+        ASSERT_EQ(worldSize(),2);
+        const auto inventory=MPIContextFactory::global()->clusterInventory();
+        ASSERT_EQ(inventory->ranks.size(),2u);
+        std::vector<NativeCPUCollectiveProgram::Participant> members;
+        for(const auto& observed:inventory->ranks)
+        {
+            ASSERT_EQ(observed.hostname,inventory->ranks.front().hostname);
+            members.push_back({observed.rank,
+                GlobalDeviceAddress::cpu(observed.cpu.numa_node,observed.hostname)});
+        }
+        ASSERT_EQ(members[0].world_rank,0);ASSERT_EQ(members[1].world_rank,1);
+        const auto program=NativeCPUCollectiveProgram::expertShardRoutePartials(
+            73004,CollectiveBackendType::UPI,members);
+        const auto observed=observeSystemMemoryCapacity();
+        ASSERT_TRUE(observed.valid());ASSERT_GT(observed.admission_available_bytes,0u);
+        const PhysicalMemoryResource cpu{rank,DeviceId::cpu(),observed.total_bytes,
+            observed.admission_available_bytes};
+        PhysicalMemoryPlanBuilder bill;
+        program.contributeDomainBOM(bill,cpu,rank);
+        NativeCPUCollectiveProgram::contributeProcessPoolBOM(bill,cpu);
+        if(rank==0)bill.add(cpu,PhysicalMemoryOwner::ActivationTransportStaging,
+            ShmemSpinArena::allocationGeometry(2).mapped_bytes);
+        auto memory=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(bill.build()),rank);
+        using Use=std::variant<NativeCPUCollectiveProgram::DomainUse,NativeCPUCollectiveProgram::ProcessUse>;
+        auto context=GlobalTPContext::createAdmittedCPUExpertDomain(MPI_COMM_WORLD,program,
+            Use(std::in_place_type<NativeCPUCollectiveProgram::DomainUse>,program.admit(memory,rank)));
+        ASSERT_TRUE(context);ASSERT_EQ(context->scope(),TPScope::NODE_LOCAL);
+        CPURootedPublicationTransportReplayAccess::replayEpochAbort(context);
+        ASSERT_EQ(MPI_Barrier(MPI_COMM_WORLD),MPI_SUCCESS);
+        ASSERT_TRUE(context->retireOriginalCPUExpertDomain());
+        EXPECT_EQ(memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeCPUCollectiveDomain),0u);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
     }
 
     /**

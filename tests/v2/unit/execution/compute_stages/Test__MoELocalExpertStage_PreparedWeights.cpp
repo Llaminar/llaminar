@@ -56,7 +56,7 @@ namespace
     class FakePreparedGemm final : public ITensorGemm, public IWorkspaceConsumer
     {
     public:
-        explicit FakePreparedGemm(DeviceNativeVNNIMatrixDesc desc)
+        explicit FakePreparedGemm(DeviceNativeQuantisedMatrixDesc desc)
             : desc_(desc)
         {
         }
@@ -95,7 +95,7 @@ namespace
 
         bool weights_converted() const override { return true; }
 
-        bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+        bool exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) override
         {
             out = desc_;
             return out.valid();
@@ -119,7 +119,7 @@ namespace
         DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
     private:
-        DeviceNativeVNNIMatrixDesc desc_;
+        DeviceNativeQuantisedMatrixDesc desc_;
         DeviceWorkspaceManager *workspace_ = nullptr;
     };
 
@@ -367,11 +367,11 @@ namespace
         bool down_projection_ = false; ///< Select the fused down role.
     };
 
-    DeviceNativeVNNIMatrixDesc nativeDesc(int expert_id, int role, int n, int k)
+    DeviceNativeQuantisedMatrixDesc nativeDesc(int expert_id, int role, int n, int k)
     {
         const uintptr_t base = 0x10000000u + static_cast<uintptr_t>(expert_id) * 0x10000u +
                                static_cast<uintptr_t>(role) * 0x1000u;
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base + 0x0100u);
         desc.scales = reinterpret_cast<const void *>(base + 0x0200u);
         desc.mins = reinterpret_cast<const void *>(base + 0x0300u);
@@ -1264,7 +1264,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     const size_t expected_bytes =
         static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) *
         static_cast<size_t>(kLogicalExperts) *
-        sizeof(DeviceNativeVNNIMatrixDesc);
+        sizeof(DeviceNativeQuantisedMatrixDesc);
 
     EXPECT_EQ(
         descriptor_bytes(

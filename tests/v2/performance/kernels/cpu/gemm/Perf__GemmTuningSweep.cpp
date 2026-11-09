@@ -26,7 +26,7 @@
 #include <cstring>
 
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "utils/DebugEnv.h"
 
 using namespace llaminar2;

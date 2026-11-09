@@ -65,7 +65,7 @@ class GeometryEngine final : public ITensorGemm
 public:
     mutable int descriptor_queries = 0;
     /** @brief Record a pure descriptor query without any native allocation. */
-    bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+    bool exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) override
     {
         ++descriptor_queries;
         out = {};
@@ -365,10 +365,10 @@ namespace llaminar2::test
 TEST(MoEIntermediateProjectionGeometry, PreparedPoolLayoutsMatchActualPoolPlans)
 {
     using Layout = GPUPreparedWeightPoolLayout;
-    for (const auto &entry : native_vnni_formats::kAllSourceFormats)
+    for (const auto &entry : native_quantised_formats::kAllSourceFormats)
     {
         const auto &source = *entry.metadata;
-        const auto format = ExpertWeightFormat::nativeVnni(
+        const auto format = ExpertWeightFormat::nativeQuantised(
             {source.codebook_id, source.is_superblock, true});
         for (const int n : {1, 128, 256, 640})
         for (const int k : {256, 512, 2560})
@@ -380,7 +380,7 @@ TEST(MoEIntermediateProjectionGeometry, PreparedPoolLayoutsMatchActualPoolPlans)
             SCOPED_TRACE(static_cast<int>(layout));
             const auto physical = layout == Layout::MigrationReusable
                 ? reusableDeviceVnniAllocationFormat(source)
-                : NativeVnniReusableDeviceAllocationFormat{
+                : NativeQuantisedReusableDeviceAllocationFormat{
                       static_cast<uint8_t>(source.payload_bytes),
                       canonicalDeviceVnniFormat(source).is_asymmetric,
                       source.has_emins};
@@ -411,7 +411,7 @@ TEST(MoEIntermediateProjectionGeometry, PreparedPoolLayoutsMatchActualPoolPlans)
             static_cast<Layout>(99)), std::invalid_argument);
     }
     EXPECT_THROW((void)resolveExpertPreparedProjectionMemoryGeometry(128, 256,
-        ExpertWeightFormat::nativeVnni({native_vnni_formats::Q5_0.codebook_id, false, true}),
+        ExpertWeightFormat::nativeQuantised({native_quantised_formats::Q5_0.codebook_id, false, true}),
         static_cast<Layout>(99)), std::invalid_argument);
 }
 } // namespace llaminar2::test

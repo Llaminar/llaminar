@@ -102,10 +102,10 @@ std::size_t preparedPredictorExpertRecords(const ModelContextReuseContract &reus
                 EXPECT_EQ(lifetime.get(), engine);
                 EXPECT_EQ(available[expert], engine != nullptr);
                 if (!engine) continue;
-                NativeVnniSourceIdentity original;
+                NativeQuantisedSourceIdentity original;
                 EXPECT_TRUE(engine->weights_converted());
-                EXPECT_TRUE(engine->exportNativeVNNISourceIdentity(original));
-                EXPECT_EQ(ExpertWeightFormat::nativeVnni(original), projection.format);
+                EXPECT_TRUE(engine->exportNativeQuantisedSourceIdentity(original));
+                EXPECT_EQ(ExpertWeightFormat::nativeQuantised(original), projection.format);
                 ++count;
             }
         }

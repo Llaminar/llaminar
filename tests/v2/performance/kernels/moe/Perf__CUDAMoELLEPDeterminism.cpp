@@ -42,9 +42,9 @@ namespace
 #ifdef HAVE_CUDA
     extern "C" bool cudaMoE_materialize_runtime_prefill_plan(
         const void *runtime,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int num_experts,
         int max_active_experts,
@@ -71,9 +71,9 @@ namespace
         const float *routing_weights,
         void *runtime,
         int *original_to_grouped,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int current_slots,
         int max_slots,
@@ -101,9 +101,9 @@ namespace
     extern "C" bool cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
         void *runtime,
         int *original_to_grouped,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int current_slots,
         int max_slots,
@@ -447,13 +447,13 @@ TEST(Perf__MoELLEPDeterminism, CUDA_RuntimePrefillPlanPublication)
         makeResidentAssignmentRouteExperts(shape),
         makeRouteWeights(shape));
 
-    DeviceNativeVNNIMatrixDesc *gate_descs = nullptr;
-    DeviceNativeVNNIMatrixDesc *up_descs = nullptr;
-    DeviceNativeVNNIMatrixDesc *down_descs = nullptr;
+    DeviceNativeQuantisedMatrixDesc *gate_descs = nullptr;
+    DeviceNativeQuantisedMatrixDesc *up_descs = nullptr;
+    DeviceNativeQuantisedMatrixDesc *down_descs = nullptr;
     int *active_expert_ids = nullptr;
     const std::size_t descriptor_bytes =
         static_cast<std::size_t>(shape.num_experts) *
-        sizeof(DeviceNativeVNNIMatrixDesc);
+        sizeof(DeviceNativeQuantisedMatrixDesc);
     ASSERT_EQ(cudaMalloc(&gate_descs, descriptor_bytes), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&up_descs, descriptor_bytes), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&down_descs, descriptor_bytes), cudaSuccess);
@@ -598,7 +598,7 @@ TEST(Perf__MoELLEPDeterminism, CUDA_CompleteRuntimePrefillPlanFusion)
 
     const std::size_t descriptor_bytes =
         static_cast<std::size_t>(shape.num_experts) *
-        sizeof(DeviceNativeVNNIMatrixDesc);
+        sizeof(DeviceNativeQuantisedMatrixDesc);
     const std::size_t route_int_bytes =
         static_cast<std::size_t>(current_slots) * sizeof(int32_t);
     const std::size_t route_float_bytes =
@@ -608,12 +608,12 @@ TEST(Perf__MoELLEPDeterminism, CUDA_CompleteRuntimePrefillPlanFusion)
     const std::size_t active_bytes =
         static_cast<std::size_t>(max_active_experts) * sizeof(int32_t);
 
-    DeviceNativeVNNIMatrixDesc *baseline_gate = nullptr;
-    DeviceNativeVNNIMatrixDesc *baseline_up = nullptr;
-    DeviceNativeVNNIMatrixDesc *baseline_down = nullptr;
-    DeviceNativeVNNIMatrixDesc *fused_gate = nullptr;
-    DeviceNativeVNNIMatrixDesc *fused_up = nullptr;
-    DeviceNativeVNNIMatrixDesc *fused_down = nullptr;
+    DeviceNativeQuantisedMatrixDesc *baseline_gate = nullptr;
+    DeviceNativeQuantisedMatrixDesc *baseline_up = nullptr;
+    DeviceNativeQuantisedMatrixDesc *baseline_down = nullptr;
+    DeviceNativeQuantisedMatrixDesc *fused_gate = nullptr;
+    DeviceNativeQuantisedMatrixDesc *fused_up = nullptr;
+    DeviceNativeQuantisedMatrixDesc *fused_down = nullptr;
     int32_t *baseline_active = nullptr;
     int32_t *fused_active = nullptr;
     int32_t *baseline_inverse = nullptr;
@@ -674,7 +674,7 @@ TEST(Perf__MoELLEPDeterminism, CUDA_CompleteRuntimePrefillPlanFusion)
             max_active_experts,
             /*filter_to_local_runtime_experts=*/0,
             /*retain_routes_for_deferred_commit=*/0,
-            llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+            llaminar2::DeviceMoEWeightFormat::NativeQuantised,
             /*device_idx=*/0,
             harness.stream_,
             llaminar2::DeviceMoEProjectionSet::CompleteExpert);
@@ -742,21 +742,21 @@ TEST(Perf__MoELLEPDeterminism, CUDA_CompleteRuntimePrefillPlanFusion)
         baseline_gate_bytes,
         baseline_active_ids,
         shape.num_experts,
-        sizeof(DeviceNativeVNNIMatrixDesc),
+        sizeof(DeviceNativeQuantisedMatrixDesc),
         inactive_descriptor_poison);
     const auto up_error = validateSparseDescriptorPublication(
         fused_up_bytes,
         baseline_up_bytes,
         baseline_active_ids,
         shape.num_experts,
-        sizeof(DeviceNativeVNNIMatrixDesc),
+        sizeof(DeviceNativeQuantisedMatrixDesc),
         inactive_descriptor_poison);
     const auto down_error = validateSparseDescriptorPublication(
         fused_down_bytes,
         baseline_down_bytes,
         baseline_active_ids,
         shape.num_experts,
-        sizeof(DeviceNativeVNNIMatrixDesc),
+        sizeof(DeviceNativeQuantisedMatrixDesc),
         inactive_descriptor_poison);
     EXPECT_TRUE(gate_error.empty()) << gate_error;
     EXPECT_TRUE(up_error.empty()) << up_error;
@@ -874,7 +874,7 @@ TEST(Perf__MoELLEPDeterminism, CUDA_CompleteRuntimePrefillPlanFusion)
             shape.top_k,
             max_active_experts,
             /*retain_routes_for_deferred_commit=*/0,
-            llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+            llaminar2::DeviceMoEWeightFormat::NativeQuantised,
             /*device_idx=*/0,
             harness.stream_,
             llaminar2::DeviceMoEProjectionSet::CompleteExpert);
@@ -931,21 +931,21 @@ TEST(Perf__MoELLEPDeterminism, CUDA_CompleteRuntimePrefillPlanFusion)
         assigned_baseline_gate_bytes,
         assigned_baseline_active_ids,
         shape.num_experts,
-        sizeof(DeviceNativeVNNIMatrixDesc),
+        sizeof(DeviceNativeQuantisedMatrixDesc),
         inactive_descriptor_poison);
     const auto assigned_up_error = validateSparseDescriptorPublication(
         copy_bytes(fused_up, descriptor_bytes),
         assigned_baseline_up_bytes,
         assigned_baseline_active_ids,
         shape.num_experts,
-        sizeof(DeviceNativeVNNIMatrixDesc),
+        sizeof(DeviceNativeQuantisedMatrixDesc),
         inactive_descriptor_poison);
     const auto assigned_down_error = validateSparseDescriptorPublication(
         copy_bytes(fused_down, descriptor_bytes),
         assigned_baseline_down_bytes,
         assigned_baseline_active_ids,
         shape.num_experts,
-        sizeof(DeviceNativeVNNIMatrixDesc),
+        sizeof(DeviceNativeQuantisedMatrixDesc),
         inactive_descriptor_poison);
     EXPECT_TRUE(assigned_gate_error.empty()) << assigned_gate_error;
     EXPECT_TRUE(assigned_up_error.empty()) << assigned_up_error;

@@ -12,7 +12,7 @@
  * - Primary entry point: multiply_tensor() with type introspection
  * - Supports any quantized weight type (IQ4_NL, Q8_0, Q4_0, Q4_K, etc.)
  * - Weights are packed once and cached with preferred and active execution families
- * - NativeVNNI-native formats keep compact payloads as the active execution family while
+ * - NativeQuantised-native formats keep compact payloads as the active execution family while
  *   still retaining an Int8Expanded fallback mirror in the cache
  * - Activations quantized on-the-fly or used directly if already Q8_1
  * - Uses CUTLASS INT8 Tensor Core GEMM (SM 8.0+ Ampere)
@@ -85,7 +85,7 @@ namespace llaminar2
          *
          * **Compute Path**:
          * 1. Weights: Pack once, recording preferred and active CUDA weight families
-         * 2. Current execution: active_family selects the primary path; NativeVNNI-native
+         * 2. Current execution: active_family selects the primary path; NativeQuantised-native
          *    formats still retain an Int8Expanded fallback mirror for fallback/tuning paths
          * 3. Activations: Q8_1 blocks used directly, or FP32→INT8 quantized
          * 4. GEMM: CUTLASS INT8×INT8→INT32 (Tensor Core mma.sync.m16n8k32)
@@ -160,11 +160,11 @@ namespace llaminar2
              * @param N Output features (rows per expert)
              * @param K Input features (columns)
              * @param cuda_device_id CUDA device ID
-             * @param d_vnni Device pointer to NativeVNNI payload for this expert
+             * @param d_vnni Device pointer to NativeQuantised payload for this expert
              * @param d_scales Device pointer to FP16 scales for this expert
              * @param d_mins Device pointer to FP16 mins (nullptr if symmetric)
              * @param d_emins Device pointer to extended mins (nullptr if not needed)
-             * @param codebook_id NativeVNNI codebook identifier
+             * @param codebook_id NativeQuantised codebook identifier
              * @param blocks_per_row Number of 32-element blocks per row (K/32)
              * @param lifetime_owner Shared pointer that keeps the GPU allocation alive
              * @param source_identity Exact GGUF arithmetic provenance
@@ -176,8 +176,8 @@ namespace llaminar2
                 uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
                 uint8_t codebook_id, uint32_t blocks_per_row,
                 std::shared_ptr<void> lifetime_owner,
-                NativeVnniSourceIdentity source_identity,
-                NativeVnniReusableDeviceAllocationFormat allocation_format = {});
+                NativeQuantisedSourceIdentity source_identity,
+                NativeQuantisedReusableDeviceAllocationFormat allocation_format = {});
 
             ~CUDAQuantisedGemmKernel() override;
 
@@ -434,10 +434,10 @@ namespace llaminar2
             }
             bool weights_converted() const override;
 
-            /// @brief Export native-VNNI device pointers for grouped MoE CUDA prefill.
-            bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
-            /** @copydoc ITensorGemm::inspectPreparedNativeVNNIMatrixDesc */
-            [[nodiscard]] bool inspectPreparedNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) const override;
+            /// @brief Export native-quantised device pointers for grouped MoE CUDA prefill.
+            bool exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) override;
+            /** @copydoc ITensorGemm::inspectPreparedNativeQuantisedMatrixDesc */
+            [[nodiscard]] bool inspectPreparedNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) const override;
             /** @copydoc ITensorGemm::q8ResidualCorrectionWorkspaceRequirements */
             WorkspaceRequirements q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const override;
             /** @copydoc ITensorGemm::multiply_q8_residual_corrected */
@@ -447,8 +447,8 @@ namespace llaminar2
             void multiply_q8_residual_corrected(HCResidualDownInput input,TensorBase*output,
                 DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace) override;
 
-            bool exportNativeVNNISourceIdentity(
-                NativeVnniSourceIdentity &out) const override;
+            bool exportNativeQuantisedSourceIdentity(
+                NativeQuantisedSourceIdentity &out) const override;
 
             /**
              * @brief Prepare weights for efficient execution (ITensorGemm interface)
@@ -569,10 +569,10 @@ namespace llaminar2
                 float alpha, float beta);
 
             /**
-             * @brief Small-M FP32 activations -> specialized native-VNNI GEMV.
+             * @brief Small-M FP32 activations -> specialized native-quantised GEMV.
              *
              * MTP verifier forwards use a runtime row count determined by the
-             * speculative depth. The generic native VNNI prefill path is tuned
+             * speculative depth. The generic native quantised prefill path is tuned
              * for larger prompt buckets and has separate dispatch regimes, so
              * verifier rows stay on the decode-class GEMV path after one shared
              * activation quantization.
@@ -583,12 +583,12 @@ namespace llaminar2
                 float alpha, float beta);
 
             /**
-             * @brief Already-quantized small-M activations -> native-VNNI GEMV.
+             * @brief Already-quantized small-M activations -> native-quantised GEMV.
              *
              * Used by fused activation paths that quantize a derived activation
              * once, for example silu(gate)*up. Passing false for
              * use_specialized_small_m_kernel is no longer a row-replay escape
-             * hatch; grouped specialized NativeVNNI is the only production path.
+             * hatch; grouped specialized NativeQuantised is the only production path.
              *
              * @param execution_stream Optional explicit CUDA stream captured by
              *        the caller at the start of a fused multi-projection launch.
@@ -612,7 +612,7 @@ namespace llaminar2
              *
              * MTP verifier publication compares grouped rows against serial
              * decode.  This helper is the public serial-decode transaction after
-             * activation quantization: it launches the generated M=1 NativeVNNI
+             * activation quantization: it launches the generated M=1 NativeQuantised
              * GEMV on the caller's explicit stream, with no padded small-M
              * detour and no alternate reduction order.  Keeping the call wrapped
              * in one named helper lets fused QKV/gate-up paths and ordinary GEMM
@@ -685,7 +685,7 @@ namespace llaminar2
             void validateWorkspace() const;
 
             /**
-             * @brief Rebind NativeVNNI prefill scratch to the per-stream slot used by concurrent fused prefill.
+             * @brief Rebind NativeQuantised prefill scratch to the per-stream slot used by concurrent fused prefill.
              *
              * validateWorkspace() binds the serial view of the workspace. Concurrent
              * prefill projections need disjoint canonical partial slices before their
@@ -694,7 +694,7 @@ namespace llaminar2
             void bindConcurrentNativePrefillScratch(int m, int n, int k, int stream_idx) const;
 
             /**
-             * @brief Rebind NativeVNNI GEMV partials to a concurrent fused-decode stream slot.
+             * @brief Rebind NativeQuantised GEMV partials to a concurrent fused-decode stream slot.
              *
              * Fused decode launches multiple M=1 projections on side streams. Some
              * projections use the two-phase KPAR GEMV reduction, so each side stream

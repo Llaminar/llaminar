@@ -34,13 +34,13 @@ namespace llaminar2
     namespace
     {
         /** @return The prepared native decoder identity, or no native descriptor. */
-        std::optional<uint8_t> nativeVNNICodebook(ITensorGemm *kernel)
+        std::optional<uint8_t> nativeQuantisedCodebook(ITensorGemm *kernel)
         {
             if (!kernel)
                 return std::nullopt;
 
-            DeviceNativeVNNIMatrixDesc desc;
-            if (!kernel->exportNativeVNNIMatrixDesc(desc) || !desc.valid())
+            DeviceNativeQuantisedMatrixDesc desc;
+            if (!kernel->exportNativeQuantisedMatrixDesc(desc) || !desc.valid())
                 return std::nullopt;
             return desc.codebook_id;
         }
@@ -279,8 +279,8 @@ namespace llaminar2
         if (!binding || !binding->immutable || binding->tensor != params_.w_qkv ||
             !engine || (params_.gemm_qkv && params_.gemm_qkv != engine))
             throw std::invalid_argument("GDN corrected QKV prepared source/ref/engine mismatch");
-        NativeVnniSourceIdentity source;
-        if (!engine->exportNativeVNNISourceIdentity(source))
+        NativeQuantisedSourceIdentity source;
+        if (!engine->exportNativeQuantisedSourceIdentity(source))
             throw std::invalid_argument("GDN corrected QKV requires unchanged original prepared source provenance");
         const auto &prepared_source=requireQ8ResidualSourceFormat(source,params_.m,params_.n_qkv,params_.k);
         const auto &original_source=requireQ8ResidualSourceFormat(
@@ -625,10 +625,10 @@ namespace llaminar2
             {gemm_b, C_b, params_.n_b, nullptr, "beta"}};
 
         std::array<std::optional<uint8_t>, 4> native_codebooks = {
-            nativeVNNICodebook(gemm_qkv),
-            nativeVNNICodebook(gemm_z),
-            nativeVNNICodebook(gemm_a),
-            nativeVNNICodebook(gemm_b)};
+            nativeQuantisedCodebook(gemm_qkv),
+            nativeQuantisedCodebook(gemm_z),
+            nativeQuantisedCodebook(gemm_a),
+            nativeQuantisedCodebook(gemm_b)};
 
         const bool corrected_qkv = params_.qkv_operand_precision ==
             QuantizedActivationOperandPrecision::TwoTermQ8;

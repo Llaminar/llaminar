@@ -437,4 +437,32 @@ if(TEST V2_Integration_MoEOverlayCPUCohortPhysicalStagingAbort)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointReusableFabricRegistryBinding)
 endif()
 
+# GPU peer cycles and CPU tier cycles share the canonical mixed ownership map;
+# no scalar CPU owner or second live assignment may enter this component gate.
+add_v2_test(V2_Integration_CPUJointWholeGPUOwnerTransitionContract
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+        --gtest_filter=CPUJointWholeGPUOwnerTransitionContract.*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;CUDA;ROCm;DeviceFree;ExpertOverlay;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointWholeGPUOwnerTransitionContract)
+
+# Original CPU cohort targets compose with the normal whole-GPU participant axis.
+add_v2_test(V2_Integration_CPUJointWholeGPUAuthorityReplay
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+        --gtest_filter=CPUJointWholeGPUAuthorityReplay.* --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;CUDA;ROCm;DeviceFree;ExpertOverlay;TraceReplay;Ownership;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointWholeGPUAuthorityReplay)
+
+# A physical mixed cycle retains each original command's logical objective.
+add_v2_test(V2_Integration_MoEMigrationCommandAxisContract
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+        --gtest_filter=MoEMigrationCommandAxisContract.*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;TraceReplay;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEMigrationCommandAxisContract)
+
 unset(V2_CPU_FRAGMENT_TEST_ENV)

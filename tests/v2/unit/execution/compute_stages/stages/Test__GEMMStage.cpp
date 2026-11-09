@@ -84,7 +84,7 @@ namespace
             requirements.merge(cpuSwiGLUWorkspaceRequirements(m, k));
         }
 
-        /** @brief Record the same independently selected product lifetime as NativeVNNI. */
+        /** @brief Record the same independently selected product lifetime as NativeQuantised. */
         void appendOutputAccumulationWorkspaceRequirements(WorkspaceRequirements &requirements, int m, int n) const override
         {
             requirements.merge(cpuProjectionFP32WorkspaceRequirements(kCPUProjectionProduct, m, n));

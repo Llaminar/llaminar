@@ -27,16 +27,16 @@
 #include <cstring>
 #include <array>
 #ifdef HAVE_ROCM
-#include "kernels/rocm/gemm/ROCmNativeVNNISerialGeometry.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedSerialGeometry.h"
 #endif
 
 // Existing backend host policy observers; these expose no device state and
 // add no production entrypoint. Scope tests never change them via a raw setter.
 #ifdef HAVE_CUDA
-extern "C" int cudaNativeVNNIGemvTuned_getSerialPartitionN();
+extern "C" int cudaNativeQuantisedGemvTuned_getSerialPartitionN();
 #endif
 #ifdef HAVE_ROCM
-extern "C" int rocmGemv_native_vnni_get_serial_partition_n();
+extern "C" int rocmGemv_native_quantised_get_serial_partition_n();
 #endif
 namespace
 {
@@ -67,14 +67,14 @@ struct Retire final
 int currentPartition(DeviceId device)
 {
 #ifdef HAVE_CUDA
-    if(device.is_cuda())return cudaNativeVNNIGemvTuned_getSerialPartitionN();
+    if(device.is_cuda())return cudaNativeQuantisedGemvTuned_getSerialPartitionN();
 #endif
 #ifdef HAVE_ROCM
-    if(device.is_rocm())return rocmGemv_native_vnni_get_serial_partition_n();
+    if(device.is_rocm())return rocmGemv_native_quantised_get_serial_partition_n();
 #endif
     throw std::invalid_argument("No compiled native partition observer");
 }
-/** @brief Exercise actual prepared NativeVNNI GEMM through the canonical single-node setup runner. */
+/** @brief Exercise actual prepared NativeQuantised GEMM through the canonical single-node setup runner. */
 void prove(DeviceId device,int serial_width=0)
 {
     auto *backend=getBackendFor(device);
@@ -107,7 +107,7 @@ void prove(DeviceId device,int serial_width=0)
          return stage->getWorkspaceRequirements(M,N,K);}();
         EXPECT_EQ(currentPartition(device),previous_partition);
         const auto bytes=requirements.total_bytes_with_alignment();
-        checked(bytes>0,"Prepared NativeVNNI GEMM declared no scratch");
+        checked(bytes>0,"Prepared NativeQuantised GEMM declared no scratch");
         PhysicalMemoryPlanBuilder plan;
         plan.add({.world_rank=0,.device=device,.total_bytes=bytes,.admission_available_bytes=bytes},
             PhysicalMemoryOwner::ExecutionWorkspace,bytes);
@@ -222,9 +222,9 @@ void prove(DeviceId device,int serial_width=0)
             // CUDA and HIP retain distinct production entrypoint families.
             // A successful byte comparison alone must not bless another path.
             native_projection |= device.is_cuda()
-                ? node.name.find("nativeVnniGemv_")!=std::string::npos ||
-                    node.name.find("nativeVnniGemvTensorCoreSmallM")!=std::string::npos
-                : node.name.find("gemv_native_vnni_kernel")!=std::string::npos;
+                ? node.name.find("nativeQuantisedGemv_")!=std::string::npos ||
+                    node.name.find("nativeQuantisedGemvTensorCoreSmallM")!=std::string::npos
+                : node.name.find("gemv_native_quantised_kernel")!=std::string::npos;
             EXPECT_EQ(node.name.find("nccl"),std::string::npos);
             EXPECT_EQ(node.name.find("capturedTransfer"),std::string::npos);
         }

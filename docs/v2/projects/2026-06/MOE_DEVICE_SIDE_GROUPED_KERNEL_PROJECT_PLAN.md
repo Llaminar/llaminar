@@ -58,7 +58,7 @@ public:
 };
 ```
 
-`ITensorGemm` should still own common weight preparation and native-VNNI metadata, but MoE grouped execution needs a compact device descriptor table that kernels can index by expert id. That table should be produced from prepared GEMM engines once at graph build/preload time.
+`ITensorGemm` should still own common weight preparation and native-quantised metadata, but MoE grouped execution needs a compact device descriptor table that kernels can index by expert id. That table should be produced from prepared GEMM engines once at graph build/preload time.
 
 ## Phase 0: Alpha/Beta Correctness Gate
 
@@ -66,12 +66,12 @@ Status: implemented as a prerequisite.
 
 Deliverables:
 
-- Ensure ROCm native-VNNI decode GEMM supports `alpha != 1` and `beta != 0` safely.
+- Ensure ROCm native-quantised decode GEMM supports `alpha != 1` and `beta != 0` safely.
 - Add tests for plain decode GEMV and fused SwiGLU/down decode accumulation.
 
 Acceptance:
 
-- Focused ROCm native-VNNI alpha/beta tests pass.
+- Focused ROCm native-quantised alpha/beta tests pass.
 - Qwen35 decode parity remains clean once direct accumulation is enabled in MoE.
 
 ## Phase 1: Decode Single-Kernel SwiGLU + Down + Accumulate
@@ -101,7 +101,7 @@ Target decode structure:
 Implementation notes:
 
 - Start with deterministic ordered accumulation. Since `d_model=2048` and `top_k` is small, one block/tile per output column range can loop over `top_k` in routing order and avoid atomics.
-- Use existing native-VNNI decode routines as a reference, but expect a new kernel because the down projection must select expert-specific weight descriptors by device-side expert id.
+- Use existing native-quantised decode routines as a reference, but expect a new kernel because the down projection must select expert-specific weight descriptors by device-side expert id.
 - Keep a debug fallback to the current per-expert path under an env flag until parity and perf settle.
 
 Acceptance:
@@ -116,7 +116,7 @@ Objective: make expert selection device-readable instead of host `ITensorGemm*` 
 
 Deliverables:
 
-- Add a compact `DeviceExpertMatrixTable` for ROCm native-VNNI weights:
+- Add a compact `DeviceExpertMatrixTable` for ROCm native-quantised weights:
   - payload pointers
   - scale/min/extra-min pointers
   - codebook ids

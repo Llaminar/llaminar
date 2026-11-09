@@ -2,7 +2,7 @@
  * @file Test__ExpertTierGpuBlobTransferIntegration.cpp
  * @brief Real-device CUDA/ROCm packed and floating expert relay proof.
  *
- * The test transfers a production-shaped separated NativeVNNI projection in
+ * The test transfers a production-shaped separated NativeQuantised projection in
  * CUDA-to-ROCm, ROCm-to-CUDA, and same-backend/no-P2P directions, then repeats
  * the cross-backend production lane for contiguous FP16, BF16, and FP32
  * payloads. It validates every byte, exercises the double-buffered async-DMA
@@ -1203,7 +1203,7 @@ namespace llaminar2
                 .source_device = source_device,
                 .destination_device = destination_device,
             };
-            const NativeVnniSourceIdentity source_identity{
+            const NativeQuantisedSourceIdentity source_identity{
                 .codebook_id = 5,
                 .is_superblock = false,
                 .present = true,

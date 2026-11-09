@@ -757,7 +757,7 @@ namespace llaminar2
                 error))
             return false;
         int rows = 0, columns = 0;
-        if (source.kind == MoEOverlayPreparedWeightSourceKind::CpuNativeVnni)
+        if (source.kind == MoEOverlayPreparedWeightSourceKind::CpuNativeQuantised)
         {
             rows = source.cpu_packed->N;
             columns = source.cpu_packed->K;

@@ -2,7 +2,7 @@
  * @file CpuExpertSlotPool.h
  * @brief Persistent NUMA-owned CPU arrival slots for ExpertOverlay epochs.
  *
- * GPU-to-CPU migration writes final CPU NativeVNNI or row-major floating-point
+ * GPU-to-CPU migration writes final CPU NativeQuantised or row-major floating-point
  * bytes directly into these preallocated slots. Each slot owns stable
  * gate/up/down GEMM objects created before inference begins. A lease is
  * identified by `(expert, epoch)`, allowing an old and candidate epoch to

@@ -1442,7 +1442,7 @@ activation approximation for quantized HC-up projections. The default is
 `two_term_q8`; select `single_q8` explicitly to use one activation term.
 TwoTerm quantizes
 both the primary activation and its residual, applies each to the same original
-prepared weights, and adds the two completed results. Every canonical NativeVNNI
+prepared weights, and adds the two completed results. Every canonical NativeQuantised
 source format retains its original weight values, codebook, scales and minima;
 no weight requantization is introduced. CPU, CUDA and ROCm use the same policy.
 Original FP32, FP16 and BF16 HC weights retain their native floating operation
@@ -1495,6 +1495,47 @@ choosing an arithmetic policy; lower router error alone does not guarantee
 lower final-logit divergence. `src/v2/utils/DebugEnv.h` owns these diagnostic
 settings.
 
+### Diagnostic MoE ordinary-prefill route transport
+
+`LLAMINAR_DIAGNOSTIC_MOE_PREFILL_ROUTE_TRANSPORT=mapped_sparse` or
+`native_collective` explicitly selects the existing transport for ordinary
+prefill in a rank-local multi-GPU ExpertOverlay continuation. The default is
+unchanged. Rank startup reads the key through `DebugEnv` once and copies the
+parsed enum into the existing phase-aware graph configuration; environment
+changes and request reset cannot alter retained graphs. Decode, grouped MTP
+verification, and MTP sidecars keep the actual topology's default transport.
+
+This is an opt-in diagnostic for matched capture/byte/economy experiments,
+not a calibrated production policy. It preserves driver P2P facts and the
+existing transfer owner; it adds no kernel or automatic error path. A native
+collective cannot span CUDA and ROCm. Empty/unknown values, incomplete topology,
+unsupported Rank layouts, and conflicting preselected policies fail explicitly.
+Unset the variable before starting a new process to return to normal selection.
+
+### NativeQuantised exact collection
+
+`scripts/refresh_native_quantised_dispatch_tables.sh` selects modern model
+work by default: Qwen3.5, Qwen3.6, explicit Qwen3.8 identities, QFN, and
+physical shapes shared with those families. It excludes Qwen2.5/Qwen3-only
+new jobs without removing runtime support or installed exact keys. The source
+catalog currently declares no explicit Qwen3.8 geometry; collection does not
+invent it. Modern `--surface all` covers decode/MTP and routed experts;
+ordinary dense-prefill collection is parked.
+
+`--resume` preserves the saved model scope and original evidence identities.
+Use `--model-scope all-retained` for an explicit full retained inventory, with
+a separate output directory when changing scope. CPU
+`--reuse-completed-root PATH` authenticates compatible completed owner receipts
+and collects missing jobs; it preserves their original producer and raw data.
+For CUDA/ROCm `--surface decode` (including MTP), the same flag retains
+completed shapes from an original native collection or superset when its exact
+producer, published hardware context, serial policy, phase, formats, device
+ordinals and timing floors match. Original raw artifacts and context remain
+receipt-bound; only missing shapes launch. `--resume` revalidates those original
+references. Pre-install M1 timings cannot be relabeled as clocks of a later
+rebuilt producer. Historical routed-MoE receipts omit actual hardware identity,
+so their cross-root reuse is inadmissible; resume their original corpus instead.
+
 ### Optional corpora
 
 Ordinary checkouts, builds, Docker images, and Unit/preflight tests do not
@@ -1504,10 +1545,11 @@ require downloading large corpora. Published data lives in
 
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 git submodule update --init -- corpora
-git -C corpora lfs pull --include 'native_vnni_dispatch/cpu/**' --exclude ''
+git -C corpora lfs pull --include '<family>/<selected-generation>/**' --exclude ''
 ```
 
-Narrow the include pattern to the desired generation. Publish corpus payloads
+Use the directory names recorded by the selected corpus generation; source
+renames do not rename already published data artifacts. Publish corpus payloads
 in that repository, then update the source gitlink; do not add them to the
 source tree or Docker build context.
 

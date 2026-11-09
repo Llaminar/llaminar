@@ -8,7 +8,7 @@
  * it is not a multiplier over GGUF bytes or an anonymous safety reserve.
  */
 #include "CPUWeightPreparationMemory.h"
-#include "CPUNativeVNNIWeightPacker.h"
+#include "CPUNativeQuantisedWeightPacker.h"
 #include "memory/CPUStorageRoot.h"
 #include <climits>
 #include <limits>
@@ -38,10 +38,10 @@ namespace llaminar2
             return {physical,0,payload};
         }
 
-        const auto *native = native_vnni_formats::forQuantType(format);
+        const auto *native = native_quantised_formats::forQuantType(format);
         if (!native || k % (native->is_superblock ? 256u : 32u))
             throw std::invalid_argument("CPU preparation requires a supported, block-aligned source format");
-        using namespace cpu::native_vnni;
+        using namespace cpu::native_quantised;
         const auto footprint = preparedFootprintForFormat(*native);
         const size_t units = multiply((n + 63) / 64, k / 32);
         const size_t interleaved = multiply(units, footprint.weight_bytes_per_n_chunk_k_block);

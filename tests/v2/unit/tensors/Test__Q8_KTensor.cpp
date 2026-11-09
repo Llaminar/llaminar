@@ -451,7 +451,7 @@ int main(int argc, char **argv)
  * explicit precision limitation, never used as the original-value oracle.
  */
 #include "loaders/ModelLoader.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <array>
 #include <bit>
 #include <limits>

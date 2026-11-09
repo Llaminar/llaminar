@@ -146,9 +146,9 @@ namespace
         bool old_device_routed_;
     };
 
-    DeviceNativeVNNIMatrixDesc runtimeDesc(uintptr_t base, int n, int k)
+    DeviceNativeQuantisedMatrixDesc runtimeDesc(uintptr_t base, int n, int k)
     {
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x1000u);
         desc.mins = reinterpret_cast<const void *>(base + 0x2000u);
@@ -361,8 +361,8 @@ namespace
         void sharedExpertGate(const float *, const float *, float *, int, int) override {}
         void swiGLU(float *, const float *, int) override {}
         int uploadGroupedExpertGateUpDescriptorTables(
-            const DeviceNativeVNNIMatrixDesc *,
-            const DeviceNativeVNNIMatrixDesc *,
+            const DeviceNativeQuantisedMatrixDesc *,
+            const DeviceNativeQuantisedMatrixDesc *,
             int,
             int,
             int,
@@ -372,7 +372,7 @@ namespace
             return gateup_table_uploads++;
         }
         int uploadGroupedExpertDownDescriptorTable(
-            const DeviceNativeVNNIMatrixDesc *,
+            const DeviceNativeQuantisedMatrixDesc *,
             int,
             int,
             int,
@@ -537,7 +537,7 @@ namespace
         {
             return true;
         }
-        bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+        bool exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) override
         {
             out = runtimeDesc(0x71000000u, desc_n_, desc_k_);
             return true;

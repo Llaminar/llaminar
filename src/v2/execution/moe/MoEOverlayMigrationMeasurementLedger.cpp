@@ -420,8 +420,8 @@ namespace llaminar2
                     }
                 }
                 for(const auto &format:row.geometry->formats()) {
-                    hashUnsigned(hash,static_cast<std::uint64_t>(format.kind));hashUnsigned(hash,format.native_vnni.codebook_id);
-                    hashUnsigned(hash,format.native_vnni.is_superblock);hashUnsigned(hash,format.native_vnni.present);
+                    hashUnsigned(hash,static_cast<std::uint64_t>(format.kind));hashUnsigned(hash,format.native_quantised.codebook_id);
+                    hashUnsigned(hash,format.native_quantised.is_superblock);hashUnsigned(hash,format.native_quantised.present);
                 }
             }
             hashUnsigned(hash,row.wave_wall_nanoseconds);hashUnsigned(hash,row.wave_sample_count);

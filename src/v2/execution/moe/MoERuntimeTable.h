@@ -165,10 +165,10 @@ namespace llaminar2
     /** @brief Pointer-bearing movable payload and its exact arithmetic identity. */
     struct DeviceMoEExpertDescriptor
     {
-        /** Prepared NativeVNNI views used when weight_format is NativeVNNI. */
-        DeviceNativeVNNIMatrixDesc gate;
-        DeviceNativeVNNIMatrixDesc up;
-        DeviceNativeVNNIMatrixDesc down;
+        /** Prepared NativeQuantised views used when weight_format is NativeQuantised. */
+        DeviceNativeQuantisedMatrixDesc gate;
+        DeviceNativeQuantisedMatrixDesc up;
+        DeviceNativeQuantisedMatrixDesc down;
         /** Contiguous floating views used for FP16, BF16, or FP32 experts. */
         DeviceMoEFloatingMatrixDesc floating_gate;
         DeviceMoEFloatingMatrixDesc floating_up;
@@ -177,16 +177,16 @@ namespace llaminar2
         int32_t owner_participant = -1;
         int32_t local_slot = -1;
         uint32_t flags = 0;
-        DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
-        // Immutable capacity tag for reusable raw storage. NativeVNNI means
+        DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
+        // Immutable capacity tag for reusable raw storage. NativeQuantised means
         // no raw view was allocated, not a conversion or alternate arithmetic.
-        DeviceMoEWeightFormat floating_allocation_format = DeviceMoEWeightFormat::NativeVNNI;
+        DeviceMoEWeightFormat floating_allocation_format = DeviceMoEWeightFormat::NativeQuantised;
         DeviceMoEProjectionSet projection_set = DeviceMoEProjectionSet::CompleteExpert;
 
         /** @return Whether the declared movable family, rather than a full FFN, exists. */
         [[nodiscard]] constexpr bool movableWeightsReady() const noexcept
         {
-            if (weight_format != DeviceMoEWeightFormat::NativeVNNI)
+            if (weight_format != DeviceMoEWeightFormat::NativeQuantised)
                 return deviceMoEFloatingExpertCopyReady(*this);
             if (!deviceMoEProjectionPayloadValid(*this) || !gate.valid() || !up.valid())
                 return false;

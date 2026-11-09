@@ -19,7 +19,7 @@
 #include "v2/tensors/BlockStructures.h"
 #include "v2/tensors/FP16Utils.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 
 using namespace llaminar2;
 
@@ -153,7 +153,7 @@ TEST_F(Test__Q4_KTensor, GemmCorrectness_SingleBlock_Ones)
 }
 
 /**
- * @brief Compare CPUNativeVNNIGemmKernel (INT8) vs FloatingPointGemmKernel (FP32) for Q4_K.
+ * @brief Compare CPUNativeQuantisedGemmKernel (INT8) vs FloatingPointGemmKernel (FP32) for Q4_K.
  *
  * This test verifies that the quantized GEMM kernel produces results close to
  * the FP32 reference implementation using OneDNN.

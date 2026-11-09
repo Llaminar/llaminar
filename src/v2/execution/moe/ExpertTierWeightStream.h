@@ -13,7 +13,7 @@
 
 #include "ExpertTierWeightDeviceLayout.h"
 #include "GPUExpertTransfer.h"
-#include "../../kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "../../kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -27,8 +27,8 @@ namespace llaminar2
     /** Packed representation named by one stream endpoint. */
     enum class ExpertTierWeightPacking : uint8_t
     {
-        GpuSeparatedNativeVnni = 1,
-        CpuNativeVnniInterleaved = 2,
+        GpuSeparatedNativeQuantised = 1,
+        CpuNativeQuantisedInterleaved = 2,
     };
 
     /** Projection identity carried independently for gate, up, and down. */
@@ -58,9 +58,9 @@ namespace llaminar2
         uint32_t magic = kMagic;
         uint16_t version = kVersion;
         ExpertTierWeightPacking source_packing =
-            ExpertTierWeightPacking::CpuNativeVnniInterleaved;
+            ExpertTierWeightPacking::CpuNativeQuantisedInterleaved;
         ExpertTierWeightPacking destination_packing =
-            ExpertTierWeightPacking::GpuSeparatedNativeVnni;
+            ExpertTierWeightPacking::GpuSeparatedNativeQuantised;
 
         // Logical identity binds late chunks to one immutable placement epoch.
         uint64_t residency_epoch = 0;
@@ -87,8 +87,8 @@ namespace llaminar2
         uint8_t cpu_is_superblock = 0;
         uint8_t gpu_is_asymmetric = 0;
         uint8_t gpu_has_emins = 0;
-        cpu::native_vnni::CPUNativeVNNIEncoding cpu_encoding =
-            cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8;
+        cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding =
+            cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
 
         // Allocation and ordered-chunk geometry derived from endpoint formats.
         uint32_t cpu_data_stride = 0;
@@ -314,11 +314,11 @@ namespace llaminar2
      * @param maximum_units_per_chunk Persistent staging capacity in units.
      * @return Complete authenticated stream manifest.
      * @throws std::invalid_argument when the source identity or geometry is
-     *         not part of the exhaustive NativeVNNI catalog.
+     *         not part of the exhaustive NativeQuantised catalog.
      */
     [[nodiscard]] ExpertTierWeightStreamManifest
     makeGpuToCpuExpertTierWeightStreamManifest(
-        const NativeVnniFormatInfo &source_format,
+        const NativeQuantisedFormatInfo &source_format,
         int N,
         int K,
         uint64_t residency_epoch,
@@ -349,7 +349,7 @@ namespace llaminar2
      */
     [[nodiscard]] ExpertTierWeightStreamManifest
     makeGpuToCpuExpertTierWeightStreamManifest(
-        const NativeVnniFormatInfo &source_format,
+        const NativeQuantisedFormatInfo &source_format,
         const GpuExpertPackedDescriptor &gpu_source,
         uint64_t residency_epoch,
         int layer_idx,
@@ -372,7 +372,7 @@ namespace llaminar2
      */
     [[nodiscard]] ExpertTierWeightStreamManifest
     makeCpuToGpuExpertTierWeightStreamManifest(
-        const cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+        const cpu::native_quantised::CPUNativeQuantisedPackedWeights &cpu_weights,
         uint64_t residency_epoch,
         int layer_idx,
         int expert_id,
@@ -391,7 +391,7 @@ namespace llaminar2
      * @return `true` when the conversion completed byte-exactly.
      */
     [[nodiscard]] bool cpuToGpuExpertPackedReference(
-        const cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+        const cpu::native_quantised::CPUNativeQuantisedPackedWeights &cpu_weights,
         HostGpuExpertPackedProjection &gpu_weights,
         std::string *error = nullptr) noexcept;
 
@@ -409,7 +409,7 @@ namespace llaminar2
      */
     [[nodiscard]] bool gpuToCpuExpertPackedReference(
         const HostGpuExpertPackedProjection &gpu_weights,
-        cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights &cpu_weights,
         std::string *error = nullptr) noexcept;
 
 } // namespace llaminar2

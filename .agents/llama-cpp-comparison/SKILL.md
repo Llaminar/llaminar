@@ -50,7 +50,7 @@ Rank **paired exposed-time deficits**, not only percent-of-total hot spots.
 Compare arithmetic, reduction order, operand formats, actual memory traffic,
 occupancy, spills, launch geometry and stream overlap for the selected kernels.
 For GEMM dispatch work also use
-[NativeVNNI tuning](../nativevnni-gemm-tuning/SKILL.md); for MTP work use
+[NativeQuantised tuning](../nativequantised-gemm-tuning/SKILL.md); for MTP work use
 [MTP tuning](../mtp-tuning/SKILL.md). Never adopt a baseline's precision or
 non-invariant reduction merely to match its timing.
 

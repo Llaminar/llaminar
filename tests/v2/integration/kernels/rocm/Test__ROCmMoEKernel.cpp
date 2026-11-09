@@ -74,7 +74,7 @@
 #include "../moe/ActiveExpertCompactionTestOracle.h"
 #include "../moe/CanonicalMoEPublicationTestOracle.h"
 #include "../moe/MoETransferStateMachineTestModel.h"
-#include "../moe/NativeVNNIExpertTransferParityTest.h"
+#include "../moe/NativeQuantisedExpertTransferParityTest.h"
 #include "../moe/SmallFloatGroupingTestOracle.h"
 #include "../moe/SharedSmallFloatGroupingCapturedRegression.h"
 
@@ -190,9 +190,9 @@ extern "C" bool hipMoE_softmax_topk_decode_equivalent_rows(
 
 extern "C" bool hipMoE_materialize_runtime_prefill_descriptor_tables(
     const void *runtime,
-    llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-    llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-    llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
     int num_experts,
     int device_idx,
     void *stream);
@@ -216,9 +216,9 @@ extern "C" bool hipMoE_materialize_runtime_floating_descriptor_tables(
 
 extern "C" bool hipMoE_materialize_runtime_prefill_plan(
     const void *runtime,
-    llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-    llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-    llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
     int *active_expert_ids,
     int num_experts,
     int max_active_experts,
@@ -413,9 +413,9 @@ namespace
 
     void populateRuntimeDescriptors(
         DeviceMoELayerRuntime &runtime,
-        const std::vector<DeviceNativeVNNIMatrixDesc> *gate_descs,
-        const std::vector<DeviceNativeVNNIMatrixDesc> *up_descs,
-        const std::vector<DeviceNativeVNNIMatrixDesc> *down_descs)
+        const std::vector<DeviceNativeQuantisedMatrixDesc> *gate_descs,
+        const std::vector<DeviceNativeQuantisedMatrixDesc> *up_descs,
+        const std::vector<DeviceNativeQuantisedMatrixDesc> *down_descs)
     {
         const int num_experts =
             std::min(static_cast<int>(runtime.expert_count), static_cast<int>(kDeviceMoEMaxExperts));
@@ -453,10 +453,10 @@ namespace
     };
 
     /**
-     * @brief NativeVNNI tensor formats that must preserve grouped verifier
+     * @brief NativeQuantised tensor formats that must preserve grouped verifier
      * decode equivalence.
      *
-     * The MoE verifier pipeline uses the same NativeVNNI descriptor contract for
+     * The MoE verifier pipeline uses the same NativeQuantised descriptor contract for
      * routed experts, shared experts, direct grouping, runtime grouping, and
      * masked LocalTP grouping.  Keep this list centralized so a newly supported
      * codebook cannot accidentally enter production without batch-invariance
@@ -513,7 +513,7 @@ namespace
                 payload_bytes = expert_prepared_memory_detail::checkedAdd(payload_bytes,
                     resolveExpertPreparedProjectionMemoryGeometry(
                         static_cast<int>(view->rows()), static_cast<int>(view->cols()),
-                        ExpertWeightFormat::nativeVnni(
+                        ExpertWeightFormat::nativeQuantised(
                             {format->codebook_id, format->is_superblock, true})).gpu_live_bytes,
                     "ROCm expert fixture payload");
                 maximum_raw_bytes = std::max(maximum_raw_bytes,
@@ -541,9 +541,9 @@ namespace
         return store;
     }
 
-    DeviceNativeVNNIMatrixDesc fakeNativeVNNIDesc(uintptr_t base)
+    DeviceNativeQuantisedMatrixDesc fakeNativeQuantisedDesc(uintptr_t base)
     {
-        DeviceNativeVNNIMatrixDesc desc{};
+        DeviceNativeQuantisedMatrixDesc desc{};
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x100u);
         desc.mins = reinterpret_cast<const void *>(base + 0x200u);
@@ -600,9 +600,9 @@ namespace
             slot.descriptor.owner_participant =
                 static_cast<int32_t>(config.participant_id);
             slot.descriptor.local_slot = static_cast<int32_t>(slot_index);
-            slot.descriptor.gate = fakeNativeVNNIDesc(base + 0x100u);
-            slot.descriptor.up = fakeNativeVNNIDesc(base + 0x200u);
-            slot.descriptor.down = fakeNativeVNNIDesc(base + 0x300u);
+            slot.descriptor.gate = fakeNativeQuantisedDesc(base + 0x100u);
+            slot.descriptor.up = fakeNativeQuantisedDesc(base + 0x200u);
+            slot.descriptor.down = fakeNativeQuantisedDesc(base + 0x300u);
             slot.descriptor.flags =
                 toMoEExpertFlags(
                     DeviceMoEExpertFlags::Valid |
@@ -636,9 +636,9 @@ namespace
                 : static_cast<uint8_t>(DeviceMoEReplicaRole::None);
         if (local_ready)
         {
-            desc.gate = fakeNativeVNNIDesc(base + 0x10u);
-            desc.up = fakeNativeVNNIDesc(base + 0x20u);
-            desc.down = fakeNativeVNNIDesc(base + 0x30u);
+            desc.gate = fakeNativeQuantisedDesc(base + 0x10u);
+            desc.up = fakeNativeQuantisedDesc(base + 0x20u);
+            desc.down = fakeNativeQuantisedDesc(base + 0x30u);
             desc.flags |= toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute);
         }
     }
@@ -675,13 +675,13 @@ namespace
         status.transaction_command_count = command_count;
     }
 
-    DeviceNativeVNNIMatrixDesc makePrefillRuntimeDesc(
+    DeviceNativeQuantisedMatrixDesc makePrefillRuntimeDesc(
         uintptr_t base,
         int rows,
         int cols,
         uint8_t codebook_id)
     {
-        DeviceNativeVNNIMatrixDesc desc{};
+        DeviceNativeQuantisedMatrixDesc desc{};
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x100u);
         desc.mins = reinterpret_cast<const void *>(base + 0x200u);
@@ -693,9 +693,9 @@ namespace
         return desc;
     }
 
-    void expectSameNativeVNNIDesc(
-        const DeviceNativeVNNIMatrixDesc &actual,
-        const DeviceNativeVNNIMatrixDesc &expected)
+    void expectSameNativeQuantisedDesc(
+        const DeviceNativeQuantisedMatrixDesc &actual,
+        const DeviceNativeQuantisedMatrixDesc &expected)
     {
         EXPECT_EQ(reinterpret_cast<uintptr_t>(actual.payload),
                   reinterpret_cast<uintptr_t>(expected.payload));
@@ -736,9 +736,9 @@ namespace
             desc.logical_expert_id = expert;
             desc.owner_participant = owners[expert];
             desc.local_slot = expert;
-            desc.gate = fakeNativeVNNIDesc(base + 0x10u);
-            desc.up = fakeNativeVNNIDesc(base + 0x20u);
-            desc.down = fakeNativeVNNIDesc(base + 0x30u);
+            desc.gate = fakeNativeQuantisedDesc(base + 0x10u);
+            desc.up = fakeNativeQuantisedDesc(base + 0x20u);
+            desc.down = fakeNativeQuantisedDesc(base + 0x30u);
             desc.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
                                           DeviceMoEExpertFlags::Resident |
                                           DeviceMoEExpertFlags::PreferredOwner);
@@ -2673,7 +2673,7 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesRejectInvalidDescriptors)
 
     auto make_down_desc = [](int rows, int cols)
     {
-        DeviceNativeVNNIMatrixDesc desc{};
+        DeviceNativeQuantisedMatrixDesc desc{};
         desc.payload = reinterpret_cast<const uint8_t *>(0x1000);
         desc.scales = reinterpret_cast<const void *>(0x2000);
         desc.n = rows;
@@ -2685,7 +2685,7 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesRejectInvalidDescriptors)
 
     auto make_gateup_desc = [](int rows, int cols)
     {
-        DeviceNativeVNNIMatrixDesc desc{};
+        DeviceNativeQuantisedMatrixDesc desc{};
         desc.payload = reinterpret_cast<const uint8_t *>(0x3000);
         desc.scales = reinterpret_cast<const void *>(0x4000);
         desc.n = rows;
@@ -2699,7 +2699,7 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesRejectInvalidDescriptors)
     bindROCmMoETestStream(moe_kernel);
     auto moe_kernel_workspace = bindDefaultMoEWorkspace(moe_kernel);
 
-    std::vector<DeviceNativeVNNIMatrixDesc> down_descs;
+    std::vector<DeviceNativeQuantisedMatrixDesc> down_descs;
     down_descs.reserve(num_experts);
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         down_descs.push_back(make_down_desc(d_model, intermediate));
@@ -2708,8 +2708,8 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesRejectInvalidDescriptors)
                   down_descs.data(), num_experts, d_model, intermediate),
               -1);
 
-    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs;
-    std::vector<DeviceNativeVNNIMatrixDesc> up_descs;
+    std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs;
+    std::vector<DeviceNativeQuantisedMatrixDesc> up_descs;
     gate_descs.reserve(num_experts);
     up_descs.reserve(num_experts);
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
@@ -2740,9 +2740,9 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
     host_runtime.active_bank = 1;
     host_runtime.active_epoch = active_epoch;
 
-    std::vector<DeviceNativeVNNIMatrixDesc> expected_gate(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> expected_up(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> expected_down(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> expected_gate(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> expected_up(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> expected_down(num_experts);
 
     for (int expert = 0; expert < num_experts; ++expert)
     {
@@ -2778,14 +2778,14 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
     ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
 
     DeviceMoELayerRuntime *device_runtime = nullptr;
-    DeviceNativeVNNIMatrixDesc *device_gate = nullptr;
-    DeviceNativeVNNIMatrixDesc *device_up = nullptr;
-    DeviceNativeVNNIMatrixDesc *device_down = nullptr;
+    DeviceNativeQuantisedMatrixDesc *device_gate = nullptr;
+    DeviceNativeQuantisedMatrixDesc *device_up = nullptr;
+    DeviceNativeQuantisedMatrixDesc *device_down = nullptr;
     int32_t *device_counts = nullptr;
     int32_t *device_active = nullptr;
-    std::vector<DeviceNativeVNNIMatrixDesc> actual_gate(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> actual_up(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> actual_down(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> actual_gate(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> actual_up(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> actual_down(num_experts);
     std::array<int32_t, num_experts> actual_active{};
     std::array<int32_t, num_experts> expert_counts{};
     std::array<int32_t, num_experts> expected_active{};
@@ -2830,13 +2830,13 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)),
               hipSuccess);
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_gate),
-                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
+                        num_experts * sizeof(DeviceNativeQuantisedMatrixDesc)),
               hipSuccess);
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_up),
-                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
+                        num_experts * sizeof(DeviceNativeQuantisedMatrixDesc)),
               hipSuccess);
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_down),
-                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
+                        num_experts * sizeof(DeviceNativeQuantisedMatrixDesc)),
               hipSuccess);
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_counts), num_experts * sizeof(int32_t)),
               hipSuccess);
@@ -2860,13 +2860,13 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
     // Poison all admitted slots before replay. The capture must overwrite every
     // descriptor/list byte; the negative control never launches expert compute.
     ASSERT_EQ(
-        hipMemsetAsync(device_gate, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        hipMemsetAsync(device_gate, 0xa5, num_experts * sizeof(DeviceNativeQuantisedMatrixDesc), stream),
         hipSuccess);
     ASSERT_EQ(
-        hipMemsetAsync(device_up, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        hipMemsetAsync(device_up, 0xa5, num_experts * sizeof(DeviceNativeQuantisedMatrixDesc), stream),
         hipSuccess);
     ASSERT_EQ(
-        hipMemsetAsync(device_down, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        hipMemsetAsync(device_down, 0xa5, num_experts * sizeof(DeviceNativeQuantisedMatrixDesc), stream),
         hipSuccess);
     ASSERT_EQ(hipMemsetAsync(device_active, 0xa5, num_experts * sizeof(int32_t), stream),
               hipSuccess);
@@ -2878,15 +2878,15 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
         device_runtime, device_gate, device_up, device_down, num_experts, 0, nullptr));
 
     ASSERT_EQ(hipMemcpyAsync(actual_gate.data(), device_gate,
-                             actual_gate.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             actual_gate.size() * sizeof(DeviceNativeQuantisedMatrixDesc),
                              hipMemcpyDeviceToHost, stream),
               hipSuccess);
     ASSERT_EQ(hipMemcpyAsync(actual_up.data(), device_up,
-                             actual_up.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             actual_up.size() * sizeof(DeviceNativeQuantisedMatrixDesc),
                              hipMemcpyDeviceToHost, stream),
               hipSuccess);
     ASSERT_EQ(hipMemcpyAsync(actual_down.data(), device_down,
-                             actual_down.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             actual_down.size() * sizeof(DeviceNativeQuantisedMatrixDesc),
                              hipMemcpyDeviceToHost, stream),
               hipSuccess);
     ASSERT_EQ(hipMemcpyAsync(actual_active.data(), device_active, sizeof(actual_active),
@@ -2898,11 +2898,11 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
     for (int expert = 0; expert < num_experts; ++expert)
     {
         SCOPED_TRACE(expert);
-        expectSameNativeVNNIDesc(actual_gate[static_cast<size_t>(expert)],
+        expectSameNativeQuantisedDesc(actual_gate[static_cast<size_t>(expert)],
                                  expected_gate[static_cast<size_t>(expert)]);
-        expectSameNativeVNNIDesc(actual_up[static_cast<size_t>(expert)],
+        expectSameNativeQuantisedDesc(actual_up[static_cast<size_t>(expert)],
                                  expected_up[static_cast<size_t>(expert)]);
-        expectSameNativeVNNIDesc(actual_down[static_cast<size_t>(expert)],
+        expectSameNativeQuantisedDesc(actual_down[static_cast<size_t>(expert)],
                                  expected_down[static_cast<size_t>(expert)]);
     }
 
@@ -3091,7 +3091,7 @@ TEST(Test__ROCmMoEKernel, RuntimeFloatingDescriptorPublication512ExpertsCaptured
         }
     }
 }
-TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptAllNativeVNNICodebooks)
+TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptAllNativeQuantisedCodebooks)
 {
     SKIP_IF_NO_ROCM();
 
@@ -3119,7 +3119,7 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptAllNativeVNNICodebo
 
     auto make_desc = [](int rows, int cols, const CodebookCase &codebook, std::uintptr_t base)
     {
-        DeviceNativeVNNIMatrixDesc desc{};
+        DeviceNativeQuantisedMatrixDesc desc{};
         desc.payload = reinterpret_cast<const uint8_t *>(base + 0x1000);
         desc.scales = reinterpret_cast<const void *>(base + 0x2000);
         desc.mins = codebook.requires_mins ? reinterpret_cast<const void *>(base + 0x3000) : nullptr;
@@ -3139,9 +3139,9 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptAllNativeVNNICodebo
         const auto &codebook = codebooks[case_idx];
         const std::uintptr_t base = 0x100000 + case_idx * 0x10000;
 
-        std::vector<DeviceNativeVNNIMatrixDesc> down_descs;
-        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs;
-        std::vector<DeviceNativeVNNIMatrixDesc> up_descs;
+        std::vector<DeviceNativeQuantisedMatrixDesc> down_descs;
+        std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs;
+        std::vector<DeviceNativeQuantisedMatrixDesc> up_descs;
         down_descs.reserve(num_experts);
         gate_descs.reserve(num_experts);
         up_descs.reserve(num_experts);
@@ -3165,7 +3165,7 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptAllNativeVNNICodebo
     }
 
     CodebookCase q2_k_missing_emins{10, true, false};
-    std::vector<DeviceNativeVNNIMatrixDesc> missing_emins;
+    std::vector<DeviceNativeQuantisedMatrixDesc> missing_emins;
     missing_emins.reserve(num_experts);
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
     {
@@ -3189,7 +3189,7 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptSparseBlankDescript
 
     auto make_desc = [](int rows, int cols, std::uintptr_t base)
     {
-        DeviceNativeVNNIMatrixDesc desc{};
+        DeviceNativeQuantisedMatrixDesc desc{};
         desc.payload = reinterpret_cast<const uint8_t *>(base + 0x1000);
         desc.scales = reinterpret_cast<const void *>(base + 0x2000);
         desc.n = rows;
@@ -3202,9 +3202,9 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptSparseBlankDescript
     ROCmMoEKernel moe_kernel(0);
     auto moe_kernel_workspace = bindDefaultMoEWorkspace(moe_kernel);
 
-    std::vector<DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(num_experts);
     down_descs[0] = make_desc(d_model, intermediate, 0x100000);
     down_descs[2] = make_desc(d_model, intermediate, 0x200000);
     gate_descs[0] = make_desc(intermediate, d_model, 0x300000);
@@ -3219,8 +3219,8 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptSparseBlankDescript
                   gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate),
               0);
 
-    std::vector<DeviceNativeVNNIMatrixDesc> incomplete_gate_descs = gate_descs;
-    std::vector<DeviceNativeVNNIMatrixDesc> incomplete_up_descs = up_descs;
+    std::vector<DeviceNativeQuantisedMatrixDesc> incomplete_gate_descs = gate_descs;
+    std::vector<DeviceNativeQuantisedMatrixDesc> incomplete_up_descs = up_descs;
     incomplete_gate_descs[1] = make_desc(intermediate, d_model, 0x700000);
     EXPECT_EQ(moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
                   incomplete_gate_descs.data(), incomplete_up_descs.data(),
@@ -4833,9 +4833,9 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedMaterializerLeavesPhysicalSlo
         auto &descriptor = bank.experts[expert];
         const uintptr_t base =
             0x3b000000u + static_cast<uintptr_t>(expert) * 0x10000u;
-        descriptor.gate = fakeNativeVNNIDesc(base + 0x10u);
-        descriptor.up = fakeNativeVNNIDesc(base + 0x20u);
-        descriptor.down = fakeNativeVNNIDesc(base + 0x30u);
+        descriptor.gate = fakeNativeQuantisedDesc(base + 0x10u);
+        descriptor.up = fakeNativeQuantisedDesc(base + 0x20u);
+        descriptor.down = fakeNativeQuantisedDesc(base + 0x30u);
         descriptor.logical_expert_id = expert;
         descriptor.owner_participant = expert == 0 ? 0 : 1;
         descriptor.local_slot = expert;
@@ -6344,7 +6344,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParti
 
     auto fake_desc = [](uintptr_t base, int n, int k)
     {
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x100u);
         desc.n = n;
@@ -6577,7 +6577,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeRecordsHotCacheBalanceImprovem
 
     auto fake_desc = [](uintptr_t base, int n, int k)
     {
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x100u);
         desc.n = n;
@@ -11341,7 +11341,7 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCompactPayloadRejectsResidentSourceWith
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&d_src_payload), projection_payload_bytes), hipSuccess);
     ASSERT_EQ(hipMalloc(&d_src_scales, projection_scales_bytes), hipSuccess);
 
-    DeviceNativeVNNIMatrixDesc projection_desc;
+    DeviceNativeQuantisedMatrixDesc projection_desc;
     projection_desc.payload = d_src_payload;
     projection_desc.scales = d_src_scales;
     projection_desc.n = n;
@@ -12551,13 +12551,13 @@ TEST(Test__ROCmMoEKernel, PrefillLLEPProjectionUsesFullPhysicalDirectoryBeyondCo
             descriptor.logical_expert_id = static_cast<int32_t>(expert);
             descriptor.owner_participant = expert < 2 ? 0 : 1;
             descriptor.local_slot = static_cast<int32_t>(expert);
-            descriptor.gate = fakeNativeVNNIDesc(
+            descriptor.gate = fakeNativeQuantisedDesc(
                 0x51000000u + static_cast<uintptr_t>(layer) * 0x100000u +
                 static_cast<uintptr_t>(expert) * 0x10000u + 0x10u);
-            descriptor.up = fakeNativeVNNIDesc(
+            descriptor.up = fakeNativeQuantisedDesc(
                 0x51000000u + static_cast<uintptr_t>(layer) * 0x100000u +
                 static_cast<uintptr_t>(expert) * 0x10000u + 0x20u);
-            descriptor.down = fakeNativeVNNIDesc(
+            descriptor.down = fakeNativeQuantisedDesc(
                 0x51000000u + static_cast<uintptr_t>(layer) * 0x100000u +
                 static_cast<uintptr_t>(expert) * 0x10000u + 0x30u);
             descriptor.flags = toMoEExpertFlags(
@@ -12606,11 +12606,11 @@ TEST(Test__ROCmMoEKernel, PrefillLLEPProjectionUsesFullPhysicalDirectoryBeyondCo
         slot.descriptor.owner_participant = participant_id;
         slot.descriptor.local_slot = static_cast<int32_t>(slot_index);
         slot.descriptor.gate =
-            fakeNativeVNNIDesc(0x52000000u + slot_index * 0x10000u + 0x10u);
+            fakeNativeQuantisedDesc(0x52000000u + slot_index * 0x10000u + 0x10u);
         slot.descriptor.up =
-            fakeNativeVNNIDesc(0x52000000u + slot_index * 0x10000u + 0x20u);
+            fakeNativeQuantisedDesc(0x52000000u + slot_index * 0x10000u + 0x20u);
         slot.descriptor.down =
-            fakeNativeVNNIDesc(0x52000000u + slot_index * 0x10000u + 0x30u);
+            fakeNativeQuantisedDesc(0x52000000u + slot_index * 0x10000u + 0x30u);
         slot.descriptor.flags = toMoEExpertFlags(
             DeviceMoEExpertFlags::Valid |
             DeviceMoEExpertFlags::TransferSlot);
@@ -12630,13 +12630,13 @@ TEST(Test__ROCmMoEKernel, PrefillLLEPProjectionUsesFullPhysicalDirectoryBeyondCo
         slot.descriptor.logical_expert_id = static_cast<int32_t>(slot_index);
         slot.descriptor.owner_participant = 0;
         slot.descriptor.gate =
-            fakeNativeVNNIDesc(
+            fakeNativeQuantisedDesc(
                 0x51000000u + slot_index * 0x10000u + 0x10u);
         slot.descriptor.up =
-            fakeNativeVNNIDesc(
+            fakeNativeQuantisedDesc(
                 0x51000000u + slot_index * 0x10000u + 0x20u);
         slot.descriptor.down =
-            fakeNativeVNNIDesc(
+            fakeNativeQuantisedDesc(
                 0x51000000u + slot_index * 0x10000u + 0x30u);
         slot.descriptor.flags |= toMoEExpertFlags(
             DeviceMoEExpertFlags::Resident |
@@ -13088,7 +13088,7 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
 
     auto matrix_desc = [](const ProjectionBuffers &projection, bool destination)
     {
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = destination ? projection.dst_payload : projection.src_payload;
         desc.scales = destination ? projection.dst_scales : projection.src_scales;
         desc.n = n;
@@ -13947,9 +13947,9 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceTransferSlotReuseRetiresPreviousReplica
         DeviceMoEExpertDirectoryEntry slot;
         const uintptr_t base =
             0x3a000000u + static_cast<uintptr_t>(expert) * 0x10000u;
-        slot.descriptor.gate = fakeNativeVNNIDesc(base + 0x10u);
-        slot.descriptor.up = fakeNativeVNNIDesc(base + 0x20u);
-        slot.descriptor.down = fakeNativeVNNIDesc(base + 0x30u);
+        slot.descriptor.gate = fakeNativeQuantisedDesc(base + 0x10u);
+        slot.descriptor.up = fakeNativeQuantisedDesc(base + 0x20u);
+        slot.descriptor.down = fakeNativeQuantisedDesc(base + 0x30u);
         slot.descriptor.logical_expert_id = static_cast<int32_t>(expert);
         slot.descriptor.owner_participant = 0;
         slot.descriptor.local_slot = stable_local_slot;
@@ -14196,9 +14196,9 @@ TEST(Test__ROCmMoEKernel,
     wave.payload_bucket_slots = 1;
 
     DeviceMoEExpertDirectoryEntry slot;
-    slot.descriptor.gate = fakeNativeVNNIDesc(0x41000010u);
-    slot.descriptor.up = fakeNativeVNNIDesc(0x41000020u);
-    slot.descriptor.down = fakeNativeVNNIDesc(0x41000030u);
+    slot.descriptor.gate = fakeNativeQuantisedDesc(0x41000010u);
+    slot.descriptor.up = fakeNativeQuantisedDesc(0x41000020u);
+    slot.descriptor.down = fakeNativeQuantisedDesc(0x41000030u);
     slot.descriptor.logical_expert_id =
         static_cast<int32_t>(new_expert);
     slot.descriptor.owner_participant = 0;
@@ -15193,9 +15193,9 @@ TEST(Test__ROCmMoEKernel,
     header.participant_count = config.participant_count;
 
     DeviceMoEExpertDirectoryEntry slot;
-    slot.descriptor.gate = fakeNativeVNNIDesc(0x3e001000u);
-    slot.descriptor.up = fakeNativeVNNIDesc(0x3e002000u);
-    slot.descriptor.down = fakeNativeVNNIDesc(0x3e003000u);
+    slot.descriptor.gate = fakeNativeQuantisedDesc(0x3e001000u);
+    slot.descriptor.up = fakeNativeQuantisedDesc(0x3e002000u);
+    slot.descriptor.down = fakeNativeQuantisedDesc(0x3e003000u);
     slot.descriptor.logical_expert_id = 0;
     slot.descriptor.owner_participant = 0;
     slot.descriptor.local_slot = 7;
@@ -15281,9 +15281,9 @@ TEST(Test__ROCmMoEKernel,
     EXPECT_EQ(slot.resident_mask, original_slot.resident_mask);
     EXPECT_EQ(slot.descriptor.logical_expert_id,
               original_slot.descriptor.logical_expert_id);
-    expectSameNativeVNNIDesc(slot.descriptor.gate, original_slot.descriptor.gate);
-    expectSameNativeVNNIDesc(slot.descriptor.up, original_slot.descriptor.up);
-    expectSameNativeVNNIDesc(slot.descriptor.down, original_slot.descriptor.down);
+    expectSameNativeQuantisedDesc(slot.descriptor.gate, original_slot.descriptor.gate);
+    expectSameNativeQuantisedDesc(slot.descriptor.up, original_slot.descriptor.up);
+    expectSameNativeQuantisedDesc(slot.descriptor.down, original_slot.descriptor.down);
 
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
@@ -18723,7 +18723,7 @@ TEST(Test__ROCmMoEKernel, GroupedExpertDownDecode_Q4_0MatchesSequential)
         auto packed = std::make_unique<rocm::ROCmPackedWeights>();
         ASSERT_TRUE(rocm::packWeightsToROCm(weights.get(), *packed))
             << "packWeightsToROCm failed for expert " << expert_ids[i];
-        ASSERT_FALSE(packed->native_vnni_payload.empty());
+        ASSERT_FALSE(packed->native_quantised_payload.empty());
 
         auto kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(packed.get(), 0);
         weight_tensors.push_back(std::move(weights));
@@ -18780,12 +18780,12 @@ TEST(Test__ROCmMoEKernel, GroupedExpertDownDecode_Q4_0MatchesSequential)
 
     ITensor *gate_ptrs[num_active] = {};
     ITensor *up_ptrs[num_active] = {};
-    DeviceNativeVNNIMatrixDesc descs[num_active] = {};
+    DeviceNativeQuantisedMatrixDesc descs[num_active] = {};
     for (int i = 0; i < num_active; ++i)
     {
         gate_ptrs[i] = gate_tensors[i].get();
         up_ptrs[i] = up_tensors[i].get();
-        ASSERT_TRUE(down_kernels[i]->exportNativeVNNIMatrixDesc(descs[i]));
+        ASSERT_TRUE(down_kernels[i]->exportNativeQuantisedMatrixDesc(descs[i]));
         ASSERT_EQ(descs[i].n, d_model);
         ASSERT_EQ(descs[i].k, intermediate);
     }
@@ -18844,7 +18844,7 @@ void runGroupedExpertDownDecodeFormatMatch(const char *label, WeightFactory crea
         auto packed = std::make_unique<rocm::ROCmPackedWeights>();
         ASSERT_TRUE(rocm::packWeightsToROCm(weights.get(), *packed))
             << "packWeightsToROCm failed for " << label << " expert " << expert_id;
-        ASSERT_FALSE(packed->native_vnni_payload.empty());
+        ASSERT_FALSE(packed->native_quantised_payload.empty());
 
         auto kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(packed.get(), 0);
         weight_tensors.push_back(std::move(weights));
@@ -18904,10 +18904,10 @@ void runGroupedExpertDownDecodeFormatMatch(const char *label, WeightFactory crea
 
     ITensor *gate_ptrs[num_active] = {};
     ITensor *up_ptrs[num_active] = {};
-    std::vector<DeviceNativeVNNIMatrixDesc> descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> descs(num_experts);
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
     {
-        ASSERT_TRUE(down_kernels[expert_id]->exportNativeVNNIMatrixDesc(descs[expert_id]));
+        ASSERT_TRUE(down_kernels[expert_id]->exportNativeQuantisedMatrixDesc(descs[expert_id]));
         ASSERT_EQ(descs[expert_id].n, d_model);
         ASSERT_EQ(descs[expert_id].k, intermediate);
     }
@@ -19154,11 +19154,11 @@ TEST(Test__ROCmMoEKernel,
             d_model);
     }
 
-    std::vector<DeviceNativeVNNIMatrixDesc> descriptors(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> descriptors(num_experts);
     for (int expert = 0; expert < num_experts; ++expert)
     {
         ASSERT_TRUE(
-            down_kernels[expert]->exportNativeVNNIMatrixDesc(
+            down_kernels[expert]->exportNativeQuantisedMatrixDesc(
                 descriptors[expert]));
     }
     ASSERT_NE(descriptors[0].codebook_id, descriptors[1].codebook_id);
@@ -19341,8 +19341,8 @@ void runGroupedExpertGateUpDecodeFormatMatch(
             << "packWeightsToROCm failed for " << label << " gate expert " << expert_id;
         ASSERT_TRUE(rocm::packWeightsToROCm(up_weights.get(), *up_packed))
             << "packWeightsToROCm failed for " << label << " up expert " << expert_id;
-        ASSERT_FALSE(gate_packed->native_vnni_payload.empty());
-        ASSERT_FALSE(up_packed->native_vnni_payload.empty());
+        ASSERT_FALSE(gate_packed->native_quantised_payload.empty());
+        ASSERT_FALSE(up_packed->native_quantised_payload.empty());
 
         auto gate_kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(gate_packed.get(), 0);
         auto up_kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(up_packed.get(), 0);
@@ -19433,12 +19433,12 @@ void runGroupedExpertGateUpDecodeFormatMatch(
         input.get(), projections, 1, d_model));
     (void)hipDeviceSynchronize();
 
-    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(num_experts);
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
     {
-        ASSERT_TRUE(gate_kernels[expert_id]->exportNativeVNNIMatrixDesc(gate_descs[expert_id]));
-        ASSERT_TRUE(up_kernels[expert_id]->exportNativeVNNIMatrixDesc(up_descs[expert_id]));
+        ASSERT_TRUE(gate_kernels[expert_id]->exportNativeQuantisedMatrixDesc(gate_descs[expert_id]));
+        ASSERT_TRUE(up_kernels[expert_id]->exportNativeQuantisedMatrixDesc(up_descs[expert_id]));
         ASSERT_EQ(gate_descs[expert_id].n, intermediate);
         ASSERT_EQ(gate_descs[expert_id].k, d_model);
         ASSERT_EQ(up_descs[expert_id].n, intermediate);
@@ -19763,12 +19763,12 @@ TEST(Test__ROCmMoEKernel, GroupedSharedExpertDecodeCapturesWithStablePointerCach
         kernel->prepareWeights();
     }
 
-    DeviceNativeVNNIMatrixDesc gate_desc{};
-    DeviceNativeVNNIMatrixDesc up_desc{};
-    DeviceNativeVNNIMatrixDesc down_desc{};
-    ASSERT_TRUE(gate_kernel->exportNativeVNNIMatrixDesc(gate_desc));
-    ASSERT_TRUE(up_kernel->exportNativeVNNIMatrixDesc(up_desc));
-    ASSERT_TRUE(down_kernel->exportNativeVNNIMatrixDesc(down_desc));
+    DeviceNativeQuantisedMatrixDesc gate_desc{};
+    DeviceNativeQuantisedMatrixDesc up_desc{};
+    DeviceNativeQuantisedMatrixDesc down_desc{};
+    ASSERT_TRUE(gate_kernel->exportNativeQuantisedMatrixDesc(gate_desc));
+    ASSERT_TRUE(up_kernel->exportNativeQuantisedMatrixDesc(up_desc));
+    ASSERT_TRUE(down_kernel->exportNativeQuantisedMatrixDesc(down_desc));
 
     const int gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
         &gate_desc, &up_desc, num_experts, d_model, intermediate);
@@ -20335,16 +20335,16 @@ template <int num_experts> void proveRuntimeDecodeGraphReplayCompleteDescriptors
         down_kernels[expert]->prepareWeights();
     }
 
-    std::array<DeviceNativeVNNIMatrixDesc, num_experts> gate_descs = {};
-    std::array<DeviceNativeVNNIMatrixDesc, num_experts> up_descs = {};
-    std::array<DeviceNativeVNNIMatrixDesc, num_experts> down_descs = {};
+    std::array<DeviceNativeQuantisedMatrixDesc, num_experts> gate_descs = {};
+    std::array<DeviceNativeQuantisedMatrixDesc, num_experts> up_descs = {};
+    std::array<DeviceNativeQuantisedMatrixDesc, num_experts> down_descs = {};
     for (int expert = 0; expert < num_experts; ++expert)
     {
-        ASSERT_TRUE(gate_kernels[expert % physical_weights]->exportNativeVNNIMatrixDesc(
+        ASSERT_TRUE(gate_kernels[expert % physical_weights]->exportNativeQuantisedMatrixDesc(
             gate_descs[expert]));
         ASSERT_TRUE(
-            up_kernels[expert % physical_weights]->exportNativeVNNIMatrixDesc(up_descs[expert]));
-        ASSERT_TRUE(down_kernels[expert % physical_weights]->exportNativeVNNIMatrixDesc(
+            up_kernels[expert % physical_weights]->exportNativeQuantisedMatrixDesc(up_descs[expert]));
+        ASSERT_TRUE(down_kernels[expert % physical_weights]->exportNativeQuantisedMatrixDesc(
             down_descs[expert]));
         ASSERT_EQ(gate_descs[expert].n, intermediate);
         ASSERT_EQ(gate_descs[expert].k, d_model);
@@ -20357,7 +20357,7 @@ template <int num_experts> void proveRuntimeDecodeGraphReplayCompleteDescriptors
         ASSERT_EQ(down_descs[expert].codebook_id, 0);
     }
 
-    std::array<DeviceNativeVNNIMatrixDesc, num_experts> stale_gate_descs{}, stale_up_descs{},
+    std::array<DeviceNativeQuantisedMatrixDesc, num_experts> stale_gate_descs{}, stale_up_descs{},
         stale_down_descs{};
     stale_gate_descs.fill(gate_descs[0]);
     stale_up_descs.fill(up_descs[0]);
@@ -20420,9 +20420,9 @@ template <int num_experts> void proveRuntimeDecodeGraphReplayCompleteDescriptors
               0.01)
         << "descriptor-table A/B reference must be distinguishable for this regression";
 
-    auto make_runtime = [&](const DeviceNativeVNNIMatrixDesc &gate,
-                            const DeviceNativeVNNIMatrixDesc &up,
-                            const DeviceNativeVNNIMatrixDesc &down) {
+    auto make_runtime = [&](const DeviceNativeQuantisedMatrixDesc &gate,
+                            const DeviceNativeQuantisedMatrixDesc &up,
+                            const DeviceNativeQuantisedMatrixDesc &down) {
         DeviceMoELayerRuntime runtime{};
         runtime.active_bank = 0;
         runtime.active_epoch = 1;
@@ -20710,9 +20710,9 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
         down_kernels[expert]->prepareWeights();
     }
 
-    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(num_experts);
     /*
      * The served Qwen 3.6 model has a 256-entry logical descriptor table, but
      * this regression does not need 256 distinct copies of the same random
@@ -20724,13 +20724,13 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
     {
         const int physical_expert = expert % physical_expert_weights;
         ASSERT_TRUE(
-            gate_kernels[physical_expert]->exportNativeVNNIMatrixDesc(
+            gate_kernels[physical_expert]->exportNativeQuantisedMatrixDesc(
                 gate_descs[expert]));
         ASSERT_TRUE(
-            up_kernels[physical_expert]->exportNativeVNNIMatrixDesc(
+            up_kernels[physical_expert]->exportNativeQuantisedMatrixDesc(
                 up_descs[expert]));
         ASSERT_TRUE(
-            down_kernels[physical_expert]->exportNativeVNNIMatrixDesc(
+            down_kernels[physical_expert]->exportNativeQuantisedMatrixDesc(
                 down_descs[expert]));
     }
 
@@ -20816,7 +20816,7 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
      */
     const auto make_projection_spec =
         [](const char *label,
-           const DeviceNativeVNNIMatrixDesc &desc)
+           const DeviceNativeQuantisedMatrixDesc &desc)
         {
             uint8_t payload_bytes_per_block = 0;
             uint8_t is_asymmetric = 0;
@@ -20840,8 +20840,8 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
                 .is_asymmetric = is_asymmetric != 0u,
                 .has_emins = has_emins != 0u,
                 .codebook_id = desc.codebook_id,
-                .format = ExpertWeightFormat::nativeVnni(
-                    NativeVnniSourceIdentity{
+                .format = ExpertWeightFormat::nativeQuantised(
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -20880,8 +20880,8 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
         DeviceMoEExpertFlags::LocalCompute);
 
     const auto copy_projection_to_transfer_slot =
-        [&](const DeviceNativeVNNIMatrixDesc &source,
-            DeviceNativeVNNIMatrixDesc &destination)
+        [&](const DeviceNativeQuantisedMatrixDesc &source,
+            DeviceNativeQuantisedMatrixDesc &destination)
         {
             uint8_t payload_bytes_per_block = 0;
             uint8_t is_asymmetric = 0;
@@ -21277,7 +21277,7 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
  * @brief Prove LocalTP transfer directories never alias a peer GPU allocation.
  *
  * ROCm peer access can make a pointer owned by another GPU numerically usable.
- * That is especially dangerous for NativeVNNI decode: millions of fine-grained
+ * That is especially dangerous for NativeQuantised decode: millions of fine-grained
  * peer loads can preserve every output byte while turning a sub-millisecond
  * grouped expert into tens of milliseconds.  Allocate the same physical
  * profile for both LocalTP participants and require HIP to report the intended
@@ -21304,8 +21304,8 @@ TEST(Test__ROCmMoEKernel, TransferSlotDirectoriesArePhysicallyParticipantLocal)
             .is_asymmetric = false,
             .has_emins = false,
             .codebook_id = 0,
-            .format = ExpertWeightFormat::nativeVnni(
-                NativeVnniSourceIdentity{
+            .format = ExpertWeightFormat::nativeQuantised(
+                NativeQuantisedSourceIdentity{
                     .codebook_id = 0,
                     .is_superblock = false,
                     .present = true,
@@ -21319,8 +21319,8 @@ TEST(Test__ROCmMoEKernel, TransferSlotDirectoriesArePhysicallyParticipantLocal)
             .is_asymmetric = false,
             .has_emins = false,
             .codebook_id = 0,
-            .format = ExpertWeightFormat::nativeVnni(
-                NativeVnniSourceIdentity{
+            .format = ExpertWeightFormat::nativeQuantised(
+                NativeQuantisedSourceIdentity{
                     .codebook_id = 0,
                     .is_superblock = false,
                     .present = true,
@@ -21334,8 +21334,8 @@ TEST(Test__ROCmMoEKernel, TransferSlotDirectoriesArePhysicallyParticipantLocal)
             .is_asymmetric = false,
             .has_emins = false,
             .codebook_id = 0,
-            .format = ExpertWeightFormat::nativeVnni(
-                NativeVnniSourceIdentity{
+            .format = ExpertWeightFormat::nativeQuantised(
+                NativeQuantisedSourceIdentity{
                     .codebook_id = 0,
                     .is_superblock = false,
                     .present = true,
@@ -21437,8 +21437,8 @@ TEST(Test__ROCmMoEKernel,
             .is_asymmetric = false,
             .has_emins = false,
             .codebook_id = 0,
-            .format = ExpertWeightFormat::nativeVnni(
-                NativeVnniSourceIdentity{
+            .format = ExpertWeightFormat::nativeQuantised(
+                NativeQuantisedSourceIdentity{
                     .codebook_id = 0,
                     .is_superblock = false,
                     .present = true,
@@ -21452,8 +21452,8 @@ TEST(Test__ROCmMoEKernel,
             .is_asymmetric = false,
             .has_emins = false,
             .codebook_id = 0,
-            .format = ExpertWeightFormat::nativeVnni(
-                NativeVnniSourceIdentity{
+            .format = ExpertWeightFormat::nativeQuantised(
+                NativeQuantisedSourceIdentity{
                     .codebook_id = 0,
                     .is_superblock = false,
                     .present = true,
@@ -21467,8 +21467,8 @@ TEST(Test__ROCmMoEKernel,
             .is_asymmetric = false,
             .has_emins = false,
             .codebook_id = 0,
-            .format = ExpertWeightFormat::nativeVnni(
-                NativeVnniSourceIdentity{
+            .format = ExpertWeightFormat::nativeQuantised(
+                NativeQuantisedSourceIdentity{
                     .codebook_id = 0,
                     .is_superblock = false,
                     .present = true,
@@ -21804,14 +21804,14 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Q4KGateUp_Q5KDownMatchesSequentialGemm)
     ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
         routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
 
-    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(num_experts);
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
     {
-        ASSERT_TRUE(gpu_gate_gemms[expert_id]->exportNativeVNNIMatrixDesc(gate_descs[expert_id]));
-        ASSERT_TRUE(gpu_up_gemms[expert_id]->exportNativeVNNIMatrixDesc(up_descs[expert_id]));
-        ASSERT_TRUE(gpu_down_gemms[expert_id]->exportNativeVNNIMatrixDesc(down_descs[expert_id]));
+        ASSERT_TRUE(gpu_gate_gemms[expert_id]->exportNativeQuantisedMatrixDesc(gate_descs[expert_id]));
+        ASSERT_TRUE(gpu_up_gemms[expert_id]->exportNativeQuantisedMatrixDesc(up_descs[expert_id]));
+        ASSERT_TRUE(gpu_down_gemms[expert_id]->exportNativeQuantisedMatrixDesc(down_descs[expert_id]));
     }
 
     const int gateup_table_id = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
@@ -22020,14 +22020,14 @@ TEST(Test__ROCmMoEKernel, GroupedPrefillMaskedTopK8MatchesRowDecode)
     auto prepared_store = admitROCmExpertPreparation(gpu_ctx);
     ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(gpu_ctx));
 
-    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(num_experts);
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
     {
-        ASSERT_TRUE(gpu_gate_gemms[expert_id]->exportNativeVNNIMatrixDesc(gate_descs[expert_id]));
-        ASSERT_TRUE(gpu_up_gemms[expert_id]->exportNativeVNNIMatrixDesc(up_descs[expert_id]));
-        ASSERT_TRUE(gpu_down_gemms[expert_id]->exportNativeVNNIMatrixDesc(down_descs[expert_id]));
+        ASSERT_TRUE(gpu_gate_gemms[expert_id]->exportNativeQuantisedMatrixDesc(gate_descs[expert_id]));
+        ASSERT_TRUE(gpu_up_gemms[expert_id]->exportNativeQuantisedMatrixDesc(up_descs[expert_id]));
+        ASSERT_TRUE(gpu_down_gemms[expert_id]->exportNativeQuantisedMatrixDesc(down_descs[expert_id]));
     }
 
     const int gateup_table_id = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
@@ -22398,14 +22398,14 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Qwen35RouteTable_Q4KQ5KMatchesCpuDequan
     ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
         routing_indices_tensor.get(), routing_weights_tensor.get(), seq_len, num_experts, top_k));
 
-    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(num_experts);
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
     {
-        ASSERT_TRUE(gpu_gate_gemms[expert_id]->exportNativeVNNIMatrixDesc(gate_descs[expert_id]));
-        ASSERT_TRUE(gpu_up_gemms[expert_id]->exportNativeVNNIMatrixDesc(up_descs[expert_id]));
-        ASSERT_TRUE(gpu_down_gemms[expert_id]->exportNativeVNNIMatrixDesc(down_descs[expert_id]));
+        ASSERT_TRUE(gpu_gate_gemms[expert_id]->exportNativeQuantisedMatrixDesc(gate_descs[expert_id]));
+        ASSERT_TRUE(gpu_up_gemms[expert_id]->exportNativeQuantisedMatrixDesc(up_descs[expert_id]));
+        ASSERT_TRUE(gpu_down_gemms[expert_id]->exportNativeQuantisedMatrixDesc(down_descs[expert_id]));
     }
 
     const int gateup_table_id = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
@@ -22685,14 +22685,14 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Qwen36RouteTable_IQ2SGateUp_IQ4XSDownMa
     ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
         routing_indices_tensor.get(), routing_weights_tensor.get(), seq_len, num_experts, top_k));
 
-    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(num_experts);
+    std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(num_experts);
     for (int expert_id = 0; expert_id < num_experts; ++expert_id)
     {
-        ASSERT_TRUE(gpu_gate_gemms[expert_id]->exportNativeVNNIMatrixDesc(gate_descs[expert_id]));
-        ASSERT_TRUE(gpu_up_gemms[expert_id]->exportNativeVNNIMatrixDesc(up_descs[expert_id]));
-        ASSERT_TRUE(gpu_down_gemms[expert_id]->exportNativeVNNIMatrixDesc(down_descs[expert_id]));
+        ASSERT_TRUE(gpu_gate_gemms[expert_id]->exportNativeQuantisedMatrixDesc(gate_descs[expert_id]));
+        ASSERT_TRUE(gpu_up_gemms[expert_id]->exportNativeQuantisedMatrixDesc(up_descs[expert_id]));
+        ASSERT_TRUE(gpu_down_gemms[expert_id]->exportNativeQuantisedMatrixDesc(down_descs[expert_id]));
     }
 
     const int gateup_table_id = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
@@ -24892,12 +24892,12 @@ TEST(Test__ROCmMoEKernel, SharedExpertGroupedPrefillMatchesSequentialPath)
         reference_gate.get(), reference_up.get(), reference_output.get(),
         seq_len, d_model, intermediate));
 
-    DeviceNativeVNNIMatrixDesc gate_desc;
-    DeviceNativeVNNIMatrixDesc up_desc;
-    DeviceNativeVNNIMatrixDesc down_desc;
-    ASSERT_TRUE(gate_kernel.exportNativeVNNIMatrixDesc(gate_desc));
-    ASSERT_TRUE(up_kernel.exportNativeVNNIMatrixDesc(up_desc));
-    ASSERT_TRUE(down_kernel.exportNativeVNNIMatrixDesc(down_desc));
+    DeviceNativeQuantisedMatrixDesc gate_desc;
+    DeviceNativeQuantisedMatrixDesc up_desc;
+    DeviceNativeQuantisedMatrixDesc down_desc;
+    ASSERT_TRUE(gate_kernel.exportNativeQuantisedMatrixDesc(gate_desc));
+    ASSERT_TRUE(up_kernel.exportNativeQuantisedMatrixDesc(up_desc));
+    ASSERT_TRUE(down_kernel.exportNativeQuantisedMatrixDesc(down_desc));
 
     ROCmMoEKernel moe_kernel(0);
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
@@ -25162,14 +25162,14 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
                                .top_k = routed_top_k}));
     }
 
-    DeviceNativeVNNIMatrixDesc serial_gate_desc{};
-    DeviceNativeVNNIMatrixDesc serial_up_desc{};
-    DeviceNativeVNNIMatrixDesc serial_down_desc{};
-    DeviceNativeVNNIMatrixDesc routed_probe_down_desc{};
-    ASSERT_TRUE(prepared.gate_kernel->exportNativeVNNIMatrixDesc(serial_gate_desc));
-    ASSERT_TRUE(prepared.up_kernel->exportNativeVNNIMatrixDesc(serial_up_desc));
-    ASSERT_TRUE(prepared.down_kernel->exportNativeVNNIMatrixDesc(serial_down_desc));
-    ASSERT_TRUE(descriptor_probe_down_prepared.kernel->exportNativeVNNIMatrixDesc(
+    DeviceNativeQuantisedMatrixDesc serial_gate_desc{};
+    DeviceNativeQuantisedMatrixDesc serial_up_desc{};
+    DeviceNativeQuantisedMatrixDesc serial_down_desc{};
+    DeviceNativeQuantisedMatrixDesc routed_probe_down_desc{};
+    ASSERT_TRUE(prepared.gate_kernel->exportNativeQuantisedMatrixDesc(serial_gate_desc));
+    ASSERT_TRUE(prepared.up_kernel->exportNativeQuantisedMatrixDesc(serial_up_desc));
+    ASSERT_TRUE(prepared.down_kernel->exportNativeQuantisedMatrixDesc(serial_down_desc));
+    ASSERT_TRUE(descriptor_probe_down_prepared.kernel->exportNativeQuantisedMatrixDesc(
         routed_probe_down_desc));
     ASSERT_NE(routed_probe_down_desc.payload, serial_down_desc.payload)
         << "The routed down-table isolation probe needs a distinct valid descriptor";
@@ -25180,12 +25180,12 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
      * retaining a valid shape and codebook.  Publishing the singleton shared
      * table below must not alter either routed descriptor.  Running this probe
      * inside the existing all-format helper makes the mixed-width registry
-     * contract part of every NativeVNNI codebook gate.
+     * contract part of every NativeQuantised codebook gate.
      */
-    std::vector<DeviceNativeVNNIMatrixDesc> routed_gate_descs(
+    std::vector<DeviceNativeQuantisedMatrixDesc> routed_gate_descs(
         routed_experts,
         serial_gate_desc);
-    std::vector<DeviceNativeVNNIMatrixDesc> routed_up_descs(
+    std::vector<DeviceNativeQuantisedMatrixDesc> routed_up_descs(
         routed_experts,
         serial_up_desc);
     constexpr int descriptor_probe_expert = 1;
@@ -25200,7 +25200,7 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecod
             intermediate);
     ASSERT_GE(routed_gateup_table, 0)
         << "routed descriptor probe rejected format=" << format_name;
-    std::vector<DeviceNativeVNNIMatrixDesc> routed_down_descs(
+    std::vector<DeviceNativeQuantisedMatrixDesc> routed_down_descs(
         routed_experts,
         serial_down_desc);
     routed_down_descs[descriptor_probe_expert] = routed_probe_down_desc;
@@ -25749,7 +25749,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertHalfRouterRequiredQ8PublicationMatchesSeri
             q8->name, q8->make, q8->make, q8->make, 256, type);
 }
 
-TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFormats_RuntimeMMatchSerialStageDecode)
+TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36AllNativeQuantisedFormats_RuntimeMMatchSerialStageDecode)
 {
     for (const int intermediate : {512, 256})
     {
@@ -25884,12 +25884,12 @@ void runSharedExpertVerifierPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     ASSERT_TRUE(up_kernel->weights_converted());
     ASSERT_TRUE(down_kernel->weights_converted());
 
-    DeviceNativeVNNIMatrixDesc gate_desc{};
-    DeviceNativeVNNIMatrixDesc up_desc{};
-    DeviceNativeVNNIMatrixDesc down_desc{};
-    ASSERT_TRUE(gate_kernel->exportNativeVNNIMatrixDesc(gate_desc));
-    ASSERT_TRUE(up_kernel->exportNativeVNNIMatrixDesc(up_desc));
-    ASSERT_TRUE(down_kernel->exportNativeVNNIMatrixDesc(down_desc));
+    DeviceNativeQuantisedMatrixDesc gate_desc{};
+    DeviceNativeQuantisedMatrixDesc up_desc{};
+    DeviceNativeQuantisedMatrixDesc down_desc{};
+    ASSERT_TRUE(gate_kernel->exportNativeQuantisedMatrixDesc(gate_desc));
+    ASSERT_TRUE(up_kernel->exportNativeQuantisedMatrixDesc(up_desc));
+    ASSERT_TRUE(down_kernel->exportNativeQuantisedMatrixDesc(down_desc));
 
     ROCmMoEKernel moe_kernel(0);
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
@@ -25951,7 +25951,7 @@ void runSharedExpertVerifierPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
              * RMSNorm and residual mixing, not after the tiny synthetic values
              * this regression originally used.  Keep the old pattern, but also
              * stress larger row scales so single-ULP expression-tree drift in
-             * NativeVNNI dot or SwiGLU quantization cannot hide until model
+             * NativeQuantised dot or SwiGLU quantization cannot hide until model
              * parity loads the full checkpoint.
              */
             hidden.mutable_data()[i] =
@@ -26035,7 +26035,7 @@ void runSharedExpertVerifierPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
-TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowByRowDecode)
+TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36AllNativeQuantisedFormats_RuntimeMMatchesRowByRowDecode)
 {
     for (const auto &format : allMoEVerifierFormatCases())
     {
@@ -26246,15 +26246,15 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         return static_cast<size_t>(expert_id % routed_variants);
     };
 
-    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(static_cast<size_t>(num_experts));
-    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(static_cast<size_t>(num_experts));
-    std::vector<DeviceNativeVNNIMatrixDesc> down_descs(static_cast<size_t>(num_experts));
+    std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(static_cast<size_t>(num_experts));
+    std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(static_cast<size_t>(num_experts));
+    std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(static_cast<size_t>(num_experts));
     for (int expert = 0; expert < num_experts; ++expert)
     {
         const GemmTriplet &triplet = routed[variant_for_expert(expert)];
-        ASSERT_TRUE(triplet.gate->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
-        ASSERT_TRUE(triplet.up->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(expert)]));
-        ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.gate->exportNativeQuantisedMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.up->exportNativeQuantisedMatrixDesc(up_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.down->exportNativeQuantisedMatrixDesc(down_descs[static_cast<size_t>(expert)]));
         if (masked_local_tp &&
             local_expert_mask[static_cast<size_t>(expert)] == 0u)
         {
@@ -26418,7 +26418,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                  * Certify the production M=1 fusion once per format against
                  * the independently executed split path above.  The check is
                  * deliberately inside the all-format sweep: fused gate/up to
-                 * Q8 publication is generic across NativeVNNI codebooks, so a
+                 * Q8 publication is generic across NativeQuantised codebooks, so a
                  * Q8_0-only regression would leave most physical decoders
                  * unproved.
                  */
@@ -27364,7 +27364,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
  * mirrored MTP sidecar declares @ref RoutedExpertRowExecutionPolicy::FullyReplicatedLocal,
  * so both ROCm participants must retain the complete top-k route and execute
  * the same local expert graph.  This regression exercises that production
- * policy for every model-loadable NativeVNNI format at the Qwen3.6 35B routed
+ * policy for every model-loadable NativeQuantised format at the Qwen3.6 35B routed
  * expert geometry, captures each device graph independently, and requires
  * identical route IDs, route weights, and nonzero FP32 expert output bytes.
  */
@@ -27496,15 +27496,15 @@ TEST(Test__ROCmMoEKernel, ReplicatedMTPRoutedExpertROCm2AllNativeFormatsAreByteI
                 ".rocm1",
             ModelContextId{9200000 + 100 * format_index});
 
-        std::array<DeviceNativeVNNIMatrixDesc, 2> gate_descs{};
-        std::array<DeviceNativeVNNIMatrixDesc, 2> up_descs{};
-        std::array<DeviceNativeVNNIMatrixDesc, 2> down_descs{};
-        ASSERT_TRUE(prepared0.gate_kernel->exportNativeVNNIMatrixDesc(gate_descs[0]));
-        ASSERT_TRUE(prepared0.up_kernel->exportNativeVNNIMatrixDesc(up_descs[0]));
-        ASSERT_TRUE(prepared0.down_kernel->exportNativeVNNIMatrixDesc(down_descs[0]));
-        ASSERT_TRUE(prepared1.gate_kernel->exportNativeVNNIMatrixDesc(gate_descs[1]));
-        ASSERT_TRUE(prepared1.up_kernel->exportNativeVNNIMatrixDesc(up_descs[1]));
-        ASSERT_TRUE(prepared1.down_kernel->exportNativeVNNIMatrixDesc(down_descs[1]));
+        std::array<DeviceNativeQuantisedMatrixDesc, 2> gate_descs{};
+        std::array<DeviceNativeQuantisedMatrixDesc, 2> up_descs{};
+        std::array<DeviceNativeQuantisedMatrixDesc, 2> down_descs{};
+        ASSERT_TRUE(prepared0.gate_kernel->exportNativeQuantisedMatrixDesc(gate_descs[0]));
+        ASSERT_TRUE(prepared0.up_kernel->exportNativeQuantisedMatrixDesc(up_descs[0]));
+        ASSERT_TRUE(prepared0.down_kernel->exportNativeQuantisedMatrixDesc(down_descs[0]));
+        ASSERT_TRUE(prepared1.gate_kernel->exportNativeQuantisedMatrixDesc(gate_descs[1]));
+        ASSERT_TRUE(prepared1.up_kernel->exportNativeQuantisedMatrixDesc(up_descs[1]));
+        ASSERT_TRUE(prepared1.down_kernel->exportNativeQuantisedMatrixDesc(down_descs[1]));
         ASSERT_EQ(gate_descs[0].codebook_id, gate_descs[1].codebook_id);
         ASSERT_EQ(up_descs[0].codebook_id, up_descs[1].codebook_id);
         ASSERT_EQ(down_descs[0].codebook_id, down_descs[1].codebook_id);
@@ -27533,15 +27533,15 @@ TEST(Test__ROCmMoEKernel, ReplicatedMTPRoutedExpertROCm2AllNativeFormatsAreByteI
         kernel0.bindWorkspace(workspace0.get());
         kernel1.bindWorkspace(workspace1.get());
 
-        std::array<std::vector<DeviceNativeVNNIMatrixDesc>, 2> gate_tables = {
-            std::vector<DeviceNativeVNNIMatrixDesc>(num_experts, gate_descs[0]),
-            std::vector<DeviceNativeVNNIMatrixDesc>(num_experts, gate_descs[1])};
-        std::array<std::vector<DeviceNativeVNNIMatrixDesc>, 2> up_tables = {
-            std::vector<DeviceNativeVNNIMatrixDesc>(num_experts, up_descs[0]),
-            std::vector<DeviceNativeVNNIMatrixDesc>(num_experts, up_descs[1])};
-        std::array<std::vector<DeviceNativeVNNIMatrixDesc>, 2> down_tables = {
-            std::vector<DeviceNativeVNNIMatrixDesc>(num_experts, down_descs[0]),
-            std::vector<DeviceNativeVNNIMatrixDesc>(num_experts, down_descs[1])};
+        std::array<std::vector<DeviceNativeQuantisedMatrixDesc>, 2> gate_tables = {
+            std::vector<DeviceNativeQuantisedMatrixDesc>(num_experts, gate_descs[0]),
+            std::vector<DeviceNativeQuantisedMatrixDesc>(num_experts, gate_descs[1])};
+        std::array<std::vector<DeviceNativeQuantisedMatrixDesc>, 2> up_tables = {
+            std::vector<DeviceNativeQuantisedMatrixDesc>(num_experts, up_descs[0]),
+            std::vector<DeviceNativeQuantisedMatrixDesc>(num_experts, up_descs[1])};
+        std::array<std::vector<DeviceNativeQuantisedMatrixDesc>, 2> down_tables = {
+            std::vector<DeviceNativeQuantisedMatrixDesc>(num_experts, down_descs[0]),
+            std::vector<DeviceNativeQuantisedMatrixDesc>(num_experts, down_descs[1])};
 
         const int gateup_table0 = kernel0.uploadGroupedExpertGateUpDescriptorTables(
             gate_tables[0].data(), up_tables[0].data(),
@@ -27578,9 +27578,9 @@ TEST(Test__ROCmMoEKernel, ReplicatedMTPRoutedExpertROCm2AllNativeFormatsAreByteI
 
         auto make_update = [&] (
                                int participant,
-                               const std::vector<DeviceNativeVNNIMatrixDesc> &gate,
-                               const std::vector<DeviceNativeVNNIMatrixDesc> &up,
-                               const std::vector<DeviceNativeVNNIMatrixDesc> &down)
+                               const std::vector<DeviceNativeQuantisedMatrixDesc> &gate,
+                               const std::vector<DeviceNativeQuantisedMatrixDesc> &up,
+                               const std::vector<DeviceNativeQuantisedMatrixDesc> &down)
         {
             MoEPlacementUpdate update;
             update.epoch = 1;
@@ -27827,7 +27827,7 @@ TEST(Test__ROCmMoEKernel, ReplicatedMTPRoutedExpertROCm2AllNativeFormatsAreByteI
 }
 
 
-TEST(Test__ROCmMoEKernel, RoutedOnlyGroupedPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowDecode)
+TEST(Test__ROCmMoEKernel, RoutedOnlyGroupedPrefill_Qwen36AllNativeQuantisedFormats_RuntimeMMatchesRowDecode)
 {
     ScopedEnvOverride perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
@@ -27848,7 +27848,7 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyGroupedPrefill_Qwen36AllNativeVNNIFormats_Ru
     }
 }
 
-TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowDecode)
+TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36AllNativeQuantisedFormats_RuntimeMMatchesRowDecode)
 {
     ScopedEnvOverride perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
@@ -28179,15 +28179,15 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_Ru
         return static_cast<size_t>(expert_id % routed_variants);
     };
 
-    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(static_cast<size_t>(num_experts));
-    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(static_cast<size_t>(num_experts));
-    std::vector<DeviceNativeVNNIMatrixDesc> down_descs(static_cast<size_t>(num_experts));
+    std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(static_cast<size_t>(num_experts));
+    std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(static_cast<size_t>(num_experts));
+    std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(static_cast<size_t>(num_experts));
     for (int expert = 0; expert < num_experts; ++expert)
     {
         const GemmTriplet &triplet = routed[variant_for_expert(expert)];
-        ASSERT_TRUE(triplet.gate->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
-        ASSERT_TRUE(triplet.up->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(expert)]));
-        ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.gate->exportNativeQuantisedMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.up->exportNativeQuantisedMatrixDesc(up_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.down->exportNativeQuantisedMatrixDesc(down_descs[static_cast<size_t>(expert)]));
     }
 
     const int gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
@@ -28661,7 +28661,7 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
     /*
      * Use the model graph's real expert preparation service.  It extracts all
      * 3D GGUF views and batches mask-active experts through one
-     * LoadOrchestrator native-VNNI pool.  Preparing each view independently is
+     * LoadOrchestrator native-quantised pool.  Preparing each view independently is
      * not a production-equivalent oracle: it changes packed-payload ownership,
      * slot alignment, and descriptor pointer layout.
      */
@@ -28748,15 +28748,15 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
         bind_gemm(triplet.down);
     }
 
-    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(static_cast<size_t>(num_experts));
-    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(static_cast<size_t>(num_experts));
-    std::vector<DeviceNativeVNNIMatrixDesc> down_descs(static_cast<size_t>(num_experts));
+    std::vector<DeviceNativeQuantisedMatrixDesc> gate_descs(static_cast<size_t>(num_experts));
+    std::vector<DeviceNativeQuantisedMatrixDesc> up_descs(static_cast<size_t>(num_experts));
+    std::vector<DeviceNativeQuantisedMatrixDesc> down_descs(static_cast<size_t>(num_experts));
     for (const int expert : used_experts)
     {
         const PreparedExpertTriplet &triplet = routed[static_cast<size_t>(expert)];
-        ASSERT_TRUE(triplet.gate->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
-        ASSERT_TRUE(triplet.up->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(expert)]));
-        ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.gate->exportNativeQuantisedMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.up->exportNativeQuantisedMatrixDesc(up_descs[static_cast<size_t>(expert)]));
+        ASSERT_TRUE(triplet.down->exportNativeQuantisedMatrixDesc(down_descs[static_cast<size_t>(expert)]));
     }
 
     const int gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
@@ -29266,7 +29266,7 @@ TEST(Test__ROCmMoEKernel, TransferredCurrentBatchAllNativeFormatsPublishExactByt
     if (device_count <= 0)
         GTEST_SKIP() << "No ROCm device available";
     ASSERT_EQ(hipSetDevice(0), hipSuccess);
-    llaminar2::test::runNativeVNNIExpertTransferGroupedParity(
+    llaminar2::test::runNativeQuantisedExpertTransferGroupedParity(
         "ROCm", llaminar2::DeviceId::rocm(0), rocmMoETestStream(),
         llaminar2::test::NativeExpertTransferProofScope::CopyPublication);
 }
@@ -29313,7 +29313,7 @@ TEST(
         GTEST_SKIP() << "No ROCm device available";
     ASSERT_EQ(hipSetDevice(0), hipSuccess);
 
-    llaminar2::test::runNativeVNNIExpertTransferGroupedParity(
+    llaminar2::test::runNativeQuantisedExpertTransferGroupedParity(
         "ROCm",
         llaminar2::DeviceId::rocm(0),
         rocmMoETestStream());

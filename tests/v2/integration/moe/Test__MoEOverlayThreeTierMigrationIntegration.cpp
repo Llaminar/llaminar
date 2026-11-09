@@ -536,7 +536,7 @@ namespace llaminar2
         struct PhysicalProjectionFlow
         {
             HostGpuExpertPackedProjection expected_gpu;
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             ExpertTierWeightDeviceLayout gpu_to_cpu_layout;
             ExpertTierWeightDeviceLayout cpu_to_gpu_layout;
             std::unique_ptr<DevicePackedProjection> gpu_source;
@@ -652,10 +652,10 @@ namespace llaminar2
                         });
 
                     const auto *source_format =
-                        native_vnni_formats::forSourceIdentity(5, true);
+                        native_quantised_formats::forSourceIdentity(5, true);
                     if (!source_format)
                         throw std::runtime_error(
-                            "Q4_K source format is absent from NativeVNNI catalog");
+                            "Q4_K source format is absent from NativeQuantised catalog");
 
                     for (int expert = 0; expert < 3; ++expert)
                     {
@@ -1277,7 +1277,7 @@ namespace llaminar2
         struct CudaCpuProjectionFlow
         {
             HostGpuExpertPackedProjection expected_gpu;
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             ExpertTierWeightDeviceLayout gpu_to_cpu_layout;
             ExpertTierWeightDeviceLayout cpu_to_gpu_layout;
             std::unique_ptr<DevicePackedProjection> gpu_source;
@@ -1341,11 +1341,11 @@ namespace llaminar2
                     }
 
                     const auto *source_format =
-                        native_vnni_formats::forSourceIdentity(5, true);
+                        native_quantised_formats::forSourceIdentity(5, true);
                     if (!source_format)
                     {
                         throw std::runtime_error(
-                            "Q4_K source format is absent from NativeVNNI catalog");
+                            "Q4_K source format is absent from NativeQuantised catalog");
                     }
 
                     for (int expert = 0; expert < 2; ++expert)

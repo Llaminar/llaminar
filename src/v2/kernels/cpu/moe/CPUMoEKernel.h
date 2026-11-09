@@ -54,7 +54,7 @@ namespace llaminar2
          * Each row is then finalized by one worker using the same softmax,
          * top-k ordering, summation, and normalization as M=1 decode. The
          * method also publishes canonical Q8_1 hidden rows for the paired
-         * NativeVNNI expert consumer.
+         * NativeQuantised expert consumer.
          *
          * @param hidden Contiguous FP32 hidden rows `[seq_len, d_model]`.
          * @param gate_weights FP32 router matrix `[num_experts, d_model]`.
@@ -184,7 +184,7 @@ namespace llaminar2
         /**
          * @brief Return the router-owned Q8_1 rows for the next grouped expert pass.
          *
-         * CPU NativeVNNI expert projections consume Q8_1 activations.  Routing
+         * CPU NativeQuantised expert projections consume Q8_1 activations.  Routing
          * and expert execution therefore share one canonical transform instead
          * of quantizing the same hidden row again for every routed expert.  A
          * publication is valid only for the exact FP32 source address, requested
@@ -207,7 +207,7 @@ namespace llaminar2
          * @brief Publish canonical Q8_1 rows received across a host boundary.
          *
          * ExpertOverlay routing may execute on a GPU while a participant-local
-         * NativeVNNI expert executes on CPU. The fixed-capacity ticket carries
+         * NativeQuantised expert executes on CPU. The fixed-capacity ticket carries
          * the authoritative FP32 rows, so the CPU boundary must perform the
          * same one-time canonical transform normally owned by CPU route(). This
          * is an explicit transport adaptation, not a missing-publication
@@ -355,10 +355,10 @@ namespace llaminar2
         void invalidateRouterQ8HiddenPublication() noexcept;
 
         /**
-         * @brief Quantize and publish runtime-M router inputs for NativeVNNI experts.
+         * @brief Quantize and publish runtime-M router inputs for NativeQuantised experts.
          *
          * The implementation deliberately uses the same Q8_1 block primitives
-         * as serial NativeVNNI decode.  Keeping this transform in the router
+         * as serial NativeQuantised decode.  Keeping this transform in the router
          * makes grouped expert execution both economical and byte-equivalent.
          */
         bool publishRouterQ8Hidden(

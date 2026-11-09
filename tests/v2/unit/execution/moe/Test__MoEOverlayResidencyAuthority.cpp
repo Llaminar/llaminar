@@ -4779,10 +4779,14 @@ namespace llaminar2::test
                 return migration.crossesTier() &&
                        migration.direction !=
                            MoEOverlayTierMigrationDirection::SamePriority &&
-                       migration.axis ==
-                           MoEOptimizationMovementAxis::Combined;
-            }))
-            << "participant intent must survive when every physical edge crosses tiers";
+                       advancesTierResidency(migration.axis);
+            }));
+        EXPECT_TRUE(std::any_of(transaction.migrations.begin(), transaction.migrations.end(),
+            [](const auto &migration) { return advancesParticipantPlacement(migration.axis); }))
+            << "the complete physical cycle must retain its participant objective";
+        EXPECT_TRUE(std::any_of(transaction.migrations.begin(), transaction.migrations.end(),
+            [](const auto &migration) { return migration.axis == MoEOptimizationMovementAxis::TierResidency; }))
+            << "a tier-only command must not acquire another command's participant objective";
 
         RecordingTransport transport(&authority);
         ASSERT_EQ(
@@ -4801,15 +4805,19 @@ namespace llaminar2::test
         const auto ledger = authority.movementLedger();
         ASSERT_TRUE(ledger.complete());
         ASSERT_EQ(ledger.edges.size(), transaction.migrations.size());
-        EXPECT_TRUE(std::all_of(
-            ledger.edges.begin(),
-            ledger.edges.end(),
-            [](const auto &edge)
-            {
-                return edge.valid() &&
-                       edge.axis == MoEOptimizationMovementAxis::Combined;
-            }))
-            << "the durable authority ledger must retain both completed objectives";
+        for (const auto &migration : transaction.migrations)
+        {
+            const auto edge = std::find_if(ledger.edges.begin(), ledger.edges.end(),
+                [&](const auto &record) { return record.layer == migration.layer_idx && record.expert == migration.expert_id; });
+            ASSERT_NE(edge, ledger.edges.end());
+            EXPECT_TRUE(edge->valid());
+            EXPECT_EQ(edge->axis, migration.axis)
+                << "the durable journal must preserve each authored command objective";
+        }
+        EXPECT_TRUE(std::any_of(ledger.edges.begin(), ledger.edges.end(),
+            [](const auto &edge) { return advancesTierResidency(edge.axis); }));
+        EXPECT_TRUE(std::any_of(ledger.edges.begin(), ledger.edges.end(),
+            [](const auto &edge) { return advancesParticipantPlacement(edge.axis); }));
 
         const auto records = PerfStatsCollector::snapshot(
             {"moe_overlay_residency"});
@@ -5825,8 +5833,12 @@ namespace llaminar2::test
 } // namespace llaminar2::test
 
 #include "CPUJointPlacementCandidateContract.inc"
+#include "CPUJointWholeGPUOwnerTransitionContract.inc"
+#include "MoEMigrationCommandAxisContract.inc"
 #include "CPUJointPlacementTransactionContract.inc"
 
 #include "CPUJointAuthoritativeTargetContract.inc"
 
 #include "CPUJointCalibrationTargetContract.inc"
+
+#include "CPUJointWholeGPUAuthorityReplay.inc"

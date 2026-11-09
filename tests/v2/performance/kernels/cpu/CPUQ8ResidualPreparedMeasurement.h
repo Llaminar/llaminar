@@ -102,7 +102,7 @@ inline int runCPUQ8ResidualMeasurement(int argc,char **argv)
     cpuMeasurementRequire(entry!=formats.end(),"CPU timing source is absent from the canonical21 catalog");
     // Raw source fixture construction must obey original native block geometry.
     // Prepared K32 slices are validated separately by source-aware loader tests.
-    const auto *source_format=native_vnni_formats::forQuantType(o.format);
+    const auto *source_format=native_quantised_formats::forQuantType(o.format);
     cpuMeasurementRequire(source_format&&(!source_format->is_superblock||o.k%256==0),
         "CPU timing raw source requires complete original superblocks");
     Threads team(o.workers);
@@ -145,10 +145,10 @@ inline int runCPUQ8ResidualMeasurement(int argc,char **argv)
         std::vector<float>(f.baseline.data(),f.baseline.data()+size_t(o.live)*o.n);
     const std::vector<float> expected_two=o.policy=="single_q8"?std::vector<float>{}:
         std::vector<float>(f.output.data(),f.output.data()+size_t(o.live)*o.n);
-    const auto *packed=f.kernel->exportCPUNativeVNNIPackedWeights();
+    const auto *packed=f.kernel->exportCPUNativeQuantisedPackedWeights();
     cpuMeasurementRequire(packed!=nullptr,"CPU timing source export disappeared");
     const auto *source_pointer=packed->interleavedBase();
-    const std::vector<uint8_t> prepared_before(source_pointer,source_pointer+cpu::native_vnni::interleavedWorkspaceSize(*packed));
+    const std::vector<uint8_t> prepared_before(source_pointer,source_pointer+cpu::native_quantised::interleavedWorkspaceSize(*packed));
     // A bounded independent prepared-source FP64 check gates timing. Full matrix
     // source/oracle and serial-byte coverage belongs to the correctness target.
     auto *primary=static_cast<Q8_1Block *>(f.workspace->get()->getBuffer(kCPUProjectionQ8));

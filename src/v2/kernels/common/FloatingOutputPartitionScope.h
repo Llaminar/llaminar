@@ -4,7 +4,7 @@
  *
  * Mirroring an LM head changes physical N, not its dot-product arithmetic.
  * Floating kernels satisfy the contract with their fixed per-column reduction,
- * independent of N, rather than NativeVNNI's serial-partition dispatch policy.
+ * independent of N, rather than NativeQuantised's serial-partition dispatch policy.
  * This scope binds that requirement to one kernel on one recording thread; it
  * is not execution state and introduces no GPU transfers or mutable graph input.
  */

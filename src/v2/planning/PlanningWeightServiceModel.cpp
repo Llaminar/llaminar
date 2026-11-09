@@ -11,7 +11,7 @@
 #include "utils/DebugEnv.h"
 #include "PlanningWeightServiceModel.h"
 #include "AutomaticPlanningStartup.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -50,11 +50,11 @@ namespace llaminar2
         double gpuProjectionBytes(const PlanningWeightOperand &operand, WeightShardMatrix matrix)
         {
             const auto format = operand.executionFormat();
-            if (const auto *native = native_vnni_formats::forQuantType(format))
+            if (const auto *native = native_quantised_formats::forQuantType(format))
             {
                 if (matrix.columns % 32 != 0)
                     throw std::invalid_argument("GPU expert work requires complete native execution blocks");
-                return nativeVnniPackedRegionSizes(matrix.rows, matrix.columns, *native).logicalBytes();
+                return nativeQuantisedPackedRegionSizes(matrix.rows, matrix.columns, *native).logicalBytes();
             }
             if (format != "F32" && format != "F16" && format != "BF16")
                 throw std::invalid_argument("GPU expert work has an unsupported executed projection format");

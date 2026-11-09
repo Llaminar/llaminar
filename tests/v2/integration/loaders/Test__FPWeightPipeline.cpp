@@ -99,9 +99,9 @@ TEST(Test__FPWeightPipeline, PlanRawWeight_SlotHasNoScales)
     EXPECT_GT(slot->payload_bytes, 0u);
     EXPECT_EQ(slot->staging_bytes, 64u * 128 * 4);
     // Raw FP weights have no scales/mins/emins
-    EXPECT_EQ(slot->d_native_vnni_scales, nullptr);
-    EXPECT_EQ(slot->d_native_vnni_mins, nullptr);
-    EXPECT_EQ(slot->d_native_vnni_emins, nullptr);
+    EXPECT_EQ(slot->d_native_quantised_scales, nullptr);
+    EXPECT_EQ(slot->d_native_quantised_mins, nullptr);
+    EXPECT_EQ(slot->d_native_quantised_emins, nullptr);
 }
 
 TEST(Test__FPWeightPipeline, PlanRawWeight_MixedWithQuantized)
@@ -123,8 +123,8 @@ TEST(Test__FPWeightPipeline, PlanRawWeight_MixedWithQuantized)
 
     // Quantized slot should have scales, FP slot should not
     // (with nullptr backend, both d_base_ is nullptr, but scales pointer logic is tested)
-    EXPECT_EQ(fp_slot->d_native_vnni_scales, nullptr);
-    EXPECT_EQ(fp_slot->d_native_vnni_mins, nullptr);
+    EXPECT_EQ(fp_slot->d_native_quantised_scales, nullptr);
+    EXPECT_EQ(fp_slot->d_native_quantised_mins, nullptr);
 }
 
 // ============================================================================
@@ -256,12 +256,12 @@ TEST_F(Test__FPDeviceLoadPipeline, RAW_FP_SingleWeight_ByteForByteParity)
     auto slot = pool.getSlot("fp32_test");
     ASSERT_TRUE(slot.has_value());
     EXPECT_EQ(slot->payload_bytes, raw_bytes);
-    EXPECT_EQ(slot->d_native_vnni_scales, nullptr);
+    EXPECT_EQ(slot->d_native_quantised_scales, nullptr);
 
     std::vector<float> gpu_data(N * K);
     ASSERT_TRUE(backend_->deviceToHost(
         gpu_data.data(),
-        slot->d_native_vnni_payload,
+        slot->d_native_quantised_payload,
         raw_bytes,
         0,
         verification_stream_));
@@ -320,7 +320,7 @@ TEST_F(Test__FPDeviceLoadPipeline, RAW_FP_FP16Weight_ByteForByteParity)
     std::vector<uint16_t> gpu_data(N * K);
     ASSERT_TRUE(backend_->deviceToHost(
         gpu_data.data(),
-        slot->d_native_vnni_payload,
+        slot->d_native_quantised_payload,
         raw_bytes,
         0,
         verification_stream_));
@@ -357,15 +357,15 @@ TEST_F(Test__FPDeviceLoadPipeline, RAW_FP_MixedWithQuantized)
     ASSERT_TRUE(fp_slot.has_value());
 
     // Q4 slot has scales; FP slot does not
-    EXPECT_NE(q4_slot->d_native_vnni_scales, nullptr);
-    EXPECT_EQ(fp_slot->d_native_vnni_scales, nullptr);
+    EXPECT_NE(q4_slot->d_native_quantised_scales, nullptr);
+    EXPECT_EQ(fp_slot->d_native_quantised_scales, nullptr);
 
     // Both have payload pointers
-    EXPECT_NE(q4_slot->d_native_vnni_payload, nullptr);
-    EXPECT_NE(fp_slot->d_native_vnni_payload, nullptr);
+    EXPECT_NE(q4_slot->d_native_quantised_payload, nullptr);
+    EXPECT_NE(fp_slot->d_native_quantised_payload, nullptr);
 
     // Payload pointers should be different (non-overlapping regions)
-    EXPECT_NE(q4_slot->d_native_vnni_payload, fp_slot->d_native_vnni_payload);
+    EXPECT_NE(q4_slot->d_native_quantised_payload, fp_slot->d_native_quantised_payload);
 
     // Setup pipeline and run just the FP job (to verify passthrough path alone)
     PinnedRingBuffer pinned(fp_raw_bytes, num_streams);
@@ -389,7 +389,7 @@ TEST_F(Test__FPDeviceLoadPipeline, RAW_FP_MixedWithQuantized)
     std::vector<float> gpu_data(N * K);
     ASSERT_TRUE(backend_->deviceToHost(
         gpu_data.data(),
-        fp_slot->d_native_vnni_payload,
+        fp_slot->d_native_quantised_payload,
         fp_raw_bytes,
         0,
         verification_stream_));
@@ -458,7 +458,7 @@ TEST_F(Test__FPDeviceLoadPipeline, RAW_FP_MultipleWeights_StreamReuse)
         std::vector<float> gpu_data(N * K);
         ASSERT_TRUE(backend_->deviceToHost(
             gpu_data.data(),
-            slot->d_native_vnni_payload,
+            slot->d_native_quantised_payload,
             raw_bytes,
             0,
             verification_stream_));
@@ -526,13 +526,13 @@ TEST_F(Test__FPDeviceLoadPipeline, LoadOrchestrator_EndToEnd_RawFP)
     std::vector<float> gpu_q(N * K), gpu_v(N * K);
     ASSERT_TRUE(backend_->deviceToHost(
         gpu_q.data(),
-        slot_q->d_native_vnni_payload,
+        slot_q->d_native_quantised_payload,
         raw_bytes,
         0,
         verification_stream_));
     ASSERT_TRUE(backend_->deviceToHost(
         gpu_v.data(),
-        slot_v->d_native_vnni_payload,
+        slot_v->d_native_quantised_payload,
         raw_bytes,
         0,
         verification_stream_));
@@ -581,7 +581,7 @@ TEST_F(Test__FPDeviceLoadPipeline, LoadOrchestrator_ChunkedRawFPParity)
     std::vector<float> gpu_data(static_cast<size_t>(N) * K);
     ASSERT_TRUE(backend_->deviceToHost(
         gpu_data.data(),
-        slot->d_native_vnni_payload,
+        slot->d_native_quantised_payload,
         raw_bytes,
         0,
         verification_stream_));

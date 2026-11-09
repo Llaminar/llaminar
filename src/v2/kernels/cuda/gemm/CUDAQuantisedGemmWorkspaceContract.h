@@ -11,7 +11,7 @@
 #pragma once
 #include "interfaces/IWorkspaceConsumer.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
-#include "CUDANativeVNNIWorkspaceHardware.h"
+#include "CUDANativeQuantisedWorkspaceHardware.h"
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -45,7 +45,7 @@ namespace llaminar2::cuda::quantized_gemm_workspace
      * @return The production named-buffer BOM without consulting runtime globals.
      */
     WorkspaceRequirements projectionRequirements(int m, int n, int k,
-        const NativeVNNIWorkspaceHardware &hardware, std::optional<NativeCodebooks> native);
+        const NativeQuantisedWorkspaceHardware &hardware, std::optional<NativeCodebooks> native);
 
     /** @brief Add disjoint verifier partials for simultaneously executing projections. */
     void appendFusedProjectionRequirements(WorkspaceRequirements &requirements, int m,

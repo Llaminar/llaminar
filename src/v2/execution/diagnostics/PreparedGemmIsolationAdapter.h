@@ -17,7 +17,7 @@
 #include "../../loaders/PreparedWeightStore.h"
 #include "../../tensors/ITensor.h"
 #include "../../transfer/TransferEngine.h"
-#include "../../tensors/NativeVnniFormatInfo.h"
+#include "../../tensors/NativeQuantisedFormatInfo.h"
 #include <tuple>
 #include <map>
 
@@ -49,7 +49,7 @@ struct IsolationWorkspaceBaseline
 }
 
 /**
- * @brief Initial runnable adapter: static plain alpha1/beta0 prepared NativeVNNI dense GEMM only.
+ * @brief Initial runnable adapter: static plain alpha1/beta0 prepared NativeQuantised dense GEMM only.
  *
  * The concrete Params and actual StageBufferContract jointly define closure.
  * Routes, live counts, recurrent state, raw bias and fused operations require
@@ -107,22 +107,22 @@ public:
         engine_=store_->gemmKernel(*p.prepared_ref);
         if(!engine_ || dynamic_cast<ITensorGemm *>(stage_->getKernelAsWorkspaceConsumer())!=engine_)
             throw std::invalid_argument("GEMM isolation must resolve its actual engine before capture");
-        if(!engine_->inspectPreparedNativeVNNIMatrixDesc(weight_) || !weight_.valid() ||
+        if(!engine_->inspectPreparedNativeQuantisedMatrixDesc(weight_) || !weight_.valid() ||
             !weight_.source_identity_present || weight_.n!=p.n || weight_.k!=p.k || p.k%32)
-            throw std::invalid_argument("Initial isolation adapter requires exact prepared NativeVNNI metadata");
-        std::optional<NativeVnniFormatInfo> physical;
-        for(const auto &source:native_vnni_formats::kAllSourceFormats)
+            throw std::invalid_argument("Initial isolation adapter requires exact prepared NativeQuantised metadata");
+        std::optional<NativeQuantisedFormatInfo> physical;
+        for(const auto &source:native_quantised_formats::kAllSourceFormats)
             if(source.metadata->codebook_id==weight_.source_codebook_id &&
                 source.metadata->is_superblock==bool(weight_.source_is_superblock))
                 for(const auto format:{canonicalDeviceVnniFormat(*source.metadata),migrationStableDeviceVnniFormat(*source.metadata)})
                     if(format.codebook_id==weight_.codebook_id)
                         // Physical storage view only; original source identity remains in weight_.
-                        physical=NativeVnniFormatInfo{.codebook_id=format.codebook_id,
+                        physical=NativeQuantisedFormatInfo{.codebook_id=format.codebook_id,
                             .payload_bytes=format.payload_bytes_per_block,.is_asymmetric=format.is_asymmetric,
                             .is_superblock=false,.has_emins=format.has_emins,
                             .max_abs_factor=source.metadata->max_abs_factor};
         if(!physical) throw std::invalid_argument("Initial isolation adapter cannot authenticate prepared format regions");
-        const auto sizes=nativeVnniPackedRegionSizes(std::size_t(p.n),std::size_t(p.k),*physical);
+        const auto sizes=nativeQuantisedPackedRegionSizes(std::size_t(p.n),std::size_t(p.k),*physical);
         weights_={{{reinterpret_cast<std::uintptr_t>(weight_.payload),sizes.payload_bytes},
                   {reinterpret_cast<std::uintptr_t>(weight_.scales),sizes.scales_bytes},
                   {reinterpret_cast<std::uintptr_t>(weight_.mins),sizes.mins_bytes},
@@ -359,7 +359,7 @@ private:
         stream_=stream; frozen_=true;
     }
     /** @brief Compare named immutable descriptor fields; C++ padding is never identity. */
-    static bool sameDescriptor(const DeviceNativeVNNIMatrixDesc &a,const DeviceNativeVNNIMatrixDesc &b) noexcept
+    static bool sameDescriptor(const DeviceNativeQuantisedMatrixDesc &a,const DeviceNativeQuantisedMatrixDesc &b) noexcept
     {
         return std::tie(a.payload, a.scales, a.mins, a.emins, a.n, a.k, a.blocks_per_row, a.codebook_id, a.allocation_payload_bytes_per_block, a.allocation_has_mins, a.allocation_has_emins, a.source_codebook_id, a.source_is_superblock, a.source_identity_present, a.reserved, a.reserved_tail) ==
                std::tie(b.payload, b.scales, b.mins, b.emins, b.n, b.k, b.blocks_per_row, b.codebook_id, b.allocation_payload_bytes_per_block, b.allocation_has_mins, b.allocation_has_emins, b.source_codebook_id, b.source_is_superblock, b.source_identity_present, b.reserved, b.reserved_tail);
@@ -376,8 +376,8 @@ private:
             arena_->getTensor(*p.a_buffer_id)!=p.A || arena_->getTensor(*p.c_buffer_id)!=p.C ||
             store_->gemmKernel(*p.prepared_ref)!=engine_ || stage_->getWorkspace()!=workspace_.get() || !stage_->hasWorkspace())
             throw std::logic_error("Isolation prepared/input/workspace binding changed");
-        DeviceNativeVNNIMatrixDesc current{};
-        if(!engine_->inspectPreparedNativeVNNIMatrixDesc(current) || !sameDescriptor(current,weight_))
+        DeviceNativeQuantisedMatrixDesc current{};
+        if(!engine_->inspectPreparedNativeQuantisedMatrixDesc(current) || !sameDescriptor(current,weight_))
             throw std::logic_error("Isolation immutable prepared descriptor changed");
         for(const auto &entry:scratch_baselines_)
         {
@@ -403,7 +403,7 @@ private:
     const IsolationOutputPartitionPolicy partition_;
     DeviceId device_;
     ITensorGemm *engine_=nullptr;
-    DeviceNativeVNNIMatrixDesc weight_{};
+    DeviceNativeQuantisedMatrixDesc weight_{};
     std::array<std::pair<std::uintptr_t,std::size_t>,4> weights_;
     std::size_t input_bytes_=0,output_bytes_=0;
     std::optional<CapturedComputeIsolationContract> contract_;

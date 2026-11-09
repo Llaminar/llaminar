@@ -23,7 +23,7 @@
 #include "planning/PlanningGPUExpertMeasurement.h"
 #include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
 #include "../../../utils/CPUExecutionTestGeometry.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <gtest/gtest.h>
 
@@ -115,13 +115,13 @@ namespace llaminar2
             ExpertTierWeightProjection role,
             int N,
             int K,
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             return {
                 .projection = role,
                 .N = N,
                 .K = K,
-                .format = ExpertWeightFormat::nativeVnni({
+                .format = ExpertWeightFormat::nativeQuantised({
                     .codebook_id = format.codebook_id,
                     .is_superblock = format.is_superblock,
                     .present = true,
@@ -132,7 +132,7 @@ namespace llaminar2
         /** @return One valid gate/up/down layer with non-trivial alignment edges. */
         [[nodiscard]] MoEOverlayLayerWeightManifest layer(
             int layer_idx,
-            const NativeVnniFormatInfo &format,
+            const NativeQuantisedFormatInfo &format,
             int geometry_delta = 0)
         {
             MoEOverlayLayerWeightManifest result;
@@ -160,7 +160,7 @@ namespace llaminar2
         /** @return A contiguous model manifest using one source codebook. */
         [[nodiscard]] std::vector<MoEOverlayLayerWeightManifest> manifest(
             int layer_count,
-            const NativeVnniFormatInfo &format,
+            const NativeQuantisedFormatInfo &format,
             bool vary_geometry = false)
         {
             std::vector<MoEOverlayLayerWeightManifest> result;
@@ -177,7 +177,7 @@ namespace llaminar2
 
         /** @return Independently expected CPU interleaved unit stride. */
         [[nodiscard]] constexpr std::size_t expectedCpuStride(
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             // Independently describe the compact multi-scale unit: 16 native
             // payload bytes per column, two half scales and two half minima.
@@ -205,7 +205,7 @@ namespace llaminar2
         /** @return Independently expected allocation for one CPU projection. */
         [[nodiscard]] std::size_t expectedCpuProjectionBytes(
             const MoEOverlayProjectionWeightManifest &spec,
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             const std::size_t padded_n = testAlignUp(
                 static_cast<std::size_t>(spec.N), 64);
@@ -244,7 +244,7 @@ namespace llaminar2
 
         /** @return Migration-stable GPU payload width for a CPU round trip. */
         [[nodiscard]] constexpr int expectedMigrationPayload(
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             // These sources never normalize to a single-scale INT8 GPU blob.
             // Migration preserves their native payload and all metadata planes.
@@ -268,7 +268,7 @@ namespace llaminar2
         /** @return Expected complete gate/up/down footprint from independent math. */
         [[nodiscard]] MoEOverlayPreparedExpertFootprint expectedFootprint(
             const MoEOverlayLayerWeightManifest &model_layer,
-            const NativeVnniFormatInfo &format)
+            const NativeQuantisedFormatInfo &format)
         {
             MoEOverlayPreparedExpertFootprint expected;
             expected.layer_idx = model_layer.layer_idx;
@@ -498,7 +498,7 @@ namespace llaminar2
         const auto capacity = Directory::planBufferedCapacity(1, 1, 2);
         for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
         {
-            auto model_manifest = manifest(2, native_vnni_formats::Q8_0);
+            auto model_manifest = manifest(2, native_quantised_formats::Q8_0);
             size_t wire_bytes = 0;
             WeightVRAMPool planner;
             for (auto &layer : model_manifest)
@@ -532,7 +532,7 @@ namespace llaminar2
     TEST(MoEOverlayCapacityResolver, MixedProjectionAdmissionNamesExactSourceTensors)
     {
         using Directory = DeviceMoETransferSlotDirectory;
-        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        for (const auto &source : native_quantised_formats::kAllSourceFormats)
         {
             for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
             {
@@ -554,7 +554,7 @@ namespace llaminar2
                         for (const auto *projection_name : {"gate", "up", "down"})
                             EXPECT_NE(message.find("blk.1.ffn_" + std::string(projection_name) +
                                                    "_exps.weight="), std::string::npos);
-                        EXPECT_NE(message.find("NativeVNNI/" + std::string(source.quant_type)),
+                        EXPECT_NE(message.find("NativeQuantised/" + std::string(source.quant_type)),
                                   std::string::npos);
                         const std::string precision = type == TensorType::FP16 ? "FP16" :
                             type == TensorType::BF16 ? "BF16" : "FP32";
@@ -578,7 +578,7 @@ namespace llaminar2
             for (const auto second : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
             {
                 if (first == second) continue;
-                auto mixed_precision = manifest(1, native_vnni_formats::Q8_0);
+                auto mixed_precision = manifest(1, native_quantised_formats::Q8_0);
                 for (auto &projection : mixed_precision.front().projections)
                     projection.format = ExpertWeightFormat::floating(first);
                 mixed_precision.front().projections[2].format = ExpertWeightFormat::floating(second);
@@ -589,8 +589,8 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, EveryCataloguedCodebookHasExactCpuAndGpuFootprint)
     {
-        ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
-        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        ASSERT_EQ(native_quantised_formats::kAllSourceFormats.size(), 21u);
+        for (const auto &source : native_quantised_formats::kAllSourceFormats)
         {
             SCOPED_TRACE(::testing::Message() << source.quant_type);
             ASSERT_NE(source.metadata, nullptr);
@@ -757,7 +757,7 @@ namespace llaminar2
         constexpr int experts = 8;
         // Small geometry exercises the same byte contracts without creating a
         // backend or mapping a model. One GPU is deliberately the limiting peer.
-        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        for (const auto &source : native_quantised_formats::kAllSourceFormats)
         for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
         {
             SCOPED_TRACE(::testing::Message() << source.quant_type << '/' << static_cast<int>(backend));
@@ -863,7 +863,7 @@ namespace llaminar2
         constexpr int kExperts = 256;
         constexpr std::uint32_t kHotReplicasPerParticipant = 25u;
         const auto model_manifest =
-            manifest(kLayers, native_vnni_formats::Q4_K);
+            manifest(kLayers, native_quantised_formats::Q4_K);
         const auto profile =
             DeviceMoETransferSlotDirectory::
                 profileForLayerWeightManifest(model_manifest);
@@ -1034,7 +1034,7 @@ namespace llaminar2
     {
         constexpr int kExperts = 6;
         const auto model_manifest = manifest(
-            2, native_vnni_formats::Q4_K, /*vary_geometry=*/true);
+            2, native_quantised_formats::Q4_K, /*vary_geometry=*/true);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
 
@@ -1176,7 +1176,7 @@ namespace llaminar2
     {
         constexpr int kExperts = 8;
         const auto model_manifest = manifest(
-            1, native_vnni_formats::Q4_K);
+            1, native_quantised_formats::Q4_K);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
 
@@ -1282,7 +1282,7 @@ namespace llaminar2
          MigrationFabricSelectsInitialSourceResidencyPolicy)
     {
         const auto model_manifest = manifest(
-            1, native_vnni_formats::Q4_0);
+            1, native_quantised_formats::Q4_0);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         const auto cuda_budget = exactBudget(
@@ -1349,7 +1349,7 @@ namespace llaminar2
     {
         constexpr int kExperts = 6;
         const auto model_manifest = manifest(
-            2, native_vnni_formats::Q4_K, /*vary_geometry=*/true);
+            2, native_quantised_formats::Q4_K, /*vary_geometry=*/true);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
 
@@ -1459,7 +1459,7 @@ namespace llaminar2
          SharedPhysicalResourceIsChargedOnceAcrossOpaqueLogicalTiers)
     {
         constexpr int kExperts = 2;
-        const auto model_manifest = manifest(1, native_vnni_formats::Q5_K);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q5_K);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         const auto shared_budget = exactBudget(
@@ -1528,7 +1528,7 @@ namespace llaminar2
     TEST(MoEOverlayCapacityAdmission,
          MissingBoundResourceAndTensorShardedTierFailClosed)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q4_0);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q4_0);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         const auto budget = exactBudget(
@@ -1615,7 +1615,7 @@ namespace llaminar2
             .overlay_world_size = 2,
         };
         const auto charges = MoEOverlayCapacityAdmission::transferStagingBOM(
-            plan, /*world_size=*/2, policy,manifest(1,native_vnni_formats::Q4_0),4);
+            plan, /*world_size=*/2, policy,manifest(1,native_quantised_formats::Q4_0),4);
         const auto bytesFor = [&](int rank, DeviceId device)
         {
             const auto found = std::find_if(
@@ -1645,7 +1645,7 @@ namespace llaminar2
         EXPECT_THROW(
             (void)MoEOverlayCapacityAdmission::transferStagingBOM(
                 plan, /*world_size=*/2,
-                underprovisioned_two_cycle_policy,manifest(1,native_vnni_formats::Q4_0),4),
+                underprovisioned_two_cycle_policy,manifest(1,native_quantised_formats::Q4_0),4),
             std::invalid_argument);
 
         auto two_cycle_policy = underprovisioned_two_cycle_policy;
@@ -1656,7 +1656,7 @@ namespace llaminar2
                     two_cycle_policy.maximum_cycles_per_layer);
         const auto two_cycle_charges =
             MoEOverlayCapacityAdmission::transferStagingBOM(
-                plan, /*world_size=*/2, two_cycle_policy,manifest(1,native_vnni_formats::Q4_0),4);
+                plan, /*world_size=*/2, two_cycle_policy,manifest(1,native_quantised_formats::Q4_0),4);
         ASSERT_EQ(two_cycle_charges.size(), charges.size());
         for (std::size_t index = 0; index < charges.size(); ++index)
         {
@@ -1686,7 +1686,7 @@ namespace llaminar2
         const auto broad_charges =
             MoEOverlayCapacityAdmission::transferStagingBOM(
                 plan, /*world_size=*/2,
-                broad_one_cycle_per_layer_policy,manifest(8,native_vnni_formats::Q4_0),4);
+                broad_one_cycle_per_layer_policy,manifest(8,native_quantised_formats::Q4_0),4);
         ASSERT_EQ(broad_charges.size(), charges.size());
         for (std::size_t index = 0; index < charges.size(); ++index)
         {
@@ -2656,7 +2656,7 @@ namespace llaminar2
     TEST(MoEOverlayLocalCapacityPlanner, PipelineCPUSetupUsesOwnedSourceIntervalAllFormats)
     {
         std::vector<std::string> formats{"F16", "BF16", "F32"};
-        for (const auto &format : native_vnni_formats::kAllSourceFormats)
+        for (const auto &format : native_quantised_formats::kAllSourceFormats)
             formats.emplace_back(format.quant_type);
         for (const auto &format : formats)
         {
@@ -3236,7 +3236,7 @@ namespace llaminar2
             gpu_load.maximum_source_bytes,
             gpu_load.policy);
         const auto model_manifest = manifest(
-            /*layers=*/1, native_vnni_formats::Q4_0);
+            /*layers=*/1, native_quantised_formats::Q4_0);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         ASSERT_EQ(footprints.size(), 1u);
@@ -3399,7 +3399,7 @@ namespace llaminar2
         auto large = planForRows(4096);
 
         const auto model_manifest = manifest(
-            profile.n_layers, native_vnni_formats::Q4_1);
+            profile.n_layers, native_quantised_formats::Q4_1);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         ASSERT_EQ(footprints.size(), 2u);
@@ -3485,7 +3485,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, SharedPhysicalResourceAggregatesEveryTierCopy)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q6_K);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q6_K);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3529,7 +3529,7 @@ namespace llaminar2
         constexpr int kLayerCount = 4;
         const auto model_manifest = manifest(
             kLayerCount,
-            native_vnni_formats::Q4_0,
+            native_quantised_formats::Q4_0,
             /*vary_geometry=*/false);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
@@ -3589,7 +3589,7 @@ namespace llaminar2
     TEST(MoEOverlayCapacityResolver,
          CapacityFailureReportsExactLimitingPhysicalBom)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q4_0);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q4_0);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         ASSERT_EQ(footprints.size(), 1u);
@@ -3650,7 +3650,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, ReplicatedTierChargesEveryParticipantCopy)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q5_1);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q5_1);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3699,7 +3699,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, EmptyTierStillPaysForMaterializedShadowBanks)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::IQ2_S);
+        const auto model_manifest = manifest(1, native_quantised_formats::IQ2_S);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3739,7 +3739,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, FallbackCoverageFailsClosedWhenOneExpertDoesNotFit)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q8_K);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q8_K);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3760,7 +3760,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, AutomaticUpperBoundsLimitHotTierAndFallbackCoverage)
     {
-        const auto model_manifest = manifest(2, native_vnni_formats::Q4_1);
+        const auto model_manifest = manifest(2, native_quantised_formats::Q4_1);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3823,7 +3823,7 @@ namespace llaminar2
             .matrices = {{{512, 2048, 0}, {512, 2048, 0}, {2048, 512, 0}}},
             .formats = {"Q8_0", "Q8_0", "Q8_0"}, .layer = 34,
             .source_bytes = 0, .largest_source_bytes = 0};
-        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        for (const auto &source : native_quantised_formats::kAllSourceFormats)
         {
             description.formats = {std::string(source.quant_type), "Q8_0", "Q4_K"};
             EXPECT_NO_THROW(PlanningGPUExpertMeasurement::validateSourceArithmetic(request, description));
@@ -3871,7 +3871,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, MalformedTopologyAndOverflowAreRejected)
     {
-        const auto model_manifest = manifest(1, native_vnni_formats::Q4_0);
+        const auto model_manifest = manifest(1, native_quantised_formats::Q4_0);
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
         MoEOverlayCapacityResolverInput input;
@@ -3912,7 +3912,7 @@ namespace llaminar2
     /** @brief Stage origins change identity, never physical bytes or row counts. */
     TEST(MoEOverlayCapacityResolver, PipelineStageCapacityUsesOnlyOwnedRowsAcrossFormatsAndBackends)
     {
-        for (const auto &format : native_vnni_formats::kAllSourceFormats)
+        for (const auto &format : native_quantised_formats::kAllSourceFormats)
         for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
         {
             const auto base_manifest = manifest(2, *format.metadata, true);
@@ -3981,7 +3981,7 @@ namespace llaminar2
                                std::array{33, 32}, std::array{std::numeric_limits<int>::max() - 1,
                                                           std::numeric_limits<int>::max()}})
         {
-            const std::vector malformed{layer(ids[0], native_vnni_formats::Q4_K), layer(ids[1], native_vnni_formats::Q4_K)};
+            const std::vector malformed{layer(ids[0], native_quantised_formats::Q4_K), layer(ids[1], native_quantised_formats::Q4_K)};
             EXPECT_THROW((void)MoEOverlayCapacityResolver::preparedFootprints(malformed), std::invalid_argument);
             EXPECT_THROW((void)DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(malformed), std::invalid_argument);
         }
@@ -3997,7 +3997,7 @@ namespace llaminar2
         plan.continuation_domain = plan.shared_expert_domain = "stage";
         plan.domains = {boundDomain("stage", 0, GlobalDeviceAddress::cpu(0))};
         plan.routed_tiers = {{.name = "owned", .domain = "stage", .priority = 0, .fallback = true}};
-        const std::vector owned{layer(32, native_vnni_formats::Q4_K), layer(33, native_vnni_formats::Q4_K)};
+        const std::vector owned{layer(32, native_quantised_formats::Q4_K), layer(33, native_quantised_formats::Q4_K)};
         const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(owned);
         const std::vector budgets{boundBudget(0, exactBudget("stage", DeviceId::cpu(), footprints, {2, 2}, 0))};
         const auto input = MoEOverlayCapacityAdmission::buildResolverInput(plan, 2, owned, budgets, {});
@@ -4014,7 +4014,7 @@ namespace llaminar2
         const auto make_draft=[] {
             MoEOverlayCapacityResolverInput input;
             input.num_experts=4;
-            input.layer_weight_manifest=manifest(1,native_vnni_formats::Q4_K);
+            input.layer_weight_manifest=manifest(1,native_quantised_formats::Q4_K);
             const auto footprints=MoEOverlayCapacityResolver::preparedFootprints(input.layer_weight_manifest);
             const auto bound=boundBudget(0,exactBudget("gpu",DeviceId::cuda(0),footprints,{4},1));
             input.physical_budgets.emplace_back("gpu",bound.certificate());
@@ -4065,7 +4065,7 @@ namespace llaminar2
     /** @test Disjoint stages share one deferred physical plan and one final table/certificate. */
     TEST(MoEOverlayCapacityResolver, PipelineDraftFinalizesOneRankTableWithoutRecomputingStageQuotas)
     {
-        auto manifests=manifest(2,native_vnni_formats::Q4_K);
+        auto manifests=manifest(2,native_quantised_formats::Q4_K);
         const auto footprint=MoEOverlayCapacityResolver::preparedFootprints({manifests.front()});
         const auto raw=exactBudget("gpu",DeviceId::cuda(0),footprint,{4},1);
         const auto capacity=raw.usableBudgetBytes()*2u;

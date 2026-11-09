@@ -36,8 +36,8 @@ namespace llaminar2
     /** Physical representation transmitted between two MPI ranks. */
     enum class MoEOverlayRemoteProjectionPacking : std::uint8_t
     {
-        CpuNativeVnniInterleaved = 1, ///< Live native CPU column planes; resident padding is excluded.
-        GpuSeparatedNativeVnni = 2,   ///< Payload/scales/mins/emins blobs.
+        CpuNativeQuantisedInterleaved = 1, ///< Live native CPU column planes; resident padding is excluded.
+        GpuSeparatedNativeQuantised = 2,   ///< Payload/scales/mins/emins blobs.
         ContiguousFloating = 3,       ///< One raw FP16/BF16/FP32 matrix blob.
     };
 
@@ -95,7 +95,7 @@ namespace llaminar2
         std::uint32_t magic = kMagic;
         std::uint16_t abi_version = kABIVersion;
         MoEOverlayRemoteProjectionPacking packing =
-            MoEOverlayRemoteProjectionPacking::CpuNativeVnniInterleaved;
+            MoEOverlayRemoteProjectionPacking::CpuNativeQuantisedInterleaved;
         /** Mathematical representation family carried by this manifest. */
         ExpertWeightFormatKind format_kind =
             ExpertWeightFormatKind::Invalid;
@@ -117,8 +117,8 @@ namespace llaminar2
         std::uint8_t cpu_is_superblock = 0;
         std::uint8_t gpu_is_asymmetric = 0;
         std::uint8_t gpu_has_emins = 0;
-        cpu::native_vnni::CPUNativeVNNIEncoding cpu_encoding =
-            cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8;
+        cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding =
+            cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
         std::uint8_t reserved_format[2]{};
 
         std::uint32_t cpu_data_stride = 0;
@@ -188,14 +188,14 @@ namespace llaminar2
         [[nodiscard]] bool carriesCpuBytes() const noexcept
         {
             return packing == MoEOverlayRemoteProjectionPacking::
-                                  CpuNativeVnniInterleaved;
+                                  CpuNativeQuantisedInterleaved;
         }
 
         /** @return Whether the wire carries common separated GPU arrays. */
         [[nodiscard]] bool carriesGpuBytes() const noexcept
         {
             return packing == MoEOverlayRemoteProjectionPacking::
-                                  GpuSeparatedNativeVnni;
+                                  GpuSeparatedNativeQuantised;
         }
 
         /** @return Whether region zero is one contiguous floating matrix. */
@@ -216,7 +216,7 @@ namespace llaminar2
     [[nodiscard]] MoEOverlayRemoteProjectionManifest
     makeMoEOverlayRemoteCpuProjectionManifest(
         const MoEOverlayRemoteProjectionIdentity &identity,
-        const cpu::native_vnni::CPUNativeVNNIPackedWeights &source,
+        const cpu::native_quantised::CPUNativeQuantisedPackedWeights &source,
         std::uint32_t maximum_chunk_bytes);
 
     /**
@@ -230,7 +230,7 @@ namespace llaminar2
      */
     [[nodiscard]] MoEOverlayRemoteProjectionManifest makeMoEOverlayRemoteCpuDestinationProjectionManifest(
         const MoEOverlayRemoteProjectionIdentity &identity,
-        const cpu::native_vnni::CPUNativeVNNIPackedWeights &destination,
+        const cpu::native_quantised::CPUNativeQuantisedPackedWeights &destination,
         const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t maximum_chunk_bytes);
 
     /**
@@ -258,7 +258,7 @@ namespace llaminar2
     makeMoEOverlayRemoteGpuProjectionManifest(
         const MoEOverlayRemoteProjectionIdentity &identity,
         const GpuExpertPackedDescriptor &source,
-        NativeVnniSourceIdentity source_identity,
+        NativeQuantisedSourceIdentity source_identity,
         std::uint32_t maximum_chunk_bytes);
 
     /**
@@ -316,7 +316,7 @@ namespace llaminar2
      * @param manifest Valid CPU-format remote projection with exactly one GPU
      *        endpoint.
      * @return Complete device-kernel layout whose chunk capacity is expressed
-     *         in indivisible CPU NativeVNNI units.
+     *         in indivisible CPU NativeQuantised units.
      * @throws std::invalid_argument When topology, format, or chunk alignment
      *         cannot drive the production streaming repack kernel.
      */

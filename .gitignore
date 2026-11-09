@@ -81,7 +81,7 @@ benchmark_results/*
 !benchmark_results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/
 !benchmark_results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/**
 # Published corpora belong to the optional top-level corpora/ submodule.
-# NativeVNNI work/results (including the former corpus location) stay ignored.
+# NativeQuantised work/results (including the former corpus location) stay ignored.
 *output.txt
 **/wget-log*
 **/*.data

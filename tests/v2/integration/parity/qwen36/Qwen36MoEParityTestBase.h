@@ -410,7 +410,7 @@ namespace llaminar2::test::parity::qwen36
              * dispatch is forced off even when the surrounding shell enables it.
              * LLAMINAR_PARITY_DIAGNOSTIC_DETERMINISTIC is an explicit debugging
              * override for isolating a broader backend-ordering defect; it does
-             * not substitute a second NativeVNNI arithmetic regime.
+             * not substitute a second NativeQuantised arithmetic regime.
              */
             const char *diagnostic_deterministic =
                 std::getenv("LLAMINAR_PARITY_DIAGNOSTIC_DETERMINISTIC");
@@ -2889,7 +2889,7 @@ namespace llaminar2::test::parity::qwen36
             expectPerfCounterPositive(
                 records,
                 "kernel",
-                "cuda_native_vnni_small_m_calls",
+                "cuda_native_quantised_small_m_calls",
                 context);
         }
         if (moEPrefixCaseUsesROCm(test_case))
@@ -2897,21 +2897,21 @@ namespace llaminar2::test::parity::qwen36
             /*
              * A fused projection group quantizes one activation row once and
              * dispatches every projection from that shared device buffer.  It
-             * supersedes the older per-projection NativeVNNI counter while
+             * supersedes the older per-projection NativeQuantised counter while
              * remaining the economical small-M production route this gate is
              * meant to certify.
              */
-            const double native_vnni_calls = perfCounterSum(
+            const double native_quantised_calls = perfCounterSum(
                 records,
                 "kernel",
-                "rocm_native_vnni_small_m_calls");
+                "rocm_native_quantised_small_m_calls");
             const double fused_shared_quant_calls = perfCounterSum(
                 records,
                 "kernel",
                 "rocm_fused_small_m_shared_quant_calls");
-            EXPECT_GT(native_vnni_calls + fused_shared_quant_calls, 0.0)
+            EXPECT_GT(native_quantised_calls + fused_shared_quant_calls, 0.0)
                 << context
-                << " should publish an economical ROCm small-M NativeVNNI or "
+                << " should publish an economical ROCm small-M NativeQuantised or "
                    "fused shared-quant projection route.\n"
                 << PerfStatsCollector::summaryString({"kernel"});
         }

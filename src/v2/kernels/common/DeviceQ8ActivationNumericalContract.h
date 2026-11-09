@@ -87,7 +87,7 @@ namespace llaminar2::device_q8_activation_contract
      * The caller publishes @p block_scale beside the returned byte. A single
      * deterministic reciprocal is multiplied by every value in that block;
      * round-to-nearest-even precedes signed-byte saturation exactly as in serial
-     * NativeVNNI decode.
+     * NativeQuantised decode.
      *
      * @param value Finite source activation.
      * @param block_scale Positive scale returned by scale().

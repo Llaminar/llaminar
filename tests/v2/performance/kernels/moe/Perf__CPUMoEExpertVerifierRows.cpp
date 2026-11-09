@@ -10,9 +10,9 @@
  * receive two. This harness reproduces that sparse expert-major geometry
  * without loading a model, then measures the exact production primitives:
  *
- * 1. one layer-batched NativeVNNI gate/up projection;
+ * 1. one layer-batched NativeQuantised gate/up projection;
  * 2. fused byte-exact SwiGLU-to-Q8_1 publication; and
- * 3. one layer-batched NativeVNNI down projection.
+ * 3. one layer-batched NativeQuantised down projection.
  *
  * Every grouped intermediate is compared byte-for-byte with independent M=1
  * serial decode before timing begins. The diagnostic serial route is never a
@@ -35,12 +35,16 @@
  * `LLAMINAR_CPU_MOE_EXPERT_PROFILE_POLICY=native|aligned`. They never collect
  * timing samples or run the other policy afterward; profiler overhead must
  * not enter a canonical timing CSV.
+ * `LLAMINAR_CPU_MOE_EXPERT_PURPOSE=decode|mtp|prefill` selects the
+ * explicit scheduling purpose for grouped descriptors only (default Decode).
+ * The independent one-row arithmetic oracle remains Decode.
+ * Geometry is authored without reconstructing a recorded model route vector.
  */
 
-#include "../../../utils/NativeVNNITestPartialStorage.h"
+#include "../../../utils/NativeQuantisedTestPartialStorage.h"
 #include <gtest/gtest.h>
 
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "utils/CPUFeatures.h"
 #include "utils/QuantizedVerifierFormats.h"
@@ -65,11 +69,14 @@
 #include <omp.h>
 
 using namespace llaminar2;
-using llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel;
-using llaminar2::cpu::native_vnni::VerifierRowsPolicy;
-using llaminar2::cpu::native_vnni::gemv_native_vnni_preq;
-using llaminar2::cpu::native_vnni::quantize_activations_to_q8_1;
-using llaminar2::cpu::native_vnni::swiglu_quantize_activations_to_q8_1;
+using llaminar2::cpu::native_quantised::CPUNativeQuantisedGemmKernel;
+using llaminar2::cpu::native_quantised::VerifierRowsPolicy;
+using llaminar2::cpu::native_quantised::ProjectionRowsPurpose;
+using llaminar2::cpu::native_quantised::projectionRowsPurposeName;
+using llaminar2::cpu::native_quantised::cpuNativeQuantisedSerialEquivalentPolicyN;
+using llaminar2::cpu::native_quantised::gemv_native_quantised_preq;
+using llaminar2::cpu::native_quantised::quantize_activations_to_q8_1;
+using llaminar2::cpu::native_quantised::swiglu_quantize_activations_to_q8_1;
 
 namespace
 {
@@ -86,9 +93,9 @@ namespace
         std::unique_ptr<TensorBase> gate_weights;
         std::unique_ptr<TensorBase> up_weights;
         std::unique_ptr<TensorBase> down_weights;
-        std::unique_ptr<CPUNativeVNNIGemmKernel> gate;
-        std::unique_ptr<CPUNativeVNNIGemmKernel> up;
-        std::unique_ptr<CPUNativeVNNIGemmKernel> down;
+        std::unique_ptr<CPUNativeQuantisedGemmKernel> gate;
+        std::unique_ptr<CPUNativeQuantisedGemmKernel> up;
+        std::unique_ptr<CPUNativeQuantisedGemmKernel> down;
     };
 
     /** @brief Timings for the three production phases and complete pipeline. */
@@ -141,6 +148,28 @@ namespace
                 std::string(name) + " must be a non-negative integer");
         }
         return static_cast<int>(parsed);
+    }
+
+    /**
+     * @brief Parse the explicit grouped scheduling intent without changing math.
+     * @param purpose Public diagnostic token: decode, mtp, or prefill.
+     * @return Existing typed purpose forwarded to every grouped projection.
+     * @throws std::invalid_argument For every unknown or empty explicit token.
+     */
+    ProjectionRowsPurpose parseProjectionPurpose(std::string_view purpose)
+    {
+        if (purpose == "decode") return ProjectionRowsPurpose::Decode;
+        if (purpose == "mtp") return ProjectionRowsPurpose::MTPVerifier;
+        if (purpose == "prefill") return ProjectionRowsPurpose::Prefill;
+        throw std::invalid_argument(
+            "LLAMINAR_CPU_MOE_EXPERT_PURPOSE must be decode, mtp, or prefill");
+    }
+
+    /** @return Explicit purpose, retaining the owner's original Decode default. */
+    ProjectionRowsPurpose selectedProjectionPurpose()
+    {
+        const char *raw = std::getenv("LLAMINAR_CPU_MOE_EXPERT_PURPOSE");
+        return parseProjectionPurpose(raw ? raw : "decode");
     }
 
     /** @brief Parse a forceable grouped-row policy for exact perf comparison. */
@@ -379,17 +408,17 @@ namespace
                     format.label);
             }
 
-            expert.gate = std::make_unique<CPUNativeVNNIGemmKernel>(
+            expert.gate = std::make_unique<CPUNativeQuantisedGemmKernel>(
                 expert.gate_weights.get(), 0, -1, numerical_policy);
-            expert.up = std::make_unique<CPUNativeVNNIGemmKernel>(
+            expert.up = std::make_unique<CPUNativeQuantisedGemmKernel>(
                 expert.up_weights.get(), 0, -1, numerical_policy);
-            expert.down = std::make_unique<CPUNativeVNNIGemmKernel>(
+            expert.down = std::make_unique<CPUNativeQuantisedGemmKernel>(
                 expert.down_weights.get(), 0, -1, numerical_policy);
             if (!expert.gate->isValid() || !expert.up->isValid() ||
                 !expert.down->isValid())
             {
                 throw std::runtime_error(
-                    std::string("NativeVNNI preparation failed for ") +
+                    std::string("NativeQuantised preparation failed for ") +
                     format.label);
             }
             experts.push_back(std::move(expert));
@@ -407,6 +436,7 @@ namespace
      * @param intermediate Logical FFN width.
      * @param numerical_policy Independent native or GPU-aligned arithmetic contract.
      * @param verifier_schedule Explicit diagnostic candidate, or production Auto.
+     * @param purpose Typed grouped scheduling intent; serial oracles remain Decode.
      * @param warmup Untimed batches before measurements.
      * @param samples Number of independently timed batches.
      * @param batch_iterations Transactions per timing interval.
@@ -423,6 +453,7 @@ namespace
         int intermediate,
         CPUProjectionNumericalPolicy numerical_policy,
         VerifierRowsPolicy verifier_schedule,
+        ProjectionRowsPurpose purpose,
         int warmup,
         int samples,
         int batch_iterations,
@@ -471,7 +502,7 @@ namespace
         std::vector<float> serial_down(grouped_down.size());
 
         using Descriptor =
-            CPUNativeVNNIGemmKernel::BatchedPrequantizedProjectionDesc;
+            CPUNativeQuantisedGemmKernel::BatchedPrequantizedProjectionDesc;
         std::vector<Descriptor> gate_up_descriptors;
         std::vector<Descriptor> down_descriptors;
         gate_up_descriptors.reserve(static_cast<size_t>(active_experts) * 2u);
@@ -490,6 +521,7 @@ namespace
                 .n = intermediate,
                 .ldc = intermediate,
                 .verifier_schedule = verifier_schedule,
+                .purpose = purpose,
             });
             gate_up_descriptors.push_back({
                 .kernel = expert.up.get(),
@@ -500,6 +532,7 @@ namespace
                 .n = intermediate,
                 .ldc = intermediate,
                 .verifier_schedule = verifier_schedule,
+                .purpose = purpose,
             });
             down_descriptors.push_back({
                 .kernel = expert.down.get(),
@@ -511,16 +544,17 @@ namespace
                 .n = d_model,
                 .ldc = d_model,
                 .verifier_schedule = verifier_schedule,
+                .purpose = purpose,
             });
         }
 
-        using PartialStorage = llaminar2::test::NativeVNNITestPartialStorage;
+        using PartialStorage = llaminar2::test::NativeQuantisedTestPartialStorage;
         PartialStorage grouped_partials(std::max(
             PartialStorage::bundleFloats(gate_up_descriptors.data(), gate_up_descriptors.size(), 1),
             PartialStorage::bundleFloats(down_descriptors.data(), down_descriptors.size(), 1)));
         auto grouped_gate_up = [&]()
         {
-            if (!CPUNativeVNNIGemmKernel::
+            if (!CPUNativeQuantisedGemmKernel::
                     multiply_batched_preq_decode_equivalent(
                         gate_up_descriptors.data(),
                         static_cast<int>(gate_up_descriptors.size()),
@@ -542,7 +576,7 @@ namespace
         };
         auto grouped_down_projection = [&]()
         {
-            if (!CPUNativeVNNIGemmKernel::
+            if (!CPUNativeQuantisedGemmKernel::
                     multiply_batched_preq_decode_equivalent(
                         down_descriptors.data(),
                         static_cast<int>(down_descriptors.size()),
@@ -559,7 +593,7 @@ namespace
         };
         auto grouped_complete_persistent = [&]()
         {
-            if (!CPUNativeVNNIGemmKernel::
+            if (!CPUNativeQuantisedGemmKernel::
                     execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
                         gate_up_descriptors.data(),
                         static_cast<int>(gate_up_descriptors.size()),
@@ -584,8 +618,8 @@ namespace
         for (const PreparedExpert &expert : experts)
             for (const auto *kernel : {expert.gate.get(), expert.up.get(), expert.down.get()})
                 partial_floats = std::max(partial_floats,
-                    cpu::native_vnni::nativeVNNIProjectionPartialFloats(kernel->packedWeights(), 1));
-        test::NativeVNNITestPartialStorage partial_storage(partial_floats);
+                    cpu::native_quantised::nativeQuantisedProjectionPartialFloats(kernel->packedWeights(), 1));
+        test::NativeQuantisedTestPartialStorage partial_storage(partial_floats);
         auto serial_complete = [&]()
         {
             for (const PreparedExpert &expert : experts)
@@ -607,9 +641,9 @@ namespace
                     float *down_row = serial_down.data() +
                         static_cast<size_t>(row) * d_model;
 
-                    gemv_native_vnni_preq(
+                    gemv_native_quantised_preq(
                         expert.gate->packedWeights(), hidden_row, gate_row, partial_storage.span());
-                    gemv_native_vnni_preq(
+                    gemv_native_quantised_preq(
                         expert.up->packedWeights(), hidden_row, up_row, partial_storage.span());
                     if (numerical_policy ==
                         CPUProjectionNumericalPolicy::GPUAlignedExpert)
@@ -635,7 +669,7 @@ namespace
                         intermediate,
                         activation_blocks,
                         numerical_policy);
-                    gemv_native_vnni_preq(
+                    gemv_native_quantised_preq(
                         expert.down->packedWeights(),
                         activation_row,
                         down_row, partial_storage.span());
@@ -719,6 +753,11 @@ namespace
                 << "[CPUMoEExpertProfiler] format=" << format.label
                 << " down_format=" << down_format.label
                 << " phase=" << profile_phase
+                << " purpose=" << projectionRowsPurposeName(purpose)
+                << " gate_up_policy_n="
+                << cpuNativeQuantisedSerialEquivalentPolicyN(intermediate)
+                << " down_policy_n="
+                << cpuNativeQuantisedSerialEquivalentPolicyN(d_model)
                 << " iterations=" << profile_iterations
                 << " checksum=" << checksum << '\n';
             // Profiling and paired timing are disjoint executions. Returning
@@ -745,6 +784,19 @@ namespace
         return timing;
     }
 } // namespace
+
+/** @brief Validate authored purpose tokens without preparing weights or timing. */
+TEST(Perf_CPUMoEExpertVerifierRows, ExplicitPurposeSelectionContract)
+{
+    EXPECT_EQ(parseProjectionPurpose("decode"), ProjectionRowsPurpose::Decode);
+    EXPECT_EQ(parseProjectionPurpose("mtp"), ProjectionRowsPurpose::MTPVerifier);
+    EXPECT_EQ(parseProjectionPurpose("prefill"), ProjectionRowsPurpose::Prefill);
+    EXPECT_STREQ(projectionRowsPurposeName(parseProjectionPurpose("mtp")),
+                 "mtp_verifier");
+    EXPECT_THROW((void)parseProjectionPurpose("unknown"), std::invalid_argument);
+    EXPECT_THROW((void)parseProjectionPurpose(""), std::invalid_argument);
+    EXPECT_THROW((void)parseProjectionPurpose("Decode"), std::invalid_argument);
+}
 
 /**
  * @brief Prove and time the production-shaped grouped CPU expert transaction.
@@ -783,6 +835,14 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
             : "complete";
     const ProfilePolicy profile_policy = selectedProfilePolicy();
     const VerifierRowsPolicy verifier_schedule = selectedVerifierPolicy();
+    const ProjectionRowsPurpose purpose = selectedProjectionPurpose();
+    // Batched descriptors have no original-output-slice binding. Query the
+    // same serial-width authority used by the production fused planner; do
+    // not substitute an imagined TP parent width for these physical matrices.
+    const int gate_up_policy_n =
+        cpuNativeQuantisedSerialEquivalentPolicyN(intermediate);
+    const int down_policy_n =
+        cpuNativeQuantisedSerialEquivalentPolicyN(d_model);
     ASSERT_LE(active_experts, 256);
     ASSERT_GE(local_route_rows, active_experts);
     ASSERT_EQ(d_model % static_cast<int>(Q8_1Block::BLOCK_SIZE), 0)
@@ -813,7 +873,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                "native_complete_us,native_persistent_us,"
                "aligned_gate_up_us,aligned_swiglu_q8_us,aligned_down_us,"
                "aligned_complete_us,aligned_persistent_us,"
-               "aligned_over_native_persistent\n";
+               "aligned_over_native_persistent,purpose,gate_up_policy_n,down_policy_n\n";
     }
     int executed = 0;
     std::cout
@@ -823,8 +883,11 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
         << ", intermediate=" << intermediate
         << ", active_experts=" << active_experts
         << ", local_route_rows=" << local_route_rows
+        << ", purpose=" << projectionRowsPurposeName(purpose)
+        << ", gate_up_policy_n=" << gate_up_policy_n
+        << ", down_policy_n=" << down_policy_n
         << ", verifier_policy="
-        << cpu::native_vnni::verifierRowsPolicyName(verifier_schedule)
+        << cpu::native_quantised::verifierRowsPolicyName(verifier_schedule)
         << ")\n"
         << "gate_up_format/down_format native_persistent_us aligned_persistent_us "
            "aligned/native native_speedup aligned_speedup\n";
@@ -845,7 +908,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 profile_policy == ProfilePolicy::Aligned
                     ? CPUProjectionNumericalPolicy::GPUAlignedExpert
                     : CPUProjectionNumericalPolicy::BackendNative,
-                verifier_schedule, warmup, samples, batch_iterations,
+                verifier_schedule, purpose, warmup, samples, batch_iterations,
                 profile_iterations, profile_phase);
             ++executed;
             continue;
@@ -864,6 +927,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 intermediate,
                 CPUProjectionNumericalPolicy::BackendNative,
                 verifier_schedule,
+                purpose,
                 warmup,
                 samples,
                 batch_iterations,
@@ -883,6 +947,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 intermediate,
                 CPUProjectionNumericalPolicy::GPUAlignedExpert,
                 verifier_schedule,
+                purpose,
                 warmup,
                 samples,
                 batch_iterations,
@@ -916,7 +981,10 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
             << aligned.persistent_complete_us << ' '
             << slowdown << ' '
             << native_speedup << ' '
-            << aligned_speedup << '\n';
+            << aligned_speedup
+            << " purpose=" << projectionRowsPurposeName(purpose)
+            << " gate_up_policy_n=" << gate_up_policy_n
+            << " down_policy_n=" << down_policy_n << '\n';
         if (csv)
         {
             csv << format.label << ',' << down_format.label << ','
@@ -929,7 +997,9 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 << native.persistent_complete_us << ','
                 << aligned.gate_up_us << ',' << aligned.swiglu_q8_us << ','
                 << aligned.down_us << ',' << aligned.complete_us << ','
-                << aligned.persistent_complete_us << ',' << slowdown << '\n';
+                << aligned.persistent_complete_us << ',' << slowdown << ','
+                << projectionRowsPurposeName(purpose) << ','
+                << gate_up_policy_n << ',' << down_policy_n << '\n';
         }
         EXPECT_GT(native_speedup, 1.0)
             << format.label

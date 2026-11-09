@@ -2,7 +2,7 @@
  * @file Test__ROCmActivationQuantization.cpp
  * @brief Byte-exact captured activation publication independent of weight format.
  *
- * Every NativeVNNI codebook consumes this same row-major INT8/FP32-scale ABI.
+ * Every NativeQuantised codebook consumes this same row-major INT8/FP32-scale ABI.
  * This focused producer proof complements, rather than replaces, the existing
  * all-codebook prepared GEMM tests. Replays change inputs without recapture,
  * check partial quantization blocks and guard words, and independently sum the

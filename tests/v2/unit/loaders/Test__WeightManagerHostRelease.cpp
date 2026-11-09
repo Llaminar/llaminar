@@ -127,7 +127,7 @@ protected:
         auto engine=store.gemmKernelLifetime(ref);
         ASSERT_TRUE(engine);ASSERT_TRUE(engine->hasWeights());ASSERT_TRUE(engine->canReleaseSourceWeightTensor());
         ASSERT_TRUE(tensor->hasPreparedDeviceState());
-        ASSERT_NE(engine->exportCPUNativeVNNIPackedWeights(),nullptr);
+        ASSERT_NE(engine->exportCPUNativeQuantisedPackedWeights(),nullptr);
         Probe probe;probe.engine=std::move(engine);
         probe.expected.resize(size_t(probe.engine->get_n()));
         FP32Tensor hidden({1,size_t(probe.engine->get_k())}),out({1,probe.expected.size()});

@@ -10,7 +10,7 @@
 #pragma once
 #include "RecordedObservation.h"
 #include "../../../../../src/v2/config/GDNHeadAssignment.h"
-#include "../../../../../src/v2/kernels/common/DeviceNativeVNNIMatrixDesc.h"
+#include "../../../../../src/v2/kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include <array>
 
 namespace llaminar2::test::recorded_gdn
@@ -27,7 +27,7 @@ using recorded_observation::fileIdentity;
  * @note The device ABI stores flags in uint8_t. Publishing that byte directly
  *       would emit a JSON number instead of the source-family boolean contract.
  */
-inline nlohmann::json nativePreparedSourceMetadata(const DeviceNativeVNNIMatrixDesc &descriptor)
+inline nlohmann::json nativePreparedSourceMetadata(const DeviceNativeQuantisedMatrixDesc &descriptor)
 {
     return {{"n",descriptor.n},{"k",descriptor.k},{"codebook",descriptor.codebook_id},
         {"source_codebook",descriptor.source_codebook_id},{"source_is_superblock",descriptor.source_is_superblock!=0}};
@@ -110,7 +110,7 @@ inline Request parse(const nlohmann::json &j)
         s.oracle=fileIdentity(v.at("oracle"));
         require(s.name==names[i] && s.key==keys[i] && s.original_n==columns[i] &&
             s.gguf_type==(i<2?8:0) && v.at("source_format")== (i<2?"Q8_0":"F32") &&
-            v.at("prepared_format")== (i<2?"NativeVNNI_Q8_0":"FP16") &&
+            v.at("prepared_format")== (i<2?"NativeQuantised_Q8_0":"FP16") &&
             (i<2?v.at("source_execution_codebook")==19:v.at("source_execution_codebook").is_null()),
             "Recorded GDN sibling order, source geometry, format or arithmetic differs");
         require(std::uint64_t(r.rows)<=std::numeric_limits<std::uint64_t>::max()/4/std::uint64_t(s.original_n) &&

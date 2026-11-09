@@ -332,7 +332,7 @@ TEST(CPUExpertShardExecution, PreparedNativeSourceAllFormatsAndSerialRows) {
     TeamScope team(1);
     for(const auto& format:quantizedMoEVerifierFormats()) {
         SCOPED_TRACE(format.label);
-        const auto identity=ExpertWeightFormat::nativeVnni({format.source_codebook_id,format.source_is_superblock,true});
+        const auto identity=ExpertWeightFormat::nativeQuantised({format.source_codebook_id,format.source_is_superblock,true});
         preparedNativeMatrix({format.create,format.create,format.create},{identity,identity,identity});
     }
     for(const auto type:{TensorType::FP32,TensorType::FP16,TensorType::BF16}) {
@@ -361,8 +361,8 @@ void qfnOriginalClass(TensorType gateType,TensorType downType,size_t fragmentByt
         return *item;
     };
     const auto& gate=find(gateType);const auto& down=find(downType);
-    const auto gateFormat=ExpertWeightFormat::nativeVnni({gate.source_codebook_id,gate.source_is_superblock,true});
-    const auto downFormat=ExpertWeightFormat::nativeVnni({down.source_codebook_id,down.source_is_superblock,true});
+    const auto gateFormat=ExpertWeightFormat::nativeQuantised({gate.source_codebook_id,gate.source_is_superblock,true});
+    const auto downFormat=ExpertWeightFormat::nativeQuantised({down.source_codebook_id,down.source_is_superblock,true});
     preparedNativeMatrix({gate.create,gate.create,down.create},{gateFormat,gateFormat,downFormat},2560,640,fragmentBytes,packed);
 }
 }
@@ -388,7 +388,7 @@ TEST(CPUExpertShardExecution, PreparedPackedSourceRecordsAllFormatsAndPhases) {
     TeamScope team(1);
     for(const auto& format:quantizedMoEVerifierFormats()) {
         SCOPED_TRACE(format.label);
-        const auto identity=ExpertWeightFormat::nativeVnni({format.source_codebook_id,format.source_is_superblock,true});
+        const auto identity=ExpertWeightFormat::nativeQuantised({format.source_codebook_id,format.source_is_superblock,true});
         preparedNativeMatrix({format.create,format.create,format.create},{identity,identity,identity},H,F,0,true);
     }
     for(const auto type:{TensorType::FP32,TensorType::FP16,TensorType::BF16}) {

@@ -119,14 +119,14 @@ inline nlohmann::json inventory(IGPUGraphCapture &graph,DeviceId device,Inventor
         checked(n.name.find("nccl")==std::string::npos && n.name.find("capturedTransfer")==std::string::npos,
             "Recorded compute contains unrelated communication");
         projection|=device.is_cuda()
-            ? n.name.find("nativeVnniGemv_")!=std::string::npos || n.name.find("nativeVnniGemvTensorCoreSmallM")!=std::string::npos
-            : n.name.find("gemv_native_vnni_kernel")!=std::string::npos;
+            ? n.name.find("nativeQuantisedGemv_")!=std::string::npos || n.name.find("nativeQuantisedGemvTensorCoreSmallM")!=std::string::npos
+            : n.name.find("gemv_native_quantised_kernel")!=std::string::npos;
         out.push_back({{"symbol",n.name},{"function",n.function_identity},{"grid",{n.grid_x,n.grid_y,n.grid_z}},
             {"block",{n.block_x,n.block_y,n.block_z}},{"dynamic_shared_bytes",n.dynamic_shared_memory_bytes},
             {"static_shared_bytes",n.static_shared_memory_bytes},{"local_bytes_per_thread",n.local_memory_bytes_per_thread},
             {"registers_per_thread",n.registers_per_thread},{"potential_max_active_blocks_per_sm",n.max_active_blocks_per_sm}});
     }
-    checked(projection || policy==InventoryPolicy::PreparedStageBundle,"Recorded compute did not retain a NativeVNNI projection");return out;
+    checked(projection || policy==InventoryPolicy::PreparedStageBundle,"Recorded compute did not retain a NativeQuantised projection");return out;
 }
 /**
  * @brief Consume exactly one completed native restore/compute transaction timing.

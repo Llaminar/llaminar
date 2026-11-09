@@ -5,6 +5,10 @@
 #include <gtest/gtest.h>
 #include "kernels/cpu/moe/CPUCanonicalShardRouteRecords.h"
 #include "execution/moe/CanonicalMoERouteRecord.h"
+#include "kernels/cpu/primitives/VectorPrimitives.h"
+#include "utils/CPUFeatures.h"
+#include <cstring>
+#include <omp.h>
 #include <array>
 #include <algorithm>
 #include <bit>
@@ -152,3 +156,114 @@ TEST(CPUShardRouteCollective, OriginalSparseRoutesMatchDenseAndRejectPartialIden
 }
 
 #include "CPUCompactGatherEconomyContract.inc"
+
+
+namespace {
+/** @brief Restore the caller's existing team width after a bounded host replay. */
+struct FirstPairTeamScope {
+    int saved=omp_get_max_threads();
+    explicit FirstPairTeamScope(int threads) { omp_set_num_threads(threads); }
+    ~FirstPairTeamScope() { omp_set_num_threads(saved); }
+};
+}
+
+/**
+ * @test The production combine retains the original copy-then-add bytes while
+ * removing its redundant first scratch copy. The oracle deliberately retains
+ * that former sequence and uses the same ISA-dispatched vec_add helper.
+ *
+ * Dense and compact records cover live prefixes, inactive slots, vector tails,
+ * participant cancellation, signed zeros, infinities and NaN payloads. Reusing
+ * poisoned output across large/small/empty calls proves storage capacity is not
+ * a write extent. Existing-team entry exercises the actual collective workshare.
+ * This is numerical/lifecycle evidence, not a timing or NUMA certificate.
+ */
+TEST(CPUShardRouteCollective, FirstPairDirectAddMatchesOriginalBytesAndLiveExtents) {
+    ::testing::Test::RecordProperty("runtime_isa",isaLevelName(activeISALevel()));
+    constexpr int capacity=7,top_k=3;
+    constexpr float poison=-913.25f;
+    constexpr std::array<uint32_t,16> patterns{
+        0x00000000u,0x80000000u,0x3f800000u,0xbf800000u,
+        0x7f800000u,0xff800000u,0x7fc12345u,0xffc54321u,
+        0x7f812345u,0x00000001u,0x80000001u,0x00800000u,
+        0x60ad78ecu,0xe0ad78ecu,0x33800000u,0x3f800001u};
+    for(int threads:{1,3}) {
+        FirstPairTeamScope team(threads);
+        for(size_t degree:{2u,4u,8u}) for(int columns:{1,2,15,16,17,31,32,33,63,64,65,513,2560}) {
+            SCOPED_TRACE(::testing::Message()<<"workers="<<threads<<" degree="<<degree<<" columns="<<columns);
+            const size_t capacity_slots=capacity*top_k;
+            std::vector<std::vector<float>> dense(degree,std::vector<float>(capacity_slots*columns));
+            for(size_t p=0;p<degree;++p) for(size_t i=0;i<dense[p].size();++i)
+                dense[p][i]=std::bit_cast<float>(patterns[(i+p*5u)%patterns.size()]);
+            std::vector<float> weights(capacity_slots);
+            for(size_t slot=0;slot<capacity_slots;++slot) weights[slot]=slot%4u==1u?0.0f:1.0f;
+            for(bool packed:{false,true}) {
+              std::vector<float> actual(capacity_slots*columns,poison);
+              size_t replay=0;
+              for(int rows:{7,2,0,1,5,1}) {
+                SCOPED_TRACE(::testing::Message()<<"packed="<<packed<<" rows="<<rows);
+                const size_t slots=static_cast<size_t>(rows)*top_k;
+                // Change the next source bytes while retaining the previous
+                // destination. A capacity-wide write would corrupt dirty tails.
+                ++replay;
+                for(size_t p=0;p<degree;++p) for(size_t i=0;i<dense[p].size();++i)
+                    dense[p][i]=std::bit_cast<float>(patterns[(i+p*5u+replay)%patterns.size()]);
+                std::vector<std::vector<float>> records(degree);
+                std::vector<std::vector<int32_t>> maps(degree,std::vector<int32_t>(slots,-1));
+                std::vector<CanonicalRouteDownPartialRows> banks(degree);
+                for(size_t p=0;p<degree;++p) {
+                    if(!packed || slots==0) { banks[p]={dense[p]};continue; }
+                    // Each participant may pack in a different arrival order.
+                    for(size_t ordinal=0;ordinal<slots;++ordinal) {
+                        const size_t slot=p%2u?slots-1u-ordinal:ordinal;
+                        if(weights[slot]==0.0f)continue;
+                        maps[p][slot]=static_cast<int32_t>(records[p].size()/(columns+1));
+                        const size_t first=records[p].size();
+                        records[p].resize(first+columns+1);
+                        std::copy_n(dense[p].data()+slot*columns,columns,records[p].data()+first);
+                        ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(records[p].data()+first,columns,slot));
+                    }
+                    banks[p]={records[p],maps[p]};
+                }
+                std::vector<float> expected=actual;
+                for(size_t slot=0;slot<slots;++slot) {
+                    if(weights[slot]==0.0f)continue;
+                    float *out=expected.data()+slot*columns;
+                    std::copy_n(dense[0].data()+slot*columns,columns,out);
+                    for(size_t p=1;p<degree;++p)
+                        primitives::vec_add(out,out,dense[p].data()+slot*columns,columns);
+                }
+                auto args=CanonicalRouteDownPartialCombineArgs{banks,actual,weights.data(),rows,top_k,columns};
+                ASSERT_TRUE(combineCanonicalRouteDownPartialsOrdered(args));
+                ASSERT_EQ(std::memcmp(expected.data(),actual.data(),expected.size()*sizeof(float)),0);
+                if(threads==3 && rows==capacity && columns==65) {
+                    std::fill(actual.begin(),actual.end(),poison);
+                    std::array<int,3> accepted{};
+#pragma omp parallel num_threads(3)
+                    { accepted[static_cast<size_t>(omp_get_thread_num())]=combineCanonicalRouteDownPartialsOrdered(args); }
+                    for(int ok:accepted)ASSERT_EQ(ok,1);
+                    ASSERT_EQ(std::memcmp(expected.data(),actual.data(),expected.size()*sizeof(float)),0);
+                }
+                if(rows==capacity) {
+                    // Validation must precede every write, including the first pair.
+                    const auto before=actual;
+                    args.ordered_participants=std::span(banks).first(1);
+                    EXPECT_FALSE(combineCanonicalRouteDownPartialsOrdered(args));
+                    EXPECT_EQ(std::memcmp(before.data(),actual.data(),before.size()*sizeof(float)),0);
+                    args.ordered_participants=banks;
+                    const auto saved=banks[1];banks[1]=banks[0];
+                    EXPECT_FALSE(combineCanonicalRouteDownPartialsOrdered(args));
+                    EXPECT_EQ(std::memcmp(before.data(),actual.data(),before.size()*sizeof(float)),0);
+                    banks[1]=saved;
+                    if(!packed) {
+                        args.combined_route_rows={dense[0].data(),dense[0].size()};
+                        const auto input_before=dense[0];
+                        EXPECT_FALSE(combineCanonicalRouteDownPartialsOrdered(args));
+                        EXPECT_EQ(std::memcmp(input_before.data(),dense[0].data(),input_before.size()*sizeof(float)),0);
+                    }
+                }
+              }
+            }
+        }
+    }
+}

@@ -743,7 +743,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceTransferCapacityRetargetsMixedProjec
 
     auto descFor = [&](uint8_t codebook_id, bool with_mins, bool with_emins)
     {
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = &payload;
         desc.scales = &scales;
         desc.mins = with_mins ? &mins : nullptr;
@@ -770,7 +770,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceTransferCapacityRetargetsMixedProjec
     destination.descriptor.gate = descFor(/*codebook_id=*/4, true, true);
     destination.descriptor.up = descFor(/*codebook_id=*/4, true, true);
     destination.descriptor.down = descFor(/*codebook_id=*/4, true, true);
-    for (DeviceNativeVNNIMatrixDesc *projection : {
+    for (DeviceNativeQuantisedMatrixDesc *projection : {
              &destination.descriptor.gate,
              &destination.descriptor.up,
              &destination.descriptor.down})
@@ -822,7 +822,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromS
         result.is_asymmetric = has_mins;
         result.has_emins = has_emins;
         result.codebook_id = codebook_id;
-        result.format = ExpertWeightFormat::nativeVnni({
+        result.format = ExpertWeightFormat::nativeQuantised({
             .codebook_id = codebook_id,
             .is_superblock = is_superblock,
             .present = true,
@@ -889,7 +889,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFloatingAndQuantizedCapacityShareOne
     }
     const auto raw_profile = Directory::profileForLayerFormats(layers);
     const auto raw_bytes = Directory::allocationBOM(capacity, raw_profile).payload_bytes;
-    for (const auto &source_format : native_vnni_formats::kAllSourceFormats)
+    for (const auto &source_format : native_quantised_formats::kAllSourceFormats)
     {
         const auto &format = *source_format.metadata;
         std::vector<Directory::ProjectionSpec> quantized;
@@ -898,7 +898,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFloatingAndQuantizedCapacityShareOne
                 .payload_bytes_per_block = format.payload_bytes,
                 .is_asymmetric = format.is_asymmetric, .has_emins = format.has_emins,
                 .codebook_id = format.codebook_id,
-                .format = ExpertWeightFormat::nativeVnni({
+                .format = ExpertWeightFormat::nativeQuantised({
                     .codebook_id = format.codebook_id,
                     .is_superblock = format.is_superblock, .present = true})});
         auto mixed = layers;

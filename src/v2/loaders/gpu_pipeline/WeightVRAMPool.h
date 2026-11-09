@@ -4,7 +4,7 @@
  * @file WeightVRAMPool.h
  * @brief Device allocation pool for GPU-prepared GEMM weights and temporary load staging.
  *
- * WeightVRAMPool plans persistent native-VNNI weight regions and short-lived device
+ * WeightVRAMPool plans persistent native-quantised weight regions and short-lived device
  * staging slots used by DeviceLoadPipeline. Prepared GEMM kernels keep pointers into
  * the persistent weight allocation, so staging memory is intentionally separable and
  * can be released after load finalization without invalidating model weights.
@@ -37,10 +37,10 @@ namespace llaminar2
          */
         struct WeightSlot
         {
-            uint8_t *d_native_vnni_payload = nullptr;
-            void *d_native_vnni_scales = nullptr;
-            void *d_native_vnni_mins = nullptr;
-            void *d_native_vnni_emins = nullptr;
+            uint8_t *d_native_quantised_payload = nullptr;
+            void *d_native_quantised_scales = nullptr;
+            void *d_native_quantised_mins = nullptr;
+            void *d_native_quantised_emins = nullptr;
             size_t payload_bytes = 0;
             size_t scales_bytes = 0;
             size_t mins_bytes = 0;

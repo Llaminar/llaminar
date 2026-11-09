@@ -34,8 +34,8 @@ auto liveCodecRows(const MoEOverlayMigrationEvidenceContext &context,int rank) {
 }
 }
 TEST(LiveEconomyEvidenceCodec, ExactIncidenceAllFormatsAndLargeSmallEmptyReplay) {
-    for(const auto &entry:native_vnni_formats::kAllSourceFormats)for(int members:{8,3,1,2}) {
-        const auto format=ExpertWeightFormat::nativeVnni({.codebook_id=entry.metadata->codebook_id,
+    for(const auto &entry:native_quantised_formats::kAllSourceFormats)for(int members:{8,3,1,2}) {
+        const auto format=ExpertWeightFormat::nativeQuantised({.codebook_id=entry.metadata->codebook_id,
             .is_superblock=entry.metadata->is_superblock,.present=true});
         const auto context=liveCodecContext(members,format);
         std::vector<std::vector<MoEOverlayCompletedMigrationMeasurement>> ranks;

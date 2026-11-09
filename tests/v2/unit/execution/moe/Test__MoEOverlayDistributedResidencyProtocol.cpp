@@ -302,17 +302,17 @@ namespace llaminar2::test
         }
 
         /** @brief Materialize deterministic final Q4_0 CPU execution bytes. */
-        cpu::native_vnni::CPUNativeVNNIPackedWeights cpuProjectionBytes()
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights cpuProjectionBytes()
         {
-            using namespace cpu::native_vnni;
-            CPUNativeVNNIPackedWeights packed;
+            using namespace cpu::native_quantised;
+            CPUNativeQuantisedPackedWeights packed;
             packed.N = 32;
             packed.K = 64;
             packed.N_padded = 64;
             packed.blocks_per_row = 2;
-            packed.codebook_id = native_vnni_formats::Q4_0.codebook_id;
+            packed.codebook_id = native_quantised_formats::Q4_0.codebook_id;
             packed.payload_bytes = 16;
-            packed.encoding = CPUNativeVNNIEncoding::NibbleLUT;
+            packed.encoding = CPUNativeQuantisedEncoding::NibbleLUT;
             packed.is_asymmetric = false;
             packed.is_superblock = false;
             packed.data_stride = static_cast<int>(
@@ -335,16 +335,16 @@ namespace llaminar2::test
         }
 
         /** @brief Materialize deterministic expanded asymmetric Q5_1 bytes. */
-        cpu::native_vnni::CPUNativeVNNIPackedWeights
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights
         cpuAsymmetricProjectionBytes()
         {
-            using namespace cpu::native_vnni;
-            CPUNativeVNNIPackedWeights packed;
+            using namespace cpu::native_quantised;
+            CPUNativeQuantisedPackedWeights packed;
             packed.N = 32;
             packed.K = 64;
             packed.N_padded = 64;
             packed.blocks_per_row = 2;
-            packed.codebook_id = native_vnni_formats::Q5_1.codebook_id;
+            packed.codebook_id = native_quantised_formats::Q5_1.codebook_id;
             packed.payload_bytes = 32;
             packed.encoding = preparedEncodingForCodebook(
                 packed.codebook_id);
@@ -484,9 +484,9 @@ namespace llaminar2::test
         auto fixture = makeTransaction();
         const auto identity = remoteProjectionIdentity(
             fixture.transaction, DeviceId::cuda(1), DeviceId::rocm(0));
-        const NativeVnniSourceIdentity source_identity{
-            .codebook_id = native_vnni_formats::Q8_0.codebook_id,
-            .is_superblock = native_vnni_formats::Q8_0.is_superblock,
+        const NativeQuantisedSourceIdentity source_identity{
+            .codebook_id = native_quantised_formats::Q8_0.codebook_id,
+            .is_superblock = native_quantised_formats::Q8_0.is_superblock,
             .present = true,
         };
         std::array<std::uint8_t, 1> byte{};
@@ -510,7 +510,7 @@ namespace llaminar2::test
             identity, normalized, source_identity, 256);
         ASSERT_TRUE(manifest.valid());
         EXPECT_EQ(manifest.source_codebook_id,
-                  native_vnni_formats::Q8_0.codebook_id);
+                  native_quantised_formats::Q8_0.codebook_id);
         EXPECT_EQ(manifest.gpu_codebook_id, 19u)
             << "A normalized promoted GPU expert must not be relabeled as its GGUF codebook";
         EXPECT_EQ(manifest.region_bytes[0], normalized.vnni_bytes);
@@ -601,7 +601,7 @@ namespace llaminar2::test
 
         auto quantized_masquerade = manifest;
         quantized_masquerade.packing =
-            MoEOverlayRemoteProjectionPacking::GpuSeparatedNativeVnni;
+            MoEOverlayRemoteProjectionPacking::GpuSeparatedNativeQuantised;
         quantized_masquerade.manifest_hash =
             quantized_masquerade.computedHash();
         EXPECT_FALSE(quantized_masquerade.valid(&error));
@@ -642,7 +642,7 @@ namespace llaminar2::test
         partial.manifest_hash = partial.computedHash();
         std::string error;
         EXPECT_FALSE(partial.valid(&error));
-        EXPECT_NE(error.find("complete NativeVNNI units"), std::string::npos);
+        EXPECT_NE(error.find("complete NativeQuantised units"), std::string::npos);
         EXPECT_THROW(
             {
                 [[maybe_unused]] const auto rejected =
@@ -722,8 +722,8 @@ namespace llaminar2::test
         const auto cpu_bytes = cpuAsymmetricProjectionBytes();
         const auto identity = remoteProjectionIdentity(
             fixture.transaction, DeviceId::cuda(0), DeviceId::cpu());
-        const NativeVnniFormatInfo *source_format =
-            native_vnni_formats::forSourceIdentity(
+        const NativeQuantisedFormatInfo *source_format =
+            native_quantised_formats::forSourceIdentity(
                 cpu_bytes.codebook_id, cpu_bytes.is_superblock);
         ASSERT_NE(source_format, nullptr);
         const auto canonical_stream =
@@ -740,7 +740,7 @@ namespace llaminar2::test
             identity, canonical_stream, /*maximum_chunk_bytes=*/4096);
         auto live = expected;
         /* Q5_1 demoted through CPU promotes as normalized INT8+minimum. */
-        live.gpu_codebook_id = kNativeVnniExpandedInt8MinCodebook;
+        live.gpu_codebook_id = kNativeQuantisedExpandedInt8MinCodebook;
         live.gpu_payload_bytes_per_block = 32;
         live.gpu_is_asymmetric = 1;
         live.gpu_has_emins = 0;

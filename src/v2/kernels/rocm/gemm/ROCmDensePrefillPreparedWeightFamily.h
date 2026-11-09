@@ -16,7 +16,7 @@ namespace llaminar2::rocm
 /** @brief Disjoint original prepared contracts, independent of source codebook. */
 enum class DensePrefillWeightFamily : std::uint8_t
 {
-    NativeVNNI = 0, ///< Native K32 payload and per-block source metadata, including CB19.
+    NativeQuantised = 0, ///< Native K32 payload and per-block source metadata, including CB19.
     Int8Blockwise = 1, ///< Expanded INT8 VNNI payload plus its weight-scaling epilogue.
 };
 /**
@@ -26,7 +26,7 @@ enum class DensePrefillWeightFamily : std::uint8_t
  */
 [[nodiscard]] constexpr bool densePrefillWeightFamilyValid(DensePrefillWeightFamily family) noexcept
 {
-    return family == DensePrefillWeightFamily::NativeVNNI ||
+    return family == DensePrefillWeightFamily::NativeQuantised ||
            family == DensePrefillWeightFamily::Int8Blockwise;
 }
 /**
@@ -42,7 +42,7 @@ enum class DensePrefillWeightFamily : std::uint8_t
     {
     case VNNIPrefillProducer::NativeCooperative:
     case VNNIPrefillProducer::NativeStreaming:
-        return family == DensePrefillWeightFamily::NativeVNNI;
+        return family == DensePrefillWeightFamily::NativeQuantised;
     case VNNIPrefillProducer::Int8BlockwiseV3:
     case VNNIPrefillProducer::Int8BlockwiseV7:
         return family == DensePrefillWeightFamily::Int8Blockwise;

@@ -123,7 +123,7 @@ TEST(MTPHardwareDefaults, DenseQwenGPUHeadDefaultsRequireMeasuredNativeLocalFami
 {
     ModelConfig model{.name = "qwen35", .n_layers = 64, .n_heads = 24, .n_kv_heads = 4,
         .hidden_size = 5120, .intermediate_size = 17408, .vocab_size = 248320, .head_dim = 256,
-        .terminal_head_source = {.codebook_id = native_vnni_formats::Q6_K.codebook_id,
+        .terminal_head_source = {.codebook_id = native_quantised_formats::Q6_K.codebook_id,
             .is_superblock = true, .present = true}};
     ExecutionPlanBuilder builder;
     for (const auto type : {DeviceType::ROCm, DeviceType::CUDA})
@@ -169,9 +169,9 @@ TEST(MTPHardwareDefaults, DenseQwenGPUHeadDefaultsRequireMeasuredNativeLocalFami
         model.terminal_head_source.present = false;
         EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
         model.terminal_head_source.present = true;
-        model.terminal_head_source.codebook_id = native_vnni_formats::Q8_0.codebook_id;
+        model.terminal_head_source.codebook_id = native_quantised_formats::Q8_0.codebook_id;
         EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
-        model.terminal_head_source.codebook_id = native_vnni_formats::Q6_K.codebook_id;
+        model.terminal_head_source.codebook_id = native_quantised_formats::Q6_K.codebook_id;
         model.name = "qwen35moe";
         EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
         model.name = "qwen35";
@@ -194,7 +194,7 @@ namespace
     {
         return {.name = "qwen4exp", .n_layers = 48, .n_heads = 24, .n_kv_heads = 2,
             .hidden_size = 2560, .intermediate_size = 640, .vocab_size = 248320, .head_dim = 256,
-            .terminal_head_source = {.codebook_id = native_vnni_formats::Q8_0.codebook_id,
+            .terminal_head_source = {.codebook_id = native_quantised_formats::Q8_0.codebook_id,
                 .is_superblock = false, .present = true}};
     }
 
@@ -292,7 +292,7 @@ TEST(MTPHardwareDefaults, QFNOrdinaryHeadDefaultsRejectOtherGeometryAndSource)
     model.terminal_head_source.is_superblock = true;
     expectOrdinaryQFNPolicy(config, model, cluster, expected);
     model = ordinaryQFN();
-    model.terminal_head_source.codebook_id = native_vnni_formats::Q6_K.codebook_id;
+    model.terminal_head_source.codebook_id = native_quantised_formats::Q6_K.codebook_id;
     expectOrdinaryQFNPolicy(config, model, cluster, expected);
 }
 

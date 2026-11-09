@@ -413,7 +413,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDARowMajorPreparationCannotRunInsideD
 {
     const auto source = stripCommentsAndStringLiterals(readFile(
         repoRoot() /
-        "src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvShardImpl.cu.inc"));
+        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedGemvShardImpl.cu.inc"));
     ASSERT_FALSE(source.empty());
 
     const auto dispatch_source = sliceBetween(
@@ -1064,7 +1064,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEPersistentMetadataCapacityCoversEver
     const std::size_t expected_descriptor_bytes =
         static_cast<std::size_t>(kGroupedDescriptorTableSlots) *
         static_cast<std::size_t>(kExperts) *
-        sizeof(llaminar2::DeviceNativeVNNIMatrixDesc);
+        sizeof(llaminar2::DeviceNativeQuantisedMatrixDesc);
     const auto cuda_requirements = cudaMoE(
         /*max_seq_len=*/16,
         /*d_model=*/2048,
@@ -1104,7 +1104,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RuntimePrefillDescriptorsUseRetainedGra
     const std::size_t expected_descriptor_bytes =
         static_cast<std::size_t>(kGroupedDescriptorTableSlots) *
         static_cast<std::size_t>(kExperts) *
-        sizeof(llaminar2::DeviceNativeVNNIMatrixDesc);
+        sizeof(llaminar2::DeviceNativeQuantisedMatrixDesc);
 
     /*
      * Runtime descriptors are rewritten on device for each placement epoch.
@@ -4173,17 +4173,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         << "Scalar graph buckets must commit the primary recurrence bank.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIDispatchSweepUsesExplicitStream)
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedDispatchSweepUsesExplicitStream)
 {
     const auto source =
         readFile(repoRoot() / "tests/v2/performance/kernels/cuda/gemm/Perf__CUDABlockwiseTensorCoreGemmSweep.cpp");
 
     EXPECT_NE(source.find("cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)"), std::string::npos)
-        << "The CUDA NativeVNNI dispatch trainer must create an explicit non-blocking stream.";
+        << "The CUDA NativeQuantised dispatch trainer must create an explicit non-blocking stream.";
     EXPECT_NE(source.find("kernel->setGPUStream(static_cast<void *>(stream))"), std::string::npos)
-        << "The CUDA NativeVNNI dispatch trainer must bind its GEMM kernel to the explicit stream.";
+        << "The CUDA NativeQuantised dispatch trainer must bind its GEMM kernel to the explicit stream.";
     EXPECT_NE(source.find("kernel->clearGPUStreamBinding()"), std::string::npos)
-        << "The CUDA NativeVNNI dispatch trainer must unbind the stream before leaving the run.";
+        << "The CUDA NativeQuantised dispatch trainer must unbind the stream before leaving the run.";
     EXPECT_NE(source.find("cudaEventRecord(start, stream)"), std::string::npos)
         << "Benchmark timing must record the start event on the same explicit stream as GEMV.";
     EXPECT_NE(source.find("cudaEventRecord(stop, stream)"), std::string::npos)
@@ -4194,10 +4194,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIDispatchSweepUsesExplicit
         << "A missing stream argument records on the default stream and invalidates capture-sensitive timing.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNISmallMDispatchSweepUsesRealCandidates)
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedSmallMDispatchSweepUsesRealCandidates)
 {
     const auto tuned_source =
-        readFile(repoRoot() / "src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvShardImpl.cu.inc");
+        readFile(repoRoot() / "src/v2/kernels/cuda/gemm/CUDANativeQuantisedGemvShardImpl.cu.inc");
     const auto kernel_source =
         readFile(repoRoot() / "src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp");
     const auto sweep_source =
@@ -4209,21 +4209,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNISmallMDispatchSweepUsesRe
         "bool dispatchSmallMByCodebook(");
 
     EXPECT_NE(small_m_body.find("if (g_sweep.active)"), std::string::npos)
-        << "CUDA runtime-M NativeVNNI trainer rows must time the requested candidate, not the generated runtime route.";
+        << "CUDA runtime-M NativeQuantised trainer rows must time the requested candidate, not the generated runtime route.";
     EXPECT_NE(small_m_body.find("tuning = GeneratedDispatchTuning{"), std::string::npos)
         << "The small-M sweep override must forward tile/family parameters into the real launch.";
 
-    EXPECT_NE(kernel_source.find("if (cudaNativeVNNIGemvSweep_isActive())"), std::string::npos)
+    EXPECT_NE(kernel_source.find("if (cudaNativeQuantisedGemvSweep_isActive())"), std::string::npos)
         << "Small-M training sweeps must fail closed instead of falling through to generic M>1 GEMM.";
 
     EXPECT_NE(sweep_source.find("candidateSupportedByGpuPreparedSweepPath"), std::string::npos)
-        << "The CUDA NativeVNNI trainer must filter candidate families unsupported by the GPU-prepared harness.";
+        << "The CUDA NativeQuantised trainer must filter candidate families unsupported by the GPU-prepared harness.";
     EXPECT_NE(sweep_source.find("if (m > 1)\n            return candidate.family == SweepFamily::KPar;"),
               std::string::npos)
         << "Grouped trainer cases must not label WIDE/DIRECT/ROWPAR rows as specialized KPAR timings.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCapturedStream)
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedFusedVerifierRowsPinCapturedStream)
 {
     const auto kernel_source =
         readFile(repoRoot() / "src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp");
@@ -4272,7 +4272,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCaptu
     const auto small_m_compact = removeAsciiWhitespace(small_m_body);
     EXPECT_NE(small_m_body.find("void *stream_handle = execution_stream ? execution_stream : gpu_stream_;"),
               std::string::npos);
-    EXPECT_NE(small_m_raw.find("NativeVNNI small-M GEMV requires an explicit CUDA stream"),
+    EXPECT_NE(small_m_raw.find("NativeQuantised small-M GEMV requires an explicit CUDA stream"),
               std::string::npos)
         << "Small-M GEMV helpers must reject null streams instead of using stream 0.";
     EXPECT_NE(small_m_body.find("impl_->native_source_identity.codebook_id"),
@@ -4280,7 +4280,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCaptu
         << "A normalized ExpertOverlay projection must retain its source-format "
            "arithmetic policy for grouped verifier rows.";
     EXPECT_NE(small_m_compact.find(
-                  "cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy("),
+                  "cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy("),
               std::string::npos)
         << "Grouped decode must route physical bytes and source arithmetic policy "
            "through the policy-aware CUDA entry point.";
@@ -4304,11 +4304,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCaptu
     // materialize that view during a launch or captured replay.
     EXPECT_NE(m1_compact.find(
                   "CUDARowMajorWeights**rowmajor_slot="
-                  "cudaNativeVNNIGemvSweep_isActive()?&impl_->rowmajor:nullptr;"),
+                  "cudaNativeQuantisedGemvSweep_isActive()?&impl_->rowmajor:nullptr;"),
               std::string::npos);
     EXPECT_NE(small_m_compact.find(
                   "CUDARowMajorWeights**rowmajor_slot="
-                  "explicitSmallMVerifierScopeActive()&&!cudaNativeVNNIGemvSweep_isActive()"
+                  "explicitSmallMVerifierScopeActive()&&!cudaNativeQuantisedGemvSweep_isActive()"
                   "?nullptr:(impl_?&impl_->rowmajor:nullptr);"),
               std::string::npos);
     for (const auto &body : {m1_compact, small_m_compact})
@@ -4316,8 +4316,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCaptu
         EXPECT_EQ(body.find("cudaRowMajorWeights_create"), std::string::npos);
         EXPECT_EQ(body.find("prepareRowMajorWeightsOutsideCapture("), std::string::npos);
     }
-    EXPECT_NE(m1_compact.find("cudaNativeVNNIGemvTuned_fp32_withPolicy("
-                              "d_A_int8,impl_->d_weights_native_vnni,impl_->d_weights_native_scales,"
+    EXPECT_NE(m1_compact.find("cudaNativeQuantisedGemvTuned_fp32_withPolicy("
+                              "d_A_int8,impl_->d_weights_native_quantised,impl_->d_weights_native_scales,"
                               "impl_->d_weights_native_mins,impl_->d_weights_native_emins,d_C,"
                               "d_scales_A_blockwise,n,k,alpha,beta,nullptr,d_bias,"
                               "impl_->native_codebook_id,arithmetic_policy_codebook_id,"
@@ -4337,17 +4337,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCaptu
            "parameter exists.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIDispatchSweepUsesFastDeterministicWeights)
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedDispatchSweepUsesFastDeterministicWeights)
 {
     const auto source =
         readFile(repoRoot() / "tests/v2/performance/kernels/cuda/gemm/Perf__CUDABlockwiseTensorCoreGemmSweep.cpp");
     const auto format_table = sliceBetween(
         source,
         "const std::vector<FormatSpec> kFormats",
-        "const NativeVnniFormatInfo &requireNativeVnniInfo");
+        "const NativeQuantisedFormatInfo &requireNativeQuantisedInfo");
 
     EXPECT_NE(source.find("createFastSweepTensor"), std::string::npos)
-        << "CUDA NativeVNNI dispatch sweeps should use deterministic packed payloads.";
+        << "CUDA NativeQuantised dispatch sweeps should use deterministic packed payloads.";
     EXPECT_EQ(format_table.find("TestTensorFactory::create"), std::string::npos)
         << "Format weights in the dispatch trainer must not use random quantizers; "
            "giant LM-head refreshes need O(weight_bytes) deterministic construction.";
@@ -13263,11 +13263,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUHybridRecurrentStateHasNoHostMirror)
               std::string::npos);
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIWorkspaceCriticalFilesHaveNoRawAllocations)
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedWorkspaceCriticalFilesHaveNoRawAllocations)
 {
     const std::vector<std::filesystem::path> files = {
-        "src/v2/kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu",
-        "src/v2/kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh",
+        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu",
+        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh",
     };
 
     for (const auto &relative : files)
@@ -13819,26 +13819,26 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ROCmVerifierDispatchPolicyIsWorkerLocal
 {
     const auto root = repoRoot();
     const auto launcher_source =
-        readFile(root / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip");
+        readFile(root / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip");
     const auto kernel_source =
         readFile(root / "src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp");
 
     EXPECT_NE(
         launcher_source.find(
-            "static thread_local int g_native_vnni_decode_equivalent_m1_config"),
+            "static thread_local int g_native_quantised_decode_equivalent_m1_config"),
         std::string::npos)
         << "ROCm LocalTP runs one verifier worker per GPU in one process. "
            "Decode-equivalent dispatch mode must therefore be worker-local.";
     EXPECT_EQ(
         launcher_source.find(
-            "static std::atomic<int> g_native_vnni_decode_equivalent_m1_config"),
+            "static std::atomic<int> g_native_quantised_decode_equivalent_m1_config"),
         std::string::npos)
         << "A process-global verifier mode lets one LocalTP worker clear a "
            "sibling worker's serial-M1 dispatch contract.";
 
     const auto grouped_policy = sliceBetween(
         kernel_source,
-        "if (g_rocm_native_vnni_decode_equivalent_scope)",
+        "if (g_rocm_native_quantised_decode_equivalent_scope)",
         "if (PerfStatsCollector::isDomainEnabled(\"kernel\") &&\n"
         "                !batched_bypass_reason.empty())");
     EXPECT_FALSE(grouped_policy.empty());
@@ -13848,7 +13848,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ROCmVerifierDispatchPolicyIsWorkerLocal
         << "Single-projection grouped verifier stages such as LM_HEAD need the "
            "same explicit serial-M1 policy as fused projection groups.";
     EXPECT_NE(
-        grouped_policy.find("rocmGemv_native_vnni_query_serial_m1_config"),
+        grouped_policy.find("rocmGemv_native_quantised_query_serial_m1_config"),
         std::string::npos);
     EXPECT_NE(grouped_policy.find("policy.kb"), std::string::npos);
     EXPECT_NE(grouped_policy.find("policy.target_waves"), std::string::npos)

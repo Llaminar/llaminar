@@ -57,7 +57,7 @@ struct GpuPackedWeightsHeader
     uint32_t magic;              //  4B  "GPWT"
     uint32_t version;            //  4B  wire format version
     uint8_t  format;             //  1B  RepackFormat enum value
-    uint8_t  codebook_id;        //  1B  NativeVnniFormatInfo codebook_id
+    uint8_t  codebook_id;        //  1B  NativeQuantisedFormatInfo codebook_id
     uint8_t  payload_bytes;      //  1B  bytes per payload block (16, 20, 24, 32, ...)
     uint8_t  is_asymmetric;      //  1B  secondary plane present (raw IQ4_XS coefficients for24)
     uint8_t  is_superblock;      //  1B  256-element super-blocks
@@ -149,12 +149,12 @@ inline bool validateGpuPackedHeader(const GpuPackedWeightsHeader& hdr, size_t bu
     // Source4+superblock is distinct from IQ4_NL despite sharing the LUT.
     // This is metadata-only rejection before a wire payload can be adopted.
     if (hdr.format == static_cast<uint8_t>(RepackFormat::IQ4_XS) &&
-        (hdr.codebook_id != kNativeVnniIQ4XSSourceScaleCodebook ||
+        (hdr.codebook_id != kNativeQuantisedIQ4XSSourceScaleCodebook ||
          hdr.payload_bytes != 16 || hdr.is_asymmetric != 1 ||
          hdr.is_superblock != 1 || hdr.has_emins != 0)) return false;
-    if (hdr.codebook_id == kNativeVnniIQ4XSSourceScaleCodebook &&
+    if (hdr.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook &&
         hdr.format != static_cast<uint8_t>(RepackFormat::IQ4_XS)) return false;
-    if (hdr.codebook_id == kNativeVnniIQ4XSSourceScaleCodebook)
+    if (hdr.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook)
     {
         const uint64_t blocks = uint64_t(hdr.N) * uint64_t(hdr.blocks_per_row);
         if (hdr.K % 32 != 0 || hdr.blocks_per_row != hdr.K / 32 ||

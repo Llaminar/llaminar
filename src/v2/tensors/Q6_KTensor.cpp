@@ -10,7 +10,7 @@
 #include "FP16Utils.h"
 
 #include "VnniPackContext.h"
-#include "NativeVnniQ6Scale.h"
+#include "NativeQuantisedQ6Scale.h"
 #include "../kernels/KernelFactory.h"
 #include "SIMDHelpers.h"
 #include "../utils/DebugEnv.h"
@@ -677,7 +677,7 @@ namespace llaminar2
         // Keep the original factors, not rounded half products. Both metadata
         // planes retain their existing byte extent across CPU/GPU migration.
         ctx.scales_array[linear] = blk->d;
-        ctx.mins_array[linear] = native_vnni_q6_scale::pack(
+        ctx.mins_array[linear] = native_quantised_q6_scale::pack(
             sc[sc_lo_idx], sc[sc_hi_idx]);
     }
 

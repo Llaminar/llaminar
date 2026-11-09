@@ -8,7 +8,7 @@
  *
  * Protocol:
  *   1. Each rank copies its data to its shared-memory staging buffer
- *   2. Signals "ready" via atomic epoch counter (store-release)
+ *   2. Signals "ready" via abort-absorbing release publication
  *   3. Spins on all peers' epoch counters (load-acquire + _mm_pause)
  *   4. AVX-512 reduces all N buffers into caller's output
  *   5. Signals "consumed" before any rank may reuse its staging buffer
@@ -37,6 +37,7 @@
 
 namespace llaminar2
 {
+    namespace test { struct CPURootedPublicationTransportReplayAccess; }
 
     /**
      * @brief Shared-memory layout for N-rank spin-wait allreduce
@@ -315,6 +316,7 @@ namespace llaminar2
 
     private:
         friend class GlobalTPContext;
+        friend struct test::CPURootedPublicationTransportReplayAccess;
         /** @return True only after successful local unmap; original creator backing remains retained. */
         bool closeOriginalExpertMapping() noexcept;
         /** @brief Release creator backing only after the original domain's all-member unmap acknowledgement. */
@@ -341,6 +343,17 @@ namespace llaminar2
          * normal unlink-completion publication. The operation is idempotent.
          */
         void teardownSharedMemory();
+
+        /**
+         * @brief Publish the next native epoch without replacing an abort witness.
+         * @return True only if the expected prior epoch was advanced and no local
+         *         abort was observed. Failure publishes the absorbing abort state.
+         *
+         * Only the original protocol caller/master advances my_epoch_. Concurrent
+         * abort may replace the shared slot, so normal publication uses one CAS;
+         * neither a precheck/store race nor a retry may resurrect that slot.
+         */
+        bool publishNextEpoch();
 
         /// Wait for a peer epoch in the shared-memory protocol, with abort/timeout handling.
         bool waitForPeerEpoch(int peer_rank, uint64_t target_epoch, const char *phase, size_t count = 0);

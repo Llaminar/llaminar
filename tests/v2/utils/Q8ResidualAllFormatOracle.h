@@ -10,9 +10,9 @@
  */
 #pragma once
 #include "QuantizedVerifierFormats.h"
-#include "kernels/common/DeviceNativeVNNIMatrixDesc.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIDecode.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedDecode.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -132,7 +132,7 @@ inline Banks cpuBanks(const Q8_1Block *a, const Q8_1Block *b, int rows, int k) {
 inline std::array<int8_t, 32> integerPayload(uint8_t codebook,
                                              std::span<const uint8_t> bytes) {
   std::array<int8_t, 32> out{};
-  if (codebook == 19 || codebook == kNativeVnniExpandedInt8MinCodebook) {
+  if (codebook == 19 || codebook == kNativeQuantisedExpandedInt8MinCodebook) {
     if (bytes.size() < 32)
       throw std::invalid_argument("Short expanded payload");
     std::memcpy(out.data(), bytes.data(), 32);
@@ -146,8 +146,8 @@ inline std::array<int8_t, 32> integerPayload(uint8_t codebook,
       out[i] = int8_t((low | (high << 4)) - 32);
     }
   } else
-    cpu::native_vnni::decode_native_block(
-        codebook == kNativeVnniIQ4XSSourceScaleCodebook ? 4 : codebook,
+    cpu::native_quantised::decode_native_block(
+        codebook == kNativeQuantisedIQ4XSSourceScaleCodebook ? 4 : codebook,
         bytes.data(), out.data());
   return out;
 }
@@ -169,7 +169,7 @@ inline std::array<double, 32> coefficients(uint8_t cb,
     lo *= .5 + (secondary & 15);
     lo *= .25;
   }
-  if (cb == kNativeVnniIQ4XSSourceScaleCodebook)
+  if (cb == kNativeQuantisedIQ4XSSourceScaleCodebook)
     lo *= int(secondary & 63) - 32;
   if (cb == 11)
     lo *= 1 + 2 * int(secondary & 15);
@@ -179,7 +179,7 @@ inline std::array<double, 32> coefficients(uint8_t cb,
     const double factor = dual && i >= 16 ? hi : lo;
     out[i] = factor * q[i];
     if (cb == 5 || cb == 7 || cb == 16 ||
-        cb == kNativeVnniExpandedInt8MinCodebook)
+        cb == kNativeQuantisedExpandedInt8MinCodebook)
       out[i] += hi;
     if (cb == 10)
       out[i] += fp16_to_fp32(uint16_t(emins >> (i < 16 ? 0 : 16)));
@@ -194,7 +194,7 @@ inline std::array<double, 32> coefficients(uint8_t cb,
 /** @brief Extract actual CPU physical coefficients without calling any
  * projection or contribution kernel. */
 inline std::vector<double>
-cpuWeights(const cpu::native_vnni::CPUNativeVNNIPackedWeights &p) {
+cpuWeights(const cpu::native_quantised::CPUNativeQuantisedPackedWeights &p) {
   std::vector<double> out(std::size_t(p.N) * p.K);
   for (int n = 0; n < p.N; ++n)
     for (int b = 0; b < p.blocks_per_row; ++b) {

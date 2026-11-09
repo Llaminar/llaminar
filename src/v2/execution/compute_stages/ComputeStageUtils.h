@@ -96,7 +96,7 @@ namespace llaminar2
     /**
      * @brief Add CUDA decode side-stream GEMV partials for fused projection stages.
      *
-     * CUDA NativeVNNI M=1 decode can launch several projections from one fused
+     * CUDA NativeQuantised M=1 decode can launch several projections from one fused
      * stage on separate streams. Slot 0 uses the normal
      * `GEMV_KPAR_PARTIALS` buffer; the remaining projections need one disjoint
      * side-stream slot each. Grouped verifier projections reuse the same

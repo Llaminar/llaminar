@@ -2,20 +2,27 @@
  * @file Test__GPUExpertTransfer_ROCm.cpp
  * @brief ROCm D2D coverage for packed and floating expert transfers.
  *
- * In addition to the separated NativeVNNI layout, this suite moves raw FP16,
+ * In addition to the separated NativeQuantised layout, this suite moves raw FP16,
  * BF16, and FP32 projection payloads through the persistent production peer
  * lane. Every case joins an exact producer event, observes completion only by
  * polling the destination event, and compares every bit at the destination.
+ * TransferEngine prepares the destination-owned execution stream; each lane
+ * retains its typed pool lease until all event-polled work and cleanup finish.
  */
 
 #include <gtest/gtest.h>
 
 #include "backends/DeviceId.h"
+#include "transfer/TransferEngine.h"
 #include "execution/moe/ExpertTierGpuPeerTransferLane.h"
 #include "execution/moe/GPUExpertTransfer.h"
+#include "execution/moe/GPUExpertTransferBackend.h"
+#include "kernels/qwen4exp/Qwen4ExpStateIO.h"
 
 #include <hip/hip_runtime.h>
 
+#include <array>
+#include <exception>
 #include <cstdint>
 #include <cstring>
 #include <chrono>
@@ -420,7 +427,7 @@ namespace
      *
      * Starting from the source device catches accidental dependence on the
      * caller's current HIP device while exact byte comparisons cover all four
-     * separated NativeVNNI regions.
+     * separated NativeQuantised regions.
      */
     void runROCmPeerLaneTransfer()
     {
@@ -505,6 +512,11 @@ namespace
             ExpertTierGpuPeerTransferLane lane({
                 .source_device = DeviceId::rocm(src_dev),
                 .destination_device = DeviceId::rocm(dst_dev),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u, DeviceId::rocm(dst_dev),
+                                     "rocm_peer_event_polled")
+                                 .front(),
                 .lane_name = "rocm_peer_event_polled",
                 .perf_device = "rocm-peer",
                 .collect_timing_measurements = true,
@@ -672,6 +684,11 @@ namespace
             ExpertTierGpuPeerTransferLane lane({
                 .source_device = DeviceId::rocm(src_dev),
                 .destination_device = DeviceId::rocm(dst_dev),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u, DeviceId::rocm(dst_dev),
+                                     std::string("rocm_peer_contiguous_") + precision_name)
+                                 .front(),
                 .lane_name = std::string("rocm_peer_contiguous_") +
                              precision_name,
                 .perf_device = "rocm-peer-floating",
@@ -776,4 +793,108 @@ TEST(Test__ExpertTierGpuPeerTransferROCm, BF16ContiguousTransferIsByteExact)
 TEST(Test__ExpertTierGpuPeerTransferROCm, FP32ContiguousTransferIsByteExact)
 {
     runROCmContiguousPeerLaneTransfer("fp32", 4, 0xF032u);
+}
+
+
+namespace
+{
+    /** @brief Own one tiny retained reset graph, including failed-test cleanup. */
+    struct ROCmPeerResetResources
+    {
+        int ordinal;
+        hipStream_t stream=nullptr;
+        hipGraph_t graph=nullptr;
+        hipGraphExec_t executable=nullptr;
+        std::uint32_t *words=nullptr;
+        /** @brief Retire the exact test stream before releasing its captured bytes. */
+        ~ROCmPeerResetResources()
+        {
+            if(hipSetDevice(ordinal)!=hipSuccess)std::terminate();
+            if(stream && hipStreamSynchronize(stream)!=hipSuccess)std::terminate();
+            if(executable && hipGraphExecDestroy(executable)!=hipSuccess)std::terminate();
+            if(graph && hipGraphDestroy(graph)!=hipSuccess)std::terminate();
+            if(words && hipFree(words)!=hipSuccess)std::terminate();
+            if(stream && hipStreamDestroy(stream)!=hipSuccess)std::terminate();
+        }
+    };
+
+    /**
+     * @brief Replay an actual partial QFN reset after repeated direct-peer setup.
+     * @param source Actual native source ordinal.
+     * @param destination Actual native consumer ordinal.
+     * @param direct_peer Whether the queried directed edge is physically supported.
+     *
+     * Peer setup and ordinary auxiliary reset stay on this SAME host thread.
+     * A fresh thread isolates the defect from unrelated earlier test cases;
+     * no last-error clear is used to make either setup or reset pass.
+     */
+    void runROCmPeerPreparationReset(int source,int destination,bool direct_peer)
+    {
+        ASSERT_EQ(hipPeekAtLastError(),hipSuccess);
+        ASSERT_EQ(hipSetDevice(destination),hipSuccess);
+        ROCmPeerResetResources owner{destination};
+        constexpr std::size_t capacity=37,live=17;
+        constexpr std::uint32_t captured_bits=0x13579BDFu;
+        ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&owner.words),capacity*sizeof(std::uint32_t)),hipSuccess);
+        ASSERT_EQ(hipStreamCreateWithFlags(&owner.stream,hipStreamNonBlocking),hipSuccess);
+        ASSERT_EQ(hipStreamBeginCapture(owner.stream,hipStreamCaptureModeThreadLocal),hipSuccess);
+        ASSERT_NO_THROW(qwen4exp::rocmQwenStateFill({owner.words,live,captured_bits},owner.stream));
+        ASSERT_EQ(hipStreamEndCapture(owner.stream,&owner.graph),hipSuccess);
+        ASSERT_EQ(hipGraphInstantiate(&owner.executable,owner.graph,nullptr,nullptr,0),hipSuccess);
+        for(unsigned replay=0;replay<20;++replay)
+        {
+            SCOPED_TRACE(replay);
+            ASSERT_EQ(hipSetDevice(source),hipSuccess);
+            ASSERT_EQ(detail::prepareDirectPeerAccessROCmBackend(DeviceId::rocm(source),DeviceId::rocm(destination)),direct_peer);
+            ASSERT_EQ(detail::prepareDirectPeerAccessROCmBackend(DeviceId::rocm(source),DeviceId::rocm(destination)),direct_peer);
+            int ambient=-1;ASSERT_EQ(hipGetDevice(&ambient),hipSuccess);ASSERT_EQ(ambient,source);
+            ASSERT_EQ(hipSetDevice(destination),hipSuccess);
+            const std::uint32_t poison=0xAA550000u+replay;
+            // This is the ordinary cache-owned reset wrapper, before replay.
+            // Repeated setup must retire only its own AlreadyEnabled status.
+            ASSERT_NO_THROW(qwen4exp::rocmQwenStateFill({owner.words,capacity,poison},owner.stream));
+            ASSERT_EQ(hipPeekAtLastError(),hipSuccess);
+            ASSERT_EQ(hipGraphLaunch(owner.executable,owner.stream),hipSuccess);
+            std::array<std::uint32_t,capacity> observed{};
+            ASSERT_EQ(hipMemcpyAsync(observed.data(),owner.words,sizeof(observed),hipMemcpyDeviceToHost,owner.stream),hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(owner.stream),hipSuccess);
+            for(std::size_t index=0;index<capacity;++index)
+                ASSERT_EQ(observed[index],index<live ? captured_bits : poison)<<index;
+        }
+    }
+}
+
+TEST(Test__ExpertTierGpuPeerTransferROCm, RepeatedPreparationPreservesCapturedAuxiliaryReset)
+{
+    if(rocmDeviceCount()<2)GTEST_SKIP()<<"Requires two actual ROCm devices";
+    const auto directed=findDirectedROCmPeerPair();
+    const int source=directed ? directed->source : 0;
+    const int destination=directed ? directed->destination : 1;
+    const bool direct_peer=directed.has_value();
+    RecordProperty("direct_peer_available",direct_peer ? 1 : 0);
+    RecordProperty("source_ordinal",source);RecordProperty("destination_ordinal",destination);
+    // Unsupported edges are an explicit negative capability: setup must return
+    // false with clean error state while the device-local reset still works.
+    std::thread worker([&]{runROCmPeerPreparationReset(source,destination,direct_peer);});
+    worker.join();
+}
+
+TEST(Test__ExpertTierGpuPeerTransferROCm, PreparationPreservesUnrelatedPreexistingError)
+{
+    const int count=rocmDeviceCount();
+    if(count<2)GTEST_SKIP()<<"Requires two actual ROCm devices";
+    std::thread worker([&]{
+        ASSERT_EQ(hipSetDevice(0),hipSuccess);
+        ASSERT_EQ(hipPeekAtLastError(),hipSuccess);
+        // The deliberately invalid ordinal is defined hip behavior, not an
+        // invalid native pointer. Only this test retires its injected error.
+        const auto injected=hipSetDevice(count);
+        ASSERT_NE(injected,hipSuccess);
+        ASSERT_EQ(hipPeekAtLastError(),injected);
+        const bool prepared=detail::prepareDirectPeerAccessROCmBackend(DeviceId::rocm(0),DeviceId::rocm(1));
+        EXPECT_FALSE(prepared);
+        EXPECT_EQ(hipPeekAtLastError(),injected);
+        EXPECT_EQ(hipGetLastError(),injected);
+    });
+    worker.join();
 }

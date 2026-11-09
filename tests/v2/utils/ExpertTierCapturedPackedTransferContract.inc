@@ -53,12 +53,12 @@
                 SCOPED_TRACE(format.label);
                 auto tensor = format.create({std::size_t(N),std::size_t(K)},91037u);
                 auto source = packProductionGpuProjection(*tensor);
-                cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
-                ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(tensor.get(), cpu));
+                cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+                ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(tensor.get(), cpu));
                 std::string error;
                 HostGpuExpertPackedProjection promoted;
                 ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, promoted, &error)) << error;
-                const auto *metadata = native_vnni_formats::forSourceIdentity(
+                const auto *metadata = native_quantised_formats::forSourceIdentity(
                     source.source_codebook_id, source.is_superblock);
                 ASSERT_NE(metadata, nullptr);
                 auto downManifest=makeGpuToCpuExpertTierWeightStreamManifest(*metadata,
@@ -68,7 +68,7 @@
                 const auto down=downManifest.deviceLayout();
                 // Same genuine CPU final root geometry as the direct rectangle
                 // contract; it is not a full-parent staging buffer.
-                cpu::native_vnni::CPUNativeVNNIPackedWeights destinationCPU;
+                cpu::native_quantised::CPUNativeQuantisedPackedWeights destinationCPU;
                 if(rectangle) {
                     destinationCPU.N=targetN;destinationCPU.K=targetK;destinationCPU.N_padded=128;
                     destinationCPU.blocks_per_row=targetK/32;destinationCPU.payload_bytes=cpu.payload_bytes;

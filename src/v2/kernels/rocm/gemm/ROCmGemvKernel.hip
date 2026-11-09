@@ -18,10 +18,10 @@
  *       - Prefill grid-kpar:    rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar
  *       - Tuning overrides:     rocmGemv_int8_vnni_{set,reset}_{,wide_}tuning_overrides
  *
- *   ROCmGemvKernel_native_VNNI.hip
- *       Native-VNNI kernels that decode 4-bit nibbles losslessly:
- *       - Q4_0/IQ4_NL decode:   rocmGemv_native_vnni_fp32
- *       (Future native-VNNI kernels for other bit widths go here.)
+ *   ROCmGemvKernel_native_quantised.hip
+ *       NativeQuantised kernels that decode 4-bit nibbles losslessly:
+ *       - Q4_0/IQ4_NL decode:   rocmGemv_native_quantised_fp32
+ *       (Future native-quantised kernels for other bit widths go here.)
  *
  *   ROCmGemvKernel.hip (this file)
  *       Kept as the canonical entry point and documentation index.
@@ -39,12 +39,12 @@
  * FP32 scales. Activation quantization happens either ahead of time
  * (scatter variants) or fused in shared memory (fused variants).
  *
- * Native-VNNI (4-bit): weights stored as nibble payloads with FP16
+ * NativeQuantised (4-bit): weights stored as nibble payloads with FP16
  * per-block scales. Decode to INT8 happens in-register with no
  * precision loss (Q4_0: q-8; IQ4_NL: LUT).
  *
  * @see ROCmGemvKernel_INT8_VNNI.hip
- * @see ROCmGemvKernel_native_VNNI.hip
+ * @see ROCmGemvKernel_native_quantised.hip
  * @see ROCmQuantisedGemmKernel.cpp  (C++ dispatch that calls these kernels)
  *
  * @author Llaminar V2

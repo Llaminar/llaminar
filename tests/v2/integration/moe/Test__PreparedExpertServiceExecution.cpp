@@ -132,7 +132,7 @@ namespace llaminar2::test
                     // different INT8 row-scale representation for those inputs.
                     packed->N = static_cast<int>(weight->rows());
                     packed->K = static_cast<int>(weight->cols());
-                    require(rocm::packNativeVNNI(weight.get(), *packed), "ROCm prepared native blocks");
+                    require(rocm::packNativeQuantised(weight.get(), *packed), "ROCm prepared native blocks");
                     std::shared_ptr<ITensorGemm> engine(
                         new rocm::ROCmQuantisedGemmKernel(packed.get(), device.gpu_ordinal()),
                         [packed](ITensorGemm *value) { delete value; });

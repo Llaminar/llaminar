@@ -112,7 +112,7 @@ __global__ void fused_swiglu_quantize_blockwise_kernel(
             row_scales[b] = scale;
 
         // Quantize, coalesced write, and optionally record the quantized
-        // block sum for asymmetric NativeVNNI min correction.
+        // block sum for asymmetric NativeQuantised min correction.
         float qval = val * inv_scale;
         const int32_t q = static_cast<int32_t>(
             rintf(fminf(127.0f, fmaxf(-127.0f, qval))));

@@ -3,7 +3,7 @@
 
 /**
  * @file ROCmWeightPacker.h
- * @brief Weight packing utilities for ROCm native-VNNI and INT8 GEMM kernels
+ * @brief Weight packing utilities for ROCm native-quantised and INT8 GEMM kernels
  *
  * Extracted from ROCmQuantisedGemmKernel.cpp to isolate the weight conversion
  * pipeline (one-time at model load) from the GEMM execution hot path.
@@ -12,7 +12,7 @@
  *
  * | Category         | Formats                                          | Packing Path         |
  * |------------------|--------------------------------------------------|----------------------|
- * | Native-VNNI      | Q4_0, IQ4_NL, Q4_1, Q5_0, Q5_1, IQ4_XS, Q4_K,  | packNativeVNNI()     |
+ * | NativeQuantised      | Q4_0, IQ4_NL, Q4_1, Q5_0, Q5_1, IQ4_XS, Q4_K,  | packNativeQuantised()     |
  * | (≤6-bit)         | Q5_K, Q6_K, Q3_K, Q2_K, IQ3_S, IQ3_XXS, IQ2_S,  |                      |
  * |                  | IQ2_XS, IQ2_XXS, IQ1_S, IQ1_M                   |                      |
  * | INT8-VNNI (8-bit)| Q8_0, Q8_1, Q8_K                                | INT8 requantization  |
@@ -38,10 +38,10 @@ namespace llaminar2
         // Forward declaration (defined in ROCmQuantisedGemmKernel.h)
         struct ROCmPackedWeights;
 
-        // NativeVnniFormatInfo metadata and block packing are now provided
+        // NativeQuantisedFormatInfo metadata and block packing are now provided
         // by each tensor class via IINT8Unpackable::vnniFormatInfo() and
         // IINT8Unpackable::packVnniBlock().  See:
-        //   - tensors/NativeVnniFormatInfo.h   (format metadata struct)
+        //   - tensors/NativeQuantisedFormatInfo.h   (format metadata struct)
         //   - tensors/VnniPackContext.h         (packing context struct)
         //   - tensors/TensorClasses.h           (per-class overrides)
 
@@ -50,11 +50,11 @@ namespace llaminar2
         // =================================================================
 
         /**
-         * @brief Initialize ROCm IQ-grid constant tables for all native-VNNI TUs.
+         * @brief Initialize ROCm IQ-grid constant tables for all native-quantised TUs.
          *
          * IQ grid formats need per-device LUTs in the GEMV, GEMM, MoE prefill,
          * and ExpertOverlay tier-stream translation units. Device preparation
-         * owns publication before capture. Host packNativeVNNI() is deliberately
+         * owns publication before capture. Host packNativeQuantised() is deliberately
          * device-free; both GPU-pipeline and host-packed upload paths must prepare
          * tables for the exact destination runtime generation.
          * @param device_id Destination ROCm device ordinal.
@@ -63,9 +63,9 @@ namespace llaminar2
         bool ensureIQGridTablesInitialized(int device_id);
 
         /**
-         * @brief Pack tensor to native-VNNI layout (internal, called by packWeightsToROCm)
+         * @brief Pack tensor to native-quantised layout (internal, called by packWeightsToROCm)
          *
-         * Converts any supported ≤6-bit quantized tensor to native-VNNI format:
+         * Converts any supported ≤6-bit quantized tensor to native-quantised format:
          * - Interleaved payload bytes for coalesced GPU access
          * - Separate uint16 metadata planes: binary16 scales/minima for ordinary
          *   formats; original half bases and raw Q6/IQ2/IQ4 coefficients for
@@ -75,7 +75,7 @@ namespace llaminar2
          * @param out Output packed weights structure
          * @return true on success
          */
-        bool packNativeVNNI(const TensorBase *tensor, ROCmPackedWeights &out);
+        bool packNativeQuantised(const TensorBase *tensor, ROCmPackedWeights &out);
 
         /**
          * @brief Batch-packed MoE expert weights for ROCm (single GPU allocation for all experts).
@@ -84,7 +84,7 @@ namespace llaminar2
          */
         struct MoEBatchPackedWeightsROCm
         {
-            std::vector<uint8_t> all_native_vnni;
+            std::vector<uint8_t> all_native_quantised;
             std::vector<uint16_t> all_native_scales;
             std::vector<uint16_t> all_native_mins; ///< Raw source coefficients or format-specific half auxiliary.
             std::vector<uint32_t> all_native_emins;
@@ -102,7 +102,7 @@ namespace llaminar2
 
             struct DeviceUpload
             {
-                uint8_t *d_native_vnni = nullptr;
+                uint8_t *d_native_quantised = nullptr;
                 void *d_native_scales = nullptr;  // __half* on device
                 void *d_native_mins = nullptr; ///< uint16 raw source coefficients or half auxiliary.
                 void *d_native_emins = nullptr;

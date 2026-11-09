@@ -7,7 +7,7 @@
  * production submission never calls this kernel or the synthetic witness.
  */
 #include <hip/hip_runtime.h>
-#include "kernels/rocm/gemm/ROCmNativeVNNIDecodeEquivalentMath.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedDecodeEquivalentMath.h"
 #include <cstdint>
 
 namespace
@@ -25,7 +25,7 @@ __global__ void originalNativeM1Reducer(const float *partial,float *output,int N
         float sum=0.0f;
         #pragma unroll 16
         for(int kb=0;kb<kblocks;++kb)
-            sum=rocm_native_vnni_accumulate_rn(sum,partial[static_cast<std::size_t>(kb)*N+n]);
+            sum=rocm_native_quantised_accumulate_rn(sum,partial[static_cast<std::size_t>(kb)*N+n]);
         output[n]=sum;
     }
 }

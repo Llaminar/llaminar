@@ -10,14 +10,14 @@
  * Original IQ3_S/IQ4_XS coefficient planes have independently fixed byte
  * extents so a production metadata omission cannot also shrink the oracle.
  */
-#include "NativeVNNIExpertTransferParityTest.h"
+#include "NativeQuantisedExpertTransferParityTest.h"
 
 namespace llaminar2::test
 {
     void runMixedFormatExpertTransferPublication(DeviceId device, void *stream,
         DeviceMoEProjectionSet projections)
     {
-        using namespace native_vnni_transfer_parity_detail;
+        using namespace native_quantised_transfer_parity_detail;
         ASSERT_TRUE(device.is_gpu());
         ASSERT_NE(stream, nullptr);
         auto *backend = getBackendFor(device);
@@ -148,7 +148,7 @@ namespace llaminar2::test
                 source.descriptor.local_slot = 0;
                 source.descriptor.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
                                                            DeviceMoEExpertFlags::Resident);
-                const std::array<DeviceNativeVNNIMatrixDesc *, 3> matrices{
+                const std::array<DeviceNativeQuantisedMatrixDesc *, 3> matrices{
                     &source.descriptor.gate, &source.descriptor.up, &source.descriptor.down};
                 const std::array<DeviceMoEFloatingMatrixDesc *, 3> raw{
                     &source.descriptor.floating_gate, &source.descriptor.floating_up,
@@ -168,7 +168,7 @@ namespace llaminar2::test
                     // Source tuples own two distinct words per block even though
                     // neither format performs an additive minimum correction.
                     // Fix these extents independently of the production metadata.
-                    if (spec.codebook_id == 11u || spec.codebook_id == kNativeVnniIQ4XSSourceScaleCodebook)
+                    if (spec.codebook_id == 11u || spec.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook)
                     {
                         EXPECT_EQ(spec.payload_bytes_per_block, spec.codebook_id == 11u ? 13u : 16u);
                         ASSERT_TRUE(spec.is_asymmetric) << "Original source coefficient plane is mandatory";
@@ -183,8 +183,8 @@ namespace llaminar2::test
                     matrix.k = k;
                     matrix.blocks_per_row = k / 32;
                     matrix.codebook_id = spec.codebook_id;
-                    matrix.source_codebook_id = spec.format.native_vnni.codebook_id;
-                    matrix.source_is_superblock = spec.format.native_vnni.is_superblock;
+                    matrix.source_codebook_id = spec.format.native_quantised.codebook_id;
+                    matrix.source_is_superblock = spec.format.native_quantised.is_superblock;
                     matrix.source_identity_present = 1u;
                     matrix.allocation_payload_bytes_per_block = spec.payload_bytes_per_block;
                     matrix.allocation_has_mins = spec.is_asymmetric;
@@ -251,7 +251,7 @@ namespace llaminar2::test
                 }
                 EXPECT_EQ(observed.descriptor.floating_allocation_format, DeviceMoEWeightFormat::FP32);
                 EXPECT_EQ(observed.descriptor.floating_gate.data, immutable_raw_pointer);
-                const std::array<DeviceNativeVNNIMatrixDesc, 3> native_dst{
+                const std::array<DeviceNativeQuantisedMatrixDesc, 3> native_dst{
                     observed.descriptor.gate, observed.descriptor.up, observed.descriptor.down};
                 const std::array<DeviceMoEFloatingMatrixDesc, 3> raw_dst{
                     observed.descriptor.floating_gate, observed.descriptor.floating_up,
@@ -275,7 +275,7 @@ namespace llaminar2::test
                     {
                         const auto &src = *matrices[projection];
                         const auto &dst = native_dst[projection];
-                        if (src.codebook_id == 11u || src.codebook_id == kNativeVnniIQ4XSSourceScaleCodebook)
+                        if (src.codebook_id == 11u || src.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook)
                         {
                             const size_t blocks = size_t(n) * size_t(k / 32);
                             const size_t payload = blocks * (src.codebook_id == 11u ? 13u : 16u);

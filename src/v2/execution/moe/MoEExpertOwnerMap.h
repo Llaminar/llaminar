@@ -10,7 +10,8 @@
  * the configured ordinal or deterministic-random order. Epoch transitions use
  * the prior immutable map as a stability constraint so experts that remain in
  * a multi-participant tier do not move merely because another expert entered
- * or left that tier.
+ * or left that tier. Explicit whole-owner participant changes remain checked
+ * against that same canonical map while retaining every CPU cohort intact.
  */
 
 #pragma once
@@ -24,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <variant>
 #include <utility>
@@ -199,14 +201,22 @@ namespace llaminar2
          * @param plan Candidate tier assignments with the unchanged declared topology.
          * @param previous Real previous live placement, retaining stable whole owners.
          * @param original Immutable source placement owning the original cohort/cut identities.
+         * @param whole_owner_changes Explicit whole-owner participant changes relative to
+         *        the canonical tier transition: previous_participant names the
+         *        post-tier-projection owner, including newly promoted experts.
+         *        Empty retains its stable owners; explicit no-op edges are rejected.
          * @return One canonical live map; no source selection or physical readiness is minted.
          * @throws std::invalid_argument For foreign topology, geometry, quotas or cohort
-         * identities.
+         * identities, stale/duplicate changes, non-apportioned or foreign whole destinations,
+         * or a change in per-layer participant capacity.
          * @note Original cohorts are shared, never rebuilt from candidate expert IDs.
+         * Participant changes cannot name a cohort member as a whole owner. Every
+         * changed whole-owner slot is paired within its original layer/tier before publication.
          */
         static MoEExpertOwnerMap buildShardTransition(const MoERoutedExpertPlacementPlan &plan,
                                                       const MoEExpertOwnerMap &previous,
-                                                      const MoEExpertOwnerMap &original);
+                                                      const MoEExpertOwnerMap &original,
+                                                      std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes = {});
 
         /**
          * @param layer_idx Original model-global layer.

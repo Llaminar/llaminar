@@ -12,7 +12,7 @@
 #include "execution/local_execution/graph/GraphResolver.h"
 #include "loaders/WeightIdentity.h"
 #include "planning/ModelMemoryProfile.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <algorithm>
 #include <limits>
@@ -74,7 +74,7 @@ MoEProjectionArenaGeometry MoEProjectionArenaGeometry::resolve(
 
         const bool floating = tensor.quant_type == "F16" || tensor.quant_type == "FP16" ||
             tensor.quant_type == "BF16" || tensor.quant_type == "F32" || tensor.quant_type == "FP32";
-        if (!floating && !native_vnni_formats::forQuantType(tensor.quant_type))
+        if (!floating && !native_quantised_formats::forQuantType(tensor.quant_type))
             throw std::invalid_argument("MoE projection arena has an unsupported down format: " + tensor.quant_type);
         const MoEGroupedIntermediateLayout row{
             floating ? MoEGroupedIntermediateEncoding::FP32 : MoEGroupedIntermediateEncoding::BlockQ8FP32Scales,

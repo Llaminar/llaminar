@@ -255,10 +255,10 @@ namespace llaminar2
                     static_cast<std::uint8_t>(projection.format.kind));
                 hashUnsigned(
                     hash,
-                    projection.format.native_vnni.codebook_id);
+                    projection.format.native_quantised.codebook_id);
                 hashUnsigned(
                     hash,
-                    projection.format.native_vnni.is_superblock ? 1u : 0u);
+                    projection.format.native_quantised.is_superblock ? 1u : 0u);
             }
         }
         std::sort(

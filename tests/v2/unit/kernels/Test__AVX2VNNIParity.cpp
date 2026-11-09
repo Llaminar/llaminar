@@ -6,14 +6,14 @@
  * Test levels:
  *  1. Intrinsic-level:  avx2_dpbusd_epi32 vs _mm512_dpbusd_epi32
  *  2. Single-chunk GEMV: 64-column chunk output comparison
- *  3. Full GEMV (M=1):  gemv_native_vnni_preq with ISAPath::AVX512 vs AVX2
- *  4. Full GEMM (M>1):  gemm_native_vnni_preq with ISAPath::AVX512 vs AVX2
+ *  3. Full GEMV (M=1):  gemv_native_quantised_preq with ISAPath::AVX512 vs AVX2
+ *  4. Full GEMM (M>1):  gemm_native_quantised_preq with ISAPath::AVX512 vs AVX2
  *
  * All tests run on AVX512-VNNI hardware, calling both paths explicitly
  * via the ISAPath runtime dispatch enum.
  */
 
-#include "../../utils/NativeVNNITestPartialStorage.h"
+#include "../../utils/NativeQuantisedTestPartialStorage.h"
 #include <gtest/gtest.h>
 #include <immintrin.h>
 #include <omp.h>
@@ -28,15 +28,15 @@
 #include <cmath>
 
 #include "kernels/cpu/gemm/VNNIEmulation.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/SIMDHelpers.h"
 #include "utils/CPUFeatures.h"
 #include "../../utils/TestTensorFactory.h"
 
-using namespace llaminar2::cpu::native_vnni;
-using namespace llaminar2::cpu::native_vnni::isa;
+using namespace llaminar2::cpu::native_quantised;
+using namespace llaminar2::cpu::native_quantised::isa;
 using namespace llaminar2;
 using llaminar2::test::TestTensorFactory;
 
@@ -48,13 +48,13 @@ using llaminar2::test::TestTensorFactory;
  * Comparing the resulting FP32 bytes rather than floating-point equality also
  * covers signed zero and every NaN payload.
  */
-TEST(NativeVNNIFP16Scale, ExhaustiveBinary16ExpansionMatchesPortableBytes)
+TEST(NativeQuantisedFP16Scale, ExhaustiveBinary16ExpansionMatchesPortableBytes)
 {
     for (uint32_t raw = 0; raw <= 0xffffu; ++raw)
     {
         const uint16_t fp16 = static_cast<uint16_t>(raw);
         const float expected = llaminar2::fp16_to_fp32(fp16);
-        const float actual = nativeVNNIFP16ScaleToFP32(fp16);
+        const float actual = nativeQuantisedFP16ScaleToFP32(fp16);
         uint32_t expected_bits = 0;
         uint32_t actual_bits = 0;
         std::memcpy(&expected_bits, &expected, sizeof(expected_bits));
@@ -95,10 +95,10 @@ namespace avx2_parity_helpers
     }
 
     // Pack weights and assert success
-    inline CPUNativeVNNIPackedWeights packWeights(const TensorBase *tensor)
+    inline CPUNativeQuantisedPackedWeights packWeights(const TensorBase *tensor)
     {
-        CPUNativeVNNIPackedWeights packed;
-        bool ok = packWeightsCPUNativeVNNI(tensor, packed);
+        CPUNativeQuantisedPackedWeights packed;
+        bool ok = packWeightsCPUNativeQuantised(tensor, packed);
         if (!ok)
             throw std::runtime_error("Weight packing failed");
         return packed;
@@ -263,7 +263,7 @@ protected:
  * NBC8 and NBC16 at a three-chunk shape are the same physical NBC4 launch and
  * must never receive independent counter records.
  */
-TEST(CPUNativeVNNIDecodePolicy, NormalizesGeometryDependentAliases)
+TEST(CPUNativeQuantisedDecodePolicy, NormalizesGeometryDependentAliases)
 {
     const auto resolve = [](DecodeSchedulePolicy policy, int n)
     {
@@ -303,7 +303,7 @@ TEST(CPUNativeVNNIDecodePolicy, NormalizesGeometryDependentAliases)
  * byte-exact work economically. Small matrices retain the coarse policies,
  * and a two-tile frozen K partition also makes NBC8 sufficiently parallel.
  */
-TEST(CPUNativeVNNIDecodePolicy, ResolvesLargeUnderfilledSchedulesToFullTeamGrid)
+TEST(CPUNativeQuantisedDecodePolicy, ResolvesLargeUnderfilledSchedulesToFullTeamGrid)
 {
     constexpr int N = 11264;
     constexpr int K = 38912;
@@ -373,11 +373,11 @@ TEST(CPUNativeVNNIDecodePolicy, ResolvesLargeUnderfilledSchedulesToFullTeamGrid)
  * one both mean full-K while only values greater than one mean independent K
  * partials.
  */
-TEST(CPUNativeVNNIVerifierSchedule, ResolvesPhysicalTaskGridIdentity)
+TEST(CPUNativeQuantisedVerifierSchedule, ResolvesPhysicalTaskGridIdentity)
 {
-    EXPECT_FALSE(nativeVNNIUsesKPartitions(0));
-    EXPECT_FALSE(nativeVNNIUsesKPartitions(1));
-    EXPECT_TRUE(nativeVNNIUsesKPartitions(2));
+    EXPECT_FALSE(nativeQuantisedUsesKPartitions(0));
+    EXPECT_FALSE(nativeQuantisedUsesKPartitions(1));
+    EXPECT_TRUE(nativeQuantisedUsesKPartitions(2));
 
     const auto resolve_full_k = [](VerifierRowsPolicy policy)
     {
@@ -483,7 +483,7 @@ TEST(CPUNativeVNNIVerifierSchedule, ResolvesPhysicalTaskGridIdentity)
  * `Auto` dispatch may publish the canonical route. The trainer-only override
  * is legal only for full-K Pairwise/WideRows pair grids.
  */
-TEST(CPUNativeVNNIVerifierSchedule, RejectsNonPhysicalExplicitIdentity)
+TEST(CPUNativeQuantisedVerifierSchedule, RejectsNonPhysicalExplicitIdentity)
 {
     const VerifierRowsScheduleGeometry small_n{
         .rows = 4,
@@ -541,11 +541,11 @@ TEST(CPUNativeVNNIVerifierSchedule, RejectsNonPhysicalExplicitIdentity)
  * K=224 selected nominal NBC8 even though its three N chunks have one physical
  * NBC4 owner.
  */
-TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
+TEST(CPUNativeQuantisedDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
 {
-    using generated::CPUNativeVNNIDecodeBuildISA;
-    using generated::CPUNativeVNNIDecodePolicy;
-    using generated::CPUNativeVNNIDecodeRuntimeISA;
+    using generated::CPUNativeQuantisedDecodeBuildISA;
+    using generated::CPUNativeQuantisedDecodePolicy;
+    using generated::CPUNativeQuantisedDecodeRuntimeISA;
 
     constexpr std::array<uint8_t, 18> codebooks{
         0, 4, 5, 6, 7, 8, 9, 10, 11,
@@ -564,15 +564,15 @@ TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
 
 #if LLAMINAR_COMPILED_WITH_AVX512
     constexpr std::array runtime_regimes{
-        std::pair{CPUNativeVNNIDecodeBuildISA::AVX512,
-                  CPUNativeVNNIDecodeRuntimeISA::AVX2},
-        std::pair{CPUNativeVNNIDecodeBuildISA::AVX512,
-                  CPUNativeVNNIDecodeRuntimeISA::AVX512},
+        std::pair{CPUNativeQuantisedDecodeBuildISA::AVX512,
+                  CPUNativeQuantisedDecodeRuntimeISA::AVX2},
+        std::pair{CPUNativeQuantisedDecodeBuildISA::AVX512,
+                  CPUNativeQuantisedDecodeRuntimeISA::AVX512},
     };
 #else
     constexpr std::array runtime_regimes{
-        std::pair{CPUNativeVNNIDecodeBuildISA::AVX2,
-                  CPUNativeVNNIDecodeRuntimeISA::AVX2},
+        std::pair{CPUNativeQuantisedDecodeBuildISA::AVX2,
+                  CPUNativeQuantisedDecodeRuntimeISA::AVX2},
     };
 #endif
 
@@ -588,9 +588,9 @@ TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
                     {
                         for (const bool serial_kpart : {false, true})
                         {
-                            CPUNativeVNNIDecodePolicy nominal{};
+                            CPUNativeQuantisedDecodePolicy nominal{};
                             ASSERT_TRUE(
-                                generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
+                                generated::selectCPUNativeQuantisedDecodeGeneratedPolicy(
                                     build_isa,
                                     runtime_isa,
                                     threads,
@@ -636,7 +636,7 @@ TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
      */
     EXPECT_EQ(
         resolveGeneratedDecodeSchedulePolicy(
-            CPUNativeVNNIDecodePolicy::Nbc8,
+            CPUNativeQuantisedDecodePolicy::Nbc8,
             DecodeScheduleGeometry{
                 .n = 160,
                 .k = 224,
@@ -654,11 +654,11 @@ TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
  * regimes, full-K and K-part geometries, and representative positive OpenMP
  * widths. No exact overlay is required for an unseen topology.
  */
-TEST(CPUNativeVNNIVerifierPolicy, GeneratedRulesCoverAllPositiveThreadCounts)
+TEST(CPUNativeQuantisedVerifierPolicy, GeneratedRulesCoverAllPositiveThreadCounts)
 {
-    using generated::CPUNativeVNNIBuildISA;
-    using generated::CPUNativeVNNIRuntimeISA;
-    using generated::CPUNativeVNNIVerifierRowsPolicy;
+    using generated::CPUNativeQuantisedBuildISA;
+    using generated::CPUNativeQuantisedRuntimeISA;
+    using generated::CPUNativeQuantisedVerifierRowsPolicy;
 
     constexpr std::array<uint8_t, 18> codebooks{
         0, 4, 5, 6, 7, 8, 9, 10, 11,
@@ -681,15 +681,15 @@ TEST(CPUNativeVNNIVerifierPolicy, GeneratedRulesCoverAllPositiveThreadCounts)
 
 #if LLAMINAR_COMPILED_WITH_AVX512
     constexpr std::array runtime_regimes{
-        std::pair{CPUNativeVNNIBuildISA::AVX512,
-                  CPUNativeVNNIRuntimeISA::AVX2},
-        std::pair{CPUNativeVNNIBuildISA::AVX512,
-                  CPUNativeVNNIRuntimeISA::AVX512},
+        std::pair{CPUNativeQuantisedBuildISA::AVX512,
+                  CPUNativeQuantisedRuntimeISA::AVX2},
+        std::pair{CPUNativeQuantisedBuildISA::AVX512,
+                  CPUNativeQuantisedRuntimeISA::AVX512},
     };
 #else
     constexpr std::array runtime_regimes{
-        std::pair{CPUNativeVNNIBuildISA::AVX2,
-                  CPUNativeVNNIRuntimeISA::AVX2},
+        std::pair{CPUNativeQuantisedBuildISA::AVX2,
+                  CPUNativeQuantisedRuntimeISA::AVX2},
     };
 #endif
 
@@ -705,10 +705,10 @@ TEST(CPUNativeVNNIVerifierPolicy, GeneratedRulesCoverAllPositiveThreadCounts)
                     {
                         for (const int k_tiles : {0, 2})
                         {
-                            CPUNativeVNNIVerifierRowsPolicy policy{};
+                            CPUNativeQuantisedVerifierRowsPolicy policy{};
                             ASSERT_TRUE(
                                 generated::
-                                    selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+                                    selectCPUNativeQuantisedVerifierRowsGeneratedPolicy(
                                         build_isa,
                                         runtime_isa,
                                         threads,
@@ -729,9 +729,9 @@ TEST(CPUNativeVNNIVerifierPolicy, GeneratedRulesCoverAllPositiveThreadCounts)
         }
     }
 
-    CPUNativeVNNIVerifierRowsPolicy policy{};
+    CPUNativeQuantisedVerifierRowsPolicy policy{};
     EXPECT_FALSE(
-        generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+        generated::selectCPUNativeQuantisedVerifierRowsGeneratedPolicy(
             runtime_regimes.front().first,
             runtime_regimes.front().second,
             0,
@@ -753,15 +753,15 @@ TEST(CPUNativeVNNIVerifierPolicy, GeneratedRulesCoverAllPositiveThreadCounts)
  * catch both topology-specific rule gaps and integer-boundary failures without
  * multiplying the complete geometry matrix by thousands of redundant widths.
  */
-TEST(CPUNativeVNNIThreadTotality, PolicyCacheRetainsFullRuntimeRowIdentity)
+TEST(CPUNativeQuantisedThreadTotality, PolicyCacheRetainsFullRuntimeRowIdentity)
 {
     constexpr std::array<uint8_t, 18> codebooks{
         0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21};
 #if LLAMINAR_COMPILED_WITH_AVX512
-    constexpr auto build = generated::CPUNativeVNNIBuildISA::AVX512;
+    constexpr auto build = generated::CPUNativeQuantisedBuildISA::AVX512;
     constexpr std::array isas{ISALevel::AVX2, ISALevel::AVX512};
 #else
-    constexpr auto build = generated::CPUNativeVNNIBuildISA::AVX2;
+    constexpr auto build = generated::CPUNativeQuantisedBuildISA::AVX2;
     constexpr std::array isas{ISALevel::AVX2};
 #endif
     // Routed prefill can exceed the exact-overlay key's eight-bit row field.
@@ -773,13 +773,13 @@ TEST(CPUNativeVNNIThreadTotality, PolicyCacheRetainsFullRuntimeRowIdentity)
                 for (int k_tiles : {0, 4})
                     for (int m : rows)
                     {
-                        CPUNativeVNNIPackedWeights packed;
+                        CPUNativeQuantisedPackedWeights packed;
                         packed.codebook_id = codebook;
                         const auto runtime = isa == ISALevel::AVX512
-                            ? generated::CPUNativeVNNIRuntimeISA::AVX512
-                            : generated::CPUNativeVNNIRuntimeISA::AVX2;
-                        generated::CPUNativeVNNIVerifierRowsPolicy expected{};
-                        ASSERT_TRUE(generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+                            ? generated::CPUNativeQuantisedRuntimeISA::AVX512
+                            : generated::CPUNativeQuantisedRuntimeISA::AVX2;
+                        generated::CPUNativeQuantisedVerifierRowsPolicy expected{};
+                        ASSERT_TRUE(generated::selectCPUNativeQuantisedVerifierRowsGeneratedPolicy(
                             build, runtime, threads, codebook, m, 512, 256, k_tiles, expected));
                         const auto actual = selectVerifierRowsPolicy(
                             packed, m, 512, 256, isa, threads, k_tiles);
@@ -790,14 +790,14 @@ TEST(CPUNativeVNNIThreadTotality, PolicyCacheRetainsFullRuntimeRowIdentity)
 }
 
 /** @test Generated dispatch is total over positive CPU worker counts. */
-TEST(CPUNativeVNNIThreadTotality, GeneratedSelectorsHaveNoPositiveThreadHoles)
+TEST(CPUNativeQuantisedThreadTotality, GeneratedSelectorsHaveNoPositiveThreadHoles)
 {
-    using generated::CPUNativeVNNIBuildISA;
-    using generated::CPUNativeVNNIDecodeBuildISA;
-    using generated::CPUNativeVNNIDecodePolicy;
-    using generated::CPUNativeVNNIDecodeRuntimeISA;
-    using generated::CPUNativeVNNIRuntimeISA;
-    using generated::CPUNativeVNNIVerifierRowsPolicy;
+    using generated::CPUNativeQuantisedBuildISA;
+    using generated::CPUNativeQuantisedDecodeBuildISA;
+    using generated::CPUNativeQuantisedDecodePolicy;
+    using generated::CPUNativeQuantisedDecodeRuntimeISA;
+    using generated::CPUNativeQuantisedRuntimeISA;
+    using generated::CPUNativeQuantisedVerifierRowsPolicy;
 
     constexpr std::array<uint8_t, 18> codebooks{
         0, 4, 5, 6, 7, 8, 9, 10, 11,
@@ -806,25 +806,25 @@ TEST(CPUNativeVNNIThreadTotality, GeneratedSelectorsHaveNoPositiveThreadHoles)
 
 #if LLAMINAR_COMPILED_WITH_AVX512
     constexpr std::array decode_runtime_regimes{
-        std::pair{CPUNativeVNNIDecodeBuildISA::AVX512,
-                  CPUNativeVNNIDecodeRuntimeISA::AVX2},
-        std::pair{CPUNativeVNNIDecodeBuildISA::AVX512,
-                  CPUNativeVNNIDecodeRuntimeISA::AVX512},
+        std::pair{CPUNativeQuantisedDecodeBuildISA::AVX512,
+                  CPUNativeQuantisedDecodeRuntimeISA::AVX2},
+        std::pair{CPUNativeQuantisedDecodeBuildISA::AVX512,
+                  CPUNativeQuantisedDecodeRuntimeISA::AVX512},
     };
     constexpr std::array verifier_runtime_regimes{
-        std::pair{CPUNativeVNNIBuildISA::AVX512,
-                  CPUNativeVNNIRuntimeISA::AVX2},
-        std::pair{CPUNativeVNNIBuildISA::AVX512,
-                  CPUNativeVNNIRuntimeISA::AVX512},
+        std::pair{CPUNativeQuantisedBuildISA::AVX512,
+                  CPUNativeQuantisedRuntimeISA::AVX2},
+        std::pair{CPUNativeQuantisedBuildISA::AVX512,
+                  CPUNativeQuantisedRuntimeISA::AVX512},
     };
 #else
     constexpr std::array decode_runtime_regimes{
-        std::pair{CPUNativeVNNIDecodeBuildISA::AVX2,
-                  CPUNativeVNNIDecodeRuntimeISA::AVX2},
+        std::pair{CPUNativeQuantisedDecodeBuildISA::AVX2,
+                  CPUNativeQuantisedDecodeRuntimeISA::AVX2},
     };
     constexpr std::array verifier_runtime_regimes{
-        std::pair{CPUNativeVNNIBuildISA::AVX2,
-                  CPUNativeVNNIRuntimeISA::AVX2},
+        std::pair{CPUNativeQuantisedBuildISA::AVX2,
+                  CPUNativeQuantisedRuntimeISA::AVX2},
     };
 #endif
 
@@ -834,9 +834,9 @@ TEST(CPUNativeVNNIThreadTotality, GeneratedSelectorsHaveNoPositiveThreadHoles)
         {
             for (const auto [build_isa, runtime_isa] : decode_runtime_regimes)
             {
-                CPUNativeVNNIDecodePolicy full_k_policy{};
+                CPUNativeQuantisedDecodePolicy full_k_policy{};
                 ASSERT_TRUE(
-                    generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
+                    generated::selectCPUNativeQuantisedDecodeGeneratedPolicy(
                         build_isa,
                         runtime_isa,
                         threads,
@@ -849,9 +849,9 @@ TEST(CPUNativeVNNIThreadTotality, GeneratedSelectorsHaveNoPositiveThreadHoles)
                     << "full-K decode threads=" << threads
                     << " codebook=" << static_cast<int>(codebook);
 
-                CPUNativeVNNIDecodePolicy kpart_policy{};
+                CPUNativeQuantisedDecodePolicy kpart_policy{};
                 ASSERT_TRUE(
-                    generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
+                    generated::selectCPUNativeQuantisedDecodeGeneratedPolicy(
                         build_isa,
                         runtime_isa,
                         threads,
@@ -867,9 +867,9 @@ TEST(CPUNativeVNNIThreadTotality, GeneratedSelectorsHaveNoPositiveThreadHoles)
 
             for (const auto [build_isa, runtime_isa] : verifier_runtime_regimes)
             {
-                CPUNativeVNNIVerifierRowsPolicy full_k_policy{};
+                CPUNativeQuantisedVerifierRowsPolicy full_k_policy{};
                 ASSERT_TRUE(
-                    generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+                    generated::selectCPUNativeQuantisedVerifierRowsGeneratedPolicy(
                         build_isa,
                         runtime_isa,
                         threads,
@@ -882,9 +882,9 @@ TEST(CPUNativeVNNIThreadTotality, GeneratedSelectorsHaveNoPositiveThreadHoles)
                     << "full-K verifier threads=" << threads
                     << " codebook=" << static_cast<int>(codebook);
 
-                CPUNativeVNNIVerifierRowsPolicy kpart_policy{};
+                CPUNativeQuantisedVerifierRowsPolicy kpart_policy{};
                 ASSERT_TRUE(
-                    generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+                    generated::selectCPUNativeQuantisedVerifierRowsGeneratedPolicy(
                         build_isa,
                         runtime_isa,
                         threads,
@@ -916,10 +916,10 @@ TEST(CPUNativeVNNIThreadTotality, GeneratedSelectorsHaveNoPositiveThreadHoles)
  * through production `Auto` dispatch. Every grouped row must be byte-identical
  * to a production M=1 invocation under the same runtime thread topology.
  */
-TEST(CPUNativeVNNIThreadTotality, ProductionDecodeAndGroupedVerifierExecute)
+TEST(CPUNativeQuantisedThreadTotality, ProductionDecodeAndGroupedVerifierExecute)
 {
     if (!cpu_supports_avx2())
-        GTEST_SKIP() << "NativeVNNI production kernels require AVX2";
+        GTEST_SKIP() << "NativeQuantised production kernels require AVX2";
 
     ScopedOpenMPControls openmp_guard;
     constexpr int M = 3;
@@ -959,7 +959,7 @@ TEST(CPUNativeVNNIThreadTotality, ProductionDecodeAndGroupedVerifierExecute)
              static_cast<size_t>(geometry.k)},
             geometry.seed);
         ASSERT_NE(weights, nullptr);
-        const CPUNativeVNNIPackedWeights packed = packWeights(weights.get());
+        const CPUNativeQuantisedPackedWeights packed = packWeights(weights.get());
 
         std::vector<Q8_1Block> activations(
             static_cast<size_t>(M) * packed.blocks_per_row);
@@ -988,18 +988,18 @@ TEST(CPUNativeVNNIThreadTotality, ProductionDecodeAndGroupedVerifierExecute)
 
             for (int row = 0; row < M; ++row)
             {
-                gemv_native_vnni_preq(
+                gemv_native_quantised_preq(
                     packed,
                     activations.data() +
                         static_cast<size_t>(row) * packed.blocks_per_row,
-                    serial.data() + static_cast<size_t>(row) * geometry.n, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
+                    serial.data() + static_cast<size_t>(row) * geometry.n, llaminar2::test::NativeQuantisedTestPartialStorage(packed, 1).span(),
                     ISAPath::AUTO,
                     DecodeSchedulePolicy::Auto);
             }
-            gemm_native_vnni_preq_decode_equivalent_rows(
+            gemm_native_quantised_preq_decode_equivalent_rows(
                 packed,
                 activations.data(),
-                grouped.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
+                grouped.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, M).span(),
                 M,
                 geometry.n);
 
@@ -1023,9 +1023,9 @@ TEST(CPUNativeVNNIThreadTotality, ProductionDecodeAndGroupedVerifierExecute)
  * but the packed geometry must remain valid so this test reaches the scalar
  * policy guard instead of the independent malformed-geometry guard.
  */
-TEST(CPUNativeVNNIDecodePolicy, RejectsScalarProductionSchedules)
+TEST(CPUNativeQuantisedDecodePolicy, RejectsScalarProductionSchedules)
 {
-    CPUNativeVNNIPackedWeights packed;
+    CPUNativeQuantisedPackedWeights packed;
     packed.N = 64;
     packed.K = 32;
     packed.blocks_per_row = 1;
@@ -1034,18 +1034,18 @@ TEST(CPUNativeVNNIDecodePolicy, RejectsScalarProductionSchedules)
     std::array<float, 64> output{};
 
     EXPECT_THROW(
-        gemv_native_vnni_preq(
+        gemv_native_quantised_preq(
             packed,
             activation.data(),
-            output.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
+            output.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, 1).span(),
             ISAPath::SCALAR,
             DecodeSchedulePolicy::Auto),
         std::runtime_error);
     EXPECT_THROW(
-        gemv_native_vnni_preq(
+        gemv_native_quantised_preq(
             packed,
             activation.data(),
-            output.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
+            output.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, 1).span(),
             ISAPath::SCALAR,
             DecodeSchedulePolicy::Nbc1),
         std::runtime_error);
@@ -1264,10 +1264,10 @@ TEST_F(AVX2VNNIParity, DpbusdIntrinsic_MultipleAccumulations)
                              ? build_decode_lut(packed.codebook_id)                        \
                              : _mm512_setzero_si512();                                     \
         if (packed.usesNibbleLUT())                                                          \
-            gemv_native_vnni_avx512_chunk_native(packed, A_q8.data(), result_512,          \
+            gemv_native_quantised_avx512_chunk_native(packed, A_q8.data(), result_512,          \
                                                  0, 0, packed.blocks_per_row, lut512);     \
         else                                                                               \
-            gemv_native_vnni_avx512_chunk_non_nibble(                                    \
+            gemv_native_quantised_avx512_chunk_non_nibble(                                    \
                 packed, A_q8.data(), result_512,                                          \
                 0, 0, packed.blocks_per_row);                                             \
                                                                                            \
@@ -1334,10 +1334,10 @@ CHUNK_PARITY_TEST(IQ1_M, createIQ1_MRandom, 64, 256)
         std::vector<float> result_512(N, 0.0f);                                            \
         std::vector<float> result_256(N, 0.0f);                                            \
                                                                                            \
-        gemv_native_vnni_preq(packed, A_q8.data(), result_512.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),                      \
+        gemv_native_quantised_preq(packed, A_q8.data(), result_512.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, 1).span(),                      \
                               ISAPath::AVX512,                                             \
                               DecodeSchedulePolicy::FrozenSerialOracle);                  \
-        gemv_native_vnni_preq(packed, A_q8.data(), result_256.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),                      \
+        gemv_native_quantised_preq(packed, A_q8.data(), result_256.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, 1).span(),                      \
                               ISAPath::AVX2,                                               \
                               DecodeSchedulePolicy::FrozenSerialOracle);                  \
                                                                                            \
@@ -1429,9 +1429,9 @@ FULL_GEMV_PARITY_TEST(IQ3_S, createIQ3_SRandom, 200, 512, 96)
         std::vector<float> result_512(static_cast<size_t>(M) * N, 0.0f);                   \
         std::vector<float> result_256(static_cast<size_t>(M) * N, 0.0f);                   \
                                                                                            \
-        gemm_native_vnni_preq(packed, A_q8_all.data(), result_512.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),                  \
+        gemm_native_quantised_preq(packed, A_q8_all.data(), result_512.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, M).span(),                  \
                               M, ldc, ISAPath::AVX512);                                    \
-        gemm_native_vnni_preq(packed, A_q8_all.data(), result_256.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),                  \
+        gemm_native_quantised_preq(packed, A_q8_all.data(), result_256.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, M).span(),                  \
                               M, ldc, ISAPath::AVX2);                                      \
                                                                                            \
         assertExactEqual(result_512.data(), result_256.data(),                              \
@@ -1566,16 +1566,16 @@ TEST_F(AVX2VNNIParity, Q6KNativeDualScaleEncodingIsByteExactForAllRuntimeRows)
         const Q8_1Block *const row_activations =
             activations.data() +
             static_cast<size_t>(row) * packed.blocks_per_row;
-        gemv_native_vnni_preq(
+        gemv_native_quantised_preq(
             packed,
             row_activations,
-            serial_avx512.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
+            serial_avx512.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeQuantisedTestPartialStorage(packed, 1).span(),
             ISAPath::AVX512,
             DecodeSchedulePolicy::FrozenSerialOracle);
-        gemv_native_vnni_preq(
+        gemv_native_quantised_preq(
             packed,
             row_activations,
-            serial_avx2.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
+            serial_avx2.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeQuantisedTestPartialStorage(packed, 1).span(),
             ISAPath::AVX2,
             DecodeSchedulePolicy::FrozenSerialOracle);
     }
@@ -1596,18 +1596,18 @@ TEST_F(AVX2VNNIParity, Q6KNativeDualScaleEncodingIsByteExactForAllRuntimeRows)
         std::vector<float> grouped_avx512(output_elements, 0.0f);
         std::vector<float> grouped_avx2(output_elements, 0.0f);
 
-        gemm_native_vnni_preq_decode_equivalent_rows(
+        gemm_native_quantised_preq_decode_equivalent_rows(
             packed,
             activations.data(),
-            grouped_avx512.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
+            grouped_avx512.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, M).span(),
             M,
             N,
             ISAPath::AVX512,
             VerifierRowsPolicy::Auto);
-        gemm_native_vnni_preq_decode_equivalent_rows(
+        gemm_native_quantised_preq_decode_equivalent_rows(
             packed,
             activations.data(),
-            grouped_avx2.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
+            grouped_avx2.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, M).span(),
             M,
             N,
             ISAPath::AVX2,
@@ -1665,33 +1665,33 @@ TEST_F(AVX2VNNIParity, RuntimeISADispatch_AVX2AVX512_ScalarM1OracleOnly)
         std::vector<float> gemv_512(N, 0.0f);
         std::vector<float> gemv_256(N, 0.0f);
         std::vector<float> gemv_scalar(N, 0.0f);
-        gemv_native_vnni_preq(
-            packed, A_q8_all.data(), gemv_512.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(), ISAPath::AVX512,
+        gemv_native_quantised_preq(
+            packed, A_q8_all.data(), gemv_512.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, 1).span(), ISAPath::AVX512,
             DecodeSchedulePolicy::FrozenSerialOracle);
-        gemv_native_vnni_preq(
-            packed, A_q8_all.data(), gemv_256.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(), ISAPath::AVX2,
+        gemv_native_quantised_preq(
+            packed, A_q8_all.data(), gemv_256.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, 1).span(), ISAPath::AVX2,
             DecodeSchedulePolicy::FrozenSerialOracle);
 
         assertExactEqual(gemv_512.data(), gemv_256.data(), N,
                          test_case.name + " M=1 AVX512 vs AVX2");
-        gemv_native_vnni_preq(
-            packed, A_q8_all.data(), gemv_scalar.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(), ISAPath::SCALAR,
+        gemv_native_quantised_preq(
+            packed, A_q8_all.data(), gemv_scalar.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, 1).span(), ISAPath::SCALAR,
             DecodeSchedulePolicy::FrozenSerialOracle);
         assertStrictMetricClose(gemv_512.data(), gemv_scalar.data(), N,
                                 test_case.name + " M=1 AVX512 vs scalar oracle");
 
         std::vector<float> rows_512(static_cast<size_t>(M) * N, 0.0f);
         std::vector<float> rows_256(static_cast<size_t>(M) * N, 0.0f);
-        gemm_native_vnni_preq_decode_equivalent_rows(
-            packed, A_q8_all.data(), rows_512.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(), M, N, ISAPath::AVX512);
-        gemm_native_vnni_preq_decode_equivalent_rows(
-            packed, A_q8_all.data(), rows_256.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(), M, N, ISAPath::AVX2);
+        gemm_native_quantised_preq_decode_equivalent_rows(
+            packed, A_q8_all.data(), rows_512.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, M).span(), M, N, ISAPath::AVX512);
+        gemm_native_quantised_preq_decode_equivalent_rows(
+            packed, A_q8_all.data(), rows_256.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, M).span(), M, N, ISAPath::AVX2);
 
         assertExactEqual(rows_512.data(), rows_256.data(), M * N,
                          test_case.name + " verifier rows AVX512 vs AVX2");
         EXPECT_THROW(
-            gemm_native_vnni_preq_decode_equivalent_rows(
-                packed, A_q8_all.data(), rows_256.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(), M, N,
+            gemm_native_quantised_preq_decode_equivalent_rows(
+                packed, A_q8_all.data(), rows_256.data(), llaminar2::test::NativeQuantisedTestPartialStorage(packed, M).span(), M, N,
                 ISAPath::SCALAR),
             std::runtime_error)
             << test_case.name

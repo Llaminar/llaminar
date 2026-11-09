@@ -24,7 +24,7 @@ namespace llaminar2
     /**
      * @brief Arithmetic format carried by one routed-expert descriptor family.
      *
-     * A movable payload uses supported NativeVNNI codebooks or one contiguous
+     * A movable payload uses supported NativeQuantised codebooks or one contiguous
      * floating-point format. The value is stored once because its projections
      * must agree on that family; accepting mixed families inside one payload
      * would make migration byte counts and captured dispatch ambiguous. A fixed
@@ -35,7 +35,7 @@ namespace llaminar2
     // descriptor; no placement bank or transfer directory grows in VRAM.
     enum class DeviceMoEWeightFormat : std::uint16_t
     {
-        NativeVNNI = 0,
+        NativeQuantised = 0,
         FP16 = 1,
         BF16 = 2,
         FP32 = 3,
@@ -163,7 +163,7 @@ namespace llaminar2
         if (deviceMoEWeightFormatIsFloating(expert.weight_format))
             return expert.floating_gate.valid() && expert.floating_up.valid() &&
                 (!needs_down || expert.floating_down.valid());
-        if (expert.weight_format != DeviceMoEWeightFormat::NativeVNNI)
+        if (expert.weight_format != DeviceMoEWeightFormat::NativeQuantised)
             return false;
         // The compact CUDA/HIP views and the host descriptor share these ABI
         // fields. Do not depend on a host-only descriptor member function.

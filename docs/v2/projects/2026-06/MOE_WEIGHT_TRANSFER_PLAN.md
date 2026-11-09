@@ -26,10 +26,10 @@ costs ~800ms per rebalance. Transferring pre-packed weights eliminates this.
 | Deliverable | File | Status |
 |---|---|---|
 | `IPackedWeights` abstract interface | `src/v2/kernels/IPackedWeights.h` | ✅ |
-| `CPUPackedWeights` concrete (wraps `CPUNativeVNNIPackedWeights`) | `src/v2/kernels/cpu/gemm/CPUPackedWeights.h` | ✅ |
+| `CPUPackedWeights` concrete (wraps `CPUNativeQuantisedPackedWeights`) | `src/v2/kernels/cpu/gemm/CPUPackedWeights.h` | ✅ |
 | `CPUPackedWeightsWithNativeBlocks` (deferred packing variant) | same file | ✅ |
 | `ITensorGemm::detachWeights/attachWeights/releaseWeights/hasWeights` | `src/v2/tensors/TensorKernels.h` | ✅ |
-| `CPUNativeVNNIGemmKernel` implementations | `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h` | ✅ |
+| `CPUNativeQuantisedGemmKernel` implementations | `src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h` | ✅ |
 | Departed expert weight freeing in `MoEFFNStage` | `src/v2/execution/compute_stages/stages/MoEFFNStage.cpp` | ✅ |
 
 ---
@@ -149,7 +149,7 @@ the existing `KernelFactory` cache.
 ```
 For each newly-acquired expert e:
   if received_packed_weights[e] exists:
-    1. Create CPUNativeVNNIGemmKernel (empty)
+    1. Create CPUNativeQuantisedGemmKernel (empty)
     2. attachWeights(received_packed_weights[e])
     3. Register in KernelFactory cache via new API
     4. Assign engine pointers

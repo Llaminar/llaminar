@@ -26,7 +26,7 @@ ModelMemoryProfile exactCPUProfile(std::string name,std::string type,size_t n,si
 /** @test Every codebook retains its actual64-row padded root for small and partial matrices. */
 TEST(CPUExactWeightFootprintContract, AllNativeFormatsRetainIndependentMatrixAndExpertPadding)
 {
-    for(const auto& format:native_vnni_formats::kAllSourceFormats)
+    for(const auto& format:native_quantised_formats::kAllSourceFormats)
       for(const size_t n:{3u,17u,65u})for(const size_t k:{256u,512u}) {
         SCOPED_TRACE(format.quant_type);
         const auto expected=CPUWeightPreparationMemory::sourceNative(format.quant_type,n,k).persistent_bytes;
@@ -42,7 +42,7 @@ TEST(CPUExactWeightFootprintContract, AllNativeFormatsRetainIndependentMatrixAnd
 /** @test Typed TP axes remain separate from native final padding on every declared degree. */
 TEST(CPUExactWeightFootprintContract, TensorShardsPreserveFinalNAndKThroughEight)
 {
-    for(const auto& format:native_vnni_formats::kAllSourceFormats)for(int degree:{1,2,4,8}) {
+    for(const auto& format:native_quantised_formats::kAllSourceFormats)for(int degree:{1,2,4,8}) {
         SCOPED_TRACE(format.quant_type);
         auto gate=exactCPUProfile("blk.0.ffn_up.weight",std::string(format.quant_type),17u*degree,256);
         auto down=exactCPUProfile("blk.0.ffn_down.weight",std::string(format.quant_type),65,256u*degree);
@@ -59,7 +59,7 @@ TEST(CPUExactWeightFootprintContract, TensorShardsPreserveFinalNAndKThroughEight
 TEST(CPUExactWeightFootprintContract, NativeResidentAndTiedLookupKeepActualFinalOwners)
 {
     const auto placement=CPUStoragePlacement::local();
-    for(const auto& format:native_vnni_formats::kAllSourceFormats) {
+    for(const auto& format:native_quantised_formats::kAllSourceFormats) {
         auto router=exactCPUProfile("blk.0.ffn_gate_inp.weight",std::string(format.quant_type),17,256);
         EXPECT_EQ(WeightMemoryEstimator::estimate(router,DeviceId::cpu()).device_bytes,
             placement.physicalBytes<uint8_t>(router.tensors[0].native_bytes));
@@ -89,7 +89,7 @@ TEST(CPUExactWeightFootprintContract, OriginalLocalAndNodePlacementRoundEveryAct
         return WeightMemoryEstimator::estimate(profile,DeviceId::cpu(),0,1,0,-1,residency,std::nullopt,
             WeightComponentScope::EmbeddingAndTerminal,placement);
     };
-    for(const auto& format:native_vnni_formats::kAllSourceFormats) {
+    for(const auto& format:native_quantised_formats::kAllSourceFormats) {
         const auto payload=CPUWeightPreparationMemory::sourceNative(format.quant_type,3,256).persistent_payload_bytes;
         auto experts=exactCPUProfile("blk.0.ffn_up_exps.weight",std::string(format.quant_type),3,256,7);
         const auto selected=DeviceWeightResidency::selectedRoutedExpertsOnly(7,{3});

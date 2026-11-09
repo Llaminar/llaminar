@@ -6775,11 +6775,11 @@ namespace llaminar2::test
                   std::string::npos);
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ROCmRuntimeNativeVNNIKernelsGuardSparseExpertTables)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ROCmRuntimeNativeQuantisedKernelsGuardSparseExpertTables)
     {
         const fs::path root = findRepoRoot();
         const fs::path decode_path =
-            root / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip";
+            root / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip";
         const fs::path prefill_path =
             root / "src/v2/kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip";
         ASSERT_TRUE(fs::exists(decode_path)) << decode_path;
@@ -6791,30 +6791,30 @@ namespace llaminar2::test
         ASSERT_FALSE(prefill_contents.empty()) << prefill_path;
 
         const std::vector<std::pair<std::string, std::string>> decode_required_tokens = {
-            {"descriptor validator", "native_vnni_desc_shape_ok"},
+            {"descriptor validator", "native_quantised_desc_shape_ok"},
             {"runtime expert bounds guard", "if (expert_id < 0 || expert_id >= num_experts)"},
-            {"blank descriptor guard", "!native_vnni_desc_shape_ok<FMT>(desc, N, K)"},
+            {"blank descriptor guard", "!native_quantised_desc_shape_ok<FMT>(desc, N, K)"},
             {"invalid route-row zero fill", "route_output[output_index] = 0.0f;"},
             {"invalid runtime gate-row zero fill", "gate_outputs[slot][n] = 0.0f;"},
             {"invalid runtime up-row zero fill", "up_outputs[slot][n] = 0.0f;"},
-            {"serial-order route fold", "moe_grouped_native_vnni_down_ordered_reduce_kernel"},
+            {"serial-order route fold", "moe_grouped_native_quantised_down_ordered_reduce_kernel"},
         };
         for (const auto &[label, token] : decode_required_tokens)
         {
             EXPECT_NE(decode_contents.find(token), std::string::npos)
-                << "ROCm grouped decode NativeVNNI kernels must retain " << label
+                << "ROCm grouped decode NativeQuantised kernels must retain " << label
                 << " for sparse rebalance descriptor tables";
         }
 
         const std::vector<std::pair<std::string, std::string>> prefill_required_tokens = {
-            {"descriptor validator", "prefill_native_vnni_desc_shape_ok"},
+            {"descriptor validator", "prefill_native_quantised_desc_shape_ok"},
             {"runtime expert bounds guard", "if (expert_id < 0 || expert_id >= num_experts)"},
-            {"blank descriptor guard", "!prefill_native_vnni_desc_shape_ok<FMT>"},
+            {"blank descriptor guard", "!prefill_native_quantised_desc_shape_ok<FMT>"},
         };
         for (const auto &[label, token] : prefill_required_tokens)
         {
             EXPECT_NE(prefill_contents.find(token), std::string::npos)
-                << "ROCm grouped prefill NativeVNNI kernels must retain " << label
+                << "ROCm grouped prefill NativeQuantised kernels must retain " << label
                 << " for sparse rebalance descriptor tables";
         }
     }
@@ -9113,7 +9113,7 @@ namespace llaminar2::test
         const fs::path cuda_path = root / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp";
         const fs::path rocm_path = root / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp";
         const fs::path rocm_gemv_path =
-            root / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip";
+            root / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip";
         const fs::path debug_env_path = root / "src/v2/utils/DebugEnv.h";
         ASSERT_TRUE(fs::exists(cuda_path)) << cuda_path;
         ASSERT_TRUE(fs::exists(rocm_path)) << rocm_path;
@@ -9208,14 +9208,14 @@ namespace llaminar2::test
             "LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE",
             "LLAMINAR_ROCM_MOE_GATEUP_KPARTS",
             "LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED",
-            "rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart",
-            "rocmMoE_grouped_gate_up_native_vnni_decode_runtime_kpart",
-            "rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart",
-            "rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_runtime_kpart",
-            "rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel",
-            "rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime_parallel",
-            "moe_grouped_native_vnni_down_parallel_experts_kernel_t",
-            "moe_grouped_native_vnni_down_runtime_parallel_experts_kernel_t",
+            "rocmMoE_grouped_gate_up_native_quantised_decode_table_kpart",
+            "rocmMoE_grouped_gate_up_native_quantised_decode_runtime_kpart",
+            "rocmMoE_grouped_gate_up_swiglu_quant_native_quantised_decode_table_kpart",
+            "rocmMoE_grouped_gate_up_swiglu_quant_native_quantised_decode_runtime_kpart",
+            "rocmMoE_grouped_swiglu_down_native_quantised_decode_table_parallel",
+            "rocmMoE_grouped_swiglu_down_native_quantised_decode_runtime_parallel",
+            "moe_grouped_native_quantised_down_parallel_experts_kernel_t",
+            "moe_grouped_native_quantised_down_runtime_parallel_experts_kernel_t",
             "const bool use_gateup_kpart = false",
             "const bool use_parallel_down = false",
         };
@@ -9227,11 +9227,11 @@ namespace llaminar2::test
         }
 
         EXPECT_NE(rocm_gemv.find(
-                      "moe_grouped_native_vnni_down_route_kernel_t"),
+                      "moe_grouped_native_quantised_down_route_kernel_t"),
                   std::string::npos)
             << "ROCm grouped down must compute route rows in parallel";
         EXPECT_NE(rocm_gemv.find(
-                      "moe_grouped_native_vnni_down_ordered_reduce_kernel"),
+                      "moe_grouped_native_quantised_down_ordered_reduce_kernel"),
                   std::string::npos)
             << "ROCm grouped down must fold route rows in fixed router order";
         EXPECT_NE(rocm.find("ordered_route_parallel_down"), std::string::npos)

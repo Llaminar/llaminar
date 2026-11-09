@@ -51,6 +51,25 @@ namespace llaminar2::test
     };
 
     /**
+     * @brief Reject a standalone source matrix that cannot represent its native blocks.
+     * @param format Original source tuple; execution re-encoding is not admission.
+     * @param columns Positive output extent, including supported output tails.
+     * @param k Positive source row width, divisible by the original32/256-value block.
+     * @throws std::invalid_argument For an unrepresentable standalone source shape.
+     *
+     * A real parent/block slice needs its own production preparation owner. This
+     * fixture never pads K or requantizes another format to manufacture admission.
+     */
+    inline void requireQuantizedVerifierSourceShape(
+        const QuantizedVerifierFormatCase &format, int columns, int k)
+    {
+        const int source_block = format.source_is_superblock ? 256 : 32;
+        if (columns <= 0 || k <= 0 || k % source_block != 0)
+            throw std::invalid_argument(std::string("Unadmitted standalone source shape for ") +
+                format.label + ": K must be positive and divisible by native block " + std::to_string(source_block));
+    }
+
+    /**
      * @brief Return every quantized model-weight format accepted by V2 loaders.
      *
      * Q8_1 is primarily an activation format, but WeightManager and GEMM accept
@@ -65,7 +84,7 @@ namespace llaminar2::test
              { return TestTensorFactory::createQ4_0Random(shape, seed); }},
             {"IQ4_NL", TensorType::IQ4_NL, 4, false, 4, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }},
-            {"IQ4_XS", TensorType::IQ4_XS, 4, true, kNativeVnniIQ4XSSourceScaleCodebook, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+            {"IQ4_XS", TensorType::IQ4_XS, 4, true, kNativeQuantisedIQ4XSSourceScaleCodebook, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createIQ4_XSRandom(shape, seed); }},
             {"Q4_1", TensorType::Q4_1, 5, false, 5, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createQ4_1Random(shape, seed); }},

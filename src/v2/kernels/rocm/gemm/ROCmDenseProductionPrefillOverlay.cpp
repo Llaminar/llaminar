@@ -12,7 +12,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <tuple>
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 namespace llaminar2::rocm
 {
 namespace
@@ -24,7 +24,7 @@ constexpr auto key(const generated::ROCmDensePrefillOverlayEntry &entry) noexcep
 /** @return Whether the canonical source catalog owns this execution decoder. */
 constexpr bool sourceOwned(std::uint8_t codebook) noexcept
 {
-    for (const auto &source : native_vnni_formats::kAllSourceFormats)
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
         if (canonicalDeviceVnniCodebookId(source.metadata->codebook_id) == codebook) return true;
     return false;
 }

@@ -302,7 +302,7 @@ TEST_F(Test__CPUEmbeddingGroupedVerifier,
 
         const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor.get());
         ASSERT_NE(unpackable, nullptr);
-        const NativeVnniFormatInfo *info = unpackable->vnniFormatInfo();
+        const NativeQuantisedFormatInfo *info = unpackable->vnniFormatInfo();
         ASSERT_NE(info, nullptr)
             << "Every canonical grouped weight format must be preparation-capable";
         EXPECT_EQ(info->codebook_id, format.source_codebook_id);

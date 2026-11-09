@@ -1,6 +1,10 @@
 /**
  * @file MoECPUExpertShardRouteStage.cpp
  * @brief Exact original TP membership and source-native compact CPU shard publication.
+ *
+ * Ordinary sparse prefill retains its original replicated CPU cohort packet as
+ * live-size transport authority. Decode/verifier and generic records keep their
+ * original transport policy; no count exchange or alternate arithmetic is added.
  */
 #include "MoECPUExpertShardRouteStage.h"
 #include "../../moe/CPUExpertShardSourceSelection.h"
@@ -224,21 +228,37 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
     if(sparse && sparse->target_participant!=p.original_source->participant().participant_id)return reject("sparse_participant_mismatch");
     const auto gather_begin=timing_observation_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(timing_observation_)timing_observation_->sample_.source=source_phase;
-    if(!p.tp->gatherVariableFloatRecordsToRoot(records,local,records,
-        // Every member selects the same original rooted protocol from this
-        // declared receive extent. Contributor storage is intentionally smaller;
-        // only the root writes the receive prefix (validated independently cold).
-        slots*p.original_source->cohort()->participants().size(),
-        canonical_moe_route_record::recordWidth(p.columns),p.root_participant,gathered,
-        p.stage_name,p.source_ranges)) return reject("original_rooted_gather");
+    const size_t receive_capacity=slots*p.original_source->cohort()->participants().size();
+    std::optional<CPURootedPublicationTransport> selected_transport;
+    bool gathered_ok=false;
+    if(sparse && source_phase==ExpertHistogramSource::PrefillChunk)
+    {
+        auto* native=dynamic_cast<GlobalTPContext*>(p.tp);
+        if(!native || !native->authenticatesOriginalCPUExpertBorrow(p.original_tp_owner))
+            return reject("original_replicated_prefill_context");
+        CPURootedPublicationTransport selected;
+        // Prepared bank, packet epoch, exact member and packed count were
+        // authenticated above. Only this private native API may derive a common
+        // live-size choice from the producer's replicated cohort route set.
+        gathered_ok=native->gatherReplicatedCPUExpertPrefillRoutesToRoot(
+            *p.original_source,*sparse,p.original_tp_owner,records,records,receive_capacity,
+            p.root_participant,gathered,p.stage_name,p.source_ranges,selected);
+        selected_transport=selected;
+    }
+    else
+        gathered_ok=p.tp->gatherVariableFloatRecordsToRoot(records,local,records,receive_capacity,
+            canonical_moe_route_record::recordWidth(p.columns),p.root_participant,gathered,
+            p.stage_name,p.source_ranges);
+    if(!gathered_ok)return reject("original_rooted_gather");
     if(timing_observation_)timing_observation_->sample_.gather_ns=rootTimingElapsed(gather_begin);
     const auto publish=[&]() {
         if(!PerfStatsCollector::isDomainEnabled("moe_canonical_publication")) return;
-        const PerfStatsCollector::Tags tags{{"stage",p.stage_name},{"root",std::to_string(p.root_participant)},
+        PerfStatsCollector::Tags tags{{"stage",p.stage_name},{"root",std::to_string(p.root_participant)},
             {"participant",std::to_string(p.tp->myIndex())},{"degree",std::to_string(p.tp->degree())},
             {"local_records",std::to_string(local)},
             {"record_width",std::to_string(canonical_moe_route_record::recordWidth(p.columns))},
             {"expert_compute","tensor_sharded"}};
+        if(selected_transport)tags.emplace("transport",CPURootedPublicationTransportPolicy::name(*selected_transport));
         PerfStatsCollector::addCounter("moe_canonical_publication","cpu_packed_route_gather_calls",1.0,
             phase,DeviceId::cpu().to_string(),tags);
         PerfStatsCollector::addCounter("moe_canonical_publication","cpu_packed_route_gather_local_bytes",

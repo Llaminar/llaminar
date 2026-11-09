@@ -817,7 +817,7 @@ void quantizeActivationsQ8_blockwise_v4_kernel(
  *
  * This is the decode-equivalent grouped-verifier quantizer.  Serial ROCm
  * decode (`M=1`) uses `quantizeActivationsQ8_blockwise_v4_kernel`, then the
- * native-VNNI GEMV recomputes the activation sum from the quantized int8
+ * native-quantised GEMV recomputes the activation sum from the quantized int8
  * block when an asymmetric codebook needs it.  Grouped verifier rows need the
  * same sum, but precomputing it is cheaper than recomputing it for every
  * projection.  Keeping the max/scale/rounding sequence byte-for-byte aligned

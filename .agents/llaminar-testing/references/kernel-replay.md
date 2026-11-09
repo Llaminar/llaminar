@@ -5,7 +5,7 @@ experiments. Replay the production operation with fixed, representative inputs,
 retained storage and its real dispatch policy. On CUDA and ROCm, retain a native
 captured graph; on CPU, repeat the production call with persistent buffers and
 the measured ISA, team and NUMA placement. Extend the owning integration/perf
-harness or NativeVNNI collector instead of creating a second benchmark framework.
+harness or NativeQuantised collector instead of creating a second benchmark framework.
 
 This is a diagnostic and test procedure. It does not authorize serial row replay,
 host state mirrors or alternative execution modes in production.
@@ -130,4 +130,4 @@ isolated replay win is a candidate until that end-to-end evidence is green.
 Backend mechanics remain in [CUDA tuning](../../cuda-tuning/SKILL.md),
 [ROCm tuning](../../rocm-tuning/SKILL.md),
 [CPU tuning](../../cpu-tuning/SKILL.md) and the
-[NativeVNNI pipeline](../../nativevnni-gemm-tuning/SKILL.md).
+[NativeQuantised pipeline](../../nativequantised-gemm-tuning/SKILL.md).

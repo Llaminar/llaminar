@@ -13,7 +13,7 @@
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "models/qwen4exp/Qwen4ExpConfig.h"
 #include "planning/ModelMemoryProfile.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <span>
 #include <algorithm>
 #include <stdexcept>
@@ -30,7 +30,7 @@ enum class TensorParallelKVProjectionSource { NativeQuantizedOriginalSlices, Flo
  * @return Native-only original-slice arithmetic or the existing explicitly floating full-bank family.
  * @throws std::invalid_argument For missing, duplicate, malformed or unsupported source descriptors.
  *
- * NativeVNNI's catalog owns format admission. Mixed native/floating K/V sources
+ * NativeQuantised's catalog owns format admission. Mixed native/floating K/V sources
  * belong to the full-bank family. No selected QueryInterval failure can choose
  * this family later; selection happens before any physical assignment.
  */
@@ -55,7 +55,7 @@ inline TensorParallelKVProjectionSource originalQfnKVProjectionSource(const Mode
                 if(!source || source->K!=std::size_t(original.d_model) || source->elements/source->K!=columns ||
                     source->elements%source->K)
                     throw std::invalid_argument("QFN K/V original matrix descriptor is missing or malformed: "+name);
-                if(native_vnni_formats::forQuantType(source->quant_type))continue;
+                if(native_quantised_formats::forQuantType(source->quant_type))continue;
                 if(source->quant_type=="F32" || source->quant_type=="F16" || source->quant_type=="BF16")floating=true;
                 else throw std::invalid_argument("QFN K/V original source arithmetic is unsupported: "+name);
             }

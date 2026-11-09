@@ -87,7 +87,7 @@ Extend the existing `MoEOverlayResidencyAuthority` proposal/snapshot with a type
 
 A migration plan intersects source and destination projection ownership in original coordinates. Each transfer rectangle carries both source and destination origins, physical strides, logical/native block extents, epoch, participant and source-layout identity. Validate all intersections before writes: exact required destination coverage, no unintended overlap, no holes, native alignment and compatible representation. Explicit replicas need typed copy semantics; they must not accidentally contribute twice to a sum.
 
-Use actual prepared storage as the source. CPU engines retain NativeVNNI or floating roots; GPU engines retain separated arrays and live format descriptors plus original provenance. Common loading releases raw source parents. Passive source geometry cannot supply raw GGUF bytes, and movement should not introduce a new GGUF reread protocol.
+Use actual prepared storage as the source. CPU engines retain NativeQuantised or floating roots; GPU engines retain separated arrays and live format descriptors plus original provenance. Common loading releases raw source parents. Passive source geometry cannot supply raw GGUF bytes, and movement should not introduce a new GGUF reread protocol.
 
 ## Existing transport and accounting boundaries
 

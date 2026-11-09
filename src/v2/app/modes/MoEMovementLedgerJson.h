@@ -157,7 +157,7 @@ namespace llaminar2::movement_json_detail
                 const auto& format=source.source().projectionForRole(role).format;
                 projections.push_back({{"projection",unsigned(role)},{"source_rows",view.source_rows},{"source_columns",view.source_columns},
                     {"first_row",view.first_row},{"rows",view.rows},{"first_column",view.first_column},{"columns",view.columns},
-                    {"format_kind",unsigned(format.kind)},{"codebook",format.native_vnni.codebook_id},{"is_superblock",format.native_vnni.is_superblock}});
+                    {"format_kind",unsigned(format.kind)},{"codebook",format.native_quantised.codebook_id},{"is_superblock",format.native_quantised.is_superblock}});
             }
             members.push_back({{"participant",member.participant_id},{"world_rank",member.world_rank},
                 {"address",member.address.toString()},{"numa_node",member.address.numa_node},{"projections",std::move(projections)}});

@@ -95,7 +95,7 @@ TEST(GPUPreparedWeightBinding, AllFormatsRejectTruncatedPoolRegions)
                     const auto &source = *unpackable->vnniFormatInfo();
                     const auto allocation = layout == GPUPreparedWeightPoolLayout::MigrationReusable
                         ? reusableDeviceVnniAllocationFormat(source)
-                        : NativeVnniReusableDeviceAllocationFormat{static_cast<uint8_t>(source.payload_bytes),
+                        : NativeQuantisedReusableDeviceAllocationFormat{static_cast<uint8_t>(source.payload_bytes),
                             canonicalDeviceVnniFormat(source).is_asymmetric, source.has_emins};
                     owner->planWeight(0, "short", 16, 256, allocation.payload_bytes_per_block,
                         allocation.has_mins, allocation.has_emins, tensor->size_bytes());
@@ -135,11 +135,11 @@ TEST(GPUPreparedWeightBinding, RejectsMissingSourceCoefficientPlane)
                 ASSERT_TRUE(pool->allocate(&backend, 0, 0));
                 const auto slot = pool->getSlot("missing.coefficients");
                 ASSERT_TRUE(slot.has_value());
-                ASSERT_NE(slot->d_native_vnni_payload, nullptr);
-                ASSERT_NE(slot->d_native_vnni_scales, nullptr);
+                ASSERT_NE(slot->d_native_quantised_payload, nullptr);
+                ASSERT_NE(slot->d_native_quantised_scales, nullptr);
                 ASSERT_EQ(slot->payload_bytes, blocks * static_cast<size_t>(payload_bytes));
                 ASSERT_EQ(slot->scales_bytes, blocks * sizeof(uint16_t));
-                ASSERT_EQ(slot->d_native_vnni_mins, nullptr);
+                ASSERT_EQ(slot->d_native_quantised_mins, nullptr);
                 ASSERT_EQ(slot->mins_bytes, 0u);
                 try
                 {
@@ -791,7 +791,7 @@ TEST_F(Test__KernelFactory, CreateGemm_ConsistentWithTensorCreateGemm)
     ASSERT_NE(factory_kernel, nullptr);
     ASSERT_NE(tensor_kernel, nullptr);
 
-    // Both should be same type (CPUNativeVNNIGemmKernel for CPU)
+    // Both should be same type (CPUNativeQuantisedGemmKernel for CPU)
     // We can't easily compare types, but we can verify they're both valid
 }
 

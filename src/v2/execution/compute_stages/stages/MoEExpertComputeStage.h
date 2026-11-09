@@ -232,7 +232,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief Select the authority that publishes CPU NativeVNNI input rows.
+     * @brief Select the authority that publishes CPU NativeQuantised input rows.
      *
      * Ordinary CPU graphs require the immediately preceding CPU router to own
      * the canonical Q8_1 publication. A heterogeneous ExpertOverlay participant
@@ -299,11 +299,11 @@ namespace llaminar2
             std::shared_ptr<MoERoutedPipelineKernelOwner> routed_pipeline_kernel_owner;
 
             /**
-             * @brief Authority for the CPU NativeVNNI hidden-row publication.
+             * @brief Authority for the CPU NativeQuantised hidden-row publication.
              *
              * Graph-native heterogeneous local-expert stages set
              * PublishTransportedRows after compact ticket dispatch. Both the
-             * serial one-row and grouped-row NativeVNNI paths publish the
+             * serial one-row and grouped-row NativeQuantised paths publish the
              * transported bytes before consuming them. Every ordinary CPU
              * graph retains RequireRouterStage and fails if its router/expert
              * publication edge is missing.
@@ -1258,14 +1258,14 @@ namespace llaminar2
             grouped_gateup_desc_table_d_model_ = 0;
             grouped_gateup_desc_table_intermediate_ = 0;
             grouped_gateup_desc_table_weight_format_ =
-                DeviceMoEWeightFormat::NativeVNNI;
+                DeviceMoEWeightFormat::NativeQuantised;
             grouped_gateup_desc_table_dirty_ = false;
             grouped_down_desc_table_id_ = -1;
             grouped_down_desc_table_num_experts_ = 0;
             grouped_down_desc_table_d_model_ = 0;
             grouped_down_desc_table_intermediate_ = 0;
             grouped_down_desc_table_weight_format_ =
-                DeviceMoEWeightFormat::NativeVNNI;
+                DeviceMoEWeightFormat::NativeQuantised;
             grouped_down_desc_table_dirty_ = false;
             combined_shared_gateup_desc_table_id_ = -1;
             combined_shared_gateup_desc_table_d_model_ = 0;
@@ -1634,7 +1634,7 @@ namespace llaminar2
         /**
          * @brief Local logical slot to its expert-major output row.
          *
-         * NativeVNNI computes every active expert into one contiguous
+         * NativeQuantised computes every active expert into one contiguous
          * expert-major layer buffer. This inverse map lets the final
          * row-owned accumulation restore original router order without an
          * intermediate output copy.
@@ -1775,7 +1775,7 @@ namespace llaminar2
          *
          * The executor builds a flat CSR schedule without per-expert heap
          * objects, consumes the router's canonical Q8 publication for every
-         * NativeVNNI expert bundle, and invokes one runtime-M gate/up and down
+         * NativeQuantised expert bundle, and invokes one runtime-M gate/up and down
          * operation per active expert.  Expert outputs remain separate until
          * they are accumulated in original row/top-k order, so ordinary
          * prefill and MTP verification are both serial-row byte-equivalent.
@@ -1996,7 +1996,7 @@ namespace llaminar2
         mutable int grouped_gateup_desc_table_d_model_ = 0;
         mutable int grouped_gateup_desc_table_intermediate_ = 0;
         mutable DeviceMoEWeightFormat grouped_gateup_desc_table_weight_format_ =
-            DeviceMoEWeightFormat::NativeVNNI;
+            DeviceMoEWeightFormat::NativeQuantised;
         bool grouped_gateup_desc_table_dirty_ = false;
 
         mutable int grouped_down_desc_table_id_ = -1;
@@ -2004,7 +2004,7 @@ namespace llaminar2
         mutable int grouped_down_desc_table_d_model_ = 0;
         mutable int grouped_down_desc_table_intermediate_ = 0;
         mutable DeviceMoEWeightFormat grouped_down_desc_table_weight_format_ =
-            DeviceMoEWeightFormat::NativeVNNI;
+            DeviceMoEWeightFormat::NativeQuantised;
         bool grouped_down_desc_table_dirty_ = false;
 
         mutable int combined_shared_desc_table_d_model_ = 0;
@@ -2303,7 +2303,7 @@ namespace llaminar2
          * @brief Publish the one-entry typed gate/up table used by grouped decode.
          *
          * The prepared gate, up, and down engines are validated as one uniform
-         * NativeVNNI or FP16/BF16/FP32 family before the backend receives any
+         * NativeQuantised or FP16/BF16/FP32 family before the backend receives any
          * descriptor. The backend owns the resulting graph-stable table.
          *
          * @param kernel Exact-stream-bound backend MoE kernel.

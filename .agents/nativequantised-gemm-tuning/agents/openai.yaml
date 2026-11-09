@@ -1,0 +1,4 @@
+interface:
+  display_name: "NativeQuantised Exact-Overlay Tuning"
+  short_description: "Measure and install exact quantised kernel dispatch"
+  default_prompt: "Use the shared production inventory to measure decode, MTP and prefill candidates, preserve byte equivalence, profile actual kernels and install exact overlays while retaining unseen-shape runtime rules."

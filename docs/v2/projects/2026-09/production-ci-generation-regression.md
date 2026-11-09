@@ -492,7 +492,7 @@ rebuild, validate the new option/default through the parser, planning and graph
 regressions and refresh the shared Unit/preflight receipt once before admitting
 that rebuilt runtime. Retain original run provenance and all existing passes;
 new image certificates must still describe the image actually executed.
-The source-only `test_native_vnni_prefill_matrix.py` suite passes all 13 tests
+The source-only `test_native_quantised_prefill_matrix.py` suite passes all 13 tests
 in 0.025s, including the new check that the compact serving cap preserves the
 complete 4096-row training inventory. This focused check does not rebuild the
 live runtime or rerun the amortized prerequisite gate.
@@ -1395,7 +1395,7 @@ and actual Unit/preflight execution remain mandatory independent obligations.
 
 All **95** pipeline Unit tests pass in 1.592s. The registered pipeline,
 ModelParityE2E and AcceleratorBuildTypeFlags groups pass together in 2.17s.
-The NativeVNNI dispatch-refresh runner also reports all 117 tests passing,
+The NativeQuantised dispatch-refresh runner also reports all 117 tests passing,
 including its per-ISA oneDNN/Docker build-cache check. Negative cases include
 missing/wrong labels for both roles and ISAs, swapped/shared image identities,
 skipped Integration builds and altered resume metadata. The producer label test
@@ -1927,7 +1927,7 @@ sweeps also pass: **69.48 seconds CUDA**, **84.84 seconds ROCm**, retaining all
 regressions, not a replacement for real-model HF or HTTP certification.
 
 The large backend-neutral transfer implementation now lives in
-`NativeVNNIExpertTransferGroupedParity.cpp`, compiled once, rather than inline
+`NativeQuantisedExpertTransferGroupedParity.cpp`, compiled once, rather than inline
 in both 26k/28k-line registration units. A typed copy/publication scope shares
 the complete codebook inventory and lifetime proof without running the
 expensive grouped arithmetic inventory. Its symmetric functional registrations

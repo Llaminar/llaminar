@@ -13,8 +13,8 @@
 #pragma once
 #include "QuantizedActivationOperandPrecision.h"
 #include "DeviceRowRange.h"
-#include "DeviceNativeVNNIMatrixDesc.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "DeviceNativeQuantisedMatrixDesc.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include <limits>
@@ -56,7 +56,7 @@ inline void validateQ8ResidualCorrectionGeometry(int m,int n,int k) {
 }
 /**
  * @brief Authenticate an original quantized format without changing its prepared bytes.
- * @param format Original GGUF format, resolved by the canonical NativeVNNI catalog.
+ * @param format Original GGUF format, resolved by the canonical NativeQuantised catalog.
  * @param m Positive physical activation-row capacity.
  * @param n Actual participant-local output width.
  * @param k Complete prepared K32 reduction width.
@@ -66,10 +66,10 @@ inline void validateQ8ResidualCorrectionGeometry(int m,int n,int k) {
  * original source uses K256 blocks. The source loader owns that original block
  * validation; this operation must not reject a legal already-prepared slice.
  */
-inline const NativeVnniFormatInfo &requireQ8ResidualSourceFormat(
+inline const NativeQuantisedFormatInfo &requireQ8ResidualSourceFormat(
  std::string_view format,int m,int n,int k) {
  validateQ8ResidualCorrectionGeometry(m,n,k);
- const auto *source=native_vnni_formats::forQuantType(format);
+ const auto *source=native_quantised_formats::forQuantType(format);
  if(!source)throw std::invalid_argument("Two-term Q8 requires a cataloged original native quantized weight format");
  return *source;
 }
@@ -82,10 +82,10 @@ inline const NativeVnniFormatInfo &requireQ8ResidualSourceFormat(
  * @return Canonical source metadata; physical decoder validation remains backend-owned.
  * @throws std::invalid_argument For missing/foreign provenance or invalid geometry.
  */
-inline const NativeVnniFormatInfo &requireQ8ResidualSourceFormat(
- NativeVnniSourceIdentity identity,int m,int n,int k) {
+inline const NativeQuantisedFormatInfo &requireQ8ResidualSourceFormat(
+ NativeQuantisedSourceIdentity identity,int m,int n,int k) {
  validateQ8ResidualCorrectionGeometry(m,n,k);
- const auto *source=identity.present ? native_vnni_formats::forSourceIdentity(
+ const auto *source=identity.present ? native_quantised_formats::forSourceIdentity(
   identity.codebook_id,identity.is_superblock) : nullptr;
  if(!source)throw std::invalid_argument("Two-term Q8 requires complete original native weight provenance");
  return *source;
@@ -193,7 +193,7 @@ inline WorkspaceRequirements gpuQ8ResidualCorrectionWorkspaceRequirements(int m,
 enum class Q8ResidualQuantizerPolicy { CPUHalfAfterQuantization, CUDAFloatScaleNativeReciprocal, ROCmFiniteHalfNativeReciprocal };
 /** @brief Capture arguments borrow one actual prepared source and exact live-row authority. */
 struct GPUQ8ResidualCorrectionArgs {
- DeviceNativeVNNIMatrixDesc weights; ///< Exact prepared native descriptor, never a reconstructed source.
+ DeviceNativeQuantisedMatrixDesc weights; ///< Exact prepared native descriptor, never a reconstructed source.
  DeviceRowRange rows; ///< Device-owned live prefix; setup never reads its count.
  Q8ResidualQuantizerPolicy quantizer; ///< Frozen actual backend primary quantizer, included in capture arguments.
  const float* input; ///< Prepared FP32 activation rows before either Q8 publication.

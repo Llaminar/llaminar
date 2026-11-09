@@ -8,7 +8,7 @@
  */
 #pragma once
 #include "execution/moe/ExpertTierWeightDeviceLayout.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -42,7 +42,7 @@ inline std::vector<uint8_t> expertTierWireOracle(const ExpertTierWeightDeviceLay
  * encodings instead of inferring their live extent from implementation writes.
  */
 inline size_t expertTierExpandedCPUByteRow(
-    const cpu::native_vnni::CPUNativeVNNIPackedWeights &root, size_t offset)
+    const cpu::native_quantised::CPUNativeQuantisedPackedWeights &root, size_t offset)
 {
     constexpr size_t data_bytes = 64u * 32u;
     const size_t stride = root.interleaved_block_stride;

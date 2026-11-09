@@ -130,10 +130,10 @@ namespace
                 if constexpr (std::is_same_v<std::decay_t<decltype(table)>,
                               MoEOverlayFixedDownProjectionBank::FloatingDescriptorTable>)
                     return table.format;
-                else return DeviceMoEWeightFormat::NativeVNNI;
+                else return DeviceMoEWeightFormat::NativeQuantised;
             }, fixed_table);
 #ifdef HAVE_ROCM
-            if (device().is_rocm() && params.rows == 1 && family == DeviceMoEWeightFormat::NativeVNNI)
+            if (device().is_rocm() && params.rows == 1 && family == DeviceMoEWeightFormat::NativeQuantised)
             {
                 const auto model_policy = rocm::compiledMoERouteOwnedModelPartitionPolicy();
                 const rocm::MoERouteOwnedModelOperation operation{
@@ -151,24 +151,24 @@ namespace
                             params.tp->backend(), startup_devices));
                 if (inspect_sources)
                 {
-                    NativeVnniExecutionFormatEnvelope envelope;
-                    std::vector<NativeVnniSourceIdentity> sources;
+                    NativeQuantisedExecutionFormatEnvelope envelope;
+                    std::vector<NativeQuantisedSourceIdentity> sources;
                     for (const auto &payload : params.initial_gate_up)
                     {
                         if (payload.empty()) continue;
-                        DeviceNativeVNNIMatrixDesc gate{}, up{};
+                        DeviceNativeQuantisedMatrixDesc gate{}, up{};
                         if (!payload.readyFor(DeviceMoEProjectionSet::GateUp) ||
-                            !payload.gate()->inspectPreparedNativeVNNIMatrixDesc(gate) ||
-                            !payload.up()->inspectPreparedNativeVNNIMatrixDesc(up) ||
+                            !payload.gate()->inspectPreparedNativeQuantisedMatrixDesc(gate) ||
+                            !payload.up()->inspectPreparedNativeQuantisedMatrixDesc(up) ||
                             gate.n != geometry.intermediate_columns || up.n != geometry.intermediate_columns ||
                             gate.k != geometry.model_columns || up.k != geometry.model_columns ||
-                            !areNativeVnniGateUpCodebooksCompatible(gate.codebook_id, up.codebook_id))
+                            !areNativeQuantisedGateUpCodebooksCompatible(gate.codebook_id, up.codebook_id))
                             throw std::logic_error("Projection launch intent requires already-prepared original native gate/up metadata");
                         for (const auto *desc : {&gate, &up})
                         {
-                            const NativeVnniSourceIdentity source{desc->source_codebook_id, desc->source_is_superblock != 0,
+                            const NativeQuantisedSourceIdentity source{desc->source_codebook_id, desc->source_is_superblock != 0,
                                 desc->source_identity_present != 0};
-                            if (!addNativeVnniExecutionFormat(envelope, desc->codebook_id, source, true))
+                            if (!addNativeQuantisedExecutionFormat(envelope, desc->codebook_id, source, true))
                                 throw std::invalid_argument("Projection owner launch intent has an invalid original source envelope");
                             sources.push_back(source);
                         }
@@ -286,7 +286,7 @@ namespace
             if (!consumer) throw std::logic_error("Projection kernel has no admitted workspace contract");
             consumer->bindWorkspace(workspace);
             const auto geometry = params.fixed_down->ownership().geometry();
-            std::vector<DeviceNativeVNNIMatrixDesc> gates(geometry.experts), ups(geometry.experts);
+            std::vector<DeviceNativeQuantisedMatrixDesc> gates(geometry.experts), ups(geometry.experts);
             std::vector<DeviceMoEFloatingMatrixDesc> fp_gates(geometry.experts), fp_ups(geometry.experts);
             for (int expert = 0; expert < geometry.experts; ++expert)
             {

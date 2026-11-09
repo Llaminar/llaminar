@@ -12,8 +12,8 @@
 
 #pragma once
 
-#include "kernels/cpu/gemm/CPUNativeVNNIPreparedFootprint.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedPreparedFootprint.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "MoEExpertProjectionOwnership.h"
 #include <algorithm>
 #include <stdexcept>
@@ -130,7 +130,7 @@ namespace llaminar2
         int32_t N=0,K=0,blocks_per_row=0;
         int32_t cpu_N=0,cpu_K=0,cpu_first_row=0,cpu_first_column=0;
         uint8_t cpu_codebook_id=0,cpu_is_asymmetric=0,cpu_is_superblock=0;
-        cpu::native_vnni::CPUNativeVNNIEncoding cpu_encoding=cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8;
+        cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding=cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
         uint32_t cpu_data_stride=0,cpu_block_stride=0,unit_count=0,maximum_units_per_chunk=0;
         unsigned wire_columns_per_unit=64;
         /** @return Whether original local bounds, native physical traits and wire counts agree. */
@@ -141,10 +141,10 @@ namespace llaminar2
                cpu_first_row<0 || cpu_first_column<0 || cpu_first_column%32 ||
                cpu_first_row>cpu_N || N>cpu_N-cpu_first_row || cpu_first_column>cpu_K || K>cpu_K-cpu_first_column ||
                wire_columns_per_unit==0 || wire_columns_per_unit>64 || cpu_is_asymmetric>1 || cpu_is_superblock>1 ||
-               !native_vnni_formats::forSourceIdentity(cpu_codebook_id,cpu_is_superblock!=0) ||
-               !cpu::native_vnni::isKnownPreparedEncoding(cpu_encoding) ||
-               cpu_data_stride!=cpu::native_vnni::preparedDataStride(cpu_encoding) ||
-               cpu_block_stride!=cpu::native_vnni::preparedInterleavedBlockStride(cpu_encoding,cpu_is_asymmetric!=0))return false;
+               !native_quantised_formats::forSourceIdentity(cpu_codebook_id,cpu_is_superblock!=0) ||
+               !cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding) ||
+               cpu_data_stride!=cpu::native_quantised::preparedDataStride(cpu_encoding) ||
+               cpu_block_stride!=cpu::native_quantised::preparedInterleavedBlockStride(cpu_encoding,cpu_is_asymmetric!=0))return false;
             const uint64_t expected=((uint64_t(N)+wire_columns_per_unit-1)/wire_columns_per_unit)*blocks_per_row;
             const uint64_t root_units=((uint64_t(cpu_N)+63)/64)*(cpu_K/32);
             return root_units<=std::numeric_limits<size_t>::max()/cpu_block_stride && expected<=std::numeric_limits<uint32_t>::max() && unit_count==expected &&
@@ -202,8 +202,8 @@ namespace llaminar2
         std::uint8_t cpu_is_superblock = 0;
         std::uint8_t gpu_is_asymmetric = 0;
         std::uint8_t gpu_has_emins = 0;
-        cpu::native_vnni::CPUNativeVNNIEncoding cpu_encoding =
-            cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8;
+        cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding =
+            cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
         // CPU-unit and persistent staging capacity; no device allocation occurs.
         std::uint32_t cpu_data_stride = 0;
         std::uint32_t cpu_block_stride = 0;
@@ -226,7 +226,7 @@ namespace llaminar2
          */
         [[nodiscard]] constexpr bool valid() const noexcept
         {
-            using Encoding = cpu::native_vnni::CPUNativeVNNIEncoding;
+            using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
             const bool gpu_to_cpu =
                 direction == ExpertTierWeightConversionDirection::GpuToCpu;
             const bool cpu_to_gpu =
@@ -237,7 +237,7 @@ namespace llaminar2
                 cpu_N>std::numeric_limits<int32_t>::max()-63 || K <= 0 || (K % 32) != 0 ||
                 blocks_per_row != K / 32 || N_padded < N ||
                 (N_padded % 64) != 0 || N_padded != ((N + 63) / 64) * 64 ||
-                !cpu::native_vnni::isKnownPreparedEncoding(cpu_encoding) ||
+                !cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding) ||
                 cpu_is_asymmetric>1 || cpu_is_superblock>1 || gpu_source_is_superblock>1 ||
                 gpu_is_asymmetric>1 || gpu_has_emins>1 ||
                 cpu_N<=0 || cpu_K<=0 || gpu_N<=0 || gpu_K<=0 || cpu_K%32 || gpu_K%32 ||
@@ -250,9 +250,9 @@ namespace llaminar2
             }
             // Redundant wire strides must agree with the canonical encoding.
             if (cpu_data_stride !=
-                    cpu::native_vnni::preparedDataStride(cpu_encoding) ||
+                    cpu::native_quantised::preparedDataStride(cpu_encoding) ||
                 cpu_block_stride !=
-                    cpu::native_vnni::preparedInterleavedBlockStride(
+                    cpu::native_quantised::preparedInterleavedBlockStride(
                         cpu_encoding, cpu_is_asymmetric != 0))
             {
                 return false;
@@ -271,8 +271,8 @@ namespace llaminar2
 
             // Both directions retain source provenance even when CPU→GPU
             // promotion normalizes an expanded source into codebook 19 or 23.
-            const NativeVnniFormatInfo *source_format =
-                native_vnni_formats::forSourceIdentity(
+            const NativeQuantisedFormatInfo *source_format =
+                native_quantised_formats::forSourceIdentity(
                     gpu_source_codebook_id,
                     gpu_source_is_superblock != 0);
             if (source_format == nullptr ||
@@ -310,7 +310,7 @@ namespace llaminar2
                     gpu_is_asymmetric == cpu_is_asymmetric &&
                     gpu_codebook_id ==
                         (cpu_is_asymmetric != 0
-                             ? kNativeVnniExpandedInt8MinCodebook
+                             ? kNativeQuantisedExpandedInt8MinCodebook
                              : static_cast<std::uint8_t>(19));
                 if ((!canonical_source && !normalized_source) ||
                     cpu_is_asymmetric !=
@@ -321,7 +321,7 @@ namespace llaminar2
                 }
 
                 const Encoding expected_encoding =
-                    gpu_codebook_id == kNativeVnniIQ4XSSourceScaleCodebook
+                    gpu_codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook
                         ? Encoding::NibbleLUTSourceScale
                         : gpu_codebook_id == 11 ? Encoding::IQ3SExpandedSourceScale
                         : gpu_codebook_id == 0 || gpu_codebook_id == 4 ||
@@ -348,7 +348,7 @@ namespace llaminar2
                        cpu_is_asymmetric == 0 && gpu_is_asymmetric == 1;
             case Encoding::NibbleLUTSourceScale:
                 return cpu_codebook_id == 4 && cpu_is_superblock != 0 &&
-                       gpu_codebook_id == kNativeVnniIQ4XSSourceScaleCodebook &&
+                       gpu_codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook &&
                        gpu_payload_bytes_per_block == 16 &&
                        cpu_is_asymmetric == 0 && gpu_is_asymmetric == 1;
             case Encoding::NibbleLUT:
@@ -361,7 +361,7 @@ namespace llaminar2
                 return gpu_payload_bytes_per_block == 32 &&
                        gpu_codebook_id ==
                            (cpu_is_asymmetric != 0
-                                ? kNativeVnniExpandedInt8MinCodebook
+                                ? kNativeQuantisedExpandedInt8MinCodebook
                                 : static_cast<std::uint8_t>(19)) &&
                        gpu_is_asymmetric == cpu_is_asymmetric;
             case Encoding::Q6KNativeDualScale:

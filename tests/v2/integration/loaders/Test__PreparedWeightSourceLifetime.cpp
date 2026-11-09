@@ -57,7 +57,7 @@ namespace
         const auto found = std::find_if(formats.begin(), formats.end(),
             [&](const auto &format) { return format.tensor_type == source.native_type(); });
         if (found == formats.end()) return ExpertWeightFormat::floating(source.native_type());
-        return ExpertWeightFormat::nativeVnni(
+        return ExpertWeightFormat::nativeQuantised(
             {found->source_codebook_id, found->source_is_superblock, true});
     }
 

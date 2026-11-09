@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <optional>
 
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 namespace llaminar2 {
 
@@ -116,7 +116,7 @@ struct RepackKernels {
     bool isValid() const { return vnniRepack != nullptr; }
 };
 
-/// Map NativeVnniFormatInfo codebook_id + is_superblock to RepackFormat.
+/// Map NativeQuantisedFormatInfo codebook_id + is_superblock to RepackFormat.
 /// Returns std::nullopt for unknown or unsupported combinations.
 inline std::optional<RepackFormat> codebookIdToRepackFormat(uint8_t codebook_id, bool is_superblock)
 {

@@ -4,6 +4,9 @@
  *
  * Fast-path allreduce for N-rank intra-node CPU tensor parallelism.
  * Uses process-owned shared mmap files, atomic epoch counters and AVX-512 reduction.
+ * Large rooted gathers reuse the socket team for disjoint live payload copies;
+ * the original caller alone owns header/chunk epochs and slot-reuse authority.
+ * Abort is an absorbing shared epoch across every native publication.
  *
  * @author David Sanftenberg
  * @date April 2026
@@ -16,6 +19,7 @@
 #include "../../utils/CPUFeatures.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
+#include "../../utils/OpenMPUtils.h"
 
 #include <algorithm>
 #include <array>
@@ -506,6 +510,44 @@ namespace llaminar2
         }
     }
 
+    bool ShmemSpinBackend::publishNextEpoch()
+    {
+        if (abort_requested_.load(std::memory_order_acquire))
+        {
+            last_error_ = "local abort rejects shared-memory epoch publication";
+            abort();
+            return false;
+        }
+        // The reserved terminal epoch cannot be reached by normal progression.
+        if (my_epoch_ >= kAbortEpoch - 1u)
+        {
+            last_error_ = "shared-memory epoch exhausted before publication";
+            abort();
+            return false;
+        }
+        uint64_t expected = my_epoch_;
+        const uint64_t next = expected + 1u;
+        if (!arena_->epoch_at(my_rank_)->epoch.compare_exchange_strong(
+                expected, next, std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            last_error_ = expected == kAbortEpoch
+                ? "shared-memory abort witness rejects epoch publication"
+                : "shared-memory epoch changed outside its original protocol owner";
+            abort();
+            return false;
+        }
+        my_epoch_ = next;
+        // Abort may have won immediately after the successful CAS. It already
+        // owns the shared marker; never clear it or report this phase completed.
+        if (abort_requested_.load(std::memory_order_acquire))
+        {
+            last_error_ = "local abort interrupted shared-memory epoch publication";
+            abort();
+            return false;
+        }
+        return true;
+    }
+
     bool ShmemSpinBackend::waitForPeerEpoch(int peer_rank, uint64_t target_epoch, const char *phase, size_t count)
     {
         const int timeout_ms = shmemSpinTimeoutMs();
@@ -514,6 +556,15 @@ namespace llaminar2
 
         while (true)
         {
+            if (abort_requested_.load(std::memory_order_acquire))
+            {
+                last_error_ = "ShmemSpinBackend abort requested while waiting for peer rank " +
+                              std::to_string(peer_rank) + " to reach epoch " + std::to_string(target_epoch) +
+                              " while " + phase;
+                LOG_ERROR("ShmemSpinBackend - " << last_error_);
+                abort();
+                return false;
+            }
             const uint64_t peer_epoch = arena_->epoch_at(peer_rank)->epoch.load(std::memory_order_acquire);
             if (peer_epoch == kAbortEpoch)
             {
@@ -525,15 +576,11 @@ namespace llaminar2
                 return false;
             }
             if (peer_epoch >= target_epoch)
-                return true;
-            if (abort_requested_.load(std::memory_order_acquire))
             {
-                last_error_ = "ShmemSpinBackend abort requested while waiting for peer rank " +
-                              std::to_string(peer_rank) + " to reach epoch " + std::to_string(target_epoch) +
-                              " while " + phase;
-                LOG_ERROR("ShmemSpinBackend - " << last_error_);
-                abort();
-                return false;
+                // A ready peer does not cancel an abort observed on this rank.
+                if (abort_requested_.load(std::memory_order_acquire))
+                    continue;
+                return true;
             }
             if (timeout_ms > 0 && (++spins & 0x3fffU) == 0 && std::chrono::steady_clock::now() >= deadline)
             {
@@ -607,10 +654,8 @@ namespace llaminar2
             auto *payload = static_cast<std::byte *>(buffer);
             const auto publish_epoch = [&](const char *phase,
                                            size_t chunk_count) {
-                ++my_epoch_;
-                arena_->epoch_at(my_rank_)->epoch.store(
-                    my_epoch_,
-                    std::memory_order_release);
+                if (!publishNextEpoch())
+                    return false;
                 for (int rank = 0; rank < num_ranks_; ++rank)
                 {
                     if (rank == my_rank_)
@@ -907,8 +952,8 @@ namespace llaminar2
         my_slot->payload_elements.store(
             static_cast<uint64_t>(local_elements),
             std::memory_order_relaxed);
-        ++my_epoch_;
-        my_slot->epoch.store(my_epoch_, std::memory_order_release);
+        if (!publishNextEpoch())
+            return false;
         for (int rank = 0; rank < num_ranks_; ++rank)
         {
             if (rank == my_rank_)
@@ -979,8 +1024,8 @@ namespace llaminar2
          * still reading transaction N and the root can observe a stale/future
          * count under an epoch that it has already acquired.
          */
-        ++my_epoch_;
-        my_slot->epoch.store(my_epoch_, std::memory_order_release);
+        if (!publishNextEpoch())
+            return false;
         for (int rank = 0; rank < num_ranks_; ++rank)
         {
             if (rank == my_rank_)
@@ -1028,84 +1073,190 @@ namespace llaminar2
                 local_elements * sizeof(float));
         }
 
-        for (size_t chunk_offset = 0u;
-             chunk_offset < maximum_participant_elements;
-             chunk_offset += ShmemSpinArena::CHUNK_CAPACITY)
+        // Reuse the native allreduce's work granularity. The caller remains
+        // the sole protocol owner; its existing socket OpenMP workers only
+        // copy disjoint live bytes. An unrelated existing team cannot be
+        // conscripted into a workshare entered by just one of its threads.
+        constexpr size_t kParallelThresholdElements = 64u * 1024u;
+        constexpr size_t kWorkSliceElements = 16u * 1024u;
+        bool parallelize = false;
+        if (maximum_participant_elements >= kParallelThresholdElements &&
+            omp_in_parallel() == 0 && omp_get_max_threads() > 1)
         {
-            const size_t my_chunk_elements =
-                chunk_offset < local_elements
-                    ? std::min(
-                          ShmemSpinArena::CHUNK_CAPACITY,
-                          local_elements - chunk_offset)
-                    : 0u;
-            if (my_rank_ != root_rank && my_chunk_elements > 0u)
-            {
-                std::memcpy(
-                    arena_->buffer_at(my_rank_),
-                    local_records + chunk_offset,
-                    my_chunk_elements * sizeof(float));
-            }
-
-            ++my_epoch_;
-            my_slot->epoch.store(my_epoch_, std::memory_order_release);
+            size_t local_copy_elements = local_elements;
             if (my_rank_ == root_rank)
             {
+                local_copy_elements = 0u;
                 for (int rank = 0; rank < num_ranks_; ++rank)
+                    if (rank != root_rank)
+                        local_copy_elements = std::max(local_copy_elements,
+                            rooted_publication_element_counts_[static_cast<size_t>(rank)]);
+            }
+            parallelize = local_copy_elements >= kParallelThresholdElements;
+        }
+        if (parallelize)
+        {
+            bool protocol_ok = true;
+            // Team-local slices join before the caller's ready/consumed stores;
+            // every failure is flushed to all workers at the same barrier.
+            auto copy_chunks = [&]()
+            {
+                for (size_t chunk_offset = 0u;
+                     chunk_offset < maximum_participant_elements && protocol_ok;
+                     chunk_offset += ShmemSpinArena::CHUNK_CAPACITY)
                 {
-                    if (rank == root_rank)
-                        continue;
+                    const size_t my_chunk_elements = chunk_offset < local_elements
+                        ? std::min(ShmemSpinArena::CHUNK_CAPACITY, local_elements - chunk_offset) : 0u;
+                    if (my_rank_ != root_rank)
+                    {
+                        const size_t slices = (my_chunk_elements + kWorkSliceElements - 1u) / kWorkSliceElements;
+#pragma omp for schedule(static)
+                        for (size_t slice = 0u; slice < slices; ++slice)
+                        {
+                            const size_t offset = slice * kWorkSliceElements;
+                            const size_t elements = std::min(kWorkSliceElements, my_chunk_elements - offset);
+                            std::memcpy(arena_->buffer_at(my_rank_) + offset,
+                                local_records + chunk_offset + offset, elements * sizeof(float));
+                        }
+                    }
+#pragma omp master
+                    {
+                        // The producer workshare has completed before release.
+                        protocol_ok = publishNextEpoch();
+                        if (my_rank_ == root_rank && protocol_ok)
+                            for (int rank = 0; rank < num_ranks_ && protocol_ok; ++rank)
+                                if (rank != root_rank)
+                                    protocol_ok = waitForPeerEpoch(rank, my_epoch_,
+                                        "waiting for a packed-record chunk", total_elements);
+                    }
+#pragma omp barrier
+                    if (!protocol_ok) break;
+                    if (my_rank_ == root_rank)
+                    {
+                        for (int rank = 0; rank < num_ranks_; ++rank)
+                        {
+                            if (rank == root_rank) continue;
+                            const size_t rank_elements = rooted_publication_element_counts_[static_cast<size_t>(rank)];
+                            const size_t chunk_elements = chunk_offset < rank_elements
+                                ? std::min(ShmemSpinArena::CHUNK_CAPACITY, rank_elements - chunk_offset) : 0u;
+                            const size_t slices = (chunk_elements + kWorkSliceElements - 1u) / kWorkSliceElements;
+#pragma omp for schedule(static)
+                            for (size_t slice = 0u; slice < slices; ++slice)
+                            {
+                                const size_t offset = slice * kWorkSliceElements;
+                                const size_t elements = std::min(kWorkSliceElements, chunk_elements - offset);
+                                std::memcpy(root_records + rooted_publication_element_offsets_[static_cast<size_t>(rank)] +
+                                        chunk_offset + offset,
+                                    arena_->buffer_at(rank) + offset, elements * sizeof(float));
+                            }
+                        }
+                    }
+#pragma omp master
+                    {
+                        // Root acknowledges only after every copy worker has
+                        // stopped reading the peer's sole reusable shared slot.
+                        if (my_rank_ == root_rank)
+                        {
+                            protocol_ok = publishNextEpoch();
+                        }
+                        else
+                        {
+                            protocol_ok = waitForPeerEpoch(root_rank, my_epoch_ + 1u,
+                                "waiting for root to consume a packed-record chunk", my_chunk_elements);
+                            if (protocol_ok)
+                            {
+                                protocol_ok = publishNextEpoch();
+                            }
+                        }
+                    }
+#pragma omp barrier
+                }
+            };
+            OMP_WORKSHARE_REGION(copy_chunks);
+            if (!protocol_ok) return false;
+        }
+        else
+        {
+            for (size_t chunk_offset = 0u;
+                 chunk_offset < maximum_participant_elements;
+                 chunk_offset += ShmemSpinArena::CHUNK_CAPACITY)
+            {
+                const size_t my_chunk_elements =
+                    chunk_offset < local_elements
+                        ? std::min(
+                              ShmemSpinArena::CHUNK_CAPACITY,
+                              local_elements - chunk_offset)
+                        : 0u;
+                if (my_rank_ != root_rank && my_chunk_elements > 0u)
+                {
+                    std::memcpy(
+                        arena_->buffer_at(my_rank_),
+                        local_records + chunk_offset,
+                        my_chunk_elements * sizeof(float));
+                }
+
+                if (!publishNextEpoch())
+                    return false;
+                if (my_rank_ == root_rank)
+                {
+                    for (int rank = 0; rank < num_ranks_; ++rank)
+                    {
+                        if (rank == root_rank)
+                            continue;
+                        if (!waitForPeerEpoch(
+                                rank,
+                                my_epoch_,
+                                "waiting for a packed-record chunk",
+                                total_elements))
+                        {
+                            return false;
+                        }
+                    }
+
+                    for (int rank = 0; rank < num_ranks_; ++rank)
+                    {
+                        if (rank == root_rank)
+                            continue;
+                        const size_t rank_elements =
+                            rooted_publication_element_counts_[
+                                static_cast<size_t>(rank)];
+                        const size_t rank_chunk_elements =
+                            chunk_offset < rank_elements
+                                ? std::min(
+                                      ShmemSpinArena::CHUNK_CAPACITY,
+                                      rank_elements - chunk_offset)
+                                : 0u;
+                        if (rank_chunk_elements == 0u)
+                            continue;
+                        std::memcpy(
+                            root_records +
+                                rooted_publication_element_offsets_[
+                                    static_cast<size_t>(rank)] +
+                                chunk_offset,
+                            arena_->buffer_at(rank),
+                            rank_chunk_elements * sizeof(float));
+                    }
+
+                    // Release every peer to reuse its sole staging buffer.
+                    if (!publishNextEpoch())
+                        return false;
+                }
+                else
+                {
+                    const uint64_t consumed_epoch = my_epoch_ + 1u;
                     if (!waitForPeerEpoch(
-                            rank,
-                            my_epoch_,
-                            "waiting for a packed-record chunk",
-                            total_elements))
+                            root_rank,
+                            consumed_epoch,
+                            "waiting for root to consume a packed-record chunk",
+                            my_chunk_elements))
                     {
                         return false;
                     }
+                    if (!publishNextEpoch())
+                        return false;
                 }
-
-                for (int rank = 0; rank < num_ranks_; ++rank)
-                {
-                    if (rank == root_rank)
-                        continue;
-                    const size_t rank_elements =
-                        rooted_publication_element_counts_[
-                            static_cast<size_t>(rank)];
-                    const size_t rank_chunk_elements =
-                        chunk_offset < rank_elements
-                            ? std::min(
-                                  ShmemSpinArena::CHUNK_CAPACITY,
-                                  rank_elements - chunk_offset)
-                            : 0u;
-                    if (rank_chunk_elements == 0u)
-                        continue;
-                    std::memcpy(
-                        root_records +
-                            rooted_publication_element_offsets_[
-                                static_cast<size_t>(rank)] +
-                            chunk_offset,
-                        arena_->buffer_at(rank),
-                        rank_chunk_elements * sizeof(float));
-                }
-
-                // Release every peer to reuse its sole staging buffer.
-                ++my_epoch_;
-                my_slot->epoch.store(my_epoch_, std::memory_order_release);
             }
-            else
-            {
-                const uint64_t consumed_epoch = my_epoch_ + 1u;
-                if (!waitForPeerEpoch(
-                        root_rank,
-                        consumed_epoch,
-                        "waiting for root to consume a packed-record chunk",
-                        my_chunk_elements))
-                {
-                    return false;
-                }
-                ++my_epoch_;
-                my_slot->epoch.store(my_epoch_, std::memory_order_release);
-            }
+
         }
 
         /*
@@ -1174,8 +1325,6 @@ namespace llaminar2
         auto *const payload = static_cast<std::byte *>(buffer);
         auto *const root_staging = reinterpret_cast<std::byte *>(
             arena_->buffer_at(root_rank));
-        auto *const my_slot = arena_->epoch_at(my_rank_);
-
         for (size_t chunk_offset = 0u; chunk_offset < count;)
         {
             const size_t chunk_elements = std::min(
@@ -1191,8 +1340,8 @@ namespace llaminar2
                     root_staging,
                     payload + byte_offset,
                     chunk_bytes);
-                ++my_epoch_;
-                my_slot->epoch.store(my_epoch_, std::memory_order_release);
+                if (!publishNextEpoch())
+                    return false;
                 for (int rank = 0; rank < num_ranks_; ++rank)
                 {
                     if (rank == root_rank)
@@ -1221,8 +1370,8 @@ namespace llaminar2
                     payload + byte_offset,
                     root_staging,
                     chunk_bytes);
-                ++my_epoch_;
-                my_slot->epoch.store(my_epoch_, std::memory_order_release);
+                if (!publishNextEpoch())
+                    return false;
             }
             chunk_offset += chunk_elements;
         }
@@ -1240,8 +1389,8 @@ namespace llaminar2
         {
             return false;
         }
-        my_epoch_++;
-        arena_->epoch_at(my_rank_)->epoch.store(my_epoch_, std::memory_order_release);
+        if (!publishNextEpoch())
+            return false;
         for (int r = 0; r < num_ranks_; ++r)
         {
             if (r == my_rank_)

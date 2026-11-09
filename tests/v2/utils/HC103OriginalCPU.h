@@ -109,7 +109,7 @@ inline uint16_t fp32_to_fp16(float f)
             return static_cast<uint16_t>(sign | (exp << 10) | (mantissa >> 13));
         }
     }
-inline float nativeVNNIFP16ScaleToFP32(uint16_t value)
+inline float nativeQuantisedFP16ScaleToFP32(uint16_t value)
     {
 #if defined(__F16C__)
         if ((value & 0x7c00u) != 0x7c00u)
@@ -544,7 +544,7 @@ inline void quantize_single_block(const float *src, Q8_1Block &dst, int valid_el
         }
 inline void quantizeResidualBlock(const float*input,const Q8_1Block&primary,Q8_1Block&residual,
  llaminar2::CPUProjectionNumericalPolicy policy) {
- alignas(64)float values[32];const auto scale=_mm256_set1_ps(nativeVNNIFP16ScaleToFP32(primary.d));
+ alignas(64)float values[32];const auto scale=_mm256_set1_ps(nativeQuantisedFP16ScaleToFP32(primary.d));
  for(int i=0;i<32;i+=8) {
   const auto bytes=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(primary.qs+i));
   const auto decoded=persistRoundedAVX2(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes)),scale));

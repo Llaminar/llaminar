@@ -31,6 +31,8 @@
  * Ordinary native QFN local TP derives one immutable assignment from the original
  * directory before weight slicing; physical device order remains context-owned.
  * CPU serial storage declarations survive admission and runtime projection.
+ * Explicit prefill transport diagnostics freeze into the existing phase-aware
+ * graph configuration; driver topology and decode/MTP policy stay authoritative.
  */
 
 #include "RankOrchestrator.h"
@@ -117,6 +119,22 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Copy the diagnostic once at cold Rank startup, never on replay.
+         * @return Immutable typed process-startup choice shared by every Rank child.
+         * @throws std::invalid_argument for a malformed explicit environment value.
+         *
+         * DebugEnv::envValue is only a lookup boundary, so the function-local
+         * const owns the parsed value rather than retaining an environment pointer.
+         * Reloading DebugEnv or changing the environment cannot rewrite live graphs.
+         */
+        const std::optional<MoEOverlayNodeLocalRouteTransport> &
+        diagnosticMoEPrefillRouteTransport()
+        {
+            static const auto selected = parseMoEOverlayDiagnosticPrefillTransport(
+                DebugEnv::envValue(kMoEOverlayDiagnosticPrefillTransportEnv));
+            return selected;
+        }
         /**
          * @brief Authenticate all local graph owners against a frozen PP domain.
          * @param runner The single-device runner or existing nested TP owner.
@@ -777,6 +795,30 @@ namespace llaminar2
         {
             throw std::invalid_argument("Invalid RankOrchestrator configuration");
         }
+        if (diagnosticMoEPrefillRouteTransport())
+        {
+            // Auxiliary expert ranks share the original global overlay plan;
+            // only its exact multi-GPU continuation cell applies this policy.
+            const auto plan = config_.moe_routed_expert_plan;
+            if (!plan)
+                throw std::invalid_argument(
+                    "Diagnostic MoE prefill route transport requires an ExpertOverlay continuation plan");
+            const auto domain = std::find_if(plan->domains.begin(), plan->domains.end(),
+                [&](const auto &candidate) {
+                    return candidate.name == plan->continuation_domain_spec.domain;
+                });
+            if (domain == plan->domains.end())
+                throw std::invalid_argument(
+                    "Diagnostic MoE prefill route transport has no original continuation domain");
+            std::vector<DeviceId> local_devices, continuation_devices;
+            for (const auto &address : tp_ctx ? tp_ctx->devices() : config_.devices)
+                local_devices.push_back(address.toLocalDeviceId());
+            for (const auto &address : domain->participants)
+                continuation_devices.push_back(address.toLocalDeviceId());
+            (void)validateMoEOverlayDiagnosticPrefillTransportOwner(
+                local_devices, continuation_devices,
+                tp_ctx || config_.effectiveMode() == ParallelismMode::TP);
+        }
         initializeRankMTPScratch();
 
         // Initialize stage sharding map from model architecture
@@ -1377,32 +1419,20 @@ namespace llaminar2
                             selectMoEOverlayNodeLocalRouteTransportPolicy(
                                 cell_devices, peer_coverage);
                     }
-                    else if (!homogeneous)
+                    // Support is independent of the default economy choice:
+                    // mapped transport on real P2P hardware is an explicit mode.
+                    validateMoEOverlayNodeLocalRouteTransportPolicy(
+                        cell_devices, peer_coverage, selected_policy);
+                    if (const auto diagnostic = diagnosticMoEPrefillRouteTransport())
                     {
-                        const auto measured =
-                            selectMoEOverlayNodeLocalRouteTransportPolicy(
-                                cell_devices, std::nullopt);
-                        if (selected_policy != measured)
-                        {
-                            throw std::runtime_error(
-                                "RankOrchestrator: preselected continuation route transport policy contradicts heterogeneous device topology");
-                        }
-                    }
-                    else if (peer_coverage)
-                    {
-                        const auto measured =
-                            selectMoEOverlayNodeLocalRouteTransportPolicy(
-                                cell_devices, peer_coverage);
-                        if (selected_policy != measured)
-                        {
-                            throw std::runtime_error(
-                                "RankOrchestrator: preselected continuation route transport policy contradicts driver-reported P2P topology");
-                        }
-                    }
-                    else if (!config_.moe_node_local_route_exchange)
-                    {
-                        throw std::runtime_error(
-                            "RankOrchestrator: homogeneous continuation route transport has no driver-backed P2P matrix");
+                        const auto diagnostic_policy =
+                            selectMoEOverlayDiagnosticPrefillTransportPolicy(
+                                cell_devices, peer_coverage, diagnostic);
+                        if (config_.moe_node_local_route_transport_policy.resolved() &&
+                            selected_policy != diagnostic_policy)
+                            throw std::invalid_argument(
+                                "Diagnostic MoE prefill route transport conflicts with the preselected graph policy");
+                        selected_policy = diagnostic_policy;
                     }
                     config_.moe_node_local_route_transport_policy =
                         selected_policy;

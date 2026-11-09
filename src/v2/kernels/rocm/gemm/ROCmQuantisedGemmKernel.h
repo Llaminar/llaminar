@@ -167,11 +167,11 @@ namespace llaminar2
                 float *d_scales = nullptr;
                 void *startup_h2d_pinned_scales = nullptr;
                 void *startup_h2d_pinned_vnni = nullptr;
-                uint8_t *d_native_vnni_payload = nullptr;
-                void *d_native_vnni_scales = nullptr; // Original Q6 d, otherwise half scale bits.
-                void *d_native_vnni_mins = nullptr;   // Packed Q6 subscales, otherwise format auxiliary bits.
-                void *d_native_vnni_emins = nullptr;  // uint32_t* packed {lo,hi} emins; Q2_K only
-                void *startup_h2d_pinned_native_vnni = nullptr;
+                uint8_t *d_native_quantised_payload = nullptr;
+                void *d_native_quantised_scales = nullptr; // Original Q6 d, otherwise half scale bits.
+                void *d_native_quantised_mins = nullptr;   // Packed Q6 subscales, otherwise format auxiliary bits.
+                void *d_native_quantised_emins = nullptr;  // uint32_t* packed {lo,hi} emins; Q2_K only
+                void *startup_h2d_pinned_native_quantised = nullptr;
                 void *startup_h2d_pinned_native_scales = nullptr;
                 void *startup_h2d_pinned_native_mins = nullptr;
                 void *startup_h2d_pinned_native_emins = nullptr;
@@ -182,15 +182,15 @@ namespace llaminar2
             std::vector<int8_t> int8_data_vnni; ///< [K/4 × N × 4] VNNI layout (the sole device layout)
             std::vector<float> scales;          ///< [N] per-column (per-output-feature) scale factors
 
-            // Native-VNNI compact container (Q4_0, IQ4_NL)
+            // NativeQuantised compact container (Q4_0, IQ4_NL)
             // Q6 preserves original factors; other codebooks retain prepared FP16 metadata.
-            std::vector<uint8_t> native_vnni_payload; ///< [blocks_per_row × N × 16] nibble payload interleaved by N
-            std::vector<uint16_t> native_vnni_scales; ///< [blocks_per_row × N] Q6 source d or prepared FP16 scale bits.
-            std::vector<uint16_t> native_vnni_mins;   ///< [blocks_per_row × N] Q6 packed signed subscales or format aux bits.
-            std::vector<uint32_t> native_vnni_emins;  ///< [blocks_per_row × N] packed {lo,hi} emins (Q2_K only)
-            uint8_t native_vnni_codebook_id = 0;      ///< NativeVNNIFormat: 0=Q4_0, 4=IQ4_NL/IQ4_XS, 5=Q4_1/Q4_K, 6=Q5_0, 7=Q5_1/Q5_K, 8=Q6_K, 9=Q3_K, 10=Q2_K, 11=IQ3_S, 12=IQ3_XXS, 13=IQ2_S, 14=IQ2_XS, 15=IQ2_XXS, 16=IQ1_S, 17=IQ1_M
-            uint32_t native_vnni_blocks_per_row = 0;  ///< K / 32
-            NativeVnniSourceIdentity native_source_identity;
+            std::vector<uint8_t> native_quantised_payload; ///< [blocks_per_row × N × 16] nibble payload interleaved by N
+            std::vector<uint16_t> native_quantised_scales; ///< [blocks_per_row × N] Q6 source d or prepared FP16 scale bits.
+            std::vector<uint16_t> native_quantised_mins;   ///< [blocks_per_row × N] Q6 packed signed subscales or format aux bits.
+            std::vector<uint32_t> native_quantised_emins;  ///< [blocks_per_row × N] packed {lo,hi} emins (Q2_K only)
+            uint8_t native_quantised_codebook_id = 0;      ///< NativeQuantisedFormat: 0=Q4_0, 4=IQ4_NL/IQ4_XS, 5=Q4_1/Q4_K, 6=Q5_0, 7=Q5_1/Q5_K, 8=Q6_K, 9=Q3_K, 10=Q2_K, 11=IQ3_S, 12=IQ3_XXS, 13=IQ2_S, 14=IQ2_XS, 15=IQ2_XXS, 16=IQ1_S, 17=IQ1_M
+            uint32_t native_quantised_blocks_per_row = 0;  ///< K / 32
+            NativeQuantisedSourceIdentity native_source_identity;
 
             int K = 0; ///< Input features (rows in CK B matrix)
             int N = 0; ///< Output features (cols in CK B matrix)
@@ -203,10 +203,10 @@ namespace llaminar2
             // Only VNNI layout is uploaded to device.
             int8_t *d_int8_data_vnni = nullptr;       ///< Device pointer to VNNI-packed weights (sole device copy)
             float *d_scales = nullptr;                ///< Device pointer to scales
-            uint8_t *d_native_vnni_payload = nullptr; ///< Device pointer to native-VNNI payload
-            void *d_native_vnni_scales = nullptr;     ///< Device pointer to native-VNNI FP16 scales (__half*)
-            void *d_native_vnni_mins = nullptr;       ///< Device pointer to native-VNNI FP16 mins (__half*, NULL for symmetric)
-            void *d_native_vnni_emins = nullptr;      ///< Device pointer to native-VNNI packed emins (uint32_t*, Q2_K only)
+            uint8_t *d_native_quantised_payload = nullptr; ///< Device pointer to native-quantised payload
+            void *d_native_quantised_scales = nullptr;     ///< Device pointer to native-quantised FP16 scales (__half*)
+            void *d_native_quantised_mins = nullptr;       ///< Device pointer to native-quantised FP16 mins (__half*, NULL for symmetric)
+            void *d_native_quantised_emins = nullptr;      ///< Device pointer to native-quantised packed emins (uint32_t*, Q2_K only)
             int rocm_device_id = -1;                  ///< Device where data is uploaded
             bool uploaded = false;                    ///< Whether device memory is allocated
 
@@ -227,33 +227,33 @@ namespace llaminar2
                     int8_data = std::move(other.int8_data);
                     int8_data_vnni = std::move(other.int8_data_vnni);
                     scales = std::move(other.scales);
-                    native_vnni_payload = std::move(other.native_vnni_payload);
-                    native_vnni_scales = std::move(other.native_vnni_scales);
-                    native_vnni_mins = std::move(other.native_vnni_mins);
-                    native_vnni_emins = std::move(other.native_vnni_emins);
-                    native_vnni_codebook_id = other.native_vnni_codebook_id;
-                    native_vnni_blocks_per_row = other.native_vnni_blocks_per_row;
+                    native_quantised_payload = std::move(other.native_quantised_payload);
+                    native_quantised_scales = std::move(other.native_quantised_scales);
+                    native_quantised_mins = std::move(other.native_quantised_mins);
+                    native_quantised_emins = std::move(other.native_quantised_emins);
+                    native_quantised_codebook_id = other.native_quantised_codebook_id;
+                    native_quantised_blocks_per_row = other.native_quantised_blocks_per_row;
                     native_source_identity = other.native_source_identity;
                     K = other.K;
                     N = other.N;
                     device_uploads = std::move(other.device_uploads);
                     d_int8_data_vnni = other.d_int8_data_vnni;
                     d_scales = other.d_scales;
-                    d_native_vnni_payload = other.d_native_vnni_payload;
-                    d_native_vnni_scales = other.d_native_vnni_scales;
-                    d_native_vnni_mins = other.d_native_vnni_mins;
-                    d_native_vnni_emins = other.d_native_vnni_emins;
+                    d_native_quantised_payload = other.d_native_quantised_payload;
+                    d_native_quantised_scales = other.d_native_quantised_scales;
+                    d_native_quantised_mins = other.d_native_quantised_mins;
+                    d_native_quantised_emins = other.d_native_quantised_emins;
                     rocm_device_id = other.rocm_device_id;
                     uploaded = other.uploaded;
 
                     other.d_int8_data_vnni = nullptr;
                     other.d_scales = nullptr;
-                    other.d_native_vnni_payload = nullptr;
-                    other.d_native_vnni_scales = nullptr;
-                    other.d_native_vnni_mins = nullptr;
-                    other.d_native_vnni_emins = nullptr;
-                    other.native_vnni_codebook_id = 0;
-                    other.native_vnni_blocks_per_row = 0;
+                    other.d_native_quantised_payload = nullptr;
+                    other.d_native_quantised_scales = nullptr;
+                    other.d_native_quantised_mins = nullptr;
+                    other.d_native_quantised_emins = nullptr;
+                    other.native_quantised_codebook_id = 0;
+                    other.native_quantised_blocks_per_row = 0;
                     other.native_source_identity = {};
                     other.rocm_device_id = -1;
                     other.uploaded = false;
@@ -377,11 +377,11 @@ namespace llaminar2
              * @param N Output features (rows per expert)
              * @param K Input features (columns)
              * @param rocm_device_id ROCm device ID
-             * @param d_native_vnni Device pointer to native-VNNI payload for this expert
+             * @param d_native_quantised Device pointer to native-quantised payload for this expert
              * @param d_native_scales Device pointer to FP16 scales (void* for __half*)
              * @param d_native_mins Device pointer to FP16 mins (nullptr if symmetric)
              * @param d_native_emins Device pointer to extended mins (nullptr if not needed)
-             * @param codebook_id NativeVNNI codebook identifier
+             * @param codebook_id NativeQuantised codebook identifier
              * @param blocks_per_row Number of 32-element blocks per row (K/32)
              * @param lifetime_owner Shared pointer that keeps the GPU allocation alive
              * @param source_identity Exact GGUF arithmetic provenance
@@ -390,12 +390,12 @@ namespace llaminar2
              */
             ROCmQuantisedGemmKernel(
                 int N, int K, int rocm_device_id,
-                uint8_t *d_native_vnni, void *d_native_scales,
+                uint8_t *d_native_quantised, void *d_native_scales,
                 void *d_native_mins, void *d_native_emins,
                 uint8_t codebook_id, uint32_t blocks_per_row,
                 std::shared_ptr<void> lifetime_owner,
-                NativeVnniSourceIdentity source_identity,
-                NativeVnniReusableDeviceAllocationFormat allocation_format = {});
+                NativeQuantisedSourceIdentity source_identity,
+                NativeQuantisedReusableDeviceAllocationFormat allocation_format = {});
 
             ~ROCmQuantisedGemmKernel() override;
 
@@ -733,9 +733,9 @@ namespace llaminar2
                 return static_cast<int>(K_);
             }
             bool weights_converted() const override;
-            bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
-            /** @copydoc ITensorGemm::inspectPreparedNativeVNNIMatrixDesc */
-            [[nodiscard]] bool inspectPreparedNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) const override;
+            bool exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) override;
+            /** @copydoc ITensorGemm::inspectPreparedNativeQuantisedMatrixDesc */
+            [[nodiscard]] bool inspectPreparedNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) const override;
             /** @copydoc ITensorGemm::q8ResidualCorrectionWorkspaceRequirements */
             WorkspaceRequirements q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const override;
             /** @copydoc ITensorGemm::multiply_q8_residual_corrected */
@@ -745,8 +745,8 @@ namespace llaminar2
             void multiply_q8_residual_corrected(HCResidualDownInput input,TensorBase*output,
                 DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace) override;
 
-            bool exportNativeVNNISourceIdentity(
-                NativeVnniSourceIdentity &out) const override;
+            bool exportNativeQuantisedSourceIdentity(
+                NativeQuantisedSourceIdentity &out) const override;
 
             /**
              * @brief Prepare weights for efficient execution (ITensorGemm interface)
@@ -766,7 +766,7 @@ namespace llaminar2
              */
             enum class PrefillDispatchPath
             {
-                NATIVE_VNNI,      ///< Native-VNNI path (lossless ≤6-bit decode, FP16 scales)
+                NATIVE_QUANTISED,      ///< NativeQuantised path (lossless ≤6-bit decode, FP16 scales)
                 INT8_VNNI_NATIVE, ///< INT8-VNNI path (requantized 8-bit weights)
                 UNSUPPORTED       ///< No viable prefill path (dimensions/weights unsupported)
             };
@@ -917,7 +917,7 @@ namespace llaminar2
             /** @brief Stack-only validated launch operands, never an allocation or registry. */
             struct GatedNormExecutionBinding {
                 GatedNormSingleQ8Input input;
-                DeviceNativeVNNIMatrixDesc weights;
+                DeviceNativeQuantisedMatrixDesc weights;
                 float* row_scales;
                 float* partials;
             };

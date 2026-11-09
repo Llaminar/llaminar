@@ -37,7 +37,7 @@
 #include "../../../backends/DeviceId.h"
 #include "../../../tensors/ITensor.h"
 #include "../../../tensors/TensorClasses.h"
-#include "../../../tensors/NativeVnniFormatInfo.h"
+#include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
@@ -109,7 +109,7 @@ namespace
      */
     void appendGroupedDescriptorIdentity(
         std::vector<std::uint64_t> &words,
-        const llaminar2::DeviceNativeVNNIMatrixDesc &descriptor)
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &descriptor)
     {
         words.push_back(static_cast<std::uint64_t>(
             reinterpret_cast<std::uintptr_t>(descriptor.payload)));
@@ -147,8 +147,8 @@ namespace
      */
     llaminar2::PersistentWorkspacePublicationKey
     groupedDescriptorPublicationKey(
-        const llaminar2::DeviceNativeVNNIMatrixDesc *primary,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *secondary,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *primary,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *secondary,
         int num_experts,
         int d_model,
         int intermediate)
@@ -288,14 +288,14 @@ namespace
 #endif
     }
 
-    /// @brief Returns whether grouped MoE kernels instantiate this native-VNNI codebook.
+    /// @brief Returns whether grouped MoE kernels instantiate this native-quantised codebook.
     bool groupedDecodeSupportsCodebook(uint8_t codebook_id)
     {
         switch (codebook_id)
         {
         case 0:  // Q4_0
         case 4:  // IQ4_NL
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: // IQ4_XS original tuple
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: // IQ4_XS original tuple
         case 5:  // Q4_1 / Q4_K
         case 6:  // Q5_0
         case 7:  // Q5_1 / Q5_K
@@ -310,7 +310,7 @@ namespace
         case 16: // IQ1_S
         case 17: // IQ1_M
         case 19: // Q8_0
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -322,7 +322,7 @@ namespace
     {
         switch (codebook_id)
         {
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: // Raw source coefficient, not a min
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: // Raw source coefficient, not a min
         case 11: // Mandatory original IQ3_S source nibble; not a minimum
         case 5:  // Q4_1 / Q4_K min correction
         case 7:  // Q5_1 / Q5_K min correction
@@ -333,7 +333,7 @@ namespace
         case 14: // IQ2_XS high half scale
         case 16: // IQ1_S min correction
         case 17: // IQ1_M high half scale
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook: // Expanded asymmetric min correction
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: // Expanded asymmetric min correction
             return true;
         default:
             return false;
@@ -383,15 +383,15 @@ namespace
      * present rather than trusted as an unchecked policy-table index.
      */
     bool validateGroupedSourceIdentity(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         if (!desc.source_identity_present)
         {
-            return desc.codebook_id != llaminar2::kNativeVnniIQ4XSSourceScaleCodebook &&
-                   desc.codebook_id != llaminar2::kNativeVnniExpandedInt8MinCodebook;
+            return desc.codebook_id != llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook &&
+                   desc.codebook_id != llaminar2::kNativeQuantisedExpandedInt8MinCodebook;
         }
         const auto *source =
-            llaminar2::native_vnni_formats::forSourceIdentity(
+            llaminar2::native_quantised_formats::forSourceIdentity(
                 desc.source_codebook_id,
                 desc.source_is_superblock != 0);
         return source != nullptr &&
@@ -401,7 +401,7 @@ namespace
 
     /** @return Bit selecting the serial-M1 source arithmetic policy. */
     uint32_t groupedPrefillPolicyCodebookBit(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         if (!validateGroupedSourceIdentity(desc))
             return 0u;
@@ -413,7 +413,7 @@ namespace
     }
 
     bool validateGroupedDownDesc(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc,
         int d_model,
         int intermediate)
     {
@@ -426,7 +426,7 @@ namespace
     }
 
     bool validateGroupedGateUpDesc(
-        const llaminar2::DeviceNativeVNNIMatrixDesc &desc,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc &desc,
         int d_model,
         int intermediate)
     {
@@ -438,7 +438,7 @@ namespace
                (!groupedDecodeRequiresEmins(desc.codebook_id) || desc.emins);
     }
 
-    bool isBlankGroupedDesc(const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+    bool isBlankGroupedDesc(const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         return desc.payload == nullptr &&
                desc.scales == nullptr &&
@@ -1155,9 +1155,9 @@ extern "C"
         const float *routing_weights,
         void *runtime,
         int *original_to_grouped,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int current_slots,
         int max_slots,
@@ -1174,9 +1174,9 @@ extern "C"
     bool hipMoE_regroup_prefill_routes_and_materialize_plan_runtime(
         void *runtime,
         int *original_to_grouped,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int current_slots,
         int max_slots,
@@ -1238,9 +1238,9 @@ extern "C"
 
     bool hipMoE_materialize_runtime_prefill_descriptor_tables(
         const void *runtime,
-        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
-        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_experts,
         int device_idx,
         void *stream);
@@ -1269,10 +1269,10 @@ extern "C"
         int expert_id, int max_tokens, int d_model,
         int device_idx, void *stream);
 
-    bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
+    bool rocmMoE_grouped_swiglu_down_native_quantised_decode(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_descs,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_descs,
         const float *d_weights,
         int8_t *d_swiglu_int8,
         float *d_swiglu_scales,
@@ -1285,10 +1285,10 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+    bool rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_desc_table,
         const int *d_expert_ids,
         const float *d_weights,
         int8_t *d_swiglu_int8,
@@ -1322,10 +1322,10 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
+    bool rocmMoE_grouped_gate_up_native_quantised_decode_table(
         const float *d_hidden,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_gate_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_up_desc_table,
         const int *d_expert_ids,
         float *const *d_gate_outputs,
         float *const *d_up_outputs,
@@ -1360,7 +1360,7 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
+    bool rocmMoE_grouped_gate_up_native_quantised_decode_runtime(
         const float *d_hidden,
         const void *d_runtime_layer,
         const int *d_expert_ids,
@@ -1380,7 +1380,7 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime(
+    bool rocmMoE_grouped_swiglu_down_native_quantised_decode_runtime(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
         const void *d_runtime_layer,
@@ -1488,9 +1488,9 @@ namespace
      */
     int singleCodebookFromMask(uint32_t codebook_mask)
     {
-        const uint32_t iq4_tuple = llaminar2::nativeVnniCodebookMaskBit(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+        const uint32_t iq4_tuple = llaminar2::nativeQuantisedCodebookMaskBit(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
         if (codebook_mask & iq4_tuple)
-            codebook_mask &= ~llaminar2::nativeVnniCodebookMaskBit(uint8_t{4});
+            codebook_mask &= ~llaminar2::nativeQuantisedCodebookMaskBit(uint8_t{4});
         if (codebook_mask == 0 ||
             (codebook_mask & (codebook_mask - 1u)) != 0u)
         {
@@ -2237,7 +2237,7 @@ namespace llaminar2
         const char *buffer_name,
         std::size_t slot,
         int num_experts,
-        DeviceNativeVNNIMatrixDesc **device_descs,
+        DeviceNativeQuantisedMatrixDesc **device_descs,
         const char *context)
     {
         if (!buffer_name || !device_descs || num_experts <= 0 ||
@@ -2251,7 +2251,7 @@ namespace llaminar2
         if (!bindWorkspaceBuffer(
                 &base,
                 buffer_name,
-                sizeof(DeviceNativeVNNIMatrixDesc),
+                sizeof(DeviceNativeQuantisedMatrixDesc),
                 context))
         {
             return false;
@@ -2263,7 +2263,7 @@ namespace llaminar2
             static_cast<std::size_t>(
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
         const std::size_t descriptor_stride =
-            slot_bytes / sizeof(DeviceNativeVNNIMatrixDesc);
+            slot_bytes / sizeof(DeviceNativeQuantisedMatrixDesc);
         if (descriptor_stride < static_cast<std::size_t>(num_experts))
         {
             LOG_ERROR("[ROCmMoEKernel] " << context
@@ -2277,7 +2277,7 @@ namespace llaminar2
 
         const std::size_t descriptor_offset = slot * descriptor_stride;
         const std::size_t descriptor_capacity =
-            available / sizeof(DeviceNativeVNNIMatrixDesc);
+            available / sizeof(DeviceNativeQuantisedMatrixDesc);
         if (descriptor_offset + static_cast<std::size_t>(num_experts) >
             descriptor_capacity)
         {
@@ -2290,7 +2290,7 @@ namespace llaminar2
         }
 
         *device_descs =
-            static_cast<DeviceNativeVNNIMatrixDesc *>(base) + descriptor_offset;
+            static_cast<DeviceNativeQuantisedMatrixDesc *>(base) + descriptor_offset;
         return true;
     }
 
@@ -2433,7 +2433,7 @@ namespace llaminar2
                     MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                     [&](std::size_t slot) -> std::shared_ptr<void>
                     {
-                        DeviceNativeVNNIMatrixDesc *slot_base = nullptr;
+                        DeviceNativeQuantisedMatrixDesc *slot_base = nullptr;
                         if (!bindGroupedDescriptorTableSlot(
                                 MoEWorkspaceBuffers::
                                     ROCM_GROUPED_DOWN_DESC_TABLES,
@@ -2511,7 +2511,7 @@ namespace llaminar2
 
         const size_t desc_bytes =
             static_cast<size_t>(table.num_experts) *
-            sizeof(DeviceNativeVNNIMatrixDesc);
+            sizeof(DeviceNativeQuantisedMatrixDesc);
         const auto publication_result =
             workspace_->getOrCreatePersistentPublication(
                 kROCmGroupedDownDescriptorLeaseDomain,
@@ -2524,7 +2524,7 @@ namespace llaminar2
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                 [&](std::size_t slot) -> std::shared_ptr<void>
                 {
-                    DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+                    DeviceNativeQuantisedMatrixDesc *device_descs = nullptr;
                     if (!bindGroupedDescriptorTableSlot(
                             MoEWorkspaceBuffers::
                                 ROCM_GROUPED_DOWN_DESC_TABLES,
@@ -2614,7 +2614,7 @@ namespace llaminar2
             return false;
         }
 
-        table.device_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+        table.device_descs = static_cast<DeviceNativeQuantisedMatrixDesc *>(
             publication->primary_descs);
         table.device_floating_descs = nullptr;
         table.workspace_publication = std::move(publication);
@@ -2667,8 +2667,8 @@ namespace llaminar2
                     MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                     [&](std::size_t slot) -> std::shared_ptr<void>
                     {
-                        DeviceNativeVNNIMatrixDesc *gate_slot_base = nullptr;
-                        DeviceNativeVNNIMatrixDesc *up_slot_base = nullptr;
+                        DeviceNativeQuantisedMatrixDesc *gate_slot_base = nullptr;
+                        DeviceNativeQuantisedMatrixDesc *up_slot_base = nullptr;
                         if (!bindGroupedDescriptorTableSlot(
                                 MoEWorkspaceBuffers::
                                     ROCM_GROUPED_GATE_DESC_TABLES,
@@ -2768,7 +2768,7 @@ namespace llaminar2
 
         const size_t desc_bytes =
             static_cast<size_t>(table.num_experts) *
-            sizeof(DeviceNativeVNNIMatrixDesc);
+            sizeof(DeviceNativeQuantisedMatrixDesc);
         const auto publication_result =
             workspace_->getOrCreatePersistentPublication(
                 kROCmGroupedGateUpDescriptorLeaseDomain,
@@ -2781,9 +2781,9 @@ namespace llaminar2
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                 [&](std::size_t slot) -> std::shared_ptr<void>
                 {
-                    DeviceNativeVNNIMatrixDesc *device_gate_descs =
+                    DeviceNativeQuantisedMatrixDesc *device_gate_descs =
                         nullptr;
-                    DeviceNativeVNNIMatrixDesc *device_up_descs =
+                    DeviceNativeQuantisedMatrixDesc *device_up_descs =
                         nullptr;
                     if (!bindGroupedDescriptorTableSlot(
                             MoEWorkspaceBuffers::
@@ -2894,9 +2894,9 @@ namespace llaminar2
             return false;
         }
 
-        table.device_gate_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+        table.device_gate_descs = static_cast<DeviceNativeQuantisedMatrixDesc *>(
             publication->primary_descs);
-        table.device_up_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+        table.device_up_descs = static_cast<DeviceNativeQuantisedMatrixDesc *>(
             publication->secondary_descs);
         table.device_floating_gate_descs = nullptr;
         table.device_floating_up_descs = nullptr;
@@ -4122,7 +4122,7 @@ namespace llaminar2
                                  "ensureGroupedDecodeCapacity(weights)") ||
             !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_down_descs_),
                                  MoEWorkspaceBuffers::ROCM_DECODE_DOWN_DESCS,
-                                 static_cast<size_t>(num_active) * sizeof(DeviceNativeVNNIMatrixDesc),
+                                 static_cast<size_t>(num_active) * sizeof(DeviceNativeQuantisedMatrixDesc),
                                  "ensureGroupedDecodeCapacity(down_descs)") ||
             !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_swiglu_int8_),
                                  MoEWorkspaceBuffers::DECODE_SWIGLU_INT8,
@@ -4138,7 +4138,7 @@ namespace llaminar2
                 MoEWorkspaceBuffers::DOWN_PARTIALS,
                 static_cast<size_t>(num_active) *
                     static_cast<size_t>(
-                        NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                        NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) *
                     static_cast<size_t>(d_model) * sizeof(float),
                 "ensureGroupedDecodeCapacity(ordered_down_partials)"))
         {
@@ -4212,7 +4212,7 @@ namespace llaminar2
                 MoEWorkspaceBuffers::GATEUP_GATE_PARTIALS,
                 static_cast<size_t>(num_active) *
                     static_cast<size_t>(
-                        NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                        NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) *
                     static_cast<size_t>(intermediate) * sizeof(float),
                 "ensureGroupedGateUpCapacity(gate_partials)") ||
             !bindWorkspaceBuffer(
@@ -4220,7 +4220,7 @@ namespace llaminar2
                 MoEWorkspaceBuffers::GATEUP_UP_PARTIALS,
                 static_cast<size_t>(num_active) *
                     static_cast<size_t>(
-                        NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                        NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) *
                     static_cast<size_t>(intermediate) * sizeof(float),
                 "ensureGroupedGateUpCapacity(up_partials)"))
         {
@@ -7016,7 +7016,7 @@ namespace llaminar2
     }
 
     int ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable(
-        const DeviceNativeVNNIMatrixDesc *down_descs,
+        const DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_experts,
         int d_model,
         int intermediate,
@@ -7045,7 +7045,7 @@ namespace llaminar2
         {
             return -1;
         }
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
@@ -7065,10 +7065,10 @@ namespace llaminar2
                           << expert_id);
                 return -1;
             }
-            if (!addNativeVnniExecutionFormat(
+            if (!addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -7089,7 +7089,7 @@ namespace llaminar2
         uint8_t codebook_id = kROCmMoEMixedCodebookSentinel;
         for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
         {
-            const uint32_t bit = nativeVnniCodebookMaskBit(codebook);
+            const uint32_t bit = nativeQuantisedCodebookMaskBit(codebook);
             if ((codebook_mask & bit) == 0u)
                 continue;
             if (groupedPrefillCodebookBit(codebook) == 0u)
@@ -7118,12 +7118,12 @@ namespace llaminar2
         }
 
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         for (size_t index = 0; index < grouped_down_desc_tables_.size(); ++index)
         {
             const auto &existing = grouped_down_desc_tables_[index];
             if (!existing.valid ||
-                existing.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+                existing.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
                 !existing.device_descs ||
                 existing.num_experts != num_experts ||
                 existing.d_model != d_model ||
@@ -7149,7 +7149,7 @@ namespace llaminar2
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
         table.descriptor_source = descriptor_source;
-        table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
+        table.weight_format = DeviceMoEWeightFormat::NativeQuantised;
         table.valid = true;
         if (!publishGroupedDownDescriptorTable(
                 table,
@@ -7170,7 +7170,7 @@ namespace llaminar2
             throw std::invalid_argument("owner gate/up preparation requires its original table and physical rows");
         auto &table = grouped_gateup_desc_tables_[table_id];
         if (!table.valid || !table.deviceReady()) throw std::logic_error("owner gate/up table is not prepared");
-        const bool selected = rows == 1 && table.weight_format == DeviceMoEWeightFormat::NativeVNNI &&
+        const bool selected = rows == 1 && table.weight_format == DeviceMoEWeightFormat::NativeQuantised &&
             table.descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
         if (!selected)
         {
@@ -7210,7 +7210,7 @@ namespace llaminar2
             throw std::logic_error("owner gate/up capture binding lost its descriptor table");
         const auto &table = grouped_gateup_desc_tables_[table_id];
         if (!table.valid || !table.deviceReady()) throw std::logic_error("owner gate/up capture binding lost its prepared storage");
-        const bool selected = rows == 1 && table.weight_format == DeviceMoEWeightFormat::NativeVNNI &&
+        const bool selected = rows == 1 && table.weight_format == DeviceMoEWeightFormat::NativeQuantised &&
             table.descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
         if (!selected) return 0;
         if (table.owner_m1_admission.has_value() != (table.owner_m1_intent != 0))
@@ -7226,7 +7226,7 @@ namespace llaminar2
         if (!execution.executesGateUp() || execution.executesDown() || rows != 1 ||
             table_id < 0 || table_id >= static_cast<int>(grouped_gateup_desc_tables_.size())) return nullptr;
         const auto &table = grouped_gateup_desc_tables_[table_id];
-        if (table.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+        if (table.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
             table.descriptor_source != MoEDecodeDescriptorSource::RuntimePlacementTable) return nullptr;
         if (!table.owner_m1_admission && !table.owner_m1_intent)
             return nullptr; // Existing unbound component path, not a declared graph policy.
@@ -7262,8 +7262,8 @@ namespace llaminar2
     }
 
     int ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables(
-        const DeviceNativeVNNIMatrixDesc *gate_descs,
-        const DeviceNativeVNNIMatrixDesc *up_descs,
+        const DeviceNativeQuantisedMatrixDesc *gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *up_descs,
         int num_experts,
         int d_model,
         int intermediate,
@@ -7292,7 +7292,7 @@ namespace llaminar2
         {
             return -1;
         }
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7315,7 +7315,7 @@ namespace llaminar2
                 return -1;
             }
 
-            if (!areNativeVnniGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id))
+            if (!areNativeQuantisedGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id))
             {
                 LOG_DEBUG("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] Gate/up codebook mismatch for expert "
                           << expert_id << ": gate=" << static_cast<int>(gate_desc.codebook_id)
@@ -7331,12 +7331,12 @@ namespace llaminar2
                 return -1;
             }
             const auto add_descriptor = [&](
-                                            const DeviceNativeVNNIMatrixDesc &desc)
+                                            const DeviceNativeQuantisedMatrixDesc &desc)
             {
-                return addNativeVnniExecutionFormat(
+                return addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -7359,7 +7359,7 @@ namespace llaminar2
         uint8_t codebook_id = kROCmMoEMixedCodebookSentinel;
         for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
         {
-            const uint32_t bit = nativeVnniCodebookMaskBit(codebook);
+            const uint32_t bit = nativeQuantisedCodebookMaskBit(codebook);
             if ((codebook_mask & bit) == 0u)
                 continue;
             if (groupedPrefillCodebookBit(codebook) == 0u)
@@ -7384,12 +7384,12 @@ namespace llaminar2
         }
 
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         for (size_t index = 0; index < grouped_gateup_desc_tables_.size(); ++index)
         {
             const auto &existing = grouped_gateup_desc_tables_[index];
             if (!existing.valid ||
-                existing.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+                existing.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
                 !existing.device_gate_descs ||
                 !existing.device_up_descs ||
                 existing.num_experts != num_experts ||
@@ -7419,7 +7419,7 @@ namespace llaminar2
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
         table.descriptor_source = descriptor_source;
-        table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
+        table.weight_format = DeviceMoEWeightFormat::NativeQuantised;
         table.valid = true;
         if (!publishGroupedGateUpDescriptorTable(
                 table,
@@ -7609,7 +7609,7 @@ namespace llaminar2
 
     bool ROCmMoEKernel::updateGroupedExpertDownDescriptorTable(
         int descriptor_table_id,
-        const DeviceNativeVNNIMatrixDesc *down_descs,
+        const DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_experts,
         int d_model,
         int intermediate)
@@ -7631,7 +7631,7 @@ namespace llaminar2
 
         auto &table = grouped_down_desc_tables_[static_cast<size_t>(descriptor_table_id)];
         if (!table.valid ||
-            table.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+            table.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
             !table.device_descs ||
             !table.workspace_publication ||
             table.num_experts != num_experts ||
@@ -7644,7 +7644,7 @@ namespace llaminar2
         const bool runtime_mutable =
             table.descriptor_source ==
             MoEDecodeDescriptorSource::RuntimePlacementTable;
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
@@ -7652,10 +7652,10 @@ namespace llaminar2
                 continue;
             if (!desc.valid() || !validateGroupedDownDesc(desc, d_model, intermediate))
                 return false;
-            if (!addNativeVnniExecutionFormat(
+            if (!addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -7689,7 +7689,7 @@ namespace llaminar2
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         if (!workspace_->rewritePersistentPublication(
                 kROCmGroupedDownDescriptorLeaseDomain,
                 groupedDescriptorPublicationKey(
@@ -7741,8 +7741,8 @@ namespace llaminar2
 
     bool ROCmMoEKernel::updateGroupedExpertGateUpDescriptorTables(
         int descriptor_table_id,
-        const DeviceNativeVNNIMatrixDesc *gate_descs,
-        const DeviceNativeVNNIMatrixDesc *up_descs,
+        const DeviceNativeQuantisedMatrixDesc *gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *up_descs,
         int num_experts,
         int d_model,
         int intermediate)
@@ -7764,7 +7764,7 @@ namespace llaminar2
 
         auto &table = grouped_gateup_desc_tables_[static_cast<size_t>(descriptor_table_id)];
         if (!table.valid ||
-            table.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+            table.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
             !table.device_gate_descs ||
             !table.device_up_descs || !table.workspace_publication ||
             table.num_experts != num_experts ||
@@ -7777,7 +7777,7 @@ namespace llaminar2
         const bool runtime_mutable =
             table.descriptor_source ==
             MoEDecodeDescriptorSource::RuntimePlacementTable;
-        NativeVnniExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7791,19 +7791,19 @@ namespace llaminar2
                 return false;
             }
             if (!gate_desc.valid() || !up_desc.valid() ||
-                !areNativeVnniGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
+                !areNativeQuantisedGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
                 !validateGroupedGateUpDesc(gate_desc, d_model, intermediate) ||
                 !validateGroupedGateUpDesc(up_desc, d_model, intermediate))
             {
                 return false;
             }
             const auto add_descriptor = [&](
-                                            const DeviceNativeVNNIMatrixDesc &desc)
+                                            const DeviceNativeQuantisedMatrixDesc &desc)
             {
-                return addNativeVnniExecutionFormat(
+                return addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
-                    NativeVnniSourceIdentity{
+                    NativeQuantisedSourceIdentity{
                         .codebook_id = desc.source_codebook_id,
                         .is_superblock =
                             desc.source_is_superblock != 0u,
@@ -7839,7 +7839,7 @@ namespace llaminar2
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         const size_t desc_bytes =
-            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeQuantisedMatrixDesc);
         if (!workspace_->rewritePersistentPublication(
                 kROCmGroupedGateUpDescriptorLeaseDomain,
                 groupedDescriptorPublicationKey(
@@ -8248,7 +8248,7 @@ namespace llaminar2
                   table.weight_format,
                   device_ordinal_,
                   getStream())
-            : rocmMoE_grouped_gate_up_native_vnni_decode_table(
+            : rocmMoE_grouped_gate_up_native_quantised_decode_table(
                   d_hidden,
                   table.device_gate_descs,
                   table.device_up_descs,
@@ -8428,7 +8428,7 @@ namespace llaminar2
          * runtime placement. Split-K variants are deliberately absent because
          * reducing partition totals changes the FP32 addition tree.
          */
-        const bool ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
+        const bool ok = rocmMoE_grouped_gate_up_native_quantised_decode_table(
             d_hidden,
             table.device_gate_descs,
             table.device_up_descs,
@@ -8549,7 +8549,7 @@ namespace llaminar2
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
 
-        const bool ok = rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
+        const bool ok = rocmMoE_grouped_gate_up_native_quantised_decode_runtime(
             d_hidden,
             runtime_layer,
             d_expert_ids,
@@ -8820,9 +8820,9 @@ namespace llaminar2
         if (descriptor_source ==
             MoEDecodeDescriptorSource::RuntimePlacementTable)
         {
-            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
             if (!bindGroupedDescriptorTableSlot(
                     MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
                     gateup_table.workspace_slot,
@@ -9161,11 +9161,11 @@ namespace llaminar2
          * placement.  Therefore mutable and immutable placement differ only in
          * where the table values are published, not in GEMV arithmetic.
          */
-        const DeviceNativeVNNIMatrixDesc *decode_gate_descs =
+        const DeviceNativeQuantisedMatrixDesc *decode_gate_descs =
             gateup_table.device_gate_descs;
-        const DeviceNativeVNNIMatrixDesc *decode_up_descs =
+        const DeviceNativeQuantisedMatrixDesc *decode_up_descs =
             gateup_table.device_up_descs;
-        const DeviceNativeVNNIMatrixDesc *decode_down_descs =
+        const DeviceNativeQuantisedMatrixDesc *decode_down_descs =
             down_table.device_descs;
         const DeviceMoEFloatingMatrixDesc *decode_floating_gate_descs =
             gateup_table.device_floating_gate_descs;
@@ -9175,9 +9175,9 @@ namespace llaminar2
             down_table.device_floating_descs;
         if (use_runtime_descriptors)
         {
-            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
             if (!bindGroupedDescriptorTableSlot(
                     MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
                     gateup_table.workspace_slot,
@@ -9330,11 +9330,11 @@ namespace llaminar2
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
         /*
-         * NativeVNNI decode has no consumer for the intermediate FP32 gate/up
+         * NativeQuantised decode has no consumer for the intermediate FP32 gate/up
          * rows.  Publish the exact decode-equivalent Q8 SwiGLU rows directly
          * from the ordered partial reducer.  Floating-point weights retain
          * their own fixed-tree FP32 contract and therefore do not enter this
-         * NativeVNNI publication path.
+         * NativeQuantised publication path.
          */
         const bool gateup_ok = floating
             ? rocmMoE_grouped_gate_up_floating_decode_table(
@@ -9351,7 +9351,7 @@ namespace llaminar2
                   gateup_table.weight_format,
                   device_ordinal_,
                   stream)
-            : rocmMoE_grouped_gate_up_native_vnni_decode_table(
+            : rocmMoE_grouped_gate_up_native_quantised_decode_table(
                   d_hidden,
                   decode_gate_descs,
                   decode_up_descs,
@@ -9387,7 +9387,7 @@ namespace llaminar2
         }
 
         /*
-         * The NativeVNNI branch consumes the Q8 rows published immediately
+         * The NativeQuantised branch consumes the Q8 rows published immediately
          * above on this exact stream.  No event or synchronization is needed
          * inside one stream; the boolean is a strict data-contract selector,
          * not permission to infer readiness from pointer non-nullness.
@@ -9408,7 +9408,7 @@ namespace llaminar2
                   down_table.weight_format,
                   device_ordinal_,
                   stream)
-            : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+            : rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
                   d_down_gate_ptrs,
                   d_down_up_ptrs,
                   decode_down_descs,
@@ -9571,7 +9571,7 @@ namespace llaminar2
                   table.weight_format,
                   device_ordinal_,
                   getStream())
-            : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+            : rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
                   d_gate_ptrs,
                   d_up_ptrs,
                   table.device_descs,
@@ -9727,7 +9727,7 @@ namespace llaminar2
          * non-local experts, so masked and unmasked decode share one reduction
          * tree without floating-point atomics.
          */
-        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+        const bool ok = rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
             d_grouped_gate_ptrs_,
             d_grouped_up_ptrs_,
             table.device_descs,
@@ -9818,7 +9818,7 @@ namespace llaminar2
             return false;
         }
 
-        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime(
+        const bool ok = rocmMoE_grouped_swiglu_down_native_quantised_decode_runtime(
             d_gate_ptrs,
             d_up_ptrs,
             runtime_layer,
@@ -9852,7 +9852,7 @@ namespace llaminar2
         ITensor *const *up_tensors,
         const int *expert_ids,
         const float *expert_weights,
-        const DeviceNativeVNNIMatrixDesc *down_descs,
+        const DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_active,
         ITensor *output,
         int d_model,
@@ -9876,7 +9876,7 @@ namespace llaminar2
             if (expert_ids[i] < 0 || !down_descs[i].valid() ||
                 down_descs[i].n != d_model || down_descs[i].k != intermediate ||
                 down_descs[i].blocks_per_row != static_cast<uint32_t>(intermediate / 32) ||
-                !areNativeVnniGateUpCodebooksCompatible(
+                !areNativeQuantisedGateUpCodebooksCompatible(
                     down_descs[i].codebook_id, codebook_id) ||
                 (groupedDecodeRequiresMins(down_descs[i].codebook_id) && !down_descs[i].mins) ||
                 (groupedDecodeRequiresEmins(down_descs[i].codebook_id) && !down_descs[i].emins))
@@ -9888,12 +9888,12 @@ namespace llaminar2
         // Preserve the old IQ4_NL/IQ4_XS mixed-down domain: the LUT decode
         // is shared, but physical24 resolves only its own raw source factors.
         for (int i = 0; i < num_active; ++i)
-            if (down_descs[i].codebook_id == kNativeVnniIQ4XSSourceScaleCodebook)
-                codebook_id = kNativeVnniIQ4XSSourceScaleCodebook;
+            if (down_descs[i].codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook)
+                codebook_id = kNativeQuantisedIQ4XSSourceScaleCodebook;
 
         if (!groupedDecodeSupportsCodebook(codebook_id))
         {
-            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecode] Unsupported native-VNNI codebook "
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecode] Unsupported native-quantised codebook "
                       << static_cast<int>(codebook_id));
             return false;
         }
@@ -9936,7 +9936,7 @@ namespace llaminar2
                                  hipMemcpyHostToDevice, stream);
         if (err == hipSuccess)
             err = hipMemcpyAsync(d_grouped_down_descs_, down_descs,
-                                 static_cast<size_t>(num_active) * sizeof(DeviceNativeVNNIMatrixDesc),
+                                 static_cast<size_t>(num_active) * sizeof(DeviceNativeQuantisedMatrixDesc),
                                  hipMemcpyHostToDevice, stream);
         if (err != hipSuccess)
         {
@@ -9945,7 +9945,7 @@ namespace llaminar2
             return false;
         }
 
-        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode(
+        const bool ok = rocmMoE_grouped_swiglu_down_native_quantised_decode(
             d_grouped_gate_ptrs_,
             d_grouped_up_ptrs_,
             d_grouped_down_descs_,
@@ -10137,9 +10137,9 @@ namespace llaminar2
             group_slots_cap_ = max_slots;
         }
 
-        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
         if (!bindGroupedDescriptorTableSlot(
                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
                 gateup_table.workspace_slot,
@@ -10256,9 +10256,9 @@ namespace llaminar2
             group_slots_cap_ = max_slots;
         }
 
-        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
         if (!bindGroupedDescriptorTableSlot(
                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
                 gateup_table.workspace_slot,
@@ -12036,9 +12036,9 @@ namespace llaminar2
          * resolves the same persistent addresses without hidden publication
          * kernels of its own.
          */
-        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeQuantisedMatrixDesc *runtime_down_descs = nullptr;
         if (!bindGroupedDescriptorTableSlot(
                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
                 gateup_table.workspace_slot,

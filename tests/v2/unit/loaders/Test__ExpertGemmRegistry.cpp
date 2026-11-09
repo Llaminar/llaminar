@@ -1121,7 +1121,7 @@ namespace
             original_={uint8_t(format->codebook_id+codebook_error),format->is_superblock,true};
         }
         /** @brief Native path deliberately retains generic get_n/get_k==0, as actual GPU quantized engines do. */
-        bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+        bool exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) override
         {
             out={};
             out.payload=data_;
@@ -1135,7 +1135,7 @@ namespace
             out.source_identity_present=1;
             return out.valid();
         }
-        bool exportNativeVNNISourceIdentity(NativeVnniSourceIdentity &out) const override
+        bool exportNativeQuantisedSourceIdentity(NativeQuantisedSourceIdentity &out) const override
         {
             out=original_;
             return true;
@@ -1145,7 +1145,7 @@ namespace
         int n_;
         int k_;
         uint16_t scale_=0;
-        NativeVnniSourceIdentity original_;
+        NativeQuantisedSourceIdentity original_;
     };
 }
 

@@ -782,7 +782,7 @@ TEST(Test__WorkspaceMemoryEstimator,
  * @brief Every production quantized codebook prices the same prepared ABI.
  *
  * Source codebooks change persistent packed-weight bytes, but ROCm prepares
- * every supported matrix into the same NativeVNNI execution contract. The
+ * every supported matrix into the same NativeQuantised execution contract. The
  * graph workspace therefore depends on N/K/rows and cannot vary by codebook.
  */
 TEST(Test__WorkspaceMemoryEstimator,
@@ -824,7 +824,7 @@ TEST(Test__WorkspaceMemoryEstimator,
     for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
     {
         const auto type = static_cast<TensorType>(raw);
-        if (!isNativeVnniFormat(type) && !isInt8VnniFormat(type))
+        if (!isNativeQuantisedFormat(type) && !isInt8VnniFormat(type))
             continue;
         profile.tensors.back().quant_type = tensorTypeName(type);
         const size_t actual =
@@ -835,7 +835,7 @@ TEST(Test__WorkspaceMemoryEstimator,
         ++exercised_codebooks;
     }
     EXPECT_EQ(exercised_codebooks, 21u)
-        << "The canonical NativeVNNI predicates must enumerate every supported quantized codebook.";
+        << "The canonical NativeQuantised predicates must enumerate every supported quantized codebook.";
 }
 
 TEST(Test__WorkspaceMemoryEstimator, DeclaredMoERejectsIncompleteGeometry)
@@ -927,7 +927,7 @@ TEST(Test__WorkspaceMemoryEstimator,
 /**
  * @brief Every prepared quantized expert codebook shares one ROCm GEMM ABI.
  *
- * Source compression changes persistent expert bytes, not the NativeVNNI
+ * Source compression changes persistent expert bytes, not the NativeQuantised
  * activation/reduction workspace. This sweep prevents a fix for the model's
  * current Q4_K_XL source format from becoming a format-specific admission
  * branch when future checkpoints select any other supported codebook.
@@ -961,7 +961,7 @@ TEST(Test__WorkspaceMemoryEstimator,
     for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
     {
         const TensorType type = static_cast<TensorType>(raw);
-        if (!isNativeVnniFormat(type) && !isInt8VnniFormat(type))
+        if (!isNativeQuantisedFormat(type) && !isInt8VnniFormat(type))
             continue;
         for (TensorSizeInfo& tensor : profile.tensors)
             tensor.quant_type = tensorTypeName(type);
@@ -982,7 +982,7 @@ TEST(Test__WorkspaceMemoryEstimator,
         128ULL * 256ULL * 2048ULL * sizeof(uint16_t);
     EXPECT_EQ(expected, 240642048ULL)
         << "The nine-row Qwen3.6-35B mapped/compact follower family must "
-           "retain the exact typed ROCm MoE and NativeVNNI workspace ABI.";
+           "retain the exact typed ROCm MoE and NativeQuantised workspace ABI.";
     EXPECT_GE(expected, 365474564ULL - retired_half_router_bank_bytes)
         << "Admission must cover the mapped 40-layer serial plan observed by "
            "the production graph allocator.";
@@ -1151,7 +1151,7 @@ TEST(Test__WorkspaceMemoryEstimator, ContinuationIncludesCompactQuantizedProject
     for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
     {
         const auto type = static_cast<TensorType>(raw);
-        if (!isNativeVnniFormat(type) && !isInt8VnniFormat(type))
+        if (!isNativeQuantisedFormat(type) && !isInt8VnniFormat(type))
             continue;
         for (auto &tensor : profile.tensors)
             tensor.quant_type = tensorTypeName(type);
@@ -1417,7 +1417,7 @@ TEST(Test__WorkspaceMemoryEstimator,
  * @brief Reproduce the retained ROCm TP4 matrix family that defeated preflight.
  *
  * The production Q8_K_XL model prepares every quantized codebook into the same
- * NativeVNNI ABI.  In particular, the mirrored vocabulary head needs a
+ * NativeQuantised ABI.  In particular, the mirrored vocabulary head needs a
  * 16-row split-K arena while the replicated MTP projector owns the widest K.
  * This inventory is metadata-only and therefore remains a fast device-free
  * regression for the exact late graph-materialization failure.

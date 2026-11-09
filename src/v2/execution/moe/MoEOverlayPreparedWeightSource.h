@@ -13,7 +13,7 @@
 
 #include "ExpertWeightFormat.h"
 #include "GPUExpertTransfer.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 
 #include <memory>
 #include <string>
@@ -25,8 +25,8 @@ namespace llaminar2
     /** @brief Physical prepared representation owned by the retained engine. */
     enum class MoEOverlayPreparedWeightSourceKind
     {
-        CpuNativeVnni,
-        GpuSeparatedNativeVnni,
+        CpuNativeQuantised,
+        GpuSeparatedNativeQuantised,
         CpuContiguousFloating,
         GpuContiguousFloating,
     };
@@ -41,11 +41,11 @@ namespace llaminar2
     struct MoEOverlayPreparedWeightSource
     {
         MoEOverlayPreparedWeightSourceKind kind =
-            MoEOverlayPreparedWeightSourceKind::CpuNativeVnni;
+            MoEOverlayPreparedWeightSourceKind::CpuNativeQuantised;
         DeviceId device = DeviceId::invalid();
         ExpertWeightFormat format;
         std::shared_ptr<ITensorGemm> engine;
-        const cpu::native_vnni::CPUNativeVNNIPackedWeights *cpu_packed =
+        const cpu::native_quantised::CPUNativeQuantisedPackedWeights *cpu_packed =
             nullptr;
         GpuExpertPackedDescriptor gpu_packed;
         ContiguousFloatingPointWeightDescriptor floating;
@@ -60,7 +60,7 @@ namespace llaminar2
      * @param device Exact participant device that owns @p engine.
      * @param output Receives a lifetime-pinned CPU or GPU source view.
      * @param error Optional exact validation diagnostic.
-     * @return True only for a complete NativeVNNI or contiguous floating source.
+     * @return True only for a complete NativeQuantised or contiguous floating source.
      */
     bool resolveMoEOverlayPreparedWeightSource(
         std::shared_ptr<ITensorGemm> engine,

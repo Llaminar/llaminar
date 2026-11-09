@@ -15,9 +15,9 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/rocm/HIPGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
-#include "kernels/common/DeviceNativeVNNIMatrixDesc.h"
+#include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
-#include "kernels/rocm/gemm/ROCmNativeVNNISerialGeometry.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedSerialGeometry.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/TensorClasses.h"
@@ -41,13 +41,13 @@
 #include <vector>
 
 /** @brief Existing source-aware production serial entrypoint; no test implementation. */
-extern "C" bool rocmGemv_native_vnni_fp32_with_policy(
+extern "C" bool rocmGemv_native_quantised_fp32_with_policy(
     const int8_t *, const uint8_t *, const void *, const void *, const void *,
     float *, const float *, float *, int, int, uint8_t, uint8_t, int, void *, const float *);
 /** @brief Existing thread-local arithmetic-width lifecycle, separate from physical N. */
-extern "C" void rocmGemv_native_vnni_set_serial_partition_n(int);
+extern "C" void rocmGemv_native_quantised_set_serial_partition_n(int);
 /** @brief Read the prior arithmetic-width binding for exact scope restoration. */
-extern "C" int rocmGemv_native_vnni_get_serial_partition_n();
+extern "C" int rocmGemv_native_quantised_get_serial_partition_n();
 
 namespace llaminar2::test
 {
@@ -87,10 +87,10 @@ class ArithmeticWidthScope final
 {
 public:
     /** @brief Set an intentionally different policy N without changing physical storage. */
-    explicit ArithmeticWidthScope(int n) : previous_(rocmGemv_native_vnni_get_serial_partition_n())
-    { rocmGemv_native_vnni_set_serial_partition_n(n); }
+    explicit ArithmeticWidthScope(int n) : previous_(rocmGemv_native_quantised_get_serial_partition_n())
+    { rocmGemv_native_quantised_set_serial_partition_n(n); }
     /** @brief Restore the exact prior thread-local arithmetic binding. */
-    ~ArithmeticWidthScope() { rocmGemv_native_vnni_set_serial_partition_n(previous_); }
+    ~ArithmeticWidthScope() { rocmGemv_native_quantised_set_serial_partition_n(previous_); }
     ArithmeticWidthScope(const ArithmeticWidthScope &) = delete;
     ArithmeticWidthScope &operator=(const ArithmeticWidthScope &) = delete;
 private:
@@ -270,8 +270,8 @@ void proveShape(DeviceId device, void *stream, int n, int k,
     auto source = TestTensorFactory::createQ8_0Random({std::size_t(n), std::size_t(k)}, 821u + n + k);
     auto prepared = makeGpuPreparedGemm(source.get(), device,
         "native_q8.serial_geometry." + std::to_string(n) + "." + std::to_string(k));
-    DeviceNativeVNNIMatrixDesc descriptor;
-    require(prepared.kernel && prepared.kernel->exportNativeVNNIMatrixDesc(descriptor) &&
+    DeviceNativeQuantisedMatrixDesc descriptor;
+    require(prepared.kernel && prepared.kernel->exportNativeQuantisedMatrixDesc(descriptor) &&
         descriptor.valid() && descriptor.codebook_id == 19 && descriptor.n == n && descriptor.k == k,
         "native-Q8 fixture did not prepare the actual native19 descriptor");
 
@@ -320,7 +320,7 @@ void proveShape(DeviceId device, void *stream, int n, int k,
         if (partial_live)
             require(hipMemsetAsync(partials->gpu_data_ptr(), 0xff, partial_live * sizeof(float),
                 static_cast<hipStream_t>(stream)) == hipSuccess, "native-Q8 captured partial poison");
-        const bool enqueued = rocmGemv_native_vnni_fp32_with_policy(
+        const bool enqueued = rocmGemv_native_quantised_fp32_with_policy(
             static_cast<const int8_t *>(activations->gpu_data_ptr()), descriptor.payload,
             descriptor.scales, descriptor.mins, descriptor.emins,
             static_cast<float *>(output->gpu_data_ptr()), nullptr,
@@ -444,11 +444,11 @@ TEST(NativeQ8SerialGeometry, CapturedTailsAndEmptyPartitionsAreByteExact)
         EXPECT_FALSE(currentNativeQ8SerialGeometry().has_value());
         {
             ScopedNativeQ8SerialGeometry scope(admissions[0]);
-            EXPECT_THROW((void)rocmGemv_native_vnni_fp32_with_policy(
+            EXPECT_THROW((void)rocmGemv_native_quantised_fp32_with_policy(
                 nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                 1, 640, 5, 5, 0, stream, nullptr), std::logic_error);
             EXPECT_FALSE(lastNativeQ8SerialLaunch().has_value());
-            EXPECT_THROW((void)rocmGemv_native_vnni_fp32_with_policy(
+            EXPECT_THROW((void)rocmGemv_native_quantised_fp32_with_policy(
                 nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                 1, 640, 19, 19, 1, stream, nullptr), std::logic_error);
             EXPECT_FALSE(lastNativeQ8SerialLaunch().has_value());
@@ -456,7 +456,7 @@ TEST(NativeQ8SerialGeometry, CapturedTailsAndEmptyPartitionsAreByteExact)
             for (void *bad_stream : {static_cast<void *>(nullptr),
                      static_cast<void *>(hipStreamLegacy), static_cast<void *>(hipStreamPerThread)})
             {
-                EXPECT_THROW((void)rocmGemv_native_vnni_fp32_with_policy(
+                EXPECT_THROW((void)rocmGemv_native_quantised_fp32_with_policy(
                     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                     1, 640, 19, 19, 0, bad_stream, nullptr), std::logic_error);
                 EXPECT_FALSE(lastNativeQ8SerialLaunch().has_value());

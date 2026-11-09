@@ -27,7 +27,7 @@
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/QuantizedVerifierFormats.h"
-#include "performance/kernels/native_vnni_dispatch/NativeVNNIMoERoutingProfiles.h"
+#include "performance/kernels/native_quantised_dispatch/NativeQuantisedMoERoutingProfiles.h"
 
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -48,7 +48,7 @@ namespace
 {
     using namespace llaminar2;
     using namespace llaminar2::test;
-    using native_vnni_dispatch::MoERoutingProfile;
+    using native_quantised_dispatch::MoERoutingProfile;
 
     /** One backend/storage/physical-row shape; no weight conversion is timed. */
     struct Case
@@ -76,14 +76,14 @@ namespace
             // Qwen's expert matrices remain whole; TP divides owned routes,
             // not each expert's N/K dimensions. Mixed source formats reproduce
             // the IQ3_S GGUF's common routed-expert arithmetic surface.
-            for (const auto profile : native_vnni_dispatch::kMoERoutingProfiles)
+            for (const auto profile : native_quantised_dispatch::kMoERoutingProfiles)
                 for (const int degree : {1, 2, 4})
                     for (const int rows : {64, 512})
                         result.push_back({device, TensorType::IQ2_S, rows, rows == 512 ? 448 : rows, 8,
                             std::string(device.is_cuda() ? "CUDA_" : "ROCm_") + "Qwen36WholeExpertShard" +
                             std::to_string(degree) + "Rows" + std::to_string(rows) +
                             (profile == MoERoutingProfile::Uniform ? "" :
-                                "_Route_" + std::string(native_vnni_dispatch::moeRoutingProfileName(profile))),
+                                "_Route_" + std::string(native_quantised_dispatch::moeRoutingProfileName(profile))),
                             2048, 512, 256, degree, TensorType::IQ4_XS, profile});
             for (auto format : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
                 for (int rows : {1, 16, 128, 512})
@@ -153,7 +153,7 @@ namespace
             std::vector<std::shared_ptr<TensorBase>> sources;
             std::vector<GpuPreparedGemm> prepared;
             std::vector<DeviceMoEFloatingMatrixDesc> gates(experts), ups(experts), downs(experts);
-            std::vector<DeviceNativeVNNIMatrixDesc> quant_gates(experts), quant_ups(experts), quant_downs(experts);
+            std::vector<DeviceNativeQuantisedMatrixDesc> quant_gates(experts), quant_ups(experts), quant_downs(experts);
             const bool floating = parameter.format == TensorType::FP16 ||
                 parameter.format == TensorType::BF16 || parameter.format == TensorType::FP32;
             DeviceMoEWeightFormat format{};
@@ -214,7 +214,7 @@ namespace
             // Retain the complete route matrix: after timing owner-local
             // producers, column-owned down needs these SAME global routes.
             // Inventing new routes there would no longer test the same input.
-            const auto global_routes = native_vnni_dispatch::makeMoERoutingIndices(
+            const auto global_routes = native_quantised_dispatch::makeMoERoutingIndices(
                 parameter.route_profile, parameter.rows, top_k, experts);
             std::vector<float> route_ids(global_routes), route_weights(route_ids.size(), 0.125f);
             size_t active_routes = 0;
@@ -236,7 +236,7 @@ namespace
             if (parameter.ownership_degree > 0)
                 std::printf("moe_route_profile,%s,%s,%d,%d,%d,%zu\n",
                     parameter.device.is_cuda() ? "CUDA" : "ROCm",
-                    std::string(native_vnni_dispatch::moeRoutingProfileName(parameter.route_profile)).c_str(),
+                    std::string(native_quantised_dispatch::moeRoutingProfileName(parameter.route_profile)).c_str(),
                     parameter.ownership_degree, parameter.rows, parameter.live_rows, active_routes);
             ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(), route_ids.data(), route_ids.size() * sizeof(float), parameter.device.ordinal, stream));
             ASSERT_TRUE(backend->hostToDevice(probabilities->gpu_data_ptr(), route_weights.data(), route_weights.size() * sizeof(float), parameter.device.ordinal, stream));
@@ -305,7 +305,7 @@ namespace
                 // merge samples from different route distributions in a curve.
                 const std::string curve_ownership = std::string(ownership) +
                     (parameter.route_profile == MoERoutingProfile::Uniform ? "" :
-                        "_" + std::string(native_vnni_dispatch::moeRoutingProfileName(parameter.route_profile)));
+                        "_" + std::string(native_quantised_dispatch::moeRoutingProfileName(parameter.route_profile)));
                 constexpr int repetitions = 8;
                 // Join the phase's exact external producer before recording.
                 // In particular, the first column fold must import the down
@@ -397,7 +397,7 @@ namespace
             const int first_column = hidden - columns;
             std::vector<std::shared_ptr<TensorBase>> column_sources;
             std::vector<GpuPreparedGemm> column_prepared;
-            std::vector<DeviceNativeVNNIMatrixDesc> column_descriptors(experts);
+            std::vector<DeviceNativeQuantisedMatrixDesc> column_descriptors(experts);
             for (int expert = 0; expert < experts; ++expert)
             {
                 // Slice SOURCE rows before packing. Reinterpreting a complete
@@ -407,7 +407,7 @@ namespace
                     static_cast<size_t>(first_column) * intermediate));
                 column_prepared.push_back(makeGpuPreparedGemm(column_sources.back().get(), parameter.device,
                     "expert.economy.fixed_down." + std::to_string(expert)));
-                ASSERT_TRUE(column_prepared.back().kernel->exportNativeVNNIMatrixDesc(column_descriptors[expert]));
+                ASSERT_TRUE(column_prepared.back().kernel->exportNativeQuantisedMatrixDesc(column_descriptors[expert]));
             }
             const int column_table = kernel->uploadGroupedExpertDownDescriptorTable(
                 column_descriptors.data(), experts, columns, intermediate);

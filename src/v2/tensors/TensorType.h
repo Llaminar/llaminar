@@ -125,15 +125,15 @@ namespace llaminar2
     }
 
     /**
-     * @brief Check if tensor type is a native-VNNI format (≤6-bit quantization)
+     * @brief Check if tensor type is a native-quantised format (≤6-bit quantization)
      *
-     * These formats use lossless native-VNNI decode with per-block FP16 scales.
+     * These formats use lossless native-quantised decode with per-block FP16 scales.
      * Other quantized types (Q8_1, Q8_K) use INT8-VNNI instead.
      *
      * @param type The tensor type enum value
-     * @return true if the format supports native-VNNI kernels
+     * @return true if the format supports native-quantised kernels
      */
-    inline bool isNativeVnniFormat(TensorType type)
+    inline bool isNativeQuantisedFormat(TensorType type)
     {
         switch (type)
         {

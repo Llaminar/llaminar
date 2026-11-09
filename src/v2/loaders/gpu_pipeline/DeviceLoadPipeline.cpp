@@ -1007,7 +1007,7 @@ namespace llaminar2
                 }
                 const size_t payload_bytes_per_row =
                     slot->payload_bytes / static_cast<size_t>(full_n);
-                auto *chunk_payload = slot->d_native_vnni_payload +
+                auto *chunk_payload = slot->d_native_quantised_payload +
                                       static_cast<size_t>(job.row_offset) * payload_bytes_per_row;
                 if (!backend_.deviceCopyAsync(
                         chunk_payload, staging_ptr, job.raw_bytes,
@@ -1058,10 +1058,10 @@ namespace llaminar2
                 const bool repack_ok = kernels_.vnniRepack(
                     job.format,
                     staging_ptr,
-                    slot->d_native_vnni_payload,
-                    static_cast<uint16_t *>(slot->d_native_vnni_scales),
-                    static_cast<uint16_t *>(slot->d_native_vnni_mins),
-                    static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                    slot->d_native_quantised_payload,
+                    static_cast<uint16_t *>(slot->d_native_quantised_scales),
+                    static_cast<uint16_t *>(slot->d_native_quantised_mins),
+                    static_cast<uint32_t *>(slot->d_native_quantised_emins),
                     job.N, job.K,
                     full_n, job.row_offset,
                     job.packed_group_rows,

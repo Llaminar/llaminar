@@ -204,7 +204,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     const WorkspaceDescriptor *sums_a =
         reqs.find(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE);
     ASSERT_NE(sums_a, nullptr)
-        << "Asymmetric NativeVNNI prefill consumes precomputed activation block sums "
+        << "Asymmetric NativeQuantised prefill consumes precomputed activation block sums "
            "from declared workspace, not ad hoc scratch.";
 
     constexpr int kBlocksPerRow = kK / 32;
@@ -251,7 +251,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     const auto *format = source->vnniFormatInfo();
     ASSERT_NE(format, nullptr);
     auto reqs = cuda::quantized_gemm_workspace::projectionRequirements(kM, kN, kK,
-        cuda::NativeVNNIWorkspaceHardware::checked(kFakeCudaDeviceId, 60),
+        cuda::NativeQuantisedWorkspaceHardware::checked(kFakeCudaDeviceId, 60),
         cuda::quantized_gemm_workspace::NativeCodebooks{
             canonicalDeviceVnniCodebookId(*format), canonicalDeviceVnniCodebookId(format->codebook_id)});
 
@@ -267,7 +267,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
            "or verifier execution, must remove this descriptor from prefill.";
 
     const size_t expected_rows = static_cast<size_t>(
-        nativeVNNIPersistentVerifierWorkspaceRows(kM, kN, kK));
+        nativeQuantisedPersistentVerifierWorkspaceRows(kM, kN, kK));
     const size_t k_groups = static_cast<size_t>((kK + 31) / 32);
     EXPECT_EQ(
         grouped->size_bytes,
@@ -432,7 +432,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 
 #ifdef HAVE_CUDA
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillGenericDirectScheduleDeclaresNoKpartScratch)
+       NativeQuantisedPrefillGenericDirectScheduleDeclaresNoKpartScratch)
 {
     ScopedCudaConcurrentPrefillSetting concurrent_prefill(/*enabled=*/false);
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/10);
@@ -447,14 +447,14 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 
     EXPECT_EQ(
         reqs.find(
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS),
         nullptr)
         << "The direct output-owner schedule folds public-M=1 partitions inside "
            "each tile and must not reserve a global partial arena.";
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillConcurrentGenericDirectScheduleDoesNotInventKpartScratch)
+       NativeQuantisedPrefillConcurrentGenericDirectScheduleDoesNotInventKpartScratch)
 {
     ScopedCudaConcurrentPrefillSetting concurrent_prefill(/*enabled=*/false);
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/1010);
@@ -468,21 +468,21 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     const auto serial_reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
     EXPECT_EQ(
         serial_reqs.find(
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS),
         nullptr);
 
     concurrent_prefill.set(/*enabled=*/true);
     const auto concurrent_reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
     EXPECT_EQ(
         concurrent_reqs.find(
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS),
         nullptr)
         << "Projection concurrency must not allocate K-partition scratch unless "
            "the selected launch family actually publishes partition partials.";
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
-       NativeVNNIPrefillGenericDirectPromptAndExpertSchedulesNeedNoKpartScratch)
+       NativeQuantisedPrefillGenericDirectPromptAndExpertSchedulesNeedNoKpartScratch)
 {
     auto weights = TestTensorFactory::createQ8_0Random({512, 2048}, /*seed=*/1011);
     CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
@@ -497,11 +497,11 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 
     EXPECT_EQ(
         prompt_reqs.find(
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS),
         nullptr);
     EXPECT_EQ(
         expert_reqs.find(
-            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS),
+            GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS),
         nullptr);
 }
 
@@ -619,27 +619,27 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     ASSERT_NE(format, nullptr);
     const cuda::quantized_gemm_workspace::NativeCodebooks codebooks{
         canonicalDeviceVnniCodebookId(*format), canonicalDeviceVnniCodebookId(format->codebook_id)};
-    const auto missing = cuda::NativeVNNIWorkspaceHardware::withoutSMObservation(128);
+    const auto missing = cuda::NativeQuantisedWorkspaceHardware::withoutSMObservation(128);
     EXPECT_NO_THROW((void)cuda::quantized_gemm_workspace::projectionRequirements(1, 64, 256, missing, codebooks));
     EXPECT_THROW((void)missing.smCount(), std::invalid_argument);
-    EXPECT_THROW((void)cuda::NativeVNNIWorkspaceHardware::checked(128, 0), std::invalid_argument);
-    EXPECT_THROW((void)cuda::NativeVNNIWorkspaceHardware::checked(128, -1), std::invalid_argument);
+    EXPECT_THROW((void)cuda::NativeQuantisedWorkspaceHardware::checked(128, 0), std::invalid_argument);
+    EXPECT_THROW((void)cuda::NativeQuantisedWorkspaceHardware::checked(128, -1), std::invalid_argument);
     EXPECT_THROW((void)cuda::quantized_gemm_workspace::projectionRequirements(595, 17408, 5120, missing, codebooks),
         std::invalid_argument);
     // This exact typed value is also the production derived-plan cache subkey;
     // runtime binding (null), explicit-unobserved and each observed SM count differ.
-    EXPECT_NE(missing, cuda::NativeVNNIWorkspaceHardware::checked(128, 60));
-    EXPECT_NE(cuda::NativeVNNIWorkspaceHardware::checked(128, 24),
-              cuda::NativeVNNIWorkspaceHardware::checked(128, 60));
-    EXPECT_NE(cuda::NativeVNNIWorkspaceHardware::checked(0, 60),
-              cuda::NativeVNNIWorkspaceHardware::checked(128, 60));
+    EXPECT_NE(missing, cuda::NativeQuantisedWorkspaceHardware::checked(128, 60));
+    EXPECT_NE(cuda::NativeQuantisedWorkspaceHardware::checked(128, 24),
+              cuda::NativeQuantisedWorkspaceHardware::checked(128, 60));
+    EXPECT_NE(cuda::NativeQuantisedWorkspaceHardware::checked(0, 60),
+              cuda::NativeQuantisedWorkspaceHardware::checked(128, 60));
     unsigned admitted_policies = 0;
     for (const int sm_count : {24, 60, 82, 132, 82, 60, 24})
     {
-        const auto hardware = cuda::NativeVNNIWorkspaceHardware::checked(128, sm_count);
+        const auto hardware = cuda::NativeQuantisedWorkspaceHardware::checked(128, sm_count);
         std::size_t bytes = 0;
         int partitions = 0, rows = 0;
-        const bool admitted = cuda::nativeVNNIPrefillWorkspaceEnvelopeForHardware(codebooks.execution, codebooks.arithmetic,
+        const bool admitted = cuda::nativeQuantisedPrefillWorkspaceEnvelopeForHardware(codebooks.execution, codebooks.arithmetic,
             595, 17408, 5120, hardware, &bytes, &partitions, &rows);
         if (!admitted)
         {
@@ -652,7 +652,7 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
         ASSERT_GT(partitions, 1);
         const auto requirements = cuda::quantized_gemm_workspace::projectionRequirements(
             595, 17408, 5120, hardware, codebooks);
-        const auto *scratch = requirements.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
+        const auto *scratch = requirements.find(GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS);
         ASSERT_NE(scratch, nullptr);
         const std::size_t padded = std::size_t(partitions) * std::size_t((rows + 127) & ~127) * 17408 * sizeof(float);
         EXPECT_EQ(scratch->size_bytes, std::max(bytes, padded));

@@ -24,7 +24,7 @@
 #include <cuda_fp16.h>
 #include <cuda/std/__cccl/assert.h>
 
-#include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
+#include "kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
@@ -240,7 +240,7 @@ namespace
                op == kDeviceMoERebalancePlanResidentExpertAssignment;
     }
 
-    struct DeviceNativeVNNIMatrixDesc
+    struct DeviceNativeQuantisedMatrixDesc
     {
         const uint8_t *payload = nullptr;
         const void *scales = nullptr;
@@ -261,14 +261,14 @@ namespace
     };
 
     static_assert(
-        sizeof(DeviceNativeVNNIMatrixDesc) == 56,
+        sizeof(DeviceNativeQuantisedMatrixDesc) == 56,
         "CUDA MoE descriptor must match the shared device ABI");
 
     struct DeviceMoEExpertDescriptorView
     {
-        DeviceNativeVNNIMatrixDesc gate;
-        DeviceNativeVNNIMatrixDesc up;
-        DeviceNativeVNNIMatrixDesc down;
+        DeviceNativeQuantisedMatrixDesc gate;
+        DeviceNativeQuantisedMatrixDesc up;
+        DeviceNativeQuantisedMatrixDesc down;
         llaminar2::DeviceMoEFloatingMatrixDesc floating_gate;
         llaminar2::DeviceMoEFloatingMatrixDesc floating_up;
         llaminar2::DeviceMoEFloatingMatrixDesc floating_down;
@@ -7264,7 +7264,7 @@ namespace
     }
 
     __device__ __forceinline__ bool rebalance_matrix_desc_ready(
-        const DeviceNativeVNNIMatrixDesc &desc)
+        const DeviceNativeQuantisedMatrixDesc &desc)
     {
         return desc.payload != nullptr &&
                desc.scales != nullptr &&
@@ -7280,7 +7280,7 @@ namespace
         if (desc.projection_set != llaminar2::DeviceMoEProjectionSet::CompleteExpert)
             return false;
         const bool native_ready =
-            desc.weight_format == llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+            desc.weight_format == llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
             rebalance_matrix_desc_ready(desc.gate) &&
             rebalance_matrix_desc_ready(desc.up) &&
             rebalance_matrix_desc_ready(desc.down);
@@ -7301,7 +7301,7 @@ namespace
         if (llaminar2::deviceMoEWeightFormatIsFloating(desc.weight_format))
             return llaminar2::deviceMoEFloatingExpertCopyReady(desc);
         return desc.weight_format ==
-                   llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+                   llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
                rebalance_matrix_desc_ready(desc.gate) &&
                rebalance_matrix_desc_ready(desc.up) &&
                (desc.projection_set == llaminar2::DeviceMoEProjectionSet::GateUp ||
@@ -7323,7 +7323,7 @@ namespace
         case 4:
             payload_bytes = 16u;
             return true;
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
             payload_bytes = 16u;
             is_asymmetric = 1u; // Physical secondary presence, not additive arithmetic.
             return true;
@@ -7375,7 +7375,7 @@ namespace
         case 20:
             payload_bytes = 32u;
             return true;
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             payload_bytes = 32u;
             is_asymmetric = 1u;
             return true;
@@ -7385,14 +7385,14 @@ namespace
     }
 
     __device__ __forceinline__ unsigned long long rebalance_block_count(
-        const DeviceNativeVNNIMatrixDesc &desc)
+        const DeviceNativeQuantisedMatrixDesc &desc)
     {
         return static_cast<unsigned long long>(desc.blocks_per_row) *
                static_cast<unsigned long long>(desc.n);
     }
 
     __device__ __forceinline__ bool rebalance_projection_format(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         uint8_t &payload_bytes,
         uint8_t &is_asymmetric,
         uint8_t &has_emins)
@@ -7405,7 +7405,7 @@ namespace
     }
 
     __device__ __forceinline__ bool rebalance_projection_allocation_capacity(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         uint8_t &payload_bytes,
         uint8_t &has_mins,
         uint8_t &has_emins)
@@ -7432,8 +7432,8 @@ namespace
     }
 
     __device__ __forceinline__ bool rebalance_matrix_fits_transfer_capacity(
-        const DeviceNativeVNNIMatrixDesc &src,
-        const DeviceNativeVNNIMatrixDesc &dst)
+        const DeviceNativeQuantisedMatrixDesc &src,
+        const DeviceNativeQuantisedMatrixDesc &dst)
     {
         if (src.n != dst.n ||
             src.k != dst.k ||
@@ -7464,8 +7464,8 @@ namespace
     }
 
     __device__ __forceinline__ void rebalance_retarget_transfer_matrix(
-        DeviceNativeVNNIMatrixDesc &dst,
-        const DeviceNativeVNNIMatrixDesc &src)
+        DeviceNativeQuantisedMatrixDesc &dst,
+        const DeviceNativeQuantisedMatrixDesc &src)
     {
         dst.n = src.n;
         dst.k = src.k;
@@ -7477,7 +7477,7 @@ namespace
     }
 
     __device__ __forceinline__ bool rebalance_matrix_copy_ready(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
         (void)entry;
@@ -7502,7 +7502,7 @@ namespace
             return false;
         if (llaminar2::deviceMoEWeightFormatIsFloating(entry.descriptor.weight_format))
             return llaminar2::deviceMoEFloatingExpertCopyReady(entry.descriptor);
-        return entry.descriptor.weight_format == llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+        return entry.descriptor.weight_format == llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
                rebalance_matrix_copy_ready(entry.descriptor.gate, entry) &&
                rebalance_matrix_copy_ready(entry.descriptor.up, entry) &&
                (entry.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::GateUp ||
@@ -7596,7 +7596,7 @@ namespace
             return false;
         if (llaminar2::deviceMoEWeightFormatIsFloating(src.descriptor.weight_format))
             return llaminar2::deviceMoEFloatingExpertFitsTransferCapacity(src.descriptor, dst.descriptor);
-        if (src.descriptor.weight_format != llaminar2::DeviceMoEWeightFormat::NativeVNNI)
+        if (src.descriptor.weight_format != llaminar2::DeviceMoEWeightFormat::NativeQuantised)
             return false;
         return rebalance_matrix_fits_transfer_capacity(
                    src.descriptor.gate,
@@ -10336,7 +10336,7 @@ namespace
     }
 
     __device__ __forceinline__ unsigned long long rebalance_projection_payload_bytes(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
         (void)entry;
@@ -10370,7 +10370,7 @@ namespace
     }
 
     __device__ unsigned long long rebalance_pack_projection_to_payload(
-        const DeviceNativeVNNIMatrixDesc &src,
+        const DeviceNativeQuantisedMatrixDesc &src,
         const DeviceMoEExpertDirectoryEntryView &entry,
         uint8_t *payload)
     {
@@ -10409,7 +10409,7 @@ namespace
 
     __device__ unsigned long long rebalance_unpack_projection_from_payload(
         const uint8_t *payload,
-        const DeviceNativeVNNIMatrixDesc &dst,
+        const DeviceNativeQuantisedMatrixDesc &dst,
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
         (void)entry;
@@ -12993,7 +12993,7 @@ namespace
         {
         case 0:
         case 4:
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
         case 5:
         case 6:
         case 7:
@@ -13008,7 +13008,7 @@ namespace
         case 16:
         case 17:
         case 19:
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -13019,7 +13019,7 @@ namespace
     {
         switch (codebook_id)
         {
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
         case 11: // Mandatory original IQ3_S source nibble.
         case 5:
         case 7:
@@ -13030,7 +13030,7 @@ namespace
         case 14:
         case 16:
         case 17:
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -13042,8 +13042,8 @@ namespace
         return codebook_id == 10;
     }
 
-    __device__ __forceinline__ bool native_vnni_desc_shape_ok_dynamic(
-        const DeviceNativeVNNIMatrixDesc &desc,
+    __device__ __forceinline__ bool native_quantised_desc_shape_ok_dynamic(
+        const DeviceNativeQuantisedMatrixDesc &desc,
         int N,
         int K)
     {
@@ -13058,14 +13058,14 @@ namespace
     }
 
     template <uint8_t CodebookId>
-    __device__ __forceinline__ bool native_vnni_desc_shape_ok(
-        const DeviceNativeVNNIMatrixDesc &desc,
+    __device__ __forceinline__ bool native_quantised_desc_shape_ok(
+        const DeviceNativeQuantisedMatrixDesc &desc,
         int N,
         int K)
     {
         if constexpr (CodebookId == kMixedCodebookSentinel)
         {
-            return native_vnni_desc_shape_ok_dynamic(desc, N, K);
+            return native_quantised_desc_shape_ok_dynamic(desc, N, K);
         }
         else
         {
@@ -13074,10 +13074,10 @@ namespace
                    desc.n == N &&
                    desc.k == K &&
                    desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
-                   llaminar2::cuda_native_vnni::native_vnni_descriptor_codebook_matches<CodebookId>(desc.codebook_id) &&
-                   (!(llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::requires_secondary_metadata) ||
-                    (CodebookId == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook && desc.codebook_id == 4) || desc.mins) &&
-                   (!llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale_asym ||
+                   llaminar2::cuda_native_quantised::native_quantised_descriptor_codebook_matches<CodebookId>(desc.codebook_id) &&
+                   (!(llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::requires_secondary_metadata) ||
+                    (CodebookId == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook && desc.codebook_id == 4) || desc.mins) &&
+                   (!llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_dual_scale_asym ||
                     desc.emins);
         }
     }
@@ -13092,18 +13092,18 @@ namespace
      * @return True only for complete descriptors with the declared payload family.
      */
     template <uint8_t CodebookId>
-    __device__ __forceinline__ bool native_vnni_pair_shape_ok(
-        const DeviceNativeVNNIMatrixDesc &gate,
-        const DeviceNativeVNNIMatrixDesc &up, int n, int k)
+    __device__ __forceinline__ bool native_quantised_pair_shape_ok(
+        const DeviceNativeQuantisedMatrixDesc &gate,
+        const DeviceNativeQuantisedMatrixDesc &up, int n, int k)
     {
-        if (!native_vnni_desc_shape_ok<CodebookId>(gate, n, k))
+        if (!native_quantised_desc_shape_ok<CodebookId>(gate, n, k))
             return false;
-        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_lut)
+        if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut)
             return up.codebook_id == 4
-                ? native_vnni_desc_shape_ok<4>(up, n, k)
-                : up.codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook &&
-                  native_vnni_desc_shape_ok<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(up, n, k);
-        return native_vnni_desc_shape_ok<CodebookId>(up, n, k);
+                ? native_quantised_desc_shape_ok<4>(up, n, k)
+                : up.codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook &&
+                  native_quantised_desc_shape_ok<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(up, n, k);
+        return native_quantised_desc_shape_ok<CodebookId>(up, n, k);
     }
 
     __device__ __forceinline__ float silu(float x)
@@ -15385,9 +15385,9 @@ namespace
         uint32_t local_bit,
         int expert,
         int num_experts,
-        DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
-        DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
-        DeviceNativeVNNIMatrixDesc *__restrict__ down_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ down_descs,
         llaminar2::DeviceMoEWeightFormat expected_format,
         llaminar2::DeviceMoEProjectionSet expected_projections)
     {
@@ -15405,17 +15405,17 @@ namespace
             desc.local_slot >= 0 &&
             desc.weight_format == expected_format && descriptor_ready;
         if (expected_format ==
-            llaminar2::DeviceMoEWeightFormat::NativeVNNI)
+            llaminar2::DeviceMoEWeightFormat::NativeQuantised)
         {
             gate_descs[expert] = local_ready
                                      ? desc.gate
-                                     : DeviceNativeVNNIMatrixDesc{};
+                                     : DeviceNativeQuantisedMatrixDesc{};
             up_descs[expert] = local_ready
                                    ? desc.up
-                                   : DeviceNativeVNNIMatrixDesc{};
+                                   : DeviceNativeQuantisedMatrixDesc{};
             down_descs[expert] = local_ready
                                      ? desc.down
-                                     : DeviceNativeVNNIMatrixDesc{};
+                                     : DeviceNativeQuantisedMatrixDesc{};
         }
         else
         {
@@ -15455,9 +15455,9 @@ namespace
      */
     __device__ __forceinline__ void publish_runtime_prefill_plan_block(
         const DeviceMoELayerRuntimeView *__restrict__ runtime,
-        DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
-        DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
-        DeviceNativeVNNIMatrixDesc *__restrict__ down_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ down_descs,
         int num_experts,
         int *__restrict__ active_expert_ids,
         int max_active_experts,
@@ -15472,7 +15472,7 @@ namespace
             execution_bank > 1u ||
             !llaminar2::deviceMoEProjectionSetValid(expected_projections) ||
             (expected_format !=
-                 llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+                 llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
              !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)) ||
             (publish_active_experts &&
              (!runtime->expert_counts || max_active_experts <= 0 ||
@@ -16134,9 +16134,9 @@ namespace
         int top_k,
         int filter_to_local_runtime_experts,
         int grouped_demand,
-        DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
-        DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
-        DeviceNativeVNNIMatrixDesc *__restrict__ down_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ down_descs,
         int *__restrict__ active_expert_ids,
         int max_active_experts,
         llaminar2::DeviceMoEWeightFormat expected_format,
@@ -16174,7 +16174,7 @@ namespace
               !active_expert_ids || max_active_experts <= 0 ||
               max_active_experts > num_experts ||
               (expected_format !=
-                   llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+                   llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
                !llaminar2::deviceMoEWeightFormatIsFloating(
                    expected_format)))) ||
             (retain_routes_for_deferred_commit != 0 &&
@@ -17788,9 +17788,9 @@ namespace
      */
     __global__ void materialize_runtime_prefill_descriptor_tables_kernel(
         DeviceMoELayerRuntimeView *__restrict__ runtime,
-        DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
-        DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
-        DeviceNativeVNNIMatrixDesc *__restrict__ down_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ down_descs,
         int num_experts,
         int *__restrict__ active_expert_ids,
         int max_active_experts,
@@ -17849,7 +17849,7 @@ namespace
      * @brief Publish one uniform floating descriptor family from the active bank.
      *
      * The destination lives in the same graph-stable descriptor workspace used
-     * by NativeVNNI. Floating descriptors are smaller, so selecting this typed
+     * by NativeQuantised. Floating descriptors are smaller, so selecting this typed
      * view changes neither arena capacity nor captured pointer identity. Every
      * lane overwrites its expert entry, including explicit zeros for remote
      * experts, before the following grouped projection consumes the table.
@@ -18417,11 +18417,11 @@ namespace
     }
 
     /**
-     * @brief Compute one 32-wide native-VNNI block with the serial GEMV FP32 order.
+     * @brief Compute one 32-wide native-quantised block with the serial GEMV FP32 order.
      *
      * MTP verifier rows are allowed to execute as grouped MoE work, but each row
      * must publish exactly the same FP32 bits as the public one-row decode GEMV.
-     * The canonical CUDA NativeVNNI verifier kernels make every multiply/add
+     * The canonical CUDA NativeQuantised verifier kernels make every multiply/add
      * boundary explicit with round-to-nearest intrinsics so nvcc cannot choose a
      * different contraction inside a larger grouped kernel body.  The MoE
      * grouped prefill kernels need the same per-block contract; otherwise a
@@ -18429,7 +18429,7 @@ namespace
      * layers later. This adapter computes only exact integer terms and then
      * delegates publication to the shared CUDA/cross-backend contract.
      *
-     * @tparam CodebookId Canonical NativeVNNI source-policy identifier.
+     * @tparam CodebookId Canonical NativeQuantised source-policy identifier.
      * @param a_vals Eight packed activation groups for one 32-value K block.
      * @param packed_groups Eight decoded signed-weight groups.
      * @param payload Prepared codebook payload for IQ1_M sign extraction.
@@ -18442,7 +18442,7 @@ namespace
      * @return Canonically rounded contribution, not yet row-accumulated.
      */
     template <uint8_t CodebookId>
-    __device__ __forceinline__ float moe_native_vnni_block_contribution_rn(
+    __device__ __forceinline__ float moe_native_quantised_block_contribution_rn(
         const int32_t *__restrict__ a_vals,
         const int32_t *__restrict__ packed_groups,
         const uint8_t *__restrict__ payload,
@@ -18454,19 +18454,19 @@ namespace
         uint8_t physical_codebook = CodebookId)
     {
         // IQ4 pairs share exact LUT integers, but retain independent factors.
-        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_lut)
+        if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut)
         {
             int dot = 0;
 #pragma unroll
             for (int group = 0; group < 8; ++group)
                 dot = __dp4a(a_vals[group], packed_groups[group], dot);
-            const float scale = physical_codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
-                ? llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(
+            const float scale = physical_codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
+                ? llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(
                       scale_base[linear], min_base[linear])
-                : llaminar2::cuda_native_vnni::fp16_bits_to_float(scale_base[linear]);
-            return llaminar2::device_native_vnni_contract::singleScaleBlock(dot, scale, scale_a);
+                : llaminar2::cuda_native_quantised::fp16_bits_to_float(scale_base[linear]);
+            return llaminar2::device_native_quantised_contract::singleScaleBlock(dot, scale, scale_a);
         }
-        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale)
+        if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_dual_scale)
         {
             int dot_lo = 0;
             int dot_hi = 0;
@@ -18477,8 +18477,8 @@ namespace
             {
                 dot_lo = __dp4a(a_vals[group], packed_groups[group], dot_lo);
                 dot_hi = __dp4a(a_vals[group + 4], packed_groups[group + 4], dot_hi);
-                sum_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[group]);
-                sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[group + 4]);
+                sum_lo += llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[group]);
+                sum_hi += llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[group + 4]);
             }
 
             uint16_t iq1m_qh = 0u;
@@ -18486,26 +18486,26 @@ namespace
             int subgroup_sum1 = 0;
             int subgroup_sum2 = 0;
             int subgroup_sum3 = 0;
-            if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq1_m)
+            if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq1_m)
             {
                 iq1m_qh = static_cast<uint16_t>(payload[4]) |
                           (static_cast<uint16_t>(payload[5]) << 8u);
                 subgroup_sum0 =
-                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[0]) +
-                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[1]);
+                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[0]) +
+                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[1]);
                 subgroup_sum1 =
-                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[2]) +
-                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[3]);
+                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[2]) +
+                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[3]);
                 subgroup_sum2 =
-                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[4]) +
-                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[5]);
+                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[4]) +
+                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[5]);
                 subgroup_sum3 =
-                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[6]) +
-                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[7]);
+                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[6]) +
+                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[7]);
             }
 
-            return llaminar2::cuda_native_vnni::
-                native_vnni_block_contribution_from_reduced_terms_rn<
+            return llaminar2::cuda_native_quantised::
+                native_quantised_block_contribution_from_reduced_terms_rn<
                     CodebookId>(
                     dot_lo,
                     dot_hi,
@@ -18530,11 +18530,11 @@ namespace
             for (int group = 0; group < 8; ++group)
             {
                 dot = __dp4a(a_vals[group], packed_groups[group], dot);
-                sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[group]);
+                sum_a += llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[group]);
             }
 
-            return llaminar2::cuda_native_vnni::
-                native_vnni_block_contribution_from_reduced_terms_rn<
+            return llaminar2::cuda_native_quantised::
+                native_quantised_block_contribution_from_reduced_terms_rn<
                     CodebookId>(
                     dot,
                     0,
@@ -18586,7 +18586,7 @@ namespace
             const float scale_a = scale_a_base[static_cast<size_t>(m) * scale_a_stride];
 
             const float contribution =
-                moe_native_vnni_block_contribution_rn<CodebookId>(
+                moe_native_quantised_block_contribution_rn<CodebookId>(
                     a4,
                     packed_groups,
                     payload,
@@ -18600,12 +18600,12 @@ namespace
     }
 
     template <uint8_t CodebookId, int kTileM, int kTileN>
-    __global__ void grouped_native_vnni_gate_up_prefill_kernel(
+    __global__ void grouped_native_quantised_gate_up_prefill_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
         llaminar2::MoEGroupedSourceRows source_rows,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
         const int *__restrict__ active_expert_ids,
@@ -18640,9 +18640,9 @@ namespace
         // shared-memory staging + __syncthreads below. Guard only the weight work / writes.
         const bool active = (n < N);
 
-        const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
-        const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        if (!native_vnni_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
+        const DeviceNativeQuantisedMatrixDesc gate_desc = gate_descs[expert_id];
+        const DeviceNativeQuantisedMatrixDesc up_desc = up_descs[expert_id];
+        if (!native_quantised_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
             return;
 
         const uint8_t *gate_payload_base = gate_desc.payload;
@@ -18678,7 +18678,7 @@ namespace
         // + __syncthreads lets the load latency overlap the staging loads and barrier wait,
         // with no extra register double-buffer (which would cost occupancy).
         constexpr int kPayloadBytes =
-            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::payload_bytes;
+            llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::payload_bytes;
 
 #pragma unroll 1
         for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx)
@@ -18693,8 +18693,8 @@ namespace
             const uint8_t *up_payload = up_payload_base + linear * kPayloadBytes;
             if (active)
             {
-                llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(gate_payload, gate_groups);
-                llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(up_payload, up_groups);
+                llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(gate_payload, gate_groups);
+                llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(up_payload, up_groups);
             }
 
             // Cooperatively load the activation tile for this K-block into shared memory.
@@ -18743,7 +18743,7 @@ namespace
 
     // Fused gate/up GEMM + SwiGLU + blockwise int8 quantization.
     //
-    // This is the fused-epilogue variant of grouped_native_vnni_gate_up_prefill_kernel: after
+    // This is the fused-epilogue variant of grouped_native_quantised_gate_up_prefill_kernel: after
     // computing gate_acc/up_acc for each token in the tile, it directly evaluates
     // silu(gate)*up and blockwise-quantizes the result to int8, writing the down-projection
     // input (swiglu_int8 + swiglu_scales) in place. This eliminates the FP32 gate/up global
@@ -18753,12 +18753,12 @@ namespace
     // intermediate (N) dimension (kTileN=128 is a multiple of 32, and N % 32 == 0), so the
     // per-block absmax is a warp-shuffle reduction with no cross-warp synchronization.
     template <uint8_t CodebookId, int kTileM, int kTileN>
-    __global__ void grouped_native_vnni_gate_up_swiglu_prefill_kernel(
+    __global__ void grouped_native_quantised_gate_up_swiglu_prefill_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
         llaminar2::MoEGroupedSourceRows source_rows,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
         const int *__restrict__ active_expert_ids,
@@ -18788,9 +18788,9 @@ namespace
         // Threads with n >= N still participate in cooperative staging + __syncthreads.
         const bool active = (n < N);
 
-        const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
-        const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        if (!native_vnni_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
+        const DeviceNativeQuantisedMatrixDesc gate_desc = gate_descs[expert_id];
+        const DeviceNativeQuantisedMatrixDesc up_desc = up_descs[expert_id];
+        if (!native_quantised_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
             return;
 
         const uint8_t *gate_payload_base = gate_desc.payload;
@@ -18815,7 +18815,7 @@ namespace
         float up_acc[kTileM] = {};
 
         constexpr int kPayloadBytes =
-            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::payload_bytes;
+            llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::payload_bytes;
 
 #pragma unroll 1
         for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx)
@@ -18829,8 +18829,8 @@ namespace
             const uint8_t *up_payload = up_payload_base + linear * kPayloadBytes;
             if (active)
             {
-                llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(gate_payload, gate_groups);
-                llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(up_payload, up_groups);
+                llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(gate_payload, gate_groups);
+                llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(up_payload, up_groups);
             }
 
             // Cooperatively stage the activation tile for this K-block into shared memory.
@@ -18943,10 +18943,10 @@ namespace
     }
 
     template <uint8_t CodebookId, int kTileM, int kTileN>
-    __global__ void grouped_native_vnni_down_prefill_kernel(
+    __global__ void grouped_native_quantised_down_prefill_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
         const int *__restrict__ active_expert_ids,
@@ -18977,8 +18977,8 @@ namespace
         // cooperative staging + __syncthreads. Guard only weight decode / output writes.
         const bool active = (n < N);
 
-        const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
-        if (!native_vnni_desc_shape_ok<CodebookId>(desc, N, K))
+        const DeviceNativeQuantisedMatrixDesc desc = descs[expert_id];
+        if (!native_quantised_desc_shape_ok<CodebookId>(desc, N, K))
             return;
 
         const uint8_t *payload_base = desc.payload;
@@ -19018,8 +19018,8 @@ namespace
                 const size_t linear = static_cast<size_t>(block_idx) * N + static_cast<size_t>(n);
                 int32_t packed_groups[8];
                 const uint8_t *payload = payload_base +
-                    linear * llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CodebookId>();
-                llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(payload, packed_groups);
+                    linear * llaminar2::cuda_native_quantised::payload_bytes_for_codebook<CodebookId>();
+                llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(payload, packed_groups);
                 accumulate_prefill_dot_block<CodebookId, kTileM>(
                     packed_groups, scale_base, min_base, emin_base, payload,
                     linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
@@ -19187,7 +19187,7 @@ namespace
      * K dimension so that multiple thread blocks can cooperate on a single output
      * column. Passing [0, K/32) reproduces the full reduction.
      *
-     * @param desc                 Native-VNNI weight descriptor (column n of B).
+     * @param desc                 NativeQuantised weight descriptor (column n of B).
      * @param n                    Output column index into the weight matrix.
      * @param A_int8               Quantized activation row (int8, K elements).
      * @param scales_A_blockwise   Per-K-block activation scales.
@@ -19198,8 +19198,8 @@ namespace
      * @return Partial accumulated dot product over the requested K-block range.
      */
     template <uint8_t CodebookId>
-    __device__ __forceinline__ float native_vnni_dot_desc_range(
-        const DeviceNativeVNNIMatrixDesc &desc,
+    __device__ __forceinline__ float native_quantised_dot_desc_range(
+        const DeviceNativeQuantisedMatrixDesc &desc,
         int n,
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -19214,7 +19214,7 @@ namespace
             n < 0 ||
             n >= N ||
             blocks_per_row <= 0 ||
-            !native_vnni_desc_shape_ok<CodebookId>(desc, N, K))
+            !native_quantised_desc_shape_ok<CodebookId>(desc, N, K))
         {
             return 0.0f;
         }
@@ -19236,14 +19236,14 @@ namespace
             const int32_t *a4 = reinterpret_cast<const int32_t *>(A_int8 + block_idx * 32);
             const size_t linear = static_cast<size_t>(block_idx) * N + static_cast<size_t>(n);
             const uint8_t *payload = payload_base +
-                                     linear * llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CodebookId>();
+                                     linear * llaminar2::cuda_native_quantised::payload_bytes_for_codebook<CodebookId>();
 
             int32_t packed_groups[8];
-            llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(payload, packed_groups);
+            llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(payload, packed_groups);
 
             const float scale_a = scales_A_blockwise[block_idx];
             const float contribution =
-                moe_native_vnni_block_contribution_rn<CodebookId>(
+                moe_native_quantised_block_contribution_rn<CodebookId>(
                     a4,
                     packed_groups,
                     payload,
@@ -19263,7 +19263,7 @@ namespace
      *
      * Gate and up descriptors have identical geometry and consume the same
      * quantized activation row. The former implementation called
-     * native_vnni_dot_desc_range() twice, which repeated activation/scaling
+     * native_quantised_dot_desc_range() twice, which repeated activation/scaling
      * loads and all loop/index work. This paired primitive loads each
      * activation block once, decodes the two independent payloads in sequence,
      * and retains one accumulator per projection.
@@ -19275,9 +19275,9 @@ namespace
      * preserved.
      */
     template <uint8_t CodebookId>
-    __device__ __forceinline__ void native_vnni_dot_desc_pair_range(
-        const DeviceNativeVNNIMatrixDesc &gate_desc,
-        const DeviceNativeVNNIMatrixDesc &up_desc,
+    __device__ __forceinline__ void native_quantised_dot_desc_pair_range(
+        const DeviceNativeQuantisedMatrixDesc &gate_desc,
+        const DeviceNativeQuantisedMatrixDesc &up_desc,
         int n,
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -19293,7 +19293,7 @@ namespace
         up_acc = 0.0f;
         if (!A_int8 || !scales_A_blockwise || n < 0 || n >= N ||
             blocks_per_row <= 0 ||
-            !native_vnni_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
+            !native_quantised_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
         {
             return;
         }
@@ -19314,7 +19314,7 @@ namespace
         b_start = max(0, b_start);
         b_end = min(blocks_per_row, b_end);
         const size_t payload_bytes =
-            llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CodebookId>();
+            llaminar2::cuda_native_quantised::payload_bytes_for_codebook<CodebookId>();
 
 #pragma unroll 1
         for (int block_idx = b_start; block_idx < b_end; ++block_idx)
@@ -19328,11 +19328,11 @@ namespace
             int32_t packed_groups[8];
             const uint8_t *gate_payload =
                 gate_desc.payload + linear * payload_bytes;
-            llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(
+            llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(
                 gate_payload, packed_groups);
             gate_acc = __fadd_rn(
                 gate_acc,
-                moe_native_vnni_block_contribution_rn<CodebookId>(
+                moe_native_quantised_block_contribution_rn<CodebookId>(
                     a4,
                     packed_groups,
                     gate_payload,
@@ -19344,11 +19344,11 @@ namespace
 
             const uint8_t *up_payload =
                 up_desc.payload + linear * payload_bytes;
-            llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(
+            llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(
                 up_payload, packed_groups);
             up_acc = __fadd_rn(
                 up_acc,
-                moe_native_vnni_block_contribution_rn<CodebookId>(
+                moe_native_quantised_block_contribution_rn<CodebookId>(
                     a4,
                     packed_groups,
                     up_payload,
@@ -19365,20 +19365,20 @@ namespace
      *        original single-shot reduction semantics for non-split-K callers.
      */
     template <uint8_t CodebookId>
-    __device__ __forceinline__ float native_vnni_dot_desc(
-        const DeviceNativeVNNIMatrixDesc &desc,
+    __device__ __forceinline__ float native_quantised_dot_desc(
+        const DeviceNativeQuantisedMatrixDesc &desc,
         int n,
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
         int N,
         int K)
     {
-        return native_vnni_dot_desc_range<CodebookId>(
+        return native_quantised_dot_desc_range<CodebookId>(
             desc, n, A_int8, scales_A_blockwise, N, K, 0, K / 32);
     }
 
-    __device__ __forceinline__ float native_vnni_dot_desc_range_dynamic(
-        const DeviceNativeVNNIMatrixDesc &desc,
+    __device__ __forceinline__ float native_quantised_dot_desc_range_dynamic(
+        const DeviceNativeQuantisedMatrixDesc &desc,
         int n,
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -19390,42 +19390,42 @@ namespace
         switch (desc.codebook_id)
         {
         case 0:
-            return native_vnni_dot_desc_range<0>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<0>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 4:
-            return native_vnni_dot_desc_range<4>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
-            return native_vnni_dot_desc_range<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<4>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
+            return native_quantised_dot_desc_range<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 5:
-            return native_vnni_dot_desc_range<5>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<5>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 6:
-            return native_vnni_dot_desc_range<6>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<6>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 7:
-            return native_vnni_dot_desc_range<7>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<7>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 8:
-            return native_vnni_dot_desc_range<8>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<8>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 9:
-            return native_vnni_dot_desc_range<9>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<9>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 10:
-            return native_vnni_dot_desc_range<10>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<10>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 11:
-            return native_vnni_dot_desc_range<11>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<11>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 12:
-            return native_vnni_dot_desc_range<12>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<12>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 13:
-            return native_vnni_dot_desc_range<13>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<13>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 14:
-            return native_vnni_dot_desc_range<14>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<14>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 15:
-            return native_vnni_dot_desc_range<15>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<15>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 16:
-            return native_vnni_dot_desc_range<16>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<16>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 17:
-            return native_vnni_dot_desc_range<17>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<17>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 19:
-            return native_vnni_dot_desc_range<19>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
-            return native_vnni_dot_desc_range<
-                llaminar2::kNativeVnniExpandedInt8MinCodebook>(
+            return native_quantised_dot_desc_range<19>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
+            return native_quantised_dot_desc_range<
+                llaminar2::kNativeQuantisedExpandedInt8MinCodebook>(
                 desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         default:
             return 0.0f;
@@ -19433,8 +19433,8 @@ namespace
     }
 
     template <uint8_t CodebookId>
-    __device__ __forceinline__ float native_vnni_dot_desc_range_dispatch(
-        const DeviceNativeVNNIMatrixDesc &desc,
+    __device__ __forceinline__ float native_quantised_dot_desc_range_dispatch(
+        const DeviceNativeQuantisedMatrixDesc &desc,
         int n,
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -19445,26 +19445,26 @@ namespace
     {
         if constexpr (CodebookId == kMixedCodebookSentinel)
         {
-            return native_vnni_dot_desc_range_dynamic(
+            return native_quantised_dot_desc_range_dynamic(
                 desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         }
         else
         {
-            return native_vnni_dot_desc_range<CodebookId>(
+            return native_quantised_dot_desc_range<CodebookId>(
                 desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         }
     }
 
     template <uint8_t CodebookId>
-    __device__ __forceinline__ float native_vnni_dot_desc_dispatch(
-        const DeviceNativeVNNIMatrixDesc &desc,
+    __device__ __forceinline__ float native_quantised_dot_desc_dispatch(
+        const DeviceNativeQuantisedMatrixDesc &desc,
         int n,
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
         int N,
         int K)
     {
-        return native_vnni_dot_desc_range_dispatch<CodebookId>(
+        return native_quantised_dot_desc_range_dispatch<CodebookId>(
             desc, n, A_int8, scales_A_blockwise, N, K, 0, K / 32);
     }
 
@@ -19481,11 +19481,11 @@ namespace
      * Grid:  ((N + 63)/64, k_partitions, num_active)   Block: (64)
      */
     template <uint8_t CodebookId>
-    __global__ void grouped_native_vnni_gate_up_kpart_decode_kernel(
+    __global__ void grouped_native_quantised_gate_up_kpart_decode_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_ids,
         float *__restrict__ gate_partials,
         float *__restrict__ up_partials,
@@ -19536,11 +19536,11 @@ namespace
             return;
         }
 
-        const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
-        const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        gate_partials[partial_index] = native_vnni_dot_desc_range_dispatch<CodebookId>(
+        const DeviceNativeQuantisedMatrixDesc gate_desc = gate_descs[expert_id];
+        const DeviceNativeQuantisedMatrixDesc up_desc = up_descs[expert_id];
+        gate_partials[partial_index] = native_quantised_dot_desc_range_dispatch<CodebookId>(
             gate_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
-        up_partials[partial_index] = native_vnni_dot_desc_range_dispatch<CodebookId>(
+        up_partials[partial_index] = native_quantised_dot_desc_range_dispatch<CodebookId>(
             up_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
     }
 
@@ -19548,12 +19548,12 @@ namespace
      * @brief Reduce K-partition partials into the final grouped gate/up outputs.
      *
      * Sums the k_partitions partial contributions for each (slot, n) produced by
-     * grouped_native_vnni_gate_up_kpart_decode_kernel and writes the result to
+     * grouped_native_quantised_gate_up_kpart_decode_kernel and writes the result to
      * the per-slot gate/up output buffers.
      *
      * Grid: ((N + 63)/64, num_active)   Block: (64)
      */
-    __global__ void grouped_native_vnni_gate_up_kpart_reduce_kernel(
+    __global__ void grouped_native_quantised_gate_up_kpart_reduce_kernel(
         const float *__restrict__ gate_partials,
         const float *__restrict__ up_partials,
         const int *__restrict__ expert_ids,
@@ -19604,12 +19604,12 @@ namespace
      * proportion to the complete context or speculative depth.
      */
     template <uint8_t CodebookId>
-    __global__ void grouped_native_vnni_gate_up_ordered_kpart_scatter_kernel(
+    __global__ void grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
         llaminar2::MoEGroupedSourceRows source_rows,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ original_to_grouped,
         const int *__restrict__ original_expert_ids,
         float *__restrict__ gate_partials,
@@ -19641,9 +19641,9 @@ namespace
         if (b_end > blocks_per_row)
             b_end = blocks_per_row;
 
-        const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
-        const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        if (!native_vnni_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
+        const DeviceNativeQuantisedMatrixDesc gate_desc = gate_descs[expert_id];
+        const DeviceNativeQuantisedMatrixDesc up_desc = up_descs[expert_id];
+        if (!native_quantised_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
             return;
 
         const size_t partial_index =
@@ -19664,7 +19664,7 @@ namespace
             scales_A_blockwise + static_cast<size_t>(source_row) * blocks_per_row;
         float gate_partial = 0.0f;
         float up_partial = 0.0f;
-        native_vnni_dot_desc_pair_range<CodebookId>(
+        native_quantised_dot_desc_pair_range<CodebookId>(
             gate_desc,
             up_desc,
             n,
@@ -19689,7 +19689,7 @@ namespace
      * benefit is architectural: verifier graphs avoid a launch and a global
      * FP32 gate/up scratch round trip.
      */
-    __global__ void grouped_native_vnni_gate_up_ordered_kpart_reduce_swiglu_kernel(
+    __global__ void grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel(
         const float *__restrict__ gate_partials,
         const float *__restrict__ up_partials,
         const int *__restrict__ original_to_grouped,
@@ -19765,10 +19765,10 @@ namespace
      * makes expert ownership irrelevant to the eventual FP32 addition tree.
      */
     template <uint8_t CodebookId>
-    __global__ void grouped_native_vnni_down_kpart_decode_route_kernel(
+    __global__ void grouped_native_quantised_down_kpart_decode_route_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ descs,
         const int *__restrict__ expert_ids,
         float *__restrict__ partials,
         int num_active,
@@ -19807,17 +19807,17 @@ namespace
             return;
         }
 
-        const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+        const DeviceNativeQuantisedMatrixDesc desc = descs[expert_id];
         const int8_t *slot_A = A_int8 + static_cast<size_t>(route) * K;
         const float *slot_scales =
             scales_A_blockwise + static_cast<size_t>(route) * blocks_per_row;
         partials[partial_index] =
-            native_vnni_dot_desc_range_dispatch<CodebookId>(
+            native_quantised_dot_desc_range_dispatch<CodebookId>(
                 desc, n, slot_A, slot_scales, N, K, b_start, b_end);
     }
 
     /** @brief Sum split-K partials while preserving the route dimension. */
-    __global__ void grouped_native_vnni_down_kpart_route_reduce_kernel(
+    __global__ void grouped_native_quantised_down_kpart_route_reduce_kernel(
         const float *__restrict__ partials,
         const float *__restrict__ route_weights,
         float *__restrict__ route_output,
@@ -19856,11 +19856,11 @@ namespace
      * This is the non-collective twin of the persistent route publication
      * path.  It first reduces K partitions within one route and then reduces
      * routes in original router order.  The two explicit FP32 loops exactly
-     * match `grouped_native_vnni_down_kpart_route_reduce_kernel` followed by
+     * match `grouped_native_quantised_down_kpart_route_reduce_kernel` followed by
      * `reduce_canonical_route_contributions_kernel`, without materializing the
      * persistent route tensor when no collective needs it.
      */
-    __global__ void grouped_native_vnni_down_kpart_routes_reduce_kernel(
+    __global__ void grouped_native_quantised_down_kpart_routes_reduce_kernel(
         const float *__restrict__ partials,
         const float *__restrict__ route_weights,
         float *__restrict__ output,
@@ -19910,7 +19910,7 @@ namespace
     __global__ void grouped_prefill_down_canonical_kpart_scatter_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ descs,
         const int *__restrict__ original_to_grouped,
         const int *__restrict__ original_expert_ids,
         float *__restrict__ partials,
@@ -19959,14 +19959,14 @@ namespace
             return;
         }
 
-        const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+        const DeviceNativeQuantisedMatrixDesc desc = descs[expert_id];
         const int8_t *slot_A =
             A_int8 + static_cast<size_t>(grouped_slot) * K;
         const float *slot_scales =
             scales_A_blockwise +
             static_cast<size_t>(grouped_slot) * blocks_per_row;
         partials[partial_index] =
-            native_vnni_dot_desc_range_dispatch<CodebookId>(
+            native_quantised_dot_desc_range_dispatch<CodebookId>(
                 desc, n, slot_A, slot_scales, N, K, b_start, b_end);
     }
 
@@ -20037,7 +20037,7 @@ namespace
     __global__ void grouped_prefill_down_canonical_kpart_fused_direct_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ descs,
         const int *__restrict__ original_to_grouped,
         const int *__restrict__ original_expert_ids,
         const float *__restrict__ grouped_weights,
@@ -20077,7 +20077,7 @@ namespace
                     const int blocks_per_row = K / 32;
                     const int blocks_per_part =
                         (blocks_per_row + k_partitions - 1) / k_partitions;
-                    const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+                    const DeviceNativeQuantisedMatrixDesc desc = descs[expert_id];
                     const int8_t *slot_A =
                         A_int8 + static_cast<size_t>(grouped_slot) * K;
                     const float *slot_scales =
@@ -20096,7 +20096,7 @@ namespace
                         if (b_start < b_end)
                         {
                             expert_partial =
-                                native_vnni_dot_desc_range_dispatch<CodebookId>(
+                                native_quantised_dot_desc_range_dispatch<CodebookId>(
                                     desc, n, slot_A, slot_scales, N, K,
                                     b_start, b_end);
                         }
@@ -20815,7 +20815,7 @@ namespace
     }
 
     template <uint8_t CodebookId>
-    __global__ void grouped_native_vnni_gate_up_kpart_decode_runtime_kernel(
+    __global__ void grouped_native_quantised_gate_up_kpart_decode_runtime_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
         const DeviceMoELayerRuntimeView *__restrict__ runtime,
@@ -20872,16 +20872,16 @@ namespace
 
         const DeviceMoEPlacementBankView &bank =
             runtime_placement_banks(runtime)[execution_bank];
-        const DeviceNativeVNNIMatrixDesc gate_desc = bank.experts[expert_id].gate;
-        const DeviceNativeVNNIMatrixDesc up_desc = bank.experts[expert_id].up;
-        gate_partials[partial_index] = native_vnni_dot_desc_range_dispatch<CodebookId>(
+        const DeviceNativeQuantisedMatrixDesc gate_desc = bank.experts[expert_id].gate;
+        const DeviceNativeQuantisedMatrixDesc up_desc = bank.experts[expert_id].up;
+        gate_partials[partial_index] = native_quantised_dot_desc_range_dispatch<CodebookId>(
             gate_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
-        up_partials[partial_index] = native_vnni_dot_desc_range_dispatch<CodebookId>(
+        up_partials[partial_index] = native_quantised_dot_desc_range_dispatch<CodebookId>(
             up_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
     }
 
     template <uint8_t CodebookId>
-    __global__ void grouped_native_vnni_down_kpart_decode_runtime_kernel(
+    __global__ void grouped_native_quantised_down_kpart_decode_runtime_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
         const DeviceMoELayerRuntimeView *__restrict__ runtime,
@@ -20935,14 +20935,14 @@ namespace
 
         const DeviceMoEPlacementBankView &bank =
             runtime_placement_banks(runtime)[execution_bank];
-        const DeviceNativeVNNIMatrixDesc desc = bank.experts[expert_id].down;
+        const DeviceNativeQuantisedMatrixDesc desc = bank.experts[expert_id].down;
         const int8_t *route_A =
             A_int8 + static_cast<size_t>(route) * static_cast<size_t>(K);
         const float *route_scales =
             scales_A_blockwise +
             static_cast<size_t>(route) * static_cast<size_t>(blocks_per_row);
         partials[partial_index] =
-            native_vnni_dot_desc_range_dispatch<CodebookId>(
+            native_quantised_dot_desc_range_dispatch<CodebookId>(
                 desc, n, route_A, route_scales, N, K, b_start, b_end);
     }
 
@@ -21022,7 +21022,7 @@ namespace
         {
         case 0:
             return query_grouped_prefill_kernel_resources(
-                grouped_native_vnni_gate_up_ordered_kpart_scatter_kernel<CodebookId>,
+                grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel<CodebookId>,
                 block_threads,
                 resources);
         case 1:
@@ -21124,7 +21124,7 @@ extern "C"
      * - 4: common gate/up split-K reduction and SwiGLU quantizer;
      * - 5: common canonical-route down split-K reduction.
      *
-     * @param codebook_id NativeVNNI execution codebook for components 0..2.
+     * @param codebook_id NativeQuantised execution codebook for components 0..2.
      * @param component Stable component identity described above.
      * @param block_threads Exact production block width in CUDA threads.
      * @param registers_per_thread Receives compiler-assigned registers.
@@ -21166,7 +21166,7 @@ extern "C"
         case 4:
             queried = block_threads == 32 &&
                       query_grouped_prefill_kernel_resources(
-                          grouped_native_vnni_gate_up_ordered_kpart_reduce_swiglu_kernel,
+                          grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel,
                           block_threads,
                           &resources);
             break;
@@ -21202,7 +21202,7 @@ extern "C"
             {
                 QUERY_GROUPED_PREFILL_CODEBOOK(0);
                 QUERY_GROUPED_PREFILL_CODEBOOK(4);
-                QUERY_GROUPED_PREFILL_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+                QUERY_GROUPED_PREFILL_CODEBOOK(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
                 QUERY_GROUPED_PREFILL_CODEBOOK(5);
                 QUERY_GROUPED_PREFILL_CODEBOOK(6);
                 QUERY_GROUPED_PREFILL_CODEBOOK(7);
@@ -21218,7 +21218,7 @@ extern "C"
                 QUERY_GROUPED_PREFILL_CODEBOOK(17);
                 QUERY_GROUPED_PREFILL_CODEBOOK(19);
                 QUERY_GROUPED_PREFILL_CODEBOOK(
-                    llaminar2::kNativeVnniExpandedInt8MinCodebook);
+                    llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
             case kMixedCodebookSentinel:
                 if (component == 1 || component == 2)
                 {
@@ -23158,7 +23158,7 @@ extern "C"
                 /*down_descs=*/nullptr,
                 /*active_expert_ids=*/nullptr,
                 /*max_active_experts=*/0,
-                llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+                llaminar2::DeviceMoEWeightFormat::NativeQuantised,
                 expected_projections);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_group_small_runtime", cuda_stream);
@@ -23202,9 +23202,9 @@ extern "C"
         const float *routing_weights,
         void *runtime,
         int *original_to_grouped,
-        DeviceNativeVNNIMatrixDesc *gate_descs,
-        DeviceNativeVNNIMatrixDesc *up_descs,
-        DeviceNativeVNNIMatrixDesc *down_descs,
+        DeviceNativeQuantisedMatrixDesc *gate_descs,
+        DeviceNativeQuantisedMatrixDesc *up_descs,
+        DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int current_slots,
         int max_slots,
@@ -23230,7 +23230,7 @@ extern "C"
             top_k <= 0 || top_k > kMaxTopK ||
             max_active_experts <= 0 || max_active_experts > num_experts ||
             (expected_format !=
-                 llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+                 llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
              !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)))
         {
             return false;
@@ -23342,7 +23342,7 @@ extern "C"
                 /*down_descs=*/nullptr,
                 /*active_expert_ids=*/nullptr,
                 /*max_active_experts=*/0,
-                llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+                llaminar2::DeviceMoEWeightFormat::NativeQuantised,
                 llaminar2::DeviceMoEProjectionSet::CompleteExpert);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_regroup_small_runtime", cuda_stream);
@@ -23381,9 +23381,9 @@ extern "C"
     cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
         void *runtime,
         int *original_to_grouped,
-        DeviceNativeVNNIMatrixDesc *gate_descs,
-        DeviceNativeVNNIMatrixDesc *up_descs,
-        DeviceNativeVNNIMatrixDesc *down_descs,
+        DeviceNativeQuantisedMatrixDesc *gate_descs,
+        DeviceNativeQuantisedMatrixDesc *up_descs,
+        DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int current_slots,
         int max_slots,
@@ -23408,7 +23408,7 @@ extern "C"
             top_k <= 0 || top_k > kMaxTopK ||
             max_active_experts <= 0 || max_active_experts > num_experts ||
             (expected_format !=
-                 llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+                 llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
              !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)))
         {
             return false;
@@ -23704,9 +23704,9 @@ extern "C"
 
     __attribute__((visibility("default"))) bool cudaMoE_materialize_runtime_prefill_descriptor_tables(
         const void *runtime,
-        DeviceNativeVNNIMatrixDesc *gate_descs,
-        DeviceNativeVNNIMatrixDesc *up_descs,
-        DeviceNativeVNNIMatrixDesc *down_descs,
+        DeviceNativeQuantisedMatrixDesc *gate_descs,
+        DeviceNativeQuantisedMatrixDesc *up_descs,
+        DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_experts,
         int device_idx,
         void *stream)
@@ -23730,7 +23730,7 @@ extern "C"
             /*max_active_experts=*/0,
             /*current_slots=*/0,
             /*publish_prefill_histogram=*/0,
-            llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+            llaminar2::DeviceMoEWeightFormat::NativeQuantised,
             llaminar2::DeviceMoEProjectionSet::CompleteExpert);
         return finishGroupedPrefillLaunch(
             "cudaMoE_materialize_runtime_prefill_descriptor_tables",
@@ -23742,9 +23742,9 @@ extern "C"
      */
     __attribute__((visibility("default"))) bool cudaMoE_materialize_runtime_prefill_plan(
         const void *runtime,
-        DeviceNativeVNNIMatrixDesc *gate_descs,
-        DeviceNativeVNNIMatrixDesc *up_descs,
-        DeviceNativeVNNIMatrixDesc *down_descs,
+        DeviceNativeQuantisedMatrixDesc *gate_descs,
+        DeviceNativeQuantisedMatrixDesc *up_descs,
+        DeviceNativeQuantisedMatrixDesc *down_descs,
         int *active_expert_ids,
         int num_experts,
         int max_active_experts,
@@ -23772,7 +23772,7 @@ extern "C"
             max_active_experts,
             /*current_slots=*/0,
             /*publish_prefill_histogram=*/0,
-            llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+            llaminar2::DeviceMoEWeightFormat::NativeQuantised,
             llaminar2::DeviceMoEProjectionSet::CompleteExpert);
         return finishGroupedPrefillLaunch(
             "cudaMoE_materialize_runtime_prefill_plan",
@@ -24094,10 +24094,10 @@ extern "C"
         return finishLaunch("cudaMoE_grouped_floating_prefill_down");
     }
 
-    bool cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+    bool cudaMoE_grouped_gate_up_native_quantised_decode_table_kpart(
         const float *d_hidden,
-        const DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const DeviceNativeQuantisedMatrixDesc *d_gate_desc_table,
+        const DeviceNativeQuantisedMatrixDesc *d_up_desc_table,
         const int *d_expert_ids,
         float *const *d_gate_outputs,
         float *const *d_up_outputs,
@@ -24124,7 +24124,7 @@ extern "C"
             num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 ||
             (K % 32) != 0 || !valid_k_partitions)
         {
-            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart] invalid arguments\n");
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_quantised_decode_table_kpart] invalid arguments\n");
             return false;
         }
 
@@ -24148,7 +24148,7 @@ extern "C"
         dim3 block(kTileN);
 
 #define LAUNCH_GROUPED_GATE_UP_KPART(CB)                                                            \
-    grouped_native_vnni_gate_up_kpart_decode_kernel<CB><<<partial_grid, block, 0, cuda_stream>>>(   \
+    grouped_native_quantised_gate_up_kpart_decode_kernel<CB><<<partial_grid, block, 0, cuda_stream>>>(   \
         d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table, d_expert_ids,           \
         d_gate_partials, d_up_partials, num_active, N, K, num_experts, k_partitions)
 
@@ -24156,7 +24156,7 @@ extern "C"
         {
         case 0:  LAUNCH_GROUPED_GATE_UP_KPART(0); break;
         case 4:  LAUNCH_GROUPED_GATE_UP_KPART(4); break;
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_GATE_UP_KPART(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook); break;
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_GATE_UP_KPART(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook); break;
         case 5:  LAUNCH_GROUPED_GATE_UP_KPART(5); break;
         case 6:  LAUNCH_GROUPED_GATE_UP_KPART(6); break;
         case 7:  LAUNCH_GROUPED_GATE_UP_KPART(7); break;
@@ -24171,10 +24171,10 @@ extern "C"
         case 16: LAUNCH_GROUPED_GATE_UP_KPART(16); break;
         case 17: LAUNCH_GROUPED_GATE_UP_KPART(17); break;
         case 19: LAUNCH_GROUPED_GATE_UP_KPART(19); break;
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook: LAUNCH_GROUPED_GATE_UP_KPART(llaminar2::kNativeVnniExpandedInt8MinCodebook); break;
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: LAUNCH_GROUPED_GATE_UP_KPART(llaminar2::kNativeQuantisedExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP_KPART(kMixedCodebookSentinel); break;
         default:
-            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n",
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_quantised_decode_table_kpart] unsupported codebook_id=%u\n",
                          static_cast<unsigned>(codebook_id));
             return false;
         }
@@ -24186,14 +24186,14 @@ extern "C"
 
         // Step 3: reduce the k_partitions partials into the final gate/up outputs.
         dim3 reduce_grid((N + kTileN - 1) / kTileN, num_active);
-        grouped_native_vnni_gate_up_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
+        grouped_native_quantised_gate_up_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
             d_gate_partials, d_up_partials, d_expert_ids, d_gate_outputs, d_up_outputs,
             num_active, N, k_partitions);
 
-        return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart");
+        return finishLaunch("cudaMoE_grouped_gate_up_native_quantised_decode_table_kpart");
     }
 
-    bool cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+    bool cudaMoE_grouped_gate_up_native_quantised_decode_runtime_kpart(
         const float *d_hidden,
         const void *d_runtime_layer,
         const int *d_expert_ids,
@@ -24222,7 +24222,7 @@ extern "C"
             num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 ||
             (K % 32) != 0 || !valid_k_partitions)
         {
-            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart] invalid arguments\n");
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_quantised_decode_runtime_kpart] invalid arguments\n");
             return false;
         }
 
@@ -24243,7 +24243,7 @@ extern "C"
         const auto *runtime = static_cast<const DeviceMoELayerRuntimeView *>(d_runtime_layer);
 
 #define LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(CB)                                                   \
-    grouped_native_vnni_gate_up_kpart_decode_runtime_kernel<CB><<<partial_grid, block, 0, cuda_stream>>>( \
+    grouped_native_quantised_gate_up_kpart_decode_runtime_kernel<CB><<<partial_grid, block, 0, cuda_stream>>>( \
         d_hidden_int8, d_hidden_scales, runtime, d_expert_ids,                                      \
         d_gate_partials, d_up_partials, num_active, N, K, num_experts, k_partitions)
 
@@ -24251,7 +24251,7 @@ extern "C"
         {
         case 0:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(0); break;
         case 4:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(4); break;
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook); break;
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook); break;
         case 5:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(5); break;
         case 6:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(6); break;
         case 7:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(7); break;
@@ -24266,31 +24266,31 @@ extern "C"
         case 16: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(16); break;
         case 17: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(17); break;
         case 19: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(19); break;
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(llaminar2::kNativeVnniExpandedInt8MinCodebook); break;
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(llaminar2::kNativeQuantisedExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(kMixedCodebookSentinel); break;
         default:
-            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart] unsupported codebook_id=%u\n",
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_quantised_decode_runtime_kpart] unsupported codebook_id=%u\n",
                          static_cast<unsigned>(codebook_id));
             return false;
         }
 
 #undef LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART
 
-        if (!finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart partial"))
+        if (!finishLaunch("cudaMoE_grouped_gate_up_native_quantised_decode_runtime_kpart partial"))
             return false;
 
         dim3 reduce_grid((N + kTileN - 1) / kTileN, num_active);
-        grouped_native_vnni_gate_up_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
+        grouped_native_quantised_gate_up_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
             d_gate_partials, d_up_partials, d_expert_ids, d_gate_outputs, d_up_outputs,
             num_active, N, k_partitions);
 
-        return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart reduce");
+        return finishLaunch("cudaMoE_grouped_gate_up_native_quantised_decode_runtime_kpart reduce");
     }
 
-    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+    bool cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
-        const DeviceNativeVNNIMatrixDesc *d_desc_table,
+        const DeviceNativeQuantisedMatrixDesc *d_desc_table,
         const int *d_expert_ids,
         const float *d_weights,
         int8_t *d_swiglu_int8,
@@ -24316,7 +24316,7 @@ extern "C"
             num_active <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 ||
             (intermediate % 32) != 0 || !valid_k_partitions)
         {
-            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart] invalid arguments\n");
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart] invalid arguments\n");
             return false;
         }
 
@@ -24346,7 +24346,7 @@ extern "C"
 
         // Step 2: every (route, k_part, n) owner writes one rounded partial.
 #define LAUNCH_GROUPED_DOWN_KPART(CB)                                                      \
-    grouped_native_vnni_down_kpart_decode_route_kernel<CB>                                 \
+    grouped_native_quantised_down_kpart_decode_route_kernel<CB>                                 \
         <<<scatter_grid, block, 0, cuda_stream>>>(                                         \
             d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids,                    \
             d_down_partials, num_active, N, K, num_experts,                                \
@@ -24356,7 +24356,7 @@ extern "C"
         {
         case 0:  LAUNCH_GROUPED_DOWN_KPART(0); break;
         case 4:  LAUNCH_GROUPED_DOWN_KPART(4); break;
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_DOWN_KPART(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook); break;
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_DOWN_KPART(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook); break;
         case 5:  LAUNCH_GROUPED_DOWN_KPART(5); break;
         case 6:  LAUNCH_GROUPED_DOWN_KPART(6); break;
         case 7:  LAUNCH_GROUPED_DOWN_KPART(7); break;
@@ -24371,23 +24371,23 @@ extern "C"
         case 16: LAUNCH_GROUPED_DOWN_KPART(16); break;
         case 17: LAUNCH_GROUPED_DOWN_KPART(17); break;
         case 19: LAUNCH_GROUPED_DOWN_KPART(19); break;
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook: LAUNCH_GROUPED_DOWN_KPART(llaminar2::kNativeVnniExpandedInt8MinCodebook); break;
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: LAUNCH_GROUPED_DOWN_KPART(llaminar2::kNativeQuantisedExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN_KPART(kMixedCodebookSentinel); break;
         default:
-            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n",
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart] unsupported codebook_id=%u\n",
                          static_cast<unsigned>(codebook_id));
             return false;
         }
 
 #undef LAUNCH_GROUPED_DOWN_KPART
 
-        if (!finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart scatter"))
+        if (!finishLaunch("cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart scatter"))
             return false;
 
         // Step 3: reduce — sum the k_partitions partials into the final output.
         if (canonical_publication)
         {
-            grouped_native_vnni_down_kpart_route_reduce_kernel<<<
+            grouped_native_quantised_down_kpart_route_reduce_kernel<<<
                 route_reduce_grid, block, 0, cuda_stream>>>(
                 d_down_partials,
                 d_weights,
@@ -24398,16 +24398,16 @@ extern "C"
         }
         else
         {
-            grouped_native_vnni_down_kpart_routes_reduce_kernel<<<
+            grouped_native_quantised_down_kpart_routes_reduce_kernel<<<
                 direct_reduce_grid, block, 0, cuda_stream>>>(
                 d_down_partials, d_weights, d_output,
                 num_active, N, k_partitions);
         }
 
-        return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart reduce");
+        return finishLaunch("cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart reduce");
     }
 
-    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
+    bool cudaMoE_grouped_swiglu_down_native_quantised_decode_runtime_kpart(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
         const void *d_runtime_layer,
@@ -24434,7 +24434,7 @@ extern "C"
             num_active <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 ||
             (intermediate % 32) != 0 || !valid_k_partitions)
         {
-            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart] invalid arguments\n");
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_quantised_decode_runtime_kpart] invalid arguments\n");
             return false;
         }
 
@@ -24457,7 +24457,7 @@ extern "C"
         const auto *runtime = static_cast<const DeviceMoELayerRuntimeView *>(d_runtime_layer);
 
 #define LAUNCH_GROUPED_DOWN_RUNTIME_KPART(CB)                                                   \
-    grouped_native_vnni_down_kpart_decode_runtime_kernel<CB><<<scatter_grid, block, 0, cuda_stream>>>( \
+    grouped_native_quantised_down_kpart_decode_runtime_kernel<CB><<<scatter_grid, block, 0, cuda_stream>>>( \
         d_swiglu_int8, d_swiglu_scales, runtime, d_expert_ids,                                  \
         d_down_partials, num_active, N, K, num_experts, k_partitions)
 
@@ -24465,7 +24465,7 @@ extern "C"
         {
         case 0:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(0); break;
         case 4:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(4); break;
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook); break;
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook); break;
         case 5:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(5); break;
         case 6:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(6); break;
         case 7:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(7); break;
@@ -24480,25 +24480,25 @@ extern "C"
         case 16: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(16); break;
         case 17: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(17); break;
         case 19: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(19); break;
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(llaminar2::kNativeVnniExpandedInt8MinCodebook); break;
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(llaminar2::kNativeQuantisedExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(kMixedCodebookSentinel); break;
         default:
-            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart] unsupported codebook_id=%u\n",
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_quantised_decode_runtime_kpart] unsupported codebook_id=%u\n",
                          static_cast<unsigned>(codebook_id));
             return false;
         }
 
 #undef LAUNCH_GROUPED_DOWN_RUNTIME_KPART
 
-        if (!finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart scatter"))
+        if (!finishLaunch("cudaMoE_grouped_swiglu_down_native_quantised_decode_runtime_kpart scatter"))
             return false;
 
-        grouped_native_vnni_down_kpart_routes_reduce_kernel<<<
+        grouped_native_quantised_down_kpart_routes_reduce_kernel<<<
             reduce_grid, block, 0, cuda_stream>>>(
             d_down_partials, d_weights, d_output,
             num_active, N, k_partitions);
 
-        return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart reduce");
+        return finishLaunch("cudaMoE_grouped_swiglu_down_native_quantised_decode_runtime_kpart reduce");
     }
 
     /**
@@ -24565,9 +24565,9 @@ extern "C"
         const float *d_hidden,
         const int8_t *d_prequantized_hidden,
         const float *d_prequantized_hidden_scales,
-        const DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const DeviceNativeVNNIMatrixDesc *d_up_desc_table,
-        const DeviceNativeVNNIMatrixDesc *d_down_desc_table,
+        const DeviceNativeQuantisedMatrixDesc *d_gate_desc_table,
+        const DeviceNativeQuantisedMatrixDesc *d_up_desc_table,
+        const DeviceNativeQuantisedMatrixDesc *d_down_desc_table,
         const int *d_group_counts,
         const int *d_group_offsets,
         uint32_t *d_group_work_directory,
@@ -24617,8 +24617,8 @@ extern "C"
     {
         // One LUT family producer handles both factor programs; each actual
         // descriptor remains untouched and selects its own source scale.
-        gateup_codebook_mask = llaminar2::cuda_native_vnni::native_vnni_iq4_launch_mask(gateup_codebook_mask);
-        down_codebook_mask = llaminar2::cuda_native_vnni::native_vnni_iq4_launch_mask(down_codebook_mask);
+        gateup_codebook_mask = llaminar2::cuda_native_quantised::native_quantised_iq4_launch_mask(gateup_codebook_mask);
+        down_codebook_mask = llaminar2::cuda_native_quantised::native_quantised_iq4_launch_mask(down_codebook_mask);
         const bool executes_gateup = execution.executesGateUp();
         const bool executes_down = execution.executesDown();
         const int down_columns = execution.columnCount();
@@ -24772,10 +24772,10 @@ extern "C"
                 }
 
                 const auto *gate_descriptors = reinterpret_cast<
-                    const llaminar2::DeviceNativeVNNIMatrixDesc *>(
+                    const llaminar2::DeviceNativeQuantisedMatrixDesc *>(
                         d_gate_desc_table);
                 const auto *up_descriptors = reinterpret_cast<
-                    const llaminar2::DeviceNativeVNNIMatrixDesc *>(
+                    const llaminar2::DeviceNativeQuantisedMatrixDesc *>(
                         d_up_desc_table);
                 if (!cudaMoEGroupedImma_projectGateUpSwiGlu(
                         gateup_input,
@@ -24822,7 +24822,7 @@ extern "C"
                         gateup_k_partitions);
 
     #define LAUNCH_GROUPED_GATEUP_ORDERED_KPART(CB)                                                   \
-        grouped_native_vnni_gate_up_ordered_kpart_scatter_kernel<CB>                                  \
+        grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel<CB>                                  \
             <<<scatter_grid, block, 0, cuda_stream>>>(                                                 \
                 gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,          \
                 d_original_to_grouped, d_original_expert_ids, d_gate_partials, d_up_partials,          \
@@ -24843,7 +24843,7 @@ extern "C"
 
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(0);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(4);
-                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(5);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(6);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(7);
@@ -24859,7 +24859,7 @@ extern "C"
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(17);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(19);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(
-                        llaminar2::kNativeVnniExpandedInt8MinCodebook);
+                        llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
                     if (!launched_gateup)
                     {
                         std::fprintf(
@@ -24873,7 +24873,7 @@ extern "C"
                     dim3 reduce_grid(
                         (intermediate + kReduceTileN - 1) / kReduceTileN,
                         tile_route_slots);
-                    grouped_native_vnni_gate_up_ordered_kpart_reduce_swiglu_kernel<<<
+                    grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel<<<
                         reduce_grid, reduce_block, 0, cuda_stream>>>(
                         d_gate_partials, d_up_partials, d_original_to_grouped,
                         d_scratch_swiglu_int8, d_scratch_swiglu_scales,
@@ -24906,13 +24906,13 @@ extern "C"
                 dim3 block(kTileN);
 
     #define LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, TM)                                                  \
-        grouped_native_vnni_gate_up_prefill_kernel<CB, TM, kTileN>                                    \
+        grouped_native_quantised_gate_up_prefill_kernel<CB, TM, kTileN>                                    \
             <<<grid, block, 0, cuda_stream>>>(                                                         \
                 gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,          \
                 d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,             \
                 d_scratch_gate, d_scratch_up, intermediate, d_model)
     #define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, TM)                                           \
-        grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, kTileN>                             \
+        grouped_native_quantised_gate_up_swiglu_prefill_kernel<CB, TM, kTileN>                             \
             <<<grid, block, 0, cuda_stream>>>(                                                         \
                 gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,          \
                 d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,             \
@@ -24945,7 +24945,7 @@ extern "C"
 
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(0);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(4);
-                LAUNCH_GROUPED_GATEUP_IF_PRESENT(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(5);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(6);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(7);
@@ -24961,7 +24961,7 @@ extern "C"
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(17);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(19);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(
-                    llaminar2::kNativeVnniExpandedInt8MinCodebook);
+                    llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
                 if (!launched_gateup)
                 {
                     std::fprintf(
@@ -25013,7 +25013,7 @@ extern "C"
         if (use_grouped_imma)
         {
             const auto *down_descriptors = reinterpret_cast<
-                const llaminar2::DeviceNativeVNNIMatrixDesc *>(
+                const llaminar2::DeviceNativeQuantisedMatrixDesc *>(
                     d_down_desc_table);
             if (!cudaMoEGroupedImma_project(
                     d_scratch_swiglu_int8,
@@ -25113,7 +25113,7 @@ extern "C"
                 {
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(0);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(4);
-                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(5);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(6);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(7);
@@ -25129,7 +25129,7 @@ extern "C"
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(17);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(19);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(
-                        llaminar2::kNativeVnniExpandedInt8MinCodebook);
+                        llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
                 }
                 if (!launched_down)
                 {
@@ -25184,12 +25184,12 @@ extern "C"
     do {                                                                                           \
         dim3 cb_grid(grid.x, grid.y, expert_grid);                                                  \
         if (kTileN == 64)                                                                            \
-            grouped_native_vnni_down_prefill_kernel<CB, TM, 64><<<cb_grid, block, 0, cuda_stream>>>( \
+            grouped_native_quantised_down_prefill_kernel<CB, TM, 64><<<cb_grid, block, 0, cuda_stream>>>( \
                 d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                  \
                 d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
                 d_scratch_down_out, down_columns, intermediate);                                         \
         else                                                                                         \
-            grouped_native_vnni_down_prefill_kernel<CB, TM, 128><<<cb_grid, block, 0, cuda_stream>>>( \
+            grouped_native_quantised_down_prefill_kernel<CB, TM, 128><<<cb_grid, block, 0, cuda_stream>>>( \
                 d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                  \
                 d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
                 d_scratch_down_out, down_columns, intermediate);                                         \
@@ -25215,7 +25215,7 @@ extern "C"
 
             LAUNCH_GROUPED_DOWN_IF_PRESENT(0);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(4);
-            LAUNCH_GROUPED_DOWN_IF_PRESENT(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+            LAUNCH_GROUPED_DOWN_IF_PRESENT(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(5);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(6);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(7);
@@ -25231,7 +25231,7 @@ extern "C"
             LAUNCH_GROUPED_DOWN_IF_PRESENT(17);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(19);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(
-                llaminar2::kNativeVnniExpandedInt8MinCodebook);
+                llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
             if (!launched_down)
             {
                 std::fprintf(stderr,

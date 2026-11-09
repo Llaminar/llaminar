@@ -95,7 +95,7 @@ struct CUDACanonicalKpartFoldResources
  * @return False for an unsupported specialization or runtime query failure.
  * @note Call on the owning current device before recording a graph.
  */
-extern "C" bool cudaNativeVNNIGemvTuned_fusedKpar_resources(
+extern "C" bool cudaNativeQuantisedGemvTuned_fusedKpar_resources(
     uint8_t codebook, const llaminar2::CUDACanonicalKpartFoldPlan &plan,
     llaminar2::CUDACanonicalKpartFoldResources &resources);
 
@@ -125,7 +125,7 @@ extern "C" bool cudaNativeVNNIGemvTuned_fusedKpar_resources(
  * @param plan Immutable physical geometry and canonical reduction identity.
  * @return Whether the exact launch was admitted and submitted successfully.
  */
-extern "C" bool cudaNativeVNNIGemvTuned_fusedKpar_fp32(
+extern "C" bool cudaNativeQuantisedGemvTuned_fusedKpar_fp32(
     const int8_t *activations, const uint8_t *payload, const uint16_t *scales,
     const uint16_t *secondary, const uint32_t *extended_minima, float *output,
     const float *activation_scales, int n, float alpha, float beta,

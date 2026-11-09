@@ -172,7 +172,7 @@ namespace llaminar2
 
         // Without GPU backend, pointers are nullptr (d_base_ is nullptr)
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
-        EXPECT_EQ(slot->d_native_vnni_payload, nullptr);
+        EXPECT_EQ(slot->d_native_quantised_payload, nullptr);
 #endif
     }
 
@@ -231,8 +231,8 @@ namespace llaminar2
 
         auto before = pool.getSlot("w1");
         ASSERT_TRUE(before.has_value());
-        ASSERT_NE(before->d_native_vnni_payload, nullptr);
-        auto *payload_before = before->d_native_vnni_payload;
+        ASSERT_NE(before->d_native_quantised_payload, nullptr);
+        auto *payload_before = before->d_native_quantised_payload;
 
         pool.releaseStaging();
 
@@ -246,7 +246,7 @@ namespace llaminar2
 
         auto after = pool.getSlot("w1");
         ASSERT_TRUE(after.has_value());
-        EXPECT_EQ(after->d_native_vnni_payload, payload_before);
+        EXPECT_EQ(after->d_native_quantised_payload, payload_before);
     }
 
     /**

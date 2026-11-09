@@ -11,7 +11,7 @@
 
 #include "execution/moe/ExpertWeightTransfer.h"
 #include "kernels/PackedWeightsSerialization.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "kernels/cpu/gemm/CPUPackedWeights.h"
 #include "utils/MPITags.h"
 
@@ -21,7 +21,7 @@
 #include <vector>
 
 using namespace llaminar2;
-using namespace llaminar2::cpu::native_vnni;
+using namespace llaminar2::cpu::native_quantised;
 using namespace llaminar2::packed_weights_serialization;
 using namespace llaminar2::mpi_tags;
 
@@ -44,14 +44,14 @@ void fillPattern(uint8_t* data, size_t size)
         data[i] = static_cast<uint8_t>((i * 7 + 13) & 0xFF);
 }
 
-/// Build a CPUNativeVNNIPackedWeights with given metadata and deterministic data.
-CPUNativeVNNIPackedWeights buildTestPacked(
+/// Build a CPUNativeQuantisedPackedWeights with given metadata and deterministic data.
+CPUNativeQuantisedPackedWeights buildTestPacked(
     int N, int K, uint8_t codebook_id, int blocks_per_row,
     int payload_bytes_val, bool is_nibble_lut, bool is_asymmetric,
     bool is_superblock, int data_stride, int interleaved_block_stride,
     size_t interleaved_sz, size_t payload_sz, size_t int8_flat_sz)
 {
-    CPUNativeVNNIPackedWeights packed;
+    CPUNativeQuantisedPackedWeights packed;
     packed.N                        = N;
     packed.K                        = K;
     packed.N_padded                 = ((N + 63) / 64) * 64;
@@ -59,8 +59,8 @@ CPUNativeVNNIPackedWeights buildTestPacked(
     packed.codebook_id              = codebook_id;
     packed.payload_bytes            = payload_bytes_val;
     packed.encoding = is_nibble_lut
-                          ? CPUNativeVNNIEncoding::NibbleLUT
-                          : CPUNativeVNNIEncoding::ExpandedInt8;
+                          ? CPUNativeQuantisedEncoding::NibbleLUT
+                          : CPUNativeQuantisedEncoding::ExpandedInt8;
     packed.is_asymmetric            = is_asymmetric;
     packed.is_superblock            = is_superblock;
     packed.data_stride              = data_stride;
@@ -343,7 +343,7 @@ TEST(Test__ExpertWeightTransfer, RoundTrip_SerializeTransferDeserialize)
     ASSERT_NE(down_result, nullptr);
 
     // Verify gate
-    EXPECT_EQ(gate_result->format(), PackedWeightsFormat::CPU_NATIVE_VNNI);
+    EXPECT_EQ(gate_result->format(), PackedWeightsFormat::CPU_NATIVE_QUANTISED);
     EXPECT_EQ(gate_result->N(), 128);
     EXPECT_EQ(gate_result->K(), 256);
 

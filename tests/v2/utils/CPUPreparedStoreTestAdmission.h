@@ -9,7 +9,7 @@
  */
 #pragma once
 #include "loaders/PreparedWeightStore.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
 #include "tensors/TensorSlice.h"
 #include <initializer_list>
@@ -22,7 +22,7 @@ namespace llaminar2::test
  * @brief Resolve one fixture's actual final packed allocation without packing.
  * @param tensor Source CPU matrix; native floating storage remains borrowed.
  * @param output_rows Exact output extent of a retained physical slice, absent for the full matrix.
- * @return Exact heap allocator extent of the retained NativeVNNI representation.
+ * @return Exact heap allocator extent of the retained NativeQuantised representation.
  */
 inline size_t cpuPreparedStoreTestBytes(const TensorBase &tensor, std::optional<size_t> output_rows = std::nullopt)
 {
@@ -39,7 +39,7 @@ inline size_t cpuPreparedStoreTestBytes(const TensorBase &tensor, std::optional<
     if (!format) return 0;
     if (packed_source->shape().size() != 2)
         throw std::invalid_argument("CPU prepared fixture requires a matrix with native packing metadata");
-    const auto footprint = cpu::native_vnni::preparedFootprintForFormat(*format, packed_source->activationRotation() != nullptr);
+    const auto footprint = cpu::native_quantised::preparedFootprintForFormat(*format, packed_source->activationRotation() != nullptr);
     const size_t rows = output_rows.value_or(packed_source->shape()[0]);
     if (rows == 0 || rows > packed_source->shape()[0])
         throw std::invalid_argument("CPU prepared fixture slice exceeds its actual source rows");

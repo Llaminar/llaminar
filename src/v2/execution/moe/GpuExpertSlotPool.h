@@ -16,7 +16,7 @@
 #include "ExpertWeightFormat.h"
 #include "../../backends/DeviceId.h"
 #include "../../loaders/gpu_pipeline/WeightVRAMPool.h"
-#include "../../tensors/NativeVnniFormatInfo.h"
+#include "../../tensors/NativeQuantisedFormatInfo.h"
 
 #include <cstddef>
 #include <cstdint>

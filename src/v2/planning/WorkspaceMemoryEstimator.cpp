@@ -45,7 +45,7 @@
 #include "kernels/rope/RoPEWorkspaceContract.h"
 #include "utils/VramBillOfMaterials.h"
 #include "collective/VocabularyGatherWorkspaceContract.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <algorithm>
 #include <array>
@@ -392,7 +392,7 @@ bool isRoutedExpertWeight(std::string_view name)
            name.ends_with(".ffn_down_exps.weight");
 }
 
-/** @brief Whether a tensor is prepared through the quantized NativeVNNI GEMM. */
+/** @brief Whether a tensor is prepared through the quantized NativeQuantised GEMM. */
 bool isQuantizedMatrixWeight(const TensorSizeInfo& tensor)
 {
     return tensor.K > 0u && tensor.elements >= tensor.K &&
@@ -1184,7 +1184,7 @@ size_t exactROCmQuantizedGemmWorkspaceBytes(
 /**
  * @brief Price CUDA quantized GEMM scratch from the live dispatch authority.
  *
- * Unlike ROCm's codebook-independent descriptor contract, CUDA NativeVNNI
+ * Unlike ROCm's codebook-independent descriptor contract, CUDA NativeQuantised
  * prefill workspace depends on the exact GPU launch policy and source
  * arithmetic codebook.  Production local admission is late enough to query
  * that policy.  Metadata-only callers deliberately keep using the documented
@@ -1229,11 +1229,11 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
         -> std::optional<cuda::quantized_gemm_workspace::NativeCodebooks>
     {
         const auto* format =
-            native_vnni_formats::forQuantType(tensor.quant_type);
+            native_quantised_formats::forQuantType(tensor.quant_type);
         if (!format)
         {
             throw std::runtime_error(
-                "CUDA workspace admission has no NativeVNNI codebook for " +
+                "CUDA workspace admission has no NativeQuantised codebook for " +
                 tensor.quant_type + " tensor " + tensor.name);
         }
         const std::uint8_t codebook =
@@ -1293,8 +1293,8 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
                 shape.output_columns,
                 shape.input_columns,
                 geometry.device_compute_units != 0
-                    ? cuda::NativeVNNIWorkspaceHardware::checked(geometry.device.ordinal, geometry.device_compute_units)
-                    : cuda::NativeVNNIWorkspaceHardware::withoutSMObservation(geometry.device.ordinal),
+                    ? cuda::NativeQuantisedWorkspaceHardware::checked(geometry.device.ordinal, geometry.device_compute_units)
+                    : cuda::NativeQuantisedWorkspaceHardware::withoutSMObservation(geometry.device.ordinal),
                 nativeCodebooks(tensor)));
     }
 
@@ -1310,8 +1310,8 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
                 shape.output_columns,
                 shape.input_columns,
                 geometry.device_compute_units != 0
-                    ? cuda::NativeVNNIWorkspaceHardware::checked(geometry.device.ordinal, geometry.device_compute_units)
-                    : cuda::NativeVNNIWorkspaceHardware::withoutSMObservation(geometry.device.ordinal),
+                    ? cuda::NativeQuantisedWorkspaceHardware::checked(geometry.device.ordinal, geometry.device_compute_units)
+                    : cuda::NativeQuantisedWorkspaceHardware::withoutSMObservation(geometry.device.ordinal),
                 nativeCodebooks(terminal)));
     }
 
@@ -1444,14 +1444,14 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
  * @brief Compose the exact ROCm GEMM ABI for both routed endpoint graph forms.
  *
  * A mapped GPU follower retains `MoEExpertComputeStage`: its gate projection
- * owns the ordinary NativeVNNI buffers and anchors the simultaneous gate/up
+ * owns the ordinary NativeQuantised buffers and anchors the simultaneous gate/up
  * side-stream arena.  A compact boundary follower retains
  * `MoELocalExpertStage`, which queries gate, up, and down projections
  * independently after flattening one row per route.  Production may retain
  * either endpoint form for the same admitted device, so this metadata-only
  * composition mirrors both stage declarations by stable workspace name.
  *
- * Every quantized GGUF codebook reaches the same prepared NativeVNNI ABI.
+ * Every quantized GGUF codebook reaches the same prepared NativeQuantised ABI.
  * Floating ROCm projections need only the three bounded device pointer arrays;
  * their scalar type does not change that graph-captured address contract.
  */
@@ -2098,7 +2098,7 @@ size_t WorkspaceMemoryEstimator::estimate(
     size_t padded_n = 8 * V * FP32;
 
     /*
-     * The grouped-prefill NativeVNNI path owns four row-scaled workspaces for
+     * The grouped-prefill NativeQuantised path owns four row-scaled workspaces for
      * the largest FFN projection: Q8 input (1 byte/value), one INT32
      * accumulator, three concurrent INT32 accumulator slots, and one FP32
      * temporary output. Together these are 21 bytes per output element.
@@ -2493,13 +2493,13 @@ size_t WorkspaceMemoryEstimator::estimatePreparedExpertService(
 #ifdef HAVE_CUDA
                 else
                 {
-                    const auto* format = native_vnni_formats::forQuantType(tensor.quant_type);
+                    const auto* format = native_quantised_formats::forQuantType(tensor.quant_type);
                     if (!format)
-                        throw std::invalid_argument("Prepared GPU service has no original NativeVNNI format");
+                        throw std::invalid_argument("Prepared GPU service has no original NativeQuantised format");
                     const auto hardware = geometry.device_compute_units != 0
-                        ? cuda::NativeVNNIWorkspaceHardware::checked(
+                        ? cuda::NativeQuantisedWorkspaceHardware::checked(
                               geometry.device.ordinal, geometry.device_compute_units)
-                        : cuda::NativeVNNIWorkspaceHardware::withoutSMObservation(geometry.device.ordinal);
+                        : cuda::NativeQuantisedWorkspaceHardware::withoutSMObservation(geometry.device.ordinal);
                     current.merge(cuda::quantized_gemm_workspace::projectionRequirements(
                         rows, shape.output_columns, shape.input_columns, hardware,
                         cuda::quantized_gemm_workspace::NativeCodebooks{

@@ -25,7 +25,7 @@
 #include "../../cpu/primitives/GPUAlignedExpertQ8Primitives.h"
 #include "../../cpu/primitives/SwiGLUPrimitives.h"
 #include "../../cpu/primitives/VectorPrimitives.h"
-#include "../gemm/CPUNativeVNNIGemv.h"
+#include "../gemm/CPUNativeQuantisedGemv.h"
 #include "../gemm/FloatingPointGemmKernel.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"

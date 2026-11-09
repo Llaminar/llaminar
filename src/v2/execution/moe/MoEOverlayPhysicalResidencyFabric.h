@@ -249,7 +249,7 @@ namespace llaminar2
      * are deliberately capacity-shaped for every catalogued execution format;
      * each arrival still receives its exact decoder and arithmetic-policy
      * identities.  CPU slots retain the exact model source identity and final
-     * NativeVNNI representation.
+     * NativeQuantised representation.
      *
      * Slot and engine ownership remain process-local. When a private remote
      * projection transport is supplied, the fabric composes those local slots

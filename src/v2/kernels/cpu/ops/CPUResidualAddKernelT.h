@@ -57,7 +57,7 @@ namespace llaminar2
          *
          * A non-serial call always uses the configured process-wide team.
          * Sub-maximal teams are deliberately forbidden in the inference path:
-         * libgomp may retire the omitted workers, forcing the next NativeVNNI
+         * libgomp may retire the omitted workers, forcing the next NativeQuantised
          * projection to recreate them at millisecond-scale cost.
          */
         inline int standaloneTeamSize(size_t num_elements)

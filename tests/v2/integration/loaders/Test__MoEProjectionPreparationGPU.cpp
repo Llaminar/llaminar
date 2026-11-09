@@ -83,7 +83,7 @@ std::vector<Format> formats()
         // prevents it from being silently certified as a model expert source.
         if (entry.tensor_type == TensorType::Q8_1) continue;
         result.push_back({entry.label, entry.tensor_type,
-            ExpertWeightFormat::nativeVnni({entry.source_codebook_id,
+            ExpertWeightFormat::nativeQuantised({entry.source_codebook_id,
                 entry.source_is_superblock, true}), entry.create});
     }
     result.push_back({"FP32", TensorType::FP32, ExpertWeightFormat::floating(TensorType::FP32),
@@ -213,9 +213,9 @@ void proveRuntimePublication(
         placement.experts.resize(experts);
         placement.local_compute_mask.resize(experts);
         placement.replica_role.assign(experts, static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
-        std::vector<DeviceNativeVNNIMatrixDesc> gates(experts), ups(experts);
+        std::vector<DeviceNativeQuantisedMatrixDesc> gates(experts), ups(experts);
         std::vector<DeviceMoEFloatingMatrixDesc> fp_gates(experts), fp_ups(experts);
-        DeviceMoEWeightFormat family = DeviceMoEWeightFormat::NativeVNNI;
+        DeviceMoEWeightFormat family = DeviceMoEWeightFormat::NativeQuantised;
         for (int expert = 0; expert < experts; ++expert)
         {
             const auto *owner = owners.ownerFor(0, expert);
@@ -574,16 +574,16 @@ void prove(DeviceId first)
                             static_cast<size_t>(whole.source_columns)},
                             static_cast<size_t>(request.expert_id) * whole.rows * whole.source_columns);
                         auto oracle = makeGpuPreparedGemm(full_matrix.get(), device);
-                        DeviceNativeVNNIMatrixDesc actual, expected;
-                        ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(actual));
-                        ASSERT_TRUE(oracle.kernel->exportNativeVNNIMatrixDesc(expected));
+                        DeviceNativeQuantisedMatrixDesc actual, expected;
+                        ASSERT_TRUE(kernel->exportNativeQuantisedMatrixDesc(actual));
+                        ASSERT_TRUE(oracle.kernel->exportNativeQuantisedMatrixDesc(expected));
                         EXPECT_EQ(actual.n, shape.rows);
                         EXPECT_EQ(actual.k, shape.source_columns);
                         EXPECT_EQ(actual.codebook_id, expected.codebook_id);
-                        EXPECT_EQ(actual.source_codebook_id, format.identity.native_vnni.codebook_id);
-                        EXPECT_EQ(actual.source_is_superblock, format.identity.native_vnni.is_superblock);
+                        EXPECT_EQ(actual.source_codebook_id, format.identity.native_quantised.codebook_id);
+                        EXPECT_EQ(actual.source_is_superblock, format.identity.native_quantised.is_superblock);
                         EXPECT_TRUE(actual.source_identity_present);
-                        const auto *metadata = native_vnni_formats::forQuantType(format.name);
+                        const auto *metadata = native_quantised_formats::forQuantType(format.name);
                         ASSERT_NE(metadata, nullptr);
                         expectPlane(device, stream.get(), actual.payload, expected.payload, metadata->payload_bytes, shape);
                         expectPlane(device, stream.get(), actual.scales, expected.scales, sizeof(uint16_t), shape);
@@ -867,20 +867,20 @@ void proveStaticPreparation(DeviceId first)
                     }
                     else
                     {
-                        DeviceNativeVNNIMatrixDesc descriptor;
-                        ASSERT_TRUE(engine->exportNativeVNNIMatrixDesc(descriptor));
+                        DeviceNativeQuantisedMatrixDesc descriptor;
+                        ASSERT_TRUE(engine->exportNativeQuantisedMatrixDesc(descriptor));
                         EXPECT_EQ(descriptor.n, shape.rows);
                         EXPECT_EQ(descriptor.k, shape.columns);
                         EXPECT_TRUE(descriptor.source_identity_present);
-                        EXPECT_EQ(descriptor.source_codebook_id, format.identity.native_vnni.codebook_id);
-                        EXPECT_EQ(descriptor.source_is_superblock, format.identity.native_vnni.is_superblock);
-                        DeviceNativeVNNIMatrixDesc oracle;
-                        ASSERT_TRUE(oracles[role].kernel->exportNativeVNNIMatrixDesc(oracle));
+                        EXPECT_EQ(descriptor.source_codebook_id, format.identity.native_quantised.codebook_id);
+                        EXPECT_EQ(descriptor.source_is_superblock, format.identity.native_quantised.is_superblock);
+                        DeviceNativeQuantisedMatrixDesc oracle;
+                        ASSERT_TRUE(oracles[role].kernel->exportNativeQuantisedMatrixDesc(oracle));
                         auto expected = shape;
                         expected.source_rows = geometry.experts * shape.rows;
                         expected.source_columns = shape.columns;
                         expected.first_row = binding.identity.expert * shape.rows;
-                        const auto *metadata = native_vnni_formats::forQuantType(format.name);
+                        const auto *metadata = native_quantised_formats::forQuantType(format.name);
                         ASSERT_NE(metadata, nullptr);
                         expectPlane(device, observation_stream.get(), descriptor.payload, oracle.payload,
                             metadata->payload_bytes, expected);

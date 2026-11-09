@@ -1,13 +1,14 @@
 # QFN tuning dashboard
 
-Updated 2026-11-08. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-11-09. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Last clean local Release 512/256 result: **197.140 P /30.199 D**.
+Release 512/256: **267.049 P /38.476 D with passive counters**.
+Versus217.619/39.048: **+22.71% P /−1.46% D**; output/MTP match.
 Skipping unused short-prefill indexer kernels gains **7.09%** over
 an identical-owner control (**183.283/30.179**); decode is unchanged. Each GPU
 executes **36 fewer kernels/chunk**. All 768 output IDs and MTP work match.
@@ -15,26 +16,27 @@ Paired retained graphs cost eight GPU expert slots: **8066 total, 4033/card**.
 Context stays 262144 with dynamic MTP/balancing, RAM ngrams, local GPU caches
 and 16/32 GiB RAM/disk prefix budgets.
 
-Broad Integration: **1254 affected Unit cases and eight native CUDA/ROCm
-registrations pass**; focused host aliases pass. Exact-feature new checks pass;
-its CPU-only companion cannot qualify 27 compiled-GPU geometry cases. **Full
-preflight, exact checkpoint GPU/model and OpenCode remain open**. The original
-owner0 remains selected: moving it to the other NUMA cohort did not help.
-Ready-data MPI gather beats retained SharedSpin by 1.42–1.48× at 1–16 MiB;
-CMA adds 1.3–1.4× on large gathers. Model qualification exposed IO/PFN-backed
-GPU migration pages rejected by CMA. Typed registered backing fixes that:
-**17 native/transfer and 21 exact-feature checks pass**. Clean model output/MTP
-matches; zero read errors. Rates are -0.19%/-1.75% versus explicit-none:
-approximately flat, with changed migration routes. Earlier CMA timings had errors.
-Next: checkpoint this fix, then interleave independent CPU integer dots.
+**MPI/CMA fix is pushed in `2eda003d6`.** Typed registered migration backing
+passes 17 native/transfer and 21 exact-feature checks; clean model output/MTP
+matches with zero read errors. Throughput is approximately flat versus the
+explicit-none control. Full preflight, exact-feature GPU/model and OpenCode
+qualification remain open; previous broad-tree passes are not that certificate.
+
+**Current CPU tuning:** modern sweeps retain105 geometries,315 completed M1
+jobs,11 grouped cells and two QFN expert cells without recollection. M1 is
+installed; the staged expert point table covers<1% of observed prefill members.
+Same-panel scheduling gives **1.62× complete CPU FFN**; parallel shared gather
+gives **~3× at16MiB**. Twelve focused registrations and matched model runs
+pass. Gather falls440→105ms/request in the diagnostic. Native bytes are preserved.
+Sparse prefill transport remains unpromoted (213.959 P,−1.45%).
+[Exact-overlay scope and measurements](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md).
 [Launch omission, matched controls and timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md).
 [Root phase timing](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md).
 [Admission correction](../2026-11/QFN_SELECTED_ATTENTION_WORKSPACE_ADMISSION_20261108.md).
-[CPU assembly and measurements](../2026-11/QFN_CPU_NATIVEVNNI_SPILL_AUDIT_20261108.md).
+[CPU assembly and measurements](../2026-11/QFN_CPU_NATIVEQUANTISED_SPILL_AUDIT_20261108.md).
 
-**Earlier checkpoint `2cf99995d`:** finite-trajectory MTP comparison and full OpenCode
-session complete on accepted ROCm TP4. [Contract and live MTP table](QFN_MTP_TP4_TUNING.md).
-The A1 rates below are historical **MTP-off** results.
+Earlier ROCm TP4 Dynamic/OpenCode checkpoint: `2cf99995d`.
+[Contract and MTP table](QFN_MTP_TP4_TUNING.md). A1 controls below use MTP off.
 
 **QFN ROCm TP4: accepted Dynamic; fresh finite-trajectory timing complete.**
 512/256 repetition: Dynamic **101.367 D**, Off **43.512**, fresh Castagna fixed6
@@ -43,10 +45,8 @@ same 255-token decode denominator. Native ignores stop termination; the fork
 permits EOS. This qualifies the observed finite trajectory, not identical EOS
 semantics or general performance superiority. Speed 6/10 remains diagnostic.
 
-The checkpoint's Unit/preflight, HTTP and ten-phase OpenCode evidence is
-retained in the host note: 110 tools, zero errors, 95.1% prefix-token reuse,
-clean retirement and owned-cache cleanup. It does not certify later changes
-or the 29 hardware cases skipped at that checkpoint.
+That checkpoint records 110 tools, zero errors, 95.1% prefix-token reuse and
+clean retirement. It does not certify later changes or its29 unavailable cases.
 [Host diagnosis and receipts](QFN_HOST_REGISTRATION_INVALIDATION_20261028.md);
 [controller plan](QFN_MTP_TARGET_CONFIRMATION_20261028.md).
 

@@ -50,7 +50,7 @@ namespace llaminar2
      * @brief One exact manifest-equivalence class used by economy calibration.
      *
      * Layers may share movement evidence only when all three projection roles,
-     * shapes, and original NativeVNNI source identities are byte-for-byte
+     * shapes, and original NativeQuantised source identities are byte-for-byte
      * equivalent.  The numerically smallest member is the physical calibration
      * representative; `member_layers` is sorted and includes it.
      */

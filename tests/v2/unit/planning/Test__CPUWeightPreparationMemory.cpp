@@ -7,8 +7,8 @@
  * weights, invoking kernels, or acquiring devices.
  */
 #include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
-#include "tensors/NativeVnniFormatInfo.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "tensors/AlignedVector.h"
 #include <gtest/gtest.h>
 #include <limits>
@@ -30,7 +30,7 @@ TEST(CPUWeightPreparationMemory, FloatingNativeBytesNeedNoPackingShadow)
 
 TEST(CPUWeightPreparationMemory, EveryNativeCodebookHasPaddedAllocationGeometry)
 {
-    for (const auto &format : native_vnni_formats::kAllSourceFormats)
+    for (const auto &format : native_quantised_formats::kAllSourceFormats)
     {
         SCOPED_TRACE(format.quant_type);
         const auto full = CPUWeightPreparationMemory::sourceNative(format.quant_type, 64, 256);
@@ -48,11 +48,11 @@ TEST(CPUWeightPreparationMemory, NibbleSetupPayloadsRetireBeforePublication)
     const auto q4 = CPUWeightPreparationMemory::sourceNative("Q4_0", 64, 32);
     EXPECT_EQ(q4.persistent_bytes,1280u);
     EXPECT_EQ(q4.persistent_payload_bytes,1280u);
-    EXPECT_EQ(q4.temporary_bytes,64u*cpu::native_vnni::NativePackGroupScratch::checked(*native_vnni_formats::forQuantType("Q4_0")).bytes);
+    EXPECT_EQ(q4.temporary_bytes,64u*cpu::native_quantised::NativePackGroupScratch::checked(*native_quantised_formats::forQuantType("Q4_0")).bytes);
     const auto q6 = CPUWeightPreparationMemory::sourceNative("Q6_K", 64, 256);
     EXPECT_EQ(q6.persistent_payload_bytes,8u*1792u);
     EXPECT_EQ(q6.persistent_bytes,AlignedVector<uint8_t>::requiredAllocationBytes(8u*1792u));
-    EXPECT_EQ(q6.temporary_bytes,64u*cpu::native_vnni::NativePackGroupScratch::checked(*native_vnni_formats::forQuantType("Q6_K")).bytes);
+    EXPECT_EQ(q6.temporary_bytes,64u*cpu::native_quantised::NativePackGroupScratch::checked(*native_quantised_formats::forQuantType("Q6_K")).bytes);
     EXPECT_GT(CPUWeightPreparationMemory::sourceNative("IQ2_S", 64, 256).temporary_bytes,0u);
 }
 
@@ -113,8 +113,8 @@ TEST(CPUWeightPreparationMemory, ImmediateNativePackingChargesBoundedOriginalScr
         const uint16_t scale=0x3c00;std::memcpy(raw.data()+offset,&scale,sizeof(scale));
     }
     StagingObservedQ4 source(source_rows,k,std::move(raw),memory,allocator);
-    cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
-    ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(&source,packed,7,72,nullptr,
+    cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
+    ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(&source,packed,7,72,nullptr,
         CPUWeightStoragePlacement::accounted(memory,allocator,PhysicalMemoryOwner::PrimaryModelWeights,
             CPUWeightStoragePlacement::local())));
     EXPECT_EQ(source.observed_bytes.load(),bytes.temporary_bytes);
@@ -122,8 +122,8 @@ TEST(CPUWeightPreparationMemory, ImmediateNativePackingChargesBoundedOriginalScr
         PhysicalMemoryMaterializationKind::NewAllocation),0u);
     EXPECT_EQ(memory->claimedBytes(allocator,PhysicalMemoryOwner::PrimaryModelWeights,
         PhysicalMemoryMaterializationKind::NewAllocation),bytes.persistent_bytes);
-    cpu::native_vnni::CPUNativeVNNIPackedWeights oracle;
-    ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(&source,oracle,7,72));
+    cpu::native_quantised::CPUNativeQuantisedPackedWeights oracle;
+    ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(&source,oracle,7,72));
     ASSERT_EQ(packed.native_interleaved.size(),oracle.native_interleaved.size());
     EXPECT_EQ(std::memcmp(packed.native_interleaved.data(),oracle.native_interleaved.data(),
         packed.native_interleaved.size()),0);

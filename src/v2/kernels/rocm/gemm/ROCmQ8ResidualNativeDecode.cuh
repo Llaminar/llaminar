@@ -7,13 +7,13 @@
  * the included decoder and contribution body is the same production authority.
  */
 #pragma once
-#include "kernels/common/DeviceNativeVNNIContributionContract.h"
+#include "kernels/common/DeviceNativeQuantisedContributionContract.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
-#include "kernels/common/NativeVNNIPackedBits.h"
-#include "tensors/NativeVnniIQ2SScale.h"
-#include "tensors/NativeVnniIQ3SScale.h"
-#include "tensors/NativeVnniIQ4XSScale.h"
-#include "tensors/NativeVnniQ6Scale.h"
+#include "kernels/common/NativeQuantisedPackedBits.h"
+#include "tensors/NativeQuantisedIQ2SScale.h"
+#include "tensors/NativeQuantisedIQ3SScale.h"
+#include "tensors/NativeQuantisedIQ4XSScale.h"
+#include "tensors/NativeQuantisedQ6Scale.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 namespace llaminar2::rocm_q8_residual
@@ -42,6 +42,6 @@ namespace llaminar2::rocm_q8_residual
             const auto select = (s & 7u) | ((s & 0x70u) << 4) | ((s & 0x700u) << 8) | ((s & 0x7000u) << 12);
             return __builtin_amdgcn_perm(b, a, select);
         }
-#include "kernels/common/DeviceNativeVNNIDecodeBody.cuh"
+#include "kernels/common/DeviceNativeQuantisedDecodeBody.cuh"
     };
 } // namespace llaminar2::rocm_q8_residual

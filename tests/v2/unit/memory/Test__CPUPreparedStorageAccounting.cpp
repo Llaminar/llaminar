@@ -109,7 +109,7 @@ TEST(CPUPreparedStorageAccounting, ReplaySharingCopyAndMoveRetainOneClaimPerAllo
 }
 
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 TEST(CPUPreparedStorageAccounting, PackedKernelDetachAttachReleaseReplay)
 {
     auto memory = admitted(65536,0,CPUWeightPreparationMemory::sourceNative("Q8_0",64,32).temporary_bytes);
@@ -125,7 +125,7 @@ TEST(CPUPreparedStorageAccounting, PackedKernelDetachAttachReleaseReplay)
     Q8_0Tensor tensor({64, 32}, raw);
     for (int replay = 0; replay < 3; ++replay)
     {
-        cpu::native_vnni::CPUNativeVNNIGemmKernel kernel(&tensor, 0, -1,
+        cpu::native_quantised::CPUNativeQuantisedGemmKernel kernel(&tensor, 0, -1,
             CPUProjectionNumericalPolicy::BackendNative, placement);
         ASSERT_TRUE(kernel.isValid());
         const auto bytes = kernel.packedWeights().native_interleaved.allocationBytes();
@@ -158,7 +158,7 @@ TEST(CPUPreparedStorageAccounting, CanonicalQuantizedFormatsPublishExactPhysical
         auto tensor = format.create({65u, 256u}, seed++);
         ASSERT_NE(tensor, nullptr);
         {
-            cpu::native_vnni::CPUNativeVNNIGemmKernel kernel(tensor.get(), 0, -1,
+            cpu::native_quantised::CPUNativeQuantisedGemmKernel kernel(tensor.get(), 0, -1,
                 CPUProjectionNumericalPolicy::BackendNative, placement);
             ASSERT_TRUE(kernel.isValid());
             const auto &storage = kernel.packedWeights();
@@ -184,14 +184,14 @@ TEST(CPUPreparedStorageAccounting, CanonicalQuantizedFormatsPublishExactPhysical
 TEST(CPUPreparedStorageAccounting, FullyOccupiedOwnerRejectsImplicitPackedClone)
 {
     auto tensor = test::quantizedVerifierFormats().front().create({64u, 256u}, 7450);
-    cpu::native_vnni::CPUNativeVNNIGemmKernel reference(tensor.get());
+    cpu::native_quantised::CPUNativeQuantisedGemmKernel reference(tensor.get());
     ASSERT_TRUE(reference.isValid());
     const auto bytes = reference.packedWeights().native_interleaved.allocationBytes();
     reference.releaseWeights();
     auto memory = admitted(bytes,0,CPUWeightPreparationMemory::sourceNative(tensorTypeName(tensor->native_type()),64,256).temporary_bytes);
     const auto placement = CPUWeightStoragePlacement::accounted(memory, DeviceId::cpu(),
         PhysicalMemoryOwner::PrimaryModelWeights, CPUWeightStoragePlacement::local());
-    cpu::native_vnni::CPUNativeVNNIGemmKernel kernel(tensor.get(), 0, -1,
+    cpu::native_quantised::CPUNativeQuantisedGemmKernel kernel(tensor.get(), 0, -1,
         CPUProjectionNumericalPolicy::BackendNative, placement);
     ASSERT_TRUE(kernel.isValid());
     ASSERT_EQ(live(memory), bytes);
@@ -209,7 +209,7 @@ TEST(CPUPreparedStorageAccounting, FullyOccupiedOwnerRejectsImplicitPackedClone)
 TEST(CPUPreparedStorageAccounting, FullPersistentOwnerClonesThroughAdmittedStaging)
 {
     auto tensor = test::quantizedVerifierFormats().front().create({64u, 256u}, 7600);
-    cpu::native_vnni::CPUNativeVNNIGemmKernel reference(tensor.get());
+    cpu::native_quantised::CPUNativeQuantisedGemmKernel reference(tensor.get());
     ASSERT_TRUE(reference.isValid());
     const auto bytes = reference.packedWeights().native_interleaved.allocationBytes();
     reference.releaseWeights();
@@ -220,7 +220,7 @@ TEST(CPUPreparedStorageAccounting, FullPersistentOwnerClonesThroughAdmittedStagi
         PhysicalMemoryOwner::ExpertMigrationStaging, CPUWeightStoragePlacement::local());
     for (int replay = 0; replay < 3; ++replay)
     {
-        cpu::native_vnni::CPUNativeVNNIGemmKernel kernel(tensor.get(), 0, -1,
+        cpu::native_quantised::CPUNativeQuantisedGemmKernel kernel(tensor.get(), 0, -1,
             CPUProjectionNumericalPolicy::BackendNative, persistent);
         ASSERT_TRUE(kernel.isValid());
         ASSERT_EQ(live(memory), bytes);
@@ -309,8 +309,8 @@ TEST(CPUPreparedStorageAccounting, StoreSlicePreservesExplicitOwnerAndReusesAllo
     for (const auto owner : {PhysicalMemoryOwner::PrimaryModelWeights, PhysicalMemoryOwner::AdditionalModelWeights})
     {
         auto tensor = test::quantizedVerifierFormats().front().create({128u, 256u}, 7800);
-        cpu::native_vnni::CPUNativeVNNIGemmKernel sourceReference(tensor.get());
-        cpu::native_vnni::CPUNativeVNNIGemmKernel sliceReference(tensor.get(), 0, 64);
+        cpu::native_quantised::CPUNativeQuantisedGemmKernel sourceReference(tensor.get());
+        cpu::native_quantised::CPUNativeQuantisedGemmKernel sliceReference(tensor.get(), 0, 64);
         const size_t full = sourceReference.packedWeights().native_interleaved.allocationBytes();
         const size_t slice = sliceReference.packedWeights().native_interleaved.allocationBytes();
         sourceReference.releaseWeights(); sliceReference.releaseWeights();

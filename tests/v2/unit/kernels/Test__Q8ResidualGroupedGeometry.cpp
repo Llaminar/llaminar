@@ -8,7 +8,7 @@
 #include <gtest/gtest.h>
 #include "kernels/common/Q8ResidualGroupedGeometry.h"
 #include "kernels/common/Q8ResidualShortKGeometry.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <array>
 #include <climits>
 #include <cstdint>
@@ -71,7 +71,7 @@ TEST(Q8ResidualGroupedGeometry, InvalidInputsAndWideCapacity) {
 TEST(Q8ResidualGroupedGeometry, OriginalFormatOwnsCooperativeTileAndGrid)
 {
     for(const auto backend:{Q8ResidualGroupedBackend::CUDA,Q8ResidualGroupedBackend::ROCm})
-    for(const auto &source:native_vnni_formats::kAllSourceFormats)
+    for(const auto &source:native_quantised_formats::kAllSourceFormats)
     for(const int rows:{1,31,32,33,63,64,65,511,512,513,1023,1024,1025,2047,2048,2049})
     for(const int columns:{1,31,32,33,63,64,65,127,128,129})
     {
@@ -79,7 +79,7 @@ TEST(Q8ResidualGroupedGeometry, OriginalFormatOwnsCooperativeTileAndGrid)
         SCOPED_TRACE(::testing::Message()<<source.quant_type<<" rows="<<rows<<" columns="<<columns);
         const auto geometry=q8ResidualGroupedGeometry(backend,rows,columns,codebook);
         const bool narrow=backend==Q8ResidualGroupedBackend::CUDA &&
-            codebook==native_vnni_formats::IQ1_M.codebook_id;
+            codebook==native_quantised_formats::IQ1_M.codebook_id;
         // These are the independently expected launch-family crossover rules,
         // not a second call to the production cooperative-column helper.
         const int matrixRows=backend==Q8ResidualGroupedBackend::CUDA ? 64 : 32;
@@ -102,15 +102,15 @@ TEST(Q8ResidualGroupedGeometry, OriginalFormatOwnsCooperativeTileAndGrid)
     // Below N32 or M64 IQ1_M stays row-vector; crossing either threshold
     // independently must not drop a partial row or a second output tile.
     EXPECT_EQ(q8ResidualGroupedGeometry(Q8ResidualGroupedBackend::CUDA,64,31,
-        native_vnni_formats::IQ1_M.codebook_id).blocks,16u);
+        native_quantised_formats::IQ1_M.codebook_id).blocks,16u);
     EXPECT_EQ(q8ResidualGroupedGeometry(Q8ResidualGroupedBackend::CUDA,63,32,
-        native_vnni_formats::IQ1_M.codebook_id).blocks,16u);
+        native_quantised_formats::IQ1_M.codebook_id).blocks,16u);
     EXPECT_EQ(q8ResidualGroupedGeometry(Q8ResidualGroupedBackend::CUDA,64,32,
-        native_vnni_formats::IQ1_M.codebook_id).blocks,1u);
+        native_quantised_formats::IQ1_M.codebook_id).blocks,1u);
     EXPECT_EQ(q8ResidualGroupedGeometry(Q8ResidualGroupedBackend::CUDA,65,33,
-        native_vnni_formats::IQ1_M.codebook_id).blocks,4u);
+        native_quantised_formats::IQ1_M.codebook_id).blocks,4u);
     EXPECT_EQ(q8ResidualGroupedGeometry(Q8ResidualGroupedBackend::CUDA,64,65,
-        native_vnni_formats::IQ1_M.codebook_id).blocks,3u);
+        native_quantised_formats::IQ1_M.codebook_id).blocks,3u);
 }
 
 /** @brief Every bounded K specialization owns complete/tail output coverage and finite CTA/LDS extents. */
@@ -136,7 +136,7 @@ TEST(Q8ResidualShortKGeometry, UnsupportedGeometryRemainsExplicitlyInapplicable)
   for(int m:{2,3,4,64,65,512,2048}) EXPECT_FALSE(q8ResidualShortKGeometry(backend,m,10240,320,19));
   for(int k:{32,544,1024,8192}) EXPECT_FALSE(q8ResidualShortKGeometry(backend,1,10240,k,19));
   for(int n:{1,31,32,33,63,64,65}) EXPECT_FALSE(q8ResidualShortKGeometry(backend,1,n,320,19));
-  for(const auto &format:native_vnni_formats::kAllSourceFormats) {
+  for(const auto &format:native_quantised_formats::kAllSourceFormats) {
    if(format.metadata->codebook_id!=19)
     EXPECT_FALSE(q8ResidualShortKGeometry(backend,1,10240,320,format.metadata->codebook_id));
   }

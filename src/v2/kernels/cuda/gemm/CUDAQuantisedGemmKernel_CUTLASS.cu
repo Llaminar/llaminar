@@ -2,14 +2,14 @@
  * @file CUDAQuantisedGemmKernel_CUTLASS.cu
  * @brief CUDA utility kernels and setup-time transfers for CUDAQuantisedGemmKernel
  *
- * After the NativeVNNI-only transition, this file retains:
+ * After the NativeQuantised-only transition, this file retains:
  * - Blockwise activation quantization (FP32→INT8 per-block-of-32)
  * - Setup-time packed-weight upload through the canonical CUDA backend
  * - Device copy utilities
  * - Checked record/wait publication on exact context-owned stream/event handles
  *
  * The CUTLASS INT8 GEMM, row-wise quantization, output scaling, and
- * blockwise dp4a GEMM kernels have been removed — NativeVNNI is now
+ * blockwise dp4a GEMM kernels have been removed — NativeQuantised is now
  * the sole CUDA GEMM execution path.
  * Activation scales remain row-major. Optional INT32 block sums are stored
  * block-major so a tensor-core consumer reads adjacent rows coalescently;
@@ -173,7 +173,7 @@ namespace
                 row_scales[b] = scale;
 
             // Quantize, coalesced write, and optionally record the quantized
-            // block sum. Asymmetric NativeVNNI prefill uses this sum for the
+            // block sum. Asymmetric NativeQuantised prefill uses this sum for the
             // min correction instead of recomputing it for every output tile.
             float qval = val * inv_scale;
             const int32_t q = static_cast<int32_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
@@ -195,7 +195,7 @@ namespace
     }
 
     // NOTE: blockwise_gemm_dp4a_kernel, quantize_activations_kernel, and
-    // apply_scaling_kernel have been removed — NativeVNNI-only mode.
+    // apply_scaling_kernel have been removed — NativeQuantised-only mode.
 
 } // anonymous namespace
 
@@ -224,7 +224,7 @@ static void validateCUDAActivationProducer(int m,int k,void* stream,const llamin
 extern "C"
 {
 
-    // NOTE: cudaQuantGemm_uploadWeights removed — NativeVNNI-only mode,
+    // NOTE: cudaQuantGemm_uploadWeights removed — NativeQuantised-only mode,
     // no Int8Expanded weight upload needed.
 
     /**
@@ -232,8 +232,8 @@ extern "C"
      */
     // NOTE: cudaQuantGemm_execute, cudaQuantGemm_applyScaling,
     // cudaQuantGemm_quantizeActivations (row-wise), and cudaQuantGemm_blockwiseGemm
-    // have been removed — NativeVNNI is now the sole CUDA GEMM execution path.
-    // Only cudaQuantGemm_quantizeActivationsBlockwise is retained (used by NativeVNNI).
+    // have been removed — NativeQuantised is now the sole CUDA GEMM execution path.
+    // Only cudaQuantGemm_quantizeActivationsBlockwise is retained (used by NativeQuantised).
 
     /**
      * @brief Quantize FP32 activations to INT8 with per-block-of-32 scales
@@ -408,7 +408,7 @@ extern "C"
         return cudaQuantGemm_quantizeActivationsBlockwiseWithSums_rows(d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K, cuda_device_id, stream, nullptr);
     }
 
-    // NOTE: cudaQuantGemm_blockwiseGemm removed — NativeVNNI-only mode.
+    // NOTE: cudaQuantGemm_blockwiseGemm removed — NativeQuantised-only mode.
 
     /**
      * @brief Release setup-owned packed-weight storage through the CUDA backend.
@@ -569,6 +569,6 @@ extern "C"
     }
 
     // NOTE: repack_weights_tc_blocked_kernel and cudaQuantGemm_prepareTensorCoreBlockedWeights
-    // removed — TC-blocked weight format is no longer used (NativeVNNI-only mode).
+    // removed — TC-blocked weight format is no longer used (NativeQuantised-only mode).
 
 } // extern "C"

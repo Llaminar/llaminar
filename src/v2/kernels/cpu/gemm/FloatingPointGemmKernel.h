@@ -7,7 +7,7 @@
  * - FP16 weights × FP16 activations → FP32 output
  * - BF16 weights × BF16 activations → FP32 output
  *
- * Quantized weights use CPUNativeVNNIGemmKernel's canonical packed layout.
+ * Quantized weights use CPUNativeQuantisedGemmKernel's canonical packed layout.
  * Explicit FP16RNE engines consume half-rounded A and prepared half B through
  * SIMD register conversions and a fixed256-lane FP32 tree for every runtime M.
  * They allocate no activation mirror and retain immutable policy in service views.
@@ -4143,7 +4143,7 @@ namespace llaminar2
              * The timers sit around grouped verifier projection families rather
              * than inside every dot product.  They are enabled only when the
              * structured perf collector is active, and they preserve enough shape
-             * tags to compare FP32 GDN projection cost with NativeVNNI cost.
+             * tags to compare FP32 GDN projection cost with NativeQuantised cost.
              */
             static void recordVerifierTiming(
                 const char *name,

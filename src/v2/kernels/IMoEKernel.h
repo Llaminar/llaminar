@@ -766,7 +766,7 @@ namespace llaminar2
          * @brief Grouped decode path for routed expert down projections.
          *
          * Implementations may consume per-active-expert gate/up scratch tensors,
-         * native-VNNI down-weight descriptors, and routing weights to produce the
+         * native-quantised down-weight descriptors, and routing weights to produce the
          * final weighted MoE output in routing order. The default returns false so
          * compute stages can fall back to the established per-expert path.
          */
@@ -775,7 +775,7 @@ namespace llaminar2
             ITensor *const *up_tensors,
             const int *expert_ids,
             const float *expert_weights,
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_active,
             ITensor *output,
             int d_model,
@@ -811,7 +811,7 @@ namespace llaminar2
          * @return Persistent backend table id, or -1 on contract failure.
          */
         virtual int uploadGroupedExpertDownDescriptorTable(
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_experts,
             int d_model,
             int intermediate,
@@ -844,8 +844,8 @@ namespace llaminar2
          * @return Persistent backend table id, or -1 on contract failure.
          */
         virtual int uploadGroupedExpertGateUpDescriptorTables(
-            const DeviceNativeVNNIMatrixDesc *gate_descs,
-            const DeviceNativeVNNIMatrixDesc *up_descs,
+            const DeviceNativeQuantisedMatrixDesc *gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *up_descs,
             int num_experts,
             int d_model,
             int intermediate,
@@ -867,7 +867,7 @@ namespace llaminar2
          * Blank entries represent experts not resident on this participant.
          * Every non-blank entry uses @p weight_format and exact row-major
          * geometry. The returned id occupies the same typed table namespace as
-         * NativeVNNI tables so captured callers cannot accidentally combine
+         * NativeQuantised tables so captured callers cannot accidentally combine
          * descriptor families.
          */
         virtual int uploadGroupedExpertFloatingDownDescriptorTable(
@@ -918,7 +918,7 @@ namespace llaminar2
          */
         virtual bool updateGroupedExpertDownDescriptorTable(
             int descriptor_table_id,
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_experts,
             int d_model,
             int intermediate)
@@ -940,8 +940,8 @@ namespace llaminar2
          */
         virtual bool updateGroupedExpertGateUpDescriptorTables(
             int descriptor_table_id,
-            const DeviceNativeVNNIMatrixDesc *gate_descs,
-            const DeviceNativeVNNIMatrixDesc *up_descs,
+            const DeviceNativeQuantisedMatrixDesc *gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *up_descs,
             int num_experts,
             int d_model,
             int intermediate)

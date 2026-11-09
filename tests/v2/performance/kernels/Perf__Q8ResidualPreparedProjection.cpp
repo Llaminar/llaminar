@@ -51,7 +51,7 @@
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #endif
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "transfer/TransferEngine.h"
@@ -204,9 +204,9 @@ std::shared_ptr<ITensorGemm> prepare(TensorBase &source,
     require(cuda::packWeightsToCUDA(&source, packed),
             "Production CUDA native pack failed");
     if (source.native_type() == TensorType::Q8_0)
-      authenticate(raw, packed.native_vnni, packed.native_scales, n, k);
+      authenticate(raw, packed.native_quantised, packed.native_scales, n, k);
     return std::make_shared<cuda::CUDAQuantisedGemmKernel>(
-        n, k, s.device.ordinal, s.input(packed.native_vnni),
+        n, k, s.device.ordinal, s.input(packed.native_quantised),
         s.input(packed.native_scales),
         packed.native_mins.empty() ? nullptr : s.input(packed.native_mins),
         packed.native_emins.empty() ? nullptr : s.input(packed.native_emins),
@@ -217,19 +217,19 @@ std::shared_ptr<ITensorGemm> prepare(TensorBase &source,
 #ifdef HAVE_ROCM
   if (s.device.is_rocm()) {
     rocm::ROCmPackedWeights packed;
-    require(rocm::packNativeVNNI(&source, packed),
+    require(rocm::packNativeQuantised(&source, packed),
             "Production HIP native pack failed");
     if (source.native_type() == TensorType::Q8_0)
-      authenticate(raw, packed.native_vnni_payload, packed.native_vnni_scales,
+      authenticate(raw, packed.native_quantised_payload, packed.native_quantised_scales,
                    n, k);
     return std::make_shared<rocm::ROCmQuantisedGemmKernel>(
-        n, k, s.device.ordinal, s.input(packed.native_vnni_payload),
-        s.input(packed.native_vnni_scales),
-        packed.native_vnni_mins.empty() ? nullptr
-                                        : s.input(packed.native_vnni_mins),
-        packed.native_vnni_emins.empty() ? nullptr
-                                         : s.input(packed.native_vnni_emins),
-        packed.native_vnni_codebook_id, packed.native_vnni_blocks_per_row,
+        n, k, s.device.ordinal, s.input(packed.native_quantised_payload),
+        s.input(packed.native_quantised_scales),
+        packed.native_quantised_mins.empty() ? nullptr
+                                        : s.input(packed.native_quantised_mins),
+        packed.native_quantised_emins.empty() ? nullptr
+                                         : s.input(packed.native_quantised_emins),
+        packed.native_quantised_codebook_id, packed.native_quantised_blocks_per_row,
         s.owners, packed.native_source_identity);
   }
 #endif
@@ -368,7 +368,7 @@ MeasureOptions options(int argc, char **argv) {
           "optional");
   const auto &format = test::quantizedVerifierFormat(o.sourceFormat);
   const auto sourceBlock = format.source_is_superblock ? 256u : 32u;
-  const auto sourceBytes = cpu::native_vnni::native_block_bytes_for_format(
+  const auto sourceBytes = cpu::native_quantised::native_block_bytes_for_format(
       format.source_codebook_id, format.source_is_superblock);
   require(o.device.is_gpu() && o.m > 0 && o.m <= 8192 && o.n > 0 &&
               o.n <= 65536 && o.k > 0 && o.k <= 65536 && o.k % 32 == 0,
@@ -517,8 +517,8 @@ struct Projection {
     require(precision == QuantizedActivationOperandPrecision::TwoTermQ8, "Original-column reference requires TwoTerm");
     const auto &p = stage->getParams();
     auto *engine = p.prepared_store->gemmKernel(*p.prepared_ref);
-    DeviceNativeVNNIMatrixDesc source{};
-    require(engine && engine->exportNativeVNNIMatrixDesc(source), "Short-K lost original prepared source");
+    DeviceNativeQuantisedMatrixDesc source{};
+    require(engine && engine->exportNativeQuantisedMatrixDesc(source), "Short-K lost original prepared source");
     const GPUQ8ResidualCorrectionArgs args{
         .weights=source, .rows=rows,
         .quantizer=storage.device.is_cuda() ? Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal
@@ -570,10 +570,10 @@ struct Projection {
     if (precision == QuantizedActivationOperandPrecision::TwoTermQ8) {
       require(nodes.size() == 2,
               "TwoTerm capture must contain only publication and projection");
-      DeviceNativeVNNIMatrixDesc source{};
+      DeviceNativeQuantisedMatrixDesc source{};
       auto *engine = stage->getParams().prepared_store->gemmKernel(
           *stage->getParams().prepared_ref);
-      require(engine && engine->exportNativeVNNIMatrixDesc(source),
+      require(engine && engine->exportNativeQuantisedMatrixDesc(source),
               "Projection lost its original source descriptor");
       // The oracle's geometry must remain independent when production dispatch evolves.
       const auto geometry = selectedKernel == ProjectionKernel::OriginalColumnReference
@@ -735,7 +735,7 @@ float elapsed(Projection &p, void *start, void *stop, int iterations) {
 void measureShortK(Storage &storage,const MeasureOptions &o,IWorkerGPUContext &worker,
                    IDeviceContext *context,FP32Tensor *input,TensorBase *weight,
                    PreparedWeightStore &store,const WeightBinding &binding,const int32_t *count,
-                   void *start,void *stop,const DeviceNativeVNNIMatrixDesc &sourceBefore,
+                   void *start,void *stop,const DeviceNativeQuantisedMatrixDesc &sourceBefore,
                    const std::vector<std::uint8_t> &raw) {
   require(bool(q8ResidualShortKGeometry(o.device.is_cuda() ? Q8ResidualGroupedBackend::CUDA
                                                          : Q8ResidualGroupedBackend::ROCm,
@@ -769,9 +769,9 @@ void measureShortK(Storage &storage,const MeasureOptions &o,IWorkerGPUContext &w
       const auto b=storage.download(static_cast<const std::uint8_t *>(candidate.banks[i]),std::size_t(bytes));
       require(a==b,"Short-K published activation bank/scales differ");
     }
-    DeviceNativeVNNIMatrixDesc after{};
+    DeviceNativeQuantisedMatrixDesc after{};
     auto *engine=store.gemmKernel(*binding.prepared);
-    require(engine && engine->exportNativeVNNIMatrixDesc(after) &&
+    require(engine && engine->exportNativeQuantisedMatrixDesc(after) &&
             std::memcmp(&after,&sourceBefore,sizeof(after))==0 &&
             std::memcmp(weight->raw_data(),raw.data(),raw.size())==0 &&
             storage.owners->size()==ownerCount && input->gpu_data_ptr()==inputPointer,
@@ -815,7 +815,7 @@ void measureShortK(Storage &storage,const MeasureOptions &o,IWorkerGPUContext &w
  */
 void exportObservedOutputs(const MeasureOptions &options, std::size_t savedRows,
                            std::size_t weightBytes,
-                           const DeviceNativeVNNIMatrixDesc &source,
+                           const DeviceNativeQuantisedMatrixDesc &source,
                            const std::vector<float> &single,
                            const std::vector<float> &two) {
   if (options.exportDirectory.empty())
@@ -902,7 +902,7 @@ void measure(const MeasureOptions &o) {
                         ExplicitGPUStream(worker.defaultStream()).get()};
         const auto &format = test::quantizedVerifierFormat(o.sourceFormat);
         const auto block = format.source_is_superblock ? 256u : 32u;
-        const auto blockBytes = cpu::native_vnni::native_block_bytes_for_format(
+        const auto blockBytes = cpu::native_quantised::native_block_bytes_for_format(
             format.source_codebook_id, format.source_is_superblock);
         const auto sourceBytes = std::size_t(o.n) *
                                  ((std::size_t(o.k) + block - 1) / block) *
@@ -941,9 +941,9 @@ void measure(const MeasureOptions &o) {
         auto binding = registerEngine(store, *weight, o.device,
                                       prepare(*weight, raw, storage, o.n, o.k),
                                       o.sourceName);
-        DeviceNativeVNNIMatrixDesc sourceBefore;
+        DeviceNativeQuantisedMatrixDesc sourceBefore;
         auto *kernel = store.gemmKernel(*binding.prepared);
-        require(kernel && kernel->exportNativeVNNIMatrixDesc(sourceBefore),
+        require(kernel && kernel->exportNativeQuantisedMatrixDesc(sourceBefore),
                 "Prepared original source unavailable");
         TransferEngine::prepareDeviceInput(input.get(), o.device,
                                            storage.stream);
@@ -1004,8 +1004,8 @@ void measure(const MeasureOptions &o) {
           require(storage.owners->size() == allocationOwners &&
                       input->gpu_data_ptr() == inputPointer,
                   "Retained allocation identity changed");
-          DeviceNativeVNNIMatrixDesc sourceAfter;
-          require(kernel->exportNativeVNNIMatrixDesc(sourceAfter) &&
+          DeviceNativeQuantisedMatrixDesc sourceAfter;
+          require(kernel->exportNativeQuantisedMatrixDesc(sourceAfter) &&
                       std::memcmp(&sourceBefore, &sourceAfter,
                                   sizeof(sourceBefore)) == 0 &&
                       std::memcmp(weight->raw_data(), raw.data(), raw.size()) ==

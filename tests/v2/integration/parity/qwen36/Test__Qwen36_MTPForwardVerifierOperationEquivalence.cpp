@@ -95,7 +95,7 @@ namespace
      *
      * A full model run records thousands of kernel counters. Dumping all of
      * them obscures the first divergent projection, so this diagnostic keeps
-     * only NativeVNNI dispatches for serial M=1 and the failing runtime M.
+     * only NativeQuantised dispatches for serial M=1 and the failing runtime M.
      * Printing both is important because eager and graph-captured policy
      * surfaces may select different reduction parenthesizations. Geometry,
      * codebook, execution mode, route, K partitioning, and grouped row reuse
@@ -110,7 +110,7 @@ namespace
                   << verifier_rows << ":\n";
         for (const auto &record : records)
         {
-            if (record.name != "cuda_native_vnni_gemv_dispatch")
+            if (record.name != "cuda_native_quantised_gemv_dispatch")
                 continue;
 
             const auto m = record.tags.find("m");

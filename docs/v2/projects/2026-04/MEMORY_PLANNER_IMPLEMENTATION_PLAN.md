@@ -379,7 +379,7 @@ Current: 12 separate `cudaMalloc` calls for entries, scratch, params, temps.
 
 Change: Report all buffers through `getWorkspaceRequirements()`. The KV cache is created before workspace allocation, so this requires reordering: estimate KV workspace needs during planning, allocate workspace first, then create KV cache with bound workspace. This is the most invasive change and may be deferred to Phase 6.
 
-#### 5c. CUDANativeVNNIGemvTuned `kpar_partials`
+#### 5c. CUDANativeQuantisedGemvTuned `kpar_partials`
 
 Current: Grow-only `cudaMalloc` in C-level struct, hot-path decode.
 

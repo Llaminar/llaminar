@@ -1,6 +1,10 @@
 /**
  * @file MoEOverlayRetainedActivationTransaction.cpp
  * @brief Native graph assembly for retained node-local activation epochs.
+ *
+ * Main units retain exact typed planner stage identities, including passive
+ * reducers. Only original manual boundaries and separately authenticated finite
+ * bodies are excluded from main coverage; the final parent owns their joins.
  */
 
 #include "MoEOverlayRetainedActivationTransaction.h"
@@ -982,9 +986,10 @@ namespace llaminar2
         // independently. Authenticate that original declaration before excluding
         // it here; final parent attachment still owns the complete body/join.
         graph.requireRetainedParticipantAuxiliaryRange();
-        // Native envelopes ignore packet-wave annotations, retaining immutable
-        // no-op reducers in main-unit stage identity. Heterogeneous envelopes
-        // instead represent those nodes as passive rendezvous after a unit.
+        // The capture planner applies passive packet-wave elision only to
+        // Ordinary graphs, which this composer does not accept. Every supported
+        // typed envelope retains immutable no-op reducers in its exact main-unit
+        // identity; native auxiliary bodies remain independently authenticated.
         std::vector<std::string> expected_stages;
         expected_stages.reserve(graph.getExecutionOrder().size());
         for (const std::string &stage_name : graph.getExecutionOrder())
@@ -997,7 +1002,6 @@ namespace llaminar2
                     stage_name);
             }
             if (node->stage->isManualGraphBoundary() ||
-                (!native_auxiliary && node->stage->isPassiveGraphCaptureNoOp()) ||
                 graph.isRetainedParticipantAuxiliaryNode(stage_name))
             {
                 continue;
@@ -1015,7 +1019,6 @@ namespace llaminar2
                 const ComputeNode *const node = graph.getNode(stage_name);
                 if (!node || !node->stage ||
                     node->stage->isManualGraphBoundary() ||
-                    (!native_auxiliary && node->stage->isPassiveGraphCaptureNoOp()) ||
                     !node->device.is_gpu() ||
                     node->stage->device() != node->device)
                 {

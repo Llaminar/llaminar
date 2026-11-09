@@ -20,9 +20,9 @@ TEST_F(CUDAExpertTierWeightKernelsTest, RectangularNativeMovementAllFormatsAndDi
         const auto& format=test::quantizedVerifierFormats()[format_index];SCOPED_TRACE(format.label);
         auto source_tensor=format.create({N,K},static_cast<uint32_t>(30117+format_index));
         auto source=packProductionGpuProjection(*source_tensor);
-        cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
-        ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(source_tensor.get(),cpu));
-        const auto* originalFormat=native_vnni_formats::forSourceIdentity(source.source_codebook_id,source.is_superblock);
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+        ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(source_tensor.get(),cpu));
+        const auto* originalFormat=native_quantised_formats::forSourceIdentity(source.source_codebook_id,source.is_superblock);
         ASSERT_NE(originalFormat,nullptr);
         const auto demotionManifest=makeGpuToCpuExpertTierWeightStreamManifest(*originalFormat,N,K,81,0,7,ExpertTierWeightProjection::Down,2).forIntersection(forward);
         const auto down=demotionManifest.deviceLayout();
@@ -32,7 +32,7 @@ TEST_F(CUDAExpertTierWeightKernelsTest, RectangularNativeMovementAllFormatsAndDi
         ASSERT_EQ(mins.upload(source.mins),cudaSuccess);ASSERT_EQ(emins.upload(source.emins),cudaSuccess);
         const ExpertTierGpuConstProjectionView in{input.data(),scales.data(),mins.data(),emins.data(),input.bytes(),scales.bytes(),mins.bytes(),emins.bytes()};
         ASSERT_TRUE(in.validFor(down));
-        cpu::native_vnni::CPUNativeVNNIPackedWeights destinationCPU;
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights destinationCPU;
         destinationCPU.N=targetN;destinationCPU.K=targetK;destinationCPU.N_padded=128;destinationCPU.blocks_per_row=targetK/32;
         destinationCPU.payload_bytes=cpu.payload_bytes;destinationCPU.codebook_id=cpu.codebook_id;destinationCPU.is_superblock=cpu.is_superblock;destinationCPU.is_asymmetric=cpu.is_asymmetric;
         destinationCPU.encoding=cpu.encoding;destinationCPU.data_stride=cpu.data_stride;destinationCPU.interleaved_block_stride=cpu.interleaved_block_stride;

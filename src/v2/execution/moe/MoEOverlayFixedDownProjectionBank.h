@@ -13,7 +13,7 @@
 
 #include "MoEExpertProjectionOwnership.h"
 #include "MoEExpertOwnerMap.h"
-#include "kernels/common/DeviceNativeVNNIMatrixDesc.h"
+#include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 
 #include <memory>
 #include <variant>
@@ -31,7 +31,7 @@ namespace llaminar2
         /** @brief Prepared native views in global expert-ID order, with source provenance. */
         struct NativeDescriptorTable
         {
-            std::vector<DeviceNativeVNNIMatrixDesc> experts;
+            std::vector<DeviceNativeQuantisedMatrixDesc> experts;
         };
 
         /** @brief One exact floating precision shared by every fixed down slice. */

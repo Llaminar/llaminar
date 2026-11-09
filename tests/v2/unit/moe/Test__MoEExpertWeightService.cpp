@@ -306,9 +306,9 @@ namespace
         projection.is_asymmetric = projection.staged.is_asymmetric;
         projection.has_emins = projection.staged.has_emins;
         projection.codebook_id = projection.staged.codebook_id;
-        projection.source_identity = NativeVnniSourceIdentity{
-            .codebook_id = native_vnni_formats::IQ4_NL.codebook_id,
-            .is_superblock = native_vnni_formats::IQ4_NL.is_superblock,
+        projection.source_identity = NativeQuantisedSourceIdentity{
+            .codebook_id = native_quantised_formats::IQ4_NL.codebook_id,
+            .is_superblock = native_quantised_formats::IQ4_NL.is_superblock,
             .present = true,
         };
         projection.transfer_slot_lifetime = lifetime;
@@ -1404,10 +1404,10 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_ReusesReleasedPhysicalSlot)
         spec.payload_bytes_per_block = 16;
         spec.is_asymmetric = true;
         spec.has_emins = false;
-        spec.codebook_id = native_vnni_formats::Q4_1.codebook_id;
-        spec.format = ExpertWeightFormat::nativeVnni({
-            .codebook_id = native_vnni_formats::Q4_1.codebook_id,
-            .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+        spec.codebook_id = native_quantised_formats::Q4_1.codebook_id;
+        spec.format = ExpertWeightFormat::nativeQuantised({
+            .codebook_id = native_quantised_formats::Q4_1.codebook_id,
+            .is_superblock = native_quantised_formats::Q4_1.is_superblock,
             .present = true,
         });
         specs.push_back(std::move(spec));
@@ -1455,10 +1455,10 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_RetainsSameExpertAcrossRcuE
             .payload_bytes_per_block = 16,
             .is_asymmetric = true,
             .has_emins = false,
-            .codebook_id = native_vnni_formats::Q4_1.codebook_id,
-            .format = ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q4_1.codebook_id,
-                .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+            .codebook_id = native_quantised_formats::Q4_1.codebook_id,
+            .format = ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q4_1.codebook_id,
+                .is_superblock = native_quantised_formats::Q4_1.is_superblock,
                 .present = true,
             }),
         });
@@ -1507,10 +1507,10 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_TransferSlotsAreSurplusAndR
         spec.payload_bytes_per_block = 16;
         spec.is_asymmetric = true;
         spec.has_emins = false;
-        spec.codebook_id = native_vnni_formats::Q4_1.codebook_id;
-        spec.format = ExpertWeightFormat::nativeVnni({
-            .codebook_id = native_vnni_formats::Q4_1.codebook_id,
-            .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+        spec.codebook_id = native_quantised_formats::Q4_1.codebook_id;
+        spec.format = ExpertWeightFormat::nativeQuantised({
+            .codebook_id = native_quantised_formats::Q4_1.codebook_id,
+            .is_superblock = native_quantised_formats::Q4_1.is_superblock,
             .present = true,
         });
         specs.push_back(std::move(spec));
@@ -2425,8 +2425,8 @@ TEST(Test__MoEExpertWeightService, GpuDirectTransferSlotStagingUsesSourceDescrip
     const std::string admission_block =
         source.substr(experts_to_copy, make_specs - experts_to_copy);
     EXPECT_NE(admission_block.find("deviceMoEProjectionFormat"), std::string::npos)
-        << "inactive destination expert views may not carry NativeVNNI metadata";
-    EXPECT_EQ(admission_block.find("has no NativeVNNI format info"), std::string::npos)
+        << "inactive destination expert views may not carry NativeQuantised metadata";
+    EXPECT_EQ(admission_block.find("has no NativeQuantised format info"), std::string::npos)
         << "GPU-direct arrivals must not require destination VNNI format metadata";
     EXPECT_EQ(admission_block.find("grp.dst_views[expert_id]->rows()"), std::string::npos)
         << "inactive destination expert views may be absent during transfer-slot staging";

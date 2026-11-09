@@ -3271,7 +3271,7 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
          {"streams", "3"}});
     PerfStatsCollector::addCounter(
         "kernel",
-        "cuda_native_vnni_small_m_fused_projection_calls",
+        "cuda_native_quantised_small_m_fused_projection_calls",
         1.0,
         "gemm",
         "cuda:0",
@@ -3328,7 +3328,7 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
         "kernel", "cuda_fused_projection_stream_pool_calls"))
         << "M=1 retained graphs must preserve their fused side-stream schedule evidence";
     EXPECT_TRUE(has_record(
-        "kernel", "cuda_native_vnni_small_m_fused_projection_calls"))
+        "kernel", "cuda_native_quantised_small_m_fused_projection_calls"))
         << "Grouped verifier graphs must preserve their fused side-stream schedule evidence";
     EXPECT_FALSE(has_record("kernel", "unrelated_warmup_kernel"))
         << "Retaining one immutable kernel route must not retain the whole noisy domain";

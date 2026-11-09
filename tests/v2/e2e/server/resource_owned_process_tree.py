@@ -14,6 +14,11 @@ from pathlib import Path
 from resource_process_identity import read_process_status
 
 
+# Linux task flags are part of the same start-time-bound /proc stat record.
+# PF_EXITING precedes exit_mm(), unlike the later zombie/dead state publication.
+PF_EXITING = 0x00000004
+
+
 def bounded_text(path: Path) -> str:
     """Read kernel metadata only, rejecting an incomplete oversized record."""
     with path.open('rb') as stream:
@@ -46,9 +51,12 @@ def process_stat(directory: Path) -> dict:
         raise ValueError('Malformed process identity record')
     identity = ProcessIdentity(int(prefix), int(fields[19]))
     parent = int(fields[1])
+    flags = int(fields[6])
+    if flags < 0:
+        raise ValueError('Malformed process task flags')
     if parent < 0 or len(fields[0]) != 1:
         raise ValueError('Malformed process state or parent')
-    return {**asdict(identity), 'ppid': parent, 'comm': comm, 'state': fields[0]}
+    return {**asdict(identity), 'ppid': parent, 'comm': comm, 'state': fields[0], 'flags': flags}
 
 
 class OwnedProcessTree:
@@ -100,7 +108,8 @@ class OwnedProcessTree:
         """Return individual memory rows, explicit zombies, and retired identities.
 
         Status and ancestry are bracketed by start-time checks. Exit races are
-        explicit retirement; permission or malformed live metadata is an error.
+        explicit retirement; observed PF_EXITING/Z/X rows retain their identity with
+        unavailable memory. Permission or malformed live metadata is an error.
         No missing counter is converted into zero memory consumption.
         """
         pending = deque(sorted(self._known))
@@ -125,8 +134,9 @@ class OwnedProcessTree:
                 owner = ProcessIdentity(pid, child['start_ticks'])
                 self._known.add(owner)
                 pending.append(owner)
-            if before['state'] in ('Z', 'X'):
-                rows.append({**before, 'memory_available': False})
+            if before['state'] in ('Z', 'X') or before['flags'] & PF_EXITING:
+                rows.append({**before, 'memory_available': False,
+                             'memory_unavailable_reason': 'observed_process_exit'})
                 continue
             try:
                 memory = read_process_status(directory / 'status', identity.pid)
@@ -135,8 +145,9 @@ class OwnedProcessTree:
                 if after is None:
                     retired.add(identity)
                     continue
-                if after['state'] in ('Z', 'X'):
-                    rows.append({**after, 'memory_available': False})
+                if after['state'] in ('Z', 'X') or after['flags'] & PF_EXITING:
+                    rows.append({**after, 'memory_available': False,
+                                 'memory_unavailable_reason': 'observed_process_exit'})
                     continue
                 raise
             after = self._current(identity)

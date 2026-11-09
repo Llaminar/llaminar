@@ -20,7 +20,7 @@
 #include "v2/tensors/TensorFactory.h"
 #include "v2/tensors/FP16Utils.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 
 namespace llaminar2
 {
@@ -278,7 +278,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Compare CPUNativeVNNIGemmKernel (INT8) vs FloatingPointGemmKernel (FP32) for Q5_0.
+         * @brief Compare CPUNativeQuantisedGemmKernel (INT8) vs FloatingPointGemmKernel (FP32) for Q5_0.
          *
          * This test verifies that the quantized GEMM kernel produces results close to
          * the FP32 reference implementation using OneDNN.

@@ -5,7 +5,7 @@
  * Every cataloged quantized tensor is packed through the same source method
  * used by production ROCm weight preparation. The HIP demotion kernel converts
  * that projection in non-zero-origin chunks, and every resulting byte is
- * compared with the CPU NativeVNNI packer. The reverse half then streams those
+ * compared with the CPU NativeQuantised packer. The reverse half then streams those
  * CPU bytes back through the production promotion kernel and compares every
  * separated destination array with the device-free reference. IQ4_XS uses
  * physical24 with original half bases and raw encoded6 secondary words; its
@@ -15,7 +15,7 @@
 #include "execution/moe/MoEOverlayMPIRemoteProjectionTransport.h"
 #include "utils/ExpertTierWeightWireTestOracle.h"
 
-#include "../../../utils/NativeVNNITestPartialStorage.h"
+#include "../../../utils/NativeQuantisedTestPartialStorage.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/TensorSlice.h"
@@ -31,14 +31,14 @@
 #include "execution/moe/ExpertTierWeightTransferLane.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
-#include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 #include "kernels/cpu/primitives/GPUAlignedExpertQ8Primitives.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #include "kernels/rocm/gemm/ROCmNativeM1Reduction.h"
-#include "kernels/rocm/gemm/ROCmNativeVNNISerialGeometry.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedSerialGeometry.h"
 #include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/VnniPackContext.h"
@@ -77,10 +77,10 @@ extern "C"
     bool testInjectNativeM1RNPartials(float *,int,int,void *);
 
     /** Select the serial-decode arithmetic policy for the production GEMV. */
-    void rocmGemv_native_vnni_set_decode_equivalent_m1_config(int enabled);
+    void rocmGemv_native_quantised_set_decode_equivalent_m1_config(int enabled);
 
-    /** Production ROCm NativeVNNI M=1 inference kernel used by overlap tests. */
-    bool rocmGemv_native_vnni_fp32(
+    /** Production ROCm NativeQuantised M=1 inference kernel used by overlap tests. */
+    bool rocmGemv_native_quantised_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
         const void *d_block_scales,
@@ -97,7 +97,7 @@ extern "C"
         const float *d_scale_A_blockwise);
 
     /** Production M=1 kernel with explicit source arithmetic policy. */
-    bool rocmGemv_native_vnni_fp32_with_policy(
+    bool rocmGemv_native_quantised_fp32_with_policy(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
         const void *d_block_scales,
@@ -114,8 +114,8 @@ extern "C"
         void *stream,
         const float *d_scale_A_blockwise);
 
-    /** Production verifier-depth NativeVNNI kernel used by promotion parity. */
-    bool rocmGemv_native_vnni_small_m_fp32(
+    /** Production verifier-depth NativeQuantised kernel used by promotion parity. */
+    bool rocmGemv_native_quantised_small_m_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
         const void *d_block_scales,
@@ -132,7 +132,7 @@ extern "C"
         void *stream);
 
     /** Production verifier kernel with explicit source arithmetic policy. */
-    bool rocmGemv_native_vnni_small_m_fp32_with_policy(
+    bool rocmGemv_native_quantised_small_m_fp32_with_policy(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
         const void *d_block_scales,
@@ -149,8 +149,8 @@ extern "C"
         int device_id,
         void *stream);
 
-    /** Production dense-prefill NativeVNNI kernel used by promotion parity. */
-    bool rocmGemm_native_vnni_fp32(
+    /** Production dense-prefill NativeQuantised kernel used by promotion parity. */
+    bool rocmGemm_native_quantised_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
         const void *d_block_scales,
@@ -167,7 +167,7 @@ extern "C"
         void *stream);
 
     /** Production prefill kernel with explicit source arithmetic policy. */
-    bool rocmGemm_native_vnni_fp32_with_policy(
+    bool rocmGemm_native_quantised_fp32_with_policy(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
         const void *d_block_scales,
@@ -185,7 +185,7 @@ extern "C"
         void *stream);
 
     /** Query exact generated serial-M1 geometry for a source policy. */
-    bool rocmGemv_native_vnni_query_serial_m1_config_with_policy(
+    bool rocmGemv_native_quantised_query_serial_m1_config_with_policy(
         std::uint8_t arithmetic_policy_codebook_id,
         int N,
         int K,
@@ -258,13 +258,13 @@ namespace llaminar2
             /** @brief Enable the serial-row dispatch contract. */
             ScopedROCmDecodeEquivalentM1()
             {
-                rocmGemv_native_vnni_set_decode_equivalent_m1_config(1);
+                rocmGemv_native_quantised_set_decode_equivalent_m1_config(1);
             }
 
             /** @brief Restore the ordinary non-verifier dispatch contract. */
             ~ScopedROCmDecodeEquivalentM1()
             {
-                rocmGemv_native_vnni_set_decode_equivalent_m1_config(0);
+                rocmGemv_native_quantised_set_decode_equivalent_m1_config(0);
             }
 
             ScopedROCmDecodeEquivalentM1(
@@ -416,7 +416,7 @@ namespace llaminar2
          * @brief Pack a real tensor into the common accelerator representation.
          * @param tensor Quantized source implementing `IINT8Unpackable`.
          * @return Production payload, metadata arrays, and source provenance.
-         * @throws std::invalid_argument for a non-NativeVNNI tensor or geometry.
+         * @throws std::invalid_argument for a non-NativeQuantised tensor or geometry.
          */
         HostGpuExpertPackedProjection packProductionGpuProjection(
             const TensorBase &tensor)
@@ -427,10 +427,10 @@ namespace llaminar2
                 unpackable->vnniFormatInfo() == nullptr)
             {
                 throw std::invalid_argument(
-                    "ROCm all-format tier test requires NativeVNNI");
+                    "ROCm all-format tier test requires NativeQuantised");
             }
 
-            const NativeVnniFormatInfo &format =
+            const NativeQuantisedFormatInfo &format =
                 *unpackable->vnniFormatInfo();
             const int N = static_cast<int>(tensor.rows());
             const int K = static_cast<int>(tensor.cols());
@@ -619,7 +619,7 @@ namespace llaminar2
                     /** @brief Retain exact original prepared planes and disjoint partial ownership. */
                     Prepared(HostGpuExpertPackedProjection source,int n,std::size_t guard):packed(std::move(source)),
                         payload(packed.payload.size()),scales(packed.scales.size()),mins(packed.mins.size()),
-                        emins(packed.emins.size()),output(n+guard),partials(std::size_t(NativeVNNIGroupedDecodePolicy::maximum_k_partitions)*n+guard),frozen(n+guard)
+                        emins(packed.emins.size()),output(n+guard),partials(std::size_t(NativeQuantisedGroupedDecodePolicy::maximum_k_partitions)*n+guard),frozen(n+guard)
                     {
                         if(payload.upload(packed.payload)!=hipSuccess || scales.upload(packed.scales)!=hipSuccess ||
                             mins.upload(packed.mins)!=hipSuccess || emins.upload(packed.emins)!=hipSuccess)
@@ -676,7 +676,7 @@ namespace llaminar2
                         const bool ok=grouped?enqueueNativeM1Producer(tickets[p],activation.data(),w.payload.data(),
                             w.scales.data(),w.mins.data(),w.emins.data(),w.output.data(),nullptr,w.partials.data(),
                             widths[p],K,w.packed.codebook_id,canonicalDeviceVnniCodebookId(w.packed.source_codebook_id),0,stream.opaque(),activation_scales.data()):
-                            rocmGemv_native_vnni_fp32_with_policy(activation.data(),w.payload.data(),w.scales.data(),
+                            rocmGemv_native_quantised_fp32_with_policy(activation.data(),w.payload.data(),w.scales.data(),
                             w.mins.data(),w.emins.data(),w.output.data(),nullptr,w.partials.data(),widths[p],K,
                             w.packed.codebook_id,canonicalDeviceVnniCodebookId(w.packed.source_codebook_id),0,stream.opaque(),activation_scales.data());
                         if(!ok)throw std::runtime_error("Deferred M1 fixture original producer failed");
@@ -1198,11 +1198,11 @@ namespace llaminar2
                 std::string error;
                 ASSERT_TRUE(source.valid(&error)) << error;
 
-                cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
-                ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+                cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
+                ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                     tensor.get(), expected_cpu));
-                const NativeVnniFormatInfo *source_format =
-                    native_vnni_formats::forSourceIdentity(
+                const NativeQuantisedFormatInfo *source_format =
+                    native_quantised_formats::forSourceIdentity(
                         source.source_codebook_id,
                         source.is_superblock);
                 ASSERT_NE(source_format, nullptr);
@@ -1429,12 +1429,12 @@ namespace llaminar2
             const HostGpuExpertPackedProjection source =
                 packProductionGpuProjection(*tensor);
 
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             std::string error;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), expected_cpu));
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(
+                native_quantised_formats::forSourceIdentity(
                     source.source_codebook_id,
                     source.is_superblock);
             ASSERT_NE(source_format, nullptr);
@@ -1613,7 +1613,7 @@ namespace llaminar2
                     static_cast<std::uint32_t>(0x122b000u + geometry_index));
                 ASSERT_NE(tensor, nullptr);
 
-                cpu::native_vnni::CPUNativeVNNIGemmKernel cpu_kernel(
+                cpu::native_quantised::CPUNativeQuantisedGemmKernel cpu_kernel(
                     tensor.get(),
                     0,
                     -1,
@@ -1658,17 +1658,17 @@ namespace llaminar2
                         published.qs,
                         32u);
                     activation_scales[static_cast<std::size_t>(block)] =
-                        cpu::native_vnni::nativeVNNIFP16ScaleToFP32(
+                        cpu::native_quantised::nativeQuantisedFP16ScaleToFP32(
                             published.d);
                 }
 
                 std::vector<float> cpu_output(
                     static_cast<std::size_t>(N), 0.0f);
-                cpu::native_vnni::gemv_native_vnni_preq(
+                cpu::native_quantised::gemv_native_quantised_preq(
                     cpu_packed,
                     activation_blocks.data(),
-                    cpu_output.data(), llaminar2::test::NativeVNNITestPartialStorage(cpu_packed, 1).span(),
-                    cpu::native_vnni::ISAPath::AUTO);
+                    cpu_output.data(), llaminar2::test::NativeQuantisedTestPartialStorage(cpu_packed, 1).span(),
+                    cpu::native_quantised::ISAPath::AUTO);
 
                 TestHIPBuffer<std::uint8_t> payload(
                     gpu_packed.payload.size());
@@ -1682,7 +1682,7 @@ namespace llaminar2
                     static_cast<std::size_t>(N));
                 TestHIPBuffer<float> partials(
                     static_cast<std::size_t>(
-                        NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                        NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) *
                     static_cast<std::size_t>(N));
                 ASSERT_EQ(payload.upload(gpu_packed.payload), hipSuccess);
                 ASSERT_EQ(scales.upload(gpu_packed.scales), hipSuccess);
@@ -1692,7 +1692,7 @@ namespace llaminar2
                     hipSuccess);
 
                 TestHIPStream stream;
-                ASSERT_TRUE(rocmGemv_native_vnni_fp32_with_policy(
+                ASSERT_TRUE(rocmGemv_native_quantised_fp32_with_policy(
                     device_activation.data(),
                     payload.data(),
                     scales.data(),
@@ -1770,11 +1770,11 @@ namespace llaminar2
             ASSERT_NE(tensor, nullptr);
             const HostGpuExpertPackedProjection source =
                 packProductionGpuProjection(*tensor);
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), expected_cpu));
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(
+                native_quantised_formats::forSourceIdentity(
                     source.source_codebook_id,
                     source.is_superblock);
             ASSERT_NE(source_format, nullptr);
@@ -2090,8 +2090,8 @@ namespace llaminar2
             auto tensor = format.create({N, K}, 0xa0c051u);
             ASSERT_NE(tensor, nullptr);
 
-            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu_weights;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_weights;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), cpu_weights));
             ASSERT_TRUE(cpu_weights.usesExpandedInt8());
             ASSERT_TRUE(cpu_weights.is_asymmetric);
@@ -2102,7 +2102,7 @@ namespace llaminar2
                 << error;
             ASSERT_EQ(
                 expected_gpu.codebook_id,
-                kNativeVnniExpandedInt8MinCodebook);
+                kNativeQuantisedExpandedInt8MinCodebook);
 
             const MoEOverlayRemoteProjectionIdentity promotion_identity{
                 .expected_epoch = promoted_epoch - 1,
@@ -2192,7 +2192,7 @@ namespace llaminar2
                 });
             ASSERT_TRUE(lane->materialize(&error)) << error;
 
-            const NativeVnniSourceIdentity source_identity{
+            const NativeQuantisedSourceIdentity source_identity{
                 .codebook_id = cpu_weights.codebook_id,
                 .is_superblock = cpu_weights.is_superblock,
                 .present = true,
@@ -2312,7 +2312,7 @@ namespace llaminar2
             EXPECT_EQ(observed_emins, expected_gpu.emins);
 
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(
+                native_quantised_formats::forSourceIdentity(
                     cpu_weights.codebook_id,
                     cpu_weights.is_superblock);
             ASSERT_NE(source_format, nullptr);
@@ -2441,8 +2441,8 @@ namespace llaminar2
             ASSERT_EQ(compact.codebook_id, 7u);
             ASSERT_TRUE(compact.is_asymmetric);
 
-            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu_weights;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_weights;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), cpu_weights));
             ASSERT_TRUE(cpu_weights.usesExpandedInt8());
             ASSERT_TRUE(cpu_weights.is_asymmetric);
@@ -2458,7 +2458,7 @@ namespace llaminar2
             ASSERT_TRUE(layout.valid());
             ASSERT_EQ(
                 layout.gpu_codebook_id,
-                kNativeVnniExpandedInt8MinCodebook);
+                kNativeQuantisedExpandedInt8MinCodebook);
             const std::size_t blocks =
                 static_cast<std::size_t>(N) * (K / 32);
 
@@ -2515,7 +2515,7 @@ namespace llaminar2
              * behavior without retaining a host mirror of accelerator state.
              */
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(
+                native_quantised_formats::forSourceIdentity(
                     compact.source_codebook_id,
                     compact.is_superblock);
             ASSERT_NE(source_format, nullptr);
@@ -2554,7 +2554,7 @@ namespace llaminar2
             ASSERT_TRUE(redemotion_layout.valid());
             ASSERT_EQ(
                 redemotion_layout.gpu_codebook_id,
-                kNativeVnniExpandedInt8MinCodebook);
+                kNativeQuantisedExpandedInt8MinCodebook);
             const ExpertTierGpuConstProjectionView promoted_source_view{
                 .payload = promoted_payload.data(),
                 .scales = promoted_scales.data(),
@@ -2634,27 +2634,27 @@ namespace llaminar2
             ScopedROCmDecodeEquivalentM1 decode_equivalent_scope;
             TestHIPBuffer<float> partials(
                 static_cast<std::size_t>(
-                    NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                    NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) *
                 verifier_rows * N);
 
             int source_kb = 0;
             int normalized_kb = 0;
             int ignored_waves = 0;
             constexpr std::uint8_t normalized_default_policy =
-                native_vnni_formats::Q8_0.codebook_id;
+                native_quantised_formats::Q8_0.codebook_id;
             ASSERT_NE(
                 compact.source_codebook_id,
                 normalized_default_policy)
                 << "The witness must distinguish source-policy provenance";
             ASSERT_TRUE(
-                rocmGemv_native_vnni_query_serial_m1_config_with_policy(
+                rocmGemv_native_quantised_query_serial_m1_config_with_policy(
                     compact.source_codebook_id,
                     N,
                     K,
                     &source_kb,
                     &ignored_waves));
             ASSERT_TRUE(
-                rocmGemv_native_vnni_query_serial_m1_config_with_policy(
+                rocmGemv_native_quantised_query_serial_m1_config_with_policy(
                     normalized_default_policy,
                     N,
                     K,
@@ -2695,13 +2695,13 @@ namespace llaminar2
                     }
                     if (rows == verifier_rows)
                     {
-                        return rocmGemv_native_vnni_small_m_fp32_with_policy(
+                        return rocmGemv_native_quantised_small_m_fp32_with_policy(
                             activation.data(), payload, scales, mins, nullptr,
                             output, activation_scales.data(), partials.data(),
                             rows, N, K, codebook,
                             arithmetic_policy_codebook, 0, stream.opaque());
                     }
-                    return rocmGemm_native_vnni_fp32_with_policy(
+                    return rocmGemm_native_quantised_fp32_with_policy(
                         activation.data(), payload, scales, mins, nullptr,
                         output, nullptr, activation_scales.data(), rows, N, K,
                         codebook, arithmetic_policy_codebook, 0,
@@ -2739,9 +2739,9 @@ namespace llaminar2
             }
 
             const auto small_m_records = PerfStatsCollector::snapshot(
-                {"kernel.rocm_native_vnni_small_m_launch"});
+                {"kernel.rocm_native_quantised_small_m_launch"});
             const auto prefill_records = PerfStatsCollector::snapshot(
-                {"kernel.rocm_native_vnni_prefill_launch"});
+                {"kernel.rocm_native_quantised_prefill_launch"});
             const auto has_policy_record = [](
                 const std::vector<PerfStatRecord> &records,
                 int rows,
@@ -2805,7 +2805,7 @@ namespace llaminar2
          * @test Production ROCm inference finishes unchanged during migration.
          *
          * The baseline and concurrent launches execute the real generated
-         * NativeVNNI Q4_0 M=1 kernel. A 24-chunk demotion advances on the
+         * NativeQuantised Q4_0 M=1 kernel. A 24-chunk demotion advances on the
          * independent persistent lane, and an event query must observe the
          * inference result while residency movement is still pending.
          */
@@ -2822,12 +2822,12 @@ namespace llaminar2
             const HostGpuExpertPackedProjection source =
                 packProductionGpuProjection(*tensor);
 
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             std::string error;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), expected_cpu));
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(
+                native_quantised_formats::forSourceIdentity(
                     source.source_codebook_id,
                     source.is_superblock);
             ASSERT_NE(source_format, nullptr);
@@ -2871,7 +2871,7 @@ namespace llaminar2
                 host_activation_scales.size());
             TestHIPBuffer<float> partials(
                 static_cast<std::size_t>(
-                    NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                    NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) *
                 static_cast<std::size_t>(N));
             TestHIPBuffer<float> baseline_output(N);
             TestHIPBuffer<float> concurrent_output(N);
@@ -2881,7 +2881,7 @@ namespace llaminar2
 
             TestHIPStream inference_stream;
             ScopedROCmDecodeEquivalentM1 decode_equivalent_scope;
-            ASSERT_TRUE(rocmGemv_native_vnni_fp32(
+            ASSERT_TRUE(rocmGemv_native_quantised_fp32(
                 activation.data(),
                 payload.data(),
                 scales.data(),
@@ -2935,7 +2935,7 @@ namespace llaminar2
                 ExpertTierSourceReadiness::producerEvent(source_ready),
                 &error)) << error;
 
-            ASSERT_TRUE(rocmGemv_native_vnni_fp32(
+            ASSERT_TRUE(rocmGemv_native_quantised_fp32(
                 activation.data(),
                 payload.data(),
                 scales.data(),
@@ -3035,11 +3035,11 @@ namespace llaminar2
             ASSERT_NE(tensor, nullptr);
             const HostGpuExpertPackedProjection source =
                 packProductionGpuProjection(*tensor);
-            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), expected_cpu));
             const auto *source_format =
-                native_vnni_formats::forSourceIdentity(0, false);
+                native_quantised_formats::forSourceIdentity(0, false);
             ASSERT_NE(source_format, nullptr);
             const auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
                 *source_format,
@@ -3104,7 +3104,7 @@ namespace llaminar2
             DeviceWorkspaceManager probe_workspace(device, 4096);
             constexpr int n = 64, k = 256;
             constexpr size_t blocks = n * (k / 32);
-            for (const auto &format : native_vnni_formats::kAllSourceFormats)
+            for (const auto &format : native_quantised_formats::kAllSourceFormats)
             {
                 SCOPED_TRACE(std::string(format.quant_type));
                 auto storage = std::make_shared<TestHIPBuffer<uint8_t>>(blocks * 40);
@@ -3112,7 +3112,7 @@ namespace llaminar2
                 auto *scales = reinterpret_cast<uint16_t *>(payload + blocks * 32);
                 auto *mins = scales + blocks;
                 auto *emins = reinterpret_cast<uint32_t *>(mins + blocks);
-                const NativeVnniSourceIdentity identity{
+                const NativeQuantisedSourceIdentity identity{
                     .codebook_id = format.metadata->codebook_id,
                     .is_superblock = format.metadata->is_superblock,
                     .present = true,
@@ -3121,7 +3121,7 @@ namespace llaminar2
                     n, k, 0, payload, scales, mins, emins,
                     canonicalDeviceVnniCodebookId(identity), k / 32,
                     storage, identity,
-                    NativeVnniReusableDeviceAllocationFormat{32, true, true});
+                    NativeQuantisedReusableDeviceAllocationFormat{32, true, true});
                 serving->setGPUStream(serving_stream.opaque());
                 serving->bindWorkspace(&serving_workspace);
                 auto probe = KernelFactory::createExpertServiceExecutionView(serving, device);
@@ -3134,9 +3134,9 @@ namespace llaminar2
                 EXPECT_EQ(serving->requireGPUStream(), serving_stream.opaque());
                 EXPECT_EQ(serving->getWorkspace(), &serving_workspace);
 
-                DeviceNativeVNNIMatrixDesc expected, observed;
-                ASSERT_TRUE(serving->exportNativeVNNIMatrixDesc(expected));
-                ASSERT_TRUE(probe->exportNativeVNNIMatrixDesc(observed));
+                DeviceNativeQuantisedMatrixDesc expected, observed;
+                ASSERT_TRUE(serving->exportNativeQuantisedMatrixDesc(expected));
+                ASSERT_TRUE(probe->exportNativeQuantisedMatrixDesc(observed));
                 EXPECT_EQ(observed.payload, expected.payload);
                 EXPECT_EQ(observed.scales, expected.scales);
                 EXPECT_EQ(observed.mins, expected.mins);
@@ -3145,8 +3145,8 @@ namespace llaminar2
                 EXPECT_EQ(observed.k, expected.k);
                 EXPECT_EQ(observed.codebook_id, expected.codebook_id);
                 EXPECT_EQ(observed.allocation_payload_bytes_per_block, 32);
-                NativeVnniSourceIdentity observed_identity;
-                ASSERT_TRUE(probe->exportNativeVNNISourceIdentity(observed_identity));
+                NativeQuantisedSourceIdentity observed_identity;
+                ASSERT_TRUE(probe->exportNativeQuantisedSourceIdentity(observed_identity));
                 EXPECT_EQ(observed_identity, identity);
                 EXPECT_THROW((void)KernelFactory::createExpertServiceExecutionView(
                     serving, DeviceId::cuda(0)), std::invalid_argument);
@@ -3274,11 +3274,11 @@ namespace llaminar2
                 ASSERT_EQ(source.payload[at * 13 + 8],block.qh[sub]);
                 ASSERT_EQ(std::memcmp(source.payload.data() + at * 13 + 9,block.signs + sub * 4,4),0);
             }
-            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(tensor.get(),cpu));
-            ASSERT_EQ(cpu.encoding,cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale);
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(tensor.get(),cpu));
+            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
             constexpr std::uint32_t first_unit = 1;
-            const auto *format = native_vnni_formats::forSourceIdentity(11,true);
+            const auto *format = native_quantised_formats::forSourceIdentity(11,true);
             ASSERT_NE(format,nullptr);
             const auto probe = makeGpuToCpuExpertTierWeightStreamManifest(*format,N,K,405,3,7,ExpertTierWeightProjection::Down,capacity_units);
             const auto demotion = probe.deviceLayout();
@@ -3368,9 +3368,9 @@ namespace llaminar2
             }
             std::vector<std::uint8_t> bytes(sizeof(original));std::memcpy(bytes.data(),&original,sizeof(original));
             auto tensor=std::make_shared<IQ3_STensor>(std::vector<std::size_t>{N,K},bytes);
-            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
-            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(tensor.get(),cpu));
-            ASSERT_EQ(cpu.encoding,cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale);
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(tensor.get(),cpu));
+            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
             const auto layout=makeCpuToGpuExpertTierWeightStreamManifest(cpu,407,3,7,ExpertTierWeightProjection::Down,2).deviceLayout();
             ASSERT_TRUE(layout.valid());ASSERT_EQ(layout.gpu_codebook_id,11);
             TestHIPBuffer<std::uint8_t> payload(8*13);

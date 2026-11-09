@@ -34,7 +34,7 @@ inline bool staticGDNIsolationFormSupported(const GDNProjectionStage::Params &p)
  * their physical capacity follows codebook 19. Explicit exact-Q8 slots name 32
  * bytes per block. Neither representation permits additional metadata planes.
  */
-inline void validateGDNIsolationQ8Allocation(const DeviceNativeVNNIMatrixDesc &n)
+inline void validateGDNIsolationQ8Allocation(const DeviceNativeQuantisedMatrixDesc &n)
 {
     if(!n.valid() || n.codebook_id!=19 || n.source_identity_present!=1 ||
         n.source_codebook_id!=19 || n.source_is_superblock || n.reserved || n.reserved_tail ||
@@ -103,7 +103,7 @@ public:
             if(!engines_[i])throw std::invalid_argument("GDN isolation has no original prepared engine");
             if(i<2)
             {
-                if(!engines_[i]->inspectPreparedNativeVNNIMatrixDesc(native_[i]) || !native_[i].valid() ||
+                if(!engines_[i]->inspectPreparedNativeQuantisedMatrixDesc(native_[i]) || !native_[i].valid() ||
                     !native_[i].source_identity_present || native_[i].source_codebook_id!=19 || native_[i].codebook_id!=19 ||
                     native_[i].n!=widths_[i] || native_[i].k!=p.k)
                     throw std::invalid_argument("GDN isolation QKV/Z require exact original Q8 prepared descriptors");
@@ -253,7 +253,7 @@ private:
         for(const auto &n:native_)
         {
             validateGDNIsolationQ8Allocation(n);
-            const auto sizes=nativeVnniPackedRegionSizes(std::size_t(n.n),std::size_t(n.k),native_vnni_formats::Q8_0);
+            const auto sizes=nativeQuantisedPackedRegionSizes(std::size_t(n.n),std::size_t(n.k),native_quantised_formats::Q8_0);
             regions.push_back({reinterpret_cast<std::uintptr_t>(n.payload),sizes.payload_bytes});
             regions.push_back({reinterpret_cast<std::uintptr_t>(n.scales),sizes.scales_bytes});
         }
@@ -279,7 +279,7 @@ private:
         }
     }
     /** @brief Compare named immutable native fields, never C++ descriptor padding. */
-    static bool sameNative(const DeviceNativeVNNIMatrixDesc &a,const DeviceNativeVNNIMatrixDesc &b)
+    static bool sameNative(const DeviceNativeQuantisedMatrixDesc &a,const DeviceNativeQuantisedMatrixDesc &b)
     {
         return std::tie(a.payload,a.scales,a.mins,a.emins,a.n,a.k,a.blocks_per_row,a.codebook_id,a.allocation_payload_bytes_per_block,
             a.allocation_has_mins,a.allocation_has_emins,a.source_codebook_id,a.source_is_superblock,a.source_identity_present,a.reserved,a.reserved_tail)==
@@ -303,8 +303,8 @@ private:
             if(!consumer || consumer->getWorkspace()!=workspace_.get())throw std::logic_error("GDN isolation engine scratch changed");
             if(i<2)
             {
-                DeviceNativeVNNIMatrixDesc current{};
-                if(!engines_[i]->inspectPreparedNativeVNNIMatrixDesc(current) || !sameNative(current,native_[i]))
+                DeviceNativeQuantisedMatrixDesc current{};
+                if(!engines_[i]->inspectPreparedNativeQuantisedMatrixDesc(current) || !sameNative(current,native_[i]))
                     throw std::logic_error("GDN isolation native prepared descriptor changed");
             }
             else
@@ -342,7 +342,7 @@ private:
     std::array<int,4> widths_{};
     std::array<std::size_t,4> output_bytes_{};
     std::array<ITensorGemm *,4> engines_{};
-    std::array<DeviceNativeVNNIMatrixDesc,2> native_{};
+    std::array<DeviceNativeQuantisedMatrixDesc,2> native_{};
     std::array<ContiguousFloatingPointWeightDescriptor,2> floating_{};
     BufferArena *arena_=nullptr;GDNProjectionStage *stage_=nullptr;
     DeviceId device_;std::size_t input_bytes_=0;std::uint64_t signature_=0;

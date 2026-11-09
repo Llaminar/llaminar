@@ -12,17 +12,17 @@
  * accepts only its canonical expanded-asymmetric CPU migration contract.
  */
 #include <gtest/gtest.h>
-#include "../../performance/kernels/native_vnni_dispatch/NativeVNNIMoEProjectionDiagnostic.h"
-#include "../../performance/kernels/native_vnni_dispatch/NativeVNNIGeometryTimingOrder.h"
+#include "../../performance/kernels/native_quantised_dispatch/NativeQuantisedMoEProjectionDiagnostic.h"
+#include "../../performance/kernels/native_quantised_dispatch/NativeQuantisedGeometryTimingOrder.h"
 
 namespace
 {
 using Json = nlohmann::json;
-using namespace llaminar2::test::native_vnni_dispatch;
+using namespace llaminar2::test::native_quantised_dispatch;
 /** @return The explicit diagnostic request shape used by the existing trainer. */
 Json request()
 {
-    return {{"schema", "native-vnni-moe-projection-diagnostic-v1"}, {"operation", "owner-gate-up-pack-m1"},
+    return {{"schema", "native-quantised-moe-projection-diagnostic-v1"}, {"operation", "owner-gate-up-pack-m1"},
         {"owner_map", "ordinal"}, {"provenance", "retained-descriptors-synthetic-seeded"}, {"m", 1},
         {"layer", 0}, {"participant", 2}, {"top_k", 10}, {"device_ordinals", {0, 1, 2, 3}},
         {"route_profile", "uniform"}, {"warmups", 31}, {"samples", 101}, {"operations_per_sample", 1},
@@ -186,7 +186,7 @@ Json syntheticRequest(const std::string &format)
 /** Every original source alias retains canonical provenance without creating model descriptor evidence. */
 TEST(MoEProjectionDiagnostic, SyntheticFixturesPreserveEveryCanonicalSourceAlias)
 {
-    for (const auto &format : llaminar2::native_vnni_formats::kAllSourceFormats)
+    for (const auto &format : llaminar2::native_quantised_formats::kAllSourceFormats)
     {
         const auto spec = parseMoEProjectionDiagnostic(syntheticRequest(std::string(format.quant_type)), Json::object());
         EXPECT_EQ(spec.source_kind, MoEProjectionSourceKind::SyntheticSourceFixture);
@@ -270,11 +270,11 @@ TEST(MoEProjectionDiagnostic, Promoted23RepresentationPreservesDefaultAndOrigina
 TEST(MoEProjectionDiagnostic, Promoted23SourcesUseCanonicalMigrationContract)
 {
     std::set<std::string> accepted;
-    for (const auto &source : llaminar2::native_vnni_formats::kAllSourceFormats)
+    for (const auto &source : llaminar2::native_quantised_formats::kAllSourceFormats)
     {
         const bool expected = source.metadata->is_asymmetric &&
             llaminar2::migrationStableDeviceVnniFormat(*source.metadata).codebook_id ==
-                llaminar2::kNativeVnniExpandedInt8MinCodebook;
+                llaminar2::kNativeQuantisedExpandedInt8MinCodebook;
         EXPECT_EQ(moeProjectionSupportsPromoted23(source.quant_type), expected);
         auto authored = syntheticRequest(std::string(source.quant_type));
         authored["prepared_representation"] = "cpu-prepared-promoted23";

@@ -680,10 +680,16 @@ namespace llaminar2
 
         bool cudaEnablePeerAccessDevice(int peer_device)
         {
-            // cudaDeviceEnablePeerAccess may return cudaErrorPeerAccessAlreadyEnabled
-            // which is OK - it means P2P was already set up
-            cudaError_t err = cudaDeviceEnablePeerAccess(peer_device, 0);
-            return (err == cudaSuccess || err == cudaErrorPeerAccessAlreadyEnabled);
+            // An existing unrelated failure belongs to its original owner.
+            // Only this invocation's exact expected status may be consumed.
+            if (cudaPeekAtLastError() != cudaSuccess)
+                return false;
+            const auto err = cudaDeviceEnablePeerAccess(peer_device, 0);
+            if (err != cudaErrorPeerAccessAlreadyEnabled)
+                return err == cudaSuccess;
+            if (cudaPeekAtLastError() != cudaErrorPeerAccessAlreadyEnabled)
+                return false;
+            return cudaGetLastError() == cudaErrorPeerAccessAlreadyEnabled;
         }
 
     } // namespace nccl_backend_detail

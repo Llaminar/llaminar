@@ -54,6 +54,39 @@
 namespace llaminar2
 {
     namespace {
+        /**
+         * @brief Express exact whole-owner targets relative to one canonical tier projection.
+         * @param baseline Complete source-bound tier candidate, including original CPU cohorts.
+         * @param desired Canonical destination rows retained by selected physical cycles.
+         * @return Whole-owner corrections only; cohorts keep their original control blocks.
+         * @throws std::logic_error For foreign rows, tier changes or altered cohort identity.
+         * The canonical owner-map constructor validates physical endpoints and counts.
+         */
+        std::vector<MoELayeredExpertOwnershipChange> wholeOwnerTargetChanges(
+            const MoEExpertOwnerMap &baseline, std::span<const MoEExpertOwner> desired)
+        {
+            std::vector<MoELayeredExpertOwnershipChange> result;
+            for (const auto &target : desired)
+            {
+                const auto *source = baseline.placementFor(target.layer_idx, target.expert_id);
+                if (!source || source->tier_idx != target.tier_idx)
+                    throw std::logic_error("Whole participant correction must retain its canonical tier");
+                if (source->shard_cohort || target.shard_cohort)
+                {
+                    if (!(*source == target) || source->shard_cohort.get() != target.shard_cohort.get() ||
+                        source->shard_cohort.owner_before(target.shard_cohort) ||
+                        target.shard_cohort.owner_before(source->shard_cohort))
+                        throw std::logic_error("Whole participant correction cannot replace an original CPU cohort");
+                    continue;
+                }
+                if (source->owner_participant != target.owner_participant)
+                    result.push_back({.layer_idx = target.layer_idx, .expert_id = target.expert_id,
+                        .previous_participant = source->owner_participant,
+                        .current_participant = target.owner_participant});
+            }
+            return result;
+        }
+
         /** @return Whether the immutable plan contains actual CPU tensor-shard members. */
         bool jointCPUPlan(const MoERoutedExpertPlacementPlan& plan)
         {
@@ -419,7 +452,7 @@ namespace llaminar2
         /** @brief Complete explicit owner table and its deterministic evidence. */
         struct ParticipantRebalancePlan
         {
-            MoELayeredExpertOwnership ownership;
+            MoEExpertOwnerMap owner_map;
             std::vector<ParticipantRebalanceLayerEvidence> evidence;
             uint64_t swap_pairs = 0;
 
@@ -476,6 +509,18 @@ namespace llaminar2
 
         /**
          * @brief Select a paired owner swap using certified endpoint service.
+         * @param participant_load Routed demand for each tier-local participant.
+         * @param tier_expert_ids Original model expert IDs owned by this tier.
+         * @param expert_counts Forecast demand for those expert IDs.
+         * @param expert_owner Tier-local participant index for each expert.
+         * @param tier_participant_ids Canonical physical IDs for the local indices.
+         * @param complete_targets One complete whole/cohort target per model expert.
+         * @param layer_idx Original model-global layer being evaluated.
+         * @param routed_window_activations Observed window size for the evidence floor.
+         * @param service_objective Checked phase service and complete target-price rows.
+         * @param policy Required imbalance, improvement and evidence thresholds.
+         * @return A paired swap, or an empty choice when no admissible gain exists.
+         * @throws std::logic_error For incomplete targets or inconsistent owner indices.
          *
          * The selector uses the final gate's phase-specific service arithmetic
          * inside the tier: no recurring phase may regress, and the sum of the
@@ -493,14 +538,26 @@ namespace llaminar2
             const std::vector<uint64_t> &expert_counts,
             const std::vector<int32_t> &expert_owner,
             const std::vector<int> &tier_participant_ids,
-            const MoELayeredExpertOwnership &complete_ownership,
+            std::span<const MoEOverlayRouteTarget> complete_targets,
             int layer_idx,
             uint64_t routed_window_activations,
             ObservedTransactionServiceObjective &service_objective,
             const MoEOverlayParticipantRebalancePolicy &policy);
 
+        /** @brief Project canonical whole/cohort owners to their complete economy target. */
+        MoEOverlayRouteTarget economyExecutionTarget(const MoEExpertOwner &owner);
+
         /**
          * @brief Balance apportioned owners inside every unchanged tier.
+         * @param plan Complete tier-placement candidate before participant balancing.
+         * @param base_owner_map Canonical physical owners for that candidate.
+         * @param original_joint_owners Original CPU cohort/cut authority, or null for whole ownership.
+         * @param window Checked routing demand with original model-layer coordinates.
+         * @param policy Participant balancing thresholds and search limits.
+         * @param service_objective Optional measured phase costs for complete targets.
+         * @return An unpublished canonical owner map and deterministic swap evidence.
+         * @throws std::logic_error For missing tiers, owners or complete service targets.
+         * @throws std::invalid_argument If explicit changes violate original source or slot capacity.
          *
          * The input owner map already reflects the tier optimizer's candidate.
          * This pass changes only exact participants within each tier and only
@@ -511,18 +568,18 @@ namespace llaminar2
         ParticipantRebalancePlan planOverlayParticipantRebalance(
             const MoERoutedExpertPlacementPlan &plan,
             const MoEExpertOwnerMap &base_owner_map,
+            const MoEExpertOwnerMap *original_joint_owners,
             const ValidatedDecodeExpertHistogramWindowView &window,
             const MoEOverlayParticipantRebalancePolicy &policy,
             std::optional<std::reference_wrapper<
                 ObservedTransactionServiceObjective>> service_objective)
         {
             ParticipantRebalancePlan result{
-                .ownership = base_owner_map.layeredOwnership(
-                    window.numLayers(),
-                    window.numExperts(), window.firstModelLayer()),
+                .owner_map = base_owner_map,
             };
             if (!policy.enabled)
                 return result;
+            std::vector<MoELayeredExpertOwnershipChange> whole_owner_changes;
 
             /*
              * Discover alternatives independently of publication capacity.
@@ -548,6 +605,22 @@ namespace llaminar2
                                 count
                             ? std::numeric_limits<uint64_t>::max()
                             : routed_window_activations + count;
+                }
+                // Service scratch contains complete execution targets for this
+                // layer only. CPU cohort tags remain fixed; accepted whole-owner
+                // pairs update their two targets before the next search round.
+                // Keeping the vector across tiers also preserves earlier tier
+                // corrections whenever complete transaction scoring reads them.
+                std::vector<MoEOverlayRouteTarget> layer_targets;
+                if (service_objective)
+                {
+                    layer_targets.reserve(static_cast<std::size_t>(window.numExperts()));
+                    for (int expert = 0; expert < window.numExperts(); ++expert)
+                    {
+                        const auto *owner = base_owner_map.placementFor(placement.layer, expert);
+                        if (!owner) throw std::logic_error("Participant service search lost a canonical layer target");
+                        layer_targets.push_back(economyExecutionTarget(*owner));
+                    }
                 }
                 uint32_t layer_swap_pairs = 0;
                 for (std::size_t tier_idx = 0;
@@ -597,8 +670,10 @@ namespace llaminar2
                         {
                             continue;
                         }
-                        const int owner = result.ownership.owner(
-                            placement.layer, expert_id);
+                        const auto *placement_owner = result.owner_map.placementFor(placement.layer, expert_id);
+                        if (!placement_owner || placement_owner->shard_cohort)
+                            throw std::logic_error("Participant search requires one canonical independently movable owner");
+                        const int owner = placement_owner->owner_participant;
                         const auto participant_it = std::find(
                             participant_ids.begin(),
                             participant_ids.end(),
@@ -662,7 +737,7 @@ namespace llaminar2
                                   expert_counts,
                                   local_owners,
                                   participant_ids,
-                                  result.ownership,
+                                  layer_targets,
                                   placement.layer,
                                   routed_window_activations,
                                   service_objective->get(),
@@ -690,16 +765,15 @@ namespace llaminar2
                          * a second greedy swap is evaluated from the exact
                          * provisional ownership state it would publish.
                          */
-                        result.ownership.assignOwner(
-                            placement.layer,
-                            expert_ids.at(choice.heavy_expert),
-                            participant_ids.at(static_cast<std::size_t>(
-                                local_owners.at(choice.heavy_expert))));
-                        result.ownership.assignOwner(
-                            placement.layer,
-                            expert_ids.at(choice.light_expert),
-                            participant_ids.at(static_cast<std::size_t>(
-                                local_owners.at(choice.light_expert))));
+                        if (service_objective)
+                        {
+                            layer_targets.at(static_cast<std::size_t>(expert_ids.at(choice.heavy_expert))) =
+                                MoEOverlayRouteTarget::whole(participant_ids.at(static_cast<std::size_t>(
+                                    local_owners.at(choice.heavy_expert))));
+                            layer_targets.at(static_cast<std::size_t>(expert_ids.at(choice.light_expert))) =
+                                MoEOverlayRouteTarget::whole(participant_ids.at(static_cast<std::size_t>(
+                                    local_owners.at(choice.light_expert))));
+                        }
                         ++layer_swap_pairs;
                         ++result.swap_pairs;
                         ++evidence.swap_pairs;
@@ -712,17 +786,32 @@ namespace llaminar2
                     evidence.load_min_after = *after_min_it;
                     evidence.load_max_after = *after_max_it;
                     result.evidence.push_back(evidence);
-
-                    for (std::size_t index = 0;
-                         index < expert_ids.size();
-                         ++index)
+                    // The existing tier-local swap scratch authors only final
+                    // whole-owner corrections. Canonical source validation and
+                    // physical count checks run once below, after every tier.
+                    for (std::size_t index = 0; index < expert_ids.size(); ++index)
                     {
-                        result.ownership.assignOwner(
-                            placement.layer,
-                            expert_ids[index],
-                            participant_ids[static_cast<std::size_t>(
-                                local_owners[index])]);
+                        const auto *source = base_owner_map.placementFor(placement.layer, expert_ids[index]);
+                        const int destination = participant_ids.at(static_cast<std::size_t>(local_owners[index]));
+                        if (source->owner_participant != destination)
+                            whole_owner_changes.push_back({.layer_idx = placement.layer,
+                                .expert_id = expert_ids[index], .previous_participant = source->owner_participant,
+                                .current_participant = destination});
                     }
+                }
+            }
+            if (!whole_owner_changes.empty())
+            {
+                if (original_joint_owners)
+                    result.owner_map = MoEExpertOwnerMap::buildShardTransition(
+                        plan, base_owner_map, *original_joint_owners, whole_owner_changes);
+                else
+                {
+                    auto ownership = base_owner_map.layeredOwnership(
+                        window.numLayers(), window.numExperts(), window.firstModelLayer());
+                    for (const auto &change : whole_owner_changes)
+                        ownership.assignOwner(change.layer_idx, change.expert_id, change.current_participant);
+                    result.owner_map = MoEExpertOwnerMap::buildExplicit(plan, ownership);
                 }
             }
             return result;
@@ -898,7 +987,12 @@ namespace llaminar2
 
             /** @param owner Original checked owner. @return Internal logical vertex, never a synthetic participant ID. */
             int32_t targetIndex(const MoEExpertOwner& owner) const {
-                const auto target=economyExecutionTarget(owner);
+                return targetIndex(economyExecutionTarget(owner));
+            }
+
+            /** @param target Canonical complete execution target, never a physical cohort member.
+             * @return Its dense certified price-row index, independent of participant numbering. */
+            int32_t targetIndex(MoEOverlayRouteTarget target) const {
                 const auto found=std::lower_bound(targets_.begin(),targets_.end(),target.word(),
                     [](auto value,int word){return value.word()<word;});
                 if(found==targets_.end() || found->word()!=target.word())
@@ -1167,7 +1261,7 @@ namespace llaminar2
             const std::vector<uint64_t> &expert_counts,
             const std::vector<int32_t> &expert_owner,
             const std::vector<int> &tier_participant_ids,
-            const MoELayeredExpertOwnership &complete_ownership,
+            std::span<const MoEOverlayRouteTarget> complete_targets,
             int layer_idx,
             uint64_t routed_window_activations,
             ObservedTransactionServiceObjective &service_objective,
@@ -1186,11 +1280,17 @@ namespace llaminar2
                 return choice;
             }
             std::vector<std::int32_t> before_owners(service_objective.numExperts());
+            if (complete_targets.size() != before_owners.size())
+                throw std::logic_error("Participant service search requires one complete typed target per expert");
             for (int expert = 0; expert < service_objective.numExperts(); ++expert)
                 before_owners[static_cast<std::size_t>(expert)] =
-                    complete_ownership.owner(layer_idx, expert);
+                    service_objective.targetIndex(complete_targets[static_cast<std::size_t>(expert)]);
+            std::vector<int> selected_targets;
+            selected_targets.reserve(tier_participant_ids.size());
+            for (const int participant : tier_participant_ids)
+                selected_targets.push_back(service_objective.targetIndex(MoEOverlayRouteTarget::whole(participant)));
             const auto baseline = service_objective.score(
-                layer_idx, before_owners, before_owners, tier_participant_ids);
+                layer_idx, before_owners, before_owners, selected_targets);
             WideCost before_total = 0;
             bool imbalance_threshold_met = false;
             for (std::size_t phase = 0; phase < kProductionHistogramSources.size(); ++phase)
@@ -1209,7 +1309,7 @@ namespace llaminar2
                 return choice;
 
             const auto swap_search = service_objective.prepareSwapSearch(
-                layer_idx, before_owners, tier_participant_ids);
+                layer_idx, before_owners, selected_targets);
             WideCost best_after_total = ~WideCost{0};
             for (std::size_t first = 0;
                  first < candidate_count;
@@ -2546,12 +2646,11 @@ namespace llaminar2
                 throw std::invalid_argument("Static CPU joint placement cannot own maintenance or economic state");
             if (config_.maintenance_mode == MoERebalanceRuntimeMode::Dynamic &&
                 (config_.initial_plan.authority_execution != MoEOverlayAuthorityExecutionKind::HostResident ||
-                 availableMoEOptimizationMovementAxes(config_.initial_plan) != MoEOptimizationMovementAxes::TierResidency ||
-                 config_.participant_rebalance_policy.enabled ||
+                 !hasTierResidencyAxis(availableMoEOptimizationMovementAxes(config_.initial_plan)) ||
                  std::none_of(config_.initial_plan.domains.begin(), config_.initial_plan.domains.end(),
                      [](const auto &domain) { return std::any_of(domain.participants.begin(), domain.participants.end(),
                          [](const auto &address) { return address.isGPU(); }); })))
-                throw std::invalid_argument("Dynamic CPU cohorts require the declared mixed GPU/CPU host authority and complete tier-residency targets; scalar participant rearrangement is unsupported");
+                throw std::invalid_argument("Dynamic CPU cohorts require the declared mixed GPU/CPU host authority and complete original cohort targets");
         }
         if (observesHistogram() && !config_.histogram)
         {
@@ -3619,11 +3718,19 @@ namespace llaminar2
             result.expected_epoch = previous->epoch;
             result.previous = previous;
             result.candidate = std::move(candidate);
-            result.migrations = buildMigrations(
-                *previous,
-                *result.candidate,
-                nullptr,
-                /*estimated_weight_bytes=*/0u);
+            std::vector<MoELayeredExpertOwnershipChange> participant_restoration;
+            if (previous->originalProjectionPreparation())
+                for (const auto &destination : result.candidate->placementOwnerMap().owners())
+                {
+                    const auto *source = previous->placementOwnerMap().placementFor(destination.layer_idx, destination.expert_id);
+                    if (source && source->tier_idx == destination.tier_idx && !source->shard_cohort &&
+                        !destination.shard_cohort && source->owner_participant != destination.owner_participant)
+                        participant_restoration.push_back({.layer_idx = destination.layer_idx,
+                            .expert_id = destination.expert_id, .previous_participant = source->owner_participant,
+                            .current_participant = destination.owner_participant});
+                }
+            result.migrations = buildMigrations(*previous, *result.candidate, nullptr,
+                /*estimated_weight_bytes=*/0u, participant_restoration);
             result.migration_cycles = buildMoEOverlayMigrationCycles(
                 result.migrations);
             result.shadow_requirements = buildMoEOverlayShadowRequirements(
@@ -3639,14 +3746,22 @@ namespace llaminar2
         const bool joint = previous->ownershipKind() ==
                            MoEOverlayResidencyOwnershipKind::CPUJointFragments;
         auto target = joint
-            ? prepareCPUJointPlacementTransaction(previous, previous->epoch,
-                  initial_snapshot_->placement_plan->placements).candidate
+            ? prepareCPUJointPlacementCandidate(previous, previous->epoch,
+                  initial_snapshot_->placement_plan->placements)
             : buildSnapshot(
             previous->epoch + 1u,
             *initial_snapshot_->placement_plan,
             config_.model_metadata,
             &previous->owner_map,
             &initial_snapshot_->layered_ownership);
+        if (joint)
+        {
+            const auto changes = wholeOwnerTargetChanges(target->placementOwnerMap(),
+                initial_snapshot_->placementOwnerMap().owners());
+            if (!changes.empty())
+                target = prepareCPUJointPlacementCandidate(previous, previous->epoch,
+                    initial_snapshot_->placement_plan->placements, changes);
+        }
         requireCapacityPreserving(*previous, *target);
         auto full = build_transaction(target);
         if (full.empty())
@@ -3694,8 +3809,8 @@ namespace llaminar2
             MoERoutedExpertPlacementPlan trial_plan =
                 *initial_snapshot_->placement_plan;
             trial_plan.placements = previous->placement_plan->placements;
-            MoELayeredExpertOwnership trial_ownership =
-                previous->layered_ownership;
+            MoELayeredExpertOwnership trial_ownership = previous->layered_ownership;
+            std::vector<MoEExpertOwner> exact_targets;
             for (const std::size_t selected : trial_cycles)
             {
                 const auto &cycle = full.migration_cycles.at(selected);
@@ -3720,8 +3835,8 @@ namespace llaminar2
                     placement->routed_expert_tier[
                         static_cast<std::size_t>(migration.expert_id)] =
                         migration.destination.tier_idx;
-                    if (!joint)
-                        trial_ownership.assignOwner(
+                    if (joint) exact_targets.push_back(migration.destination);
+                    else trial_ownership.assignOwner(
                             migration.layer_idx,
                             migration.expert_id,
                             migration.destination.owner_participant);
@@ -3737,6 +3852,13 @@ namespace llaminar2
                 config_.model_metadata,
                 &previous->owner_map,
                 &trial_ownership);
+            if (joint)
+            {
+                const auto changes = wholeOwnerTargetChanges(trial_snapshot->placementOwnerMap(), exact_targets);
+                if (!changes.empty())
+                    trial_snapshot = prepareCPUJointPlacementCandidate(previous, previous->epoch,
+                        trial_plan.placements, changes);
+            }
             requireCapacityPreserving(*previous, *trial_snapshot);
             auto trial = build_transaction(std::move(trial_snapshot));
             if (trial.empty() || !fits_wave_budget(trial))
@@ -3829,10 +3951,9 @@ namespace llaminar2
         const auto current = snapshot();
         const bool joint = current && current->ownershipKind() ==
             MoEOverlayResidencyOwnershipKind::CPUJointFragments;
-        // Structural candidate support is not member-cost certification. Never
-        // silently suppress an enabled placement axis or price cohort sentinel -1.
-        if (joint && config_.participant_rebalance_policy.enabled)
-            throw std::logic_error("Fixed CPU cohort candidates do not support scalar participant rearrangement");
+        // Whole-owner participant placement uses canonical typed maps even when
+        // another tier is a CPU cohort; a cohort is never a scalar participant.
+        // Structural candidate support still does not mint service certification.
         if(joint && config_.migration_economy_policy &&
             (!config_.phase_service_profile || !config_.phase_service_profile->prepared_plan))
             throw std::logic_error("Fixed CPU cohort candidates require original complete-target prepared service prices");
@@ -3916,12 +4037,16 @@ namespace llaminar2
         // Ordinary explicit ownership remains scalar; fixed cohorts retain the
         // original preparation and complete member target through the sealed producer.
         const auto build_candidate = [&](MoERoutedExpertPlacementPlan plan,
-                                         const MoELayeredExpertOwnership *ownership = nullptr)
+                                         const MoELayeredExpertOwnership *ownership = nullptr,
+                                         std::span<const MoEExpertOwner> exact_targets = {})
         {
             if (joint)
             {
-                auto candidate = prepareCPUJointPlacementCandidate(previous, previous->epoch,
-                    std::move(plan.placements));
+                auto candidate = prepareCPUJointPlacementCandidate(previous, previous->epoch, plan.placements);
+                const auto changes = wholeOwnerTargetChanges(candidate->placementOwnerMap(), exact_targets);
+                if (!changes.empty())
+                    candidate = prepareCPUJointPlacementCandidate(previous, previous->epoch,
+                        std::move(plan.placements), changes);
                 requireCapacityPreserving(*previous, *candidate);
                 return candidate;
             }
@@ -3983,8 +4108,8 @@ namespace llaminar2
             MoERoutedExpertPlacementPlan subset_plan =
                 *source.candidate->placement_plan;
             subset_plan.placements = previous->placement_plan->placements;
-            MoELayeredExpertOwnership subset_ownership =
-                previous->layered_ownership;
+            MoELayeredExpertOwnership subset_ownership = previous->layered_ownership;
+            std::vector<MoEExpertOwner> exact_targets;
             for (const std::size_t selected : cycle_indices)
             {
                 const auto &cycle = source.migration_cycles.at(selected);
@@ -4009,14 +4134,13 @@ namespace llaminar2
                     placement->routed_expert_tier[
                         static_cast<std::size_t>(migration.expert_id)] =
                         migration.destination.tier_idx;
-                    if (!joint) subset_ownership.assignOwner(
-                        migration.layer_idx,
-                        migration.expert_id,
-                        migration.destination.owner_participant);
+                    if (joint) exact_targets.push_back(migration.destination);
+                    else subset_ownership.assignOwner(migration.layer_idx,
+                        migration.expert_id, migration.destination.owner_participant);
                 }
             }
 
-            auto subset_snapshot = build_candidate(std::move(subset_plan), &subset_ownership);
+            auto subset_snapshot = build_candidate(std::move(subset_plan), &subset_ownership, exact_targets);
             requireCapacityPreserving(*previous, *subset_snapshot);
             return build_transaction(
                 std::move(subset_snapshot), movement_objectives);
@@ -4273,8 +4397,8 @@ namespace llaminar2
                     *tier_target_candidate->placement_plan;
                 subset_plan.placements =
                     previous->placement_plan->placements;
-                MoELayeredExpertOwnership subset_ownership =
-                    previous->layered_ownership;
+                MoELayeredExpertOwnership subset_ownership = previous->layered_ownership;
+                std::vector<MoEExpertOwner> exact_targets;
                 for (const std::size_t cycle_index : cycle_indices)
                 {
                     const auto &cycle =
@@ -4304,13 +4428,12 @@ namespace llaminar2
                             static_cast<std::size_t>(
                                 migration.expert_id)] =
                             migration.destination.tier_idx;
-                        if (!joint) subset_ownership.assignOwner(
-                            migration.layer_idx,
-                            migration.expert_id,
-                            migration.destination.owner_participant);
+                        if (joint) exact_targets.push_back(migration.destination);
+                        else subset_ownership.assignOwner(migration.layer_idx,
+                            migration.expert_id, migration.destination.owner_participant);
                     }
                 }
-                return build_candidate(std::move(subset_plan), &subset_ownership);
+                return build_candidate(std::move(subset_plan), &subset_ownership, exact_targets);
             };
 
             participant_base_candidate =
@@ -4373,9 +4496,10 @@ namespace llaminar2
                       ObservedTransactionServiceObjective>>{
                       std::ref(*observed_service)}
                 : std::nullopt;
-        const auto participant_plan = joint ? ParticipantRebalancePlan{} : planOverlayParticipantRebalance(
+        const auto participant_plan = planOverlayParticipantRebalance(
             *participant_base_candidate->placement_plan,
-            participant_base_candidate->owner_map,
+            participant_base_candidate->placementOwnerMap(),
+            joint ? &previous->originalOwnerMap() : nullptr,
             planning_evidence,
             participant_search_policy,
             participant_service_objective);
@@ -4443,8 +4567,8 @@ namespace llaminar2
             single_cycle_participant_transaction;
         if (participant_plan.ownerChanges() != 0u)
         {
-            participant_changes = participant_plan.ownership.changesFrom(
-                participant_base_candidate->layered_ownership);
+            participant_changes = wholeOwnerTargetChanges(participant_base_candidate->placementOwnerMap(),
+                participant_plan.owner_map.owners());
 
             /*
              * The base already contains the exact tier subset reserved for
@@ -4457,18 +4581,14 @@ namespace llaminar2
                 participant_base_candidate->layered_ownership;
             for (const auto &change : participant_changes)
             {
-                combined_ownership.assignOwner(
+                if (!joint) combined_ownership.assignOwner(
                     change.layer_idx,
                     change.expert_id,
                     change.current_participant);
             }
 
-            auto participant_candidate = buildSnapshot(
-                previous->epoch + 1,
-                *participant_base_candidate->placement_plan,
-                config_.model_metadata,
-                &previous->owner_map,
-                &combined_ownership);
+            auto participant_candidate = build_candidate(*participant_base_candidate->placement_plan,
+                &combined_ownership, participant_plan.owner_map.owners());
             if (!tier_target_transaction.empty() &&
                 config_.max_concurrent_cycles == 1u)
             {
@@ -6767,6 +6887,22 @@ namespace llaminar2
             ? prepareCPUJointPlacementCandidate(previous, previous->epoch, candidate_plan.placements)
             : buildSnapshot(previous->epoch + 1u, std::move(candidate_plan),
                             config_.model_metadata, &previous->owner_map, &candidate_ownership);
+        if (previous->originalProjectionPreparation())
+        {
+            std::vector<MoELayeredExpertOwnershipChange> changes;
+            for (const auto &owner : candidate->placementOwnerMap().owners())
+            {
+                const auto &entry = plan.entries[plan.offset(owner.layer_idx, owner.expert_id)];
+                if (!owner.shard_cohort && entry.candidate_target.isWhole() &&
+                    owner.owner_participant != entry.candidate_target.word())
+                    changes.push_back({.layer_idx = owner.layer_idx, .expert_id = owner.expert_id,
+                        .previous_participant = owner.owner_participant,
+                        .current_participant = entry.candidate_target.word()});
+            }
+            if (!changes.empty())
+                candidate = prepareCPUJointPlacementCandidate(previous, previous->epoch,
+                    candidate_plan.placements, changes);
+        }
         // Authenticate every dense coordinate, including unchanged targets, against
         // the actual source-derived complete placement. A cohort tag is not membership.
         for (int row = 0; row < plan.num_layers; ++row)
@@ -7563,7 +7699,8 @@ namespace llaminar2
     std::shared_ptr<const MoEOverlayResidencySnapshot>
     MoEOverlayResidencyAuthority::prepareCPUJointPlacementCandidate(
         const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
-        uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements) const
+        uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements,
+        std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes) const
     {
         const auto previous = snapshot();
         const auto same_owner = [](const auto &a, const auto &b)
@@ -7583,7 +7720,7 @@ namespace llaminar2
         plan.placements = std::move(placements);
         const auto live =
             std::make_shared<const MoEExpertOwnerMap>(MoEExpertOwnerMap::buildShardTransition(
-                plan, previous->placementOwnerMap(), previous->originalOwnerMap()));
+                plan, previous->placementOwnerMap(), previous->originalOwnerMap(), whole_owner_changes));
         auto candidate = std::make_shared<MoEOverlayResidencySnapshot>();
         candidate->epoch = previous->epoch + 1;
         candidate->placement_plan =
@@ -7600,15 +7737,16 @@ namespace llaminar2
     MoEOverlayResidencyTransaction
     MoEOverlayResidencyAuthority::prepareCPUJointPlacementTransaction(
         const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
-        uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements) const
+        uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements,
+        std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes) const
     {
         MoEOverlayResidencyTransaction result;
         result.expected_epoch = expected_epoch;
         result.previous = expected_live;
         result.candidate = prepareCPUJointPlacementCandidate(
-            expected_live, expected_epoch, std::move(placements));
+            expected_live, expected_epoch, std::move(placements), whole_owner_changes);
         requireCapacityPreserving(*result.previous, *result.candidate);
-        result.migrations = buildMigrations(*result.previous, *result.candidate, nullptr, 0);
+        result.migrations = buildMigrations(*result.previous, *result.candidate, nullptr, 0, whole_owner_changes);
         result.migration_cycles = buildMoEOverlayMigrationCycles(result.migrations);
         result.shadow_requirements = buildMoEOverlayShadowRequirements(result.migrations);
         if (!result.valid())
@@ -7695,24 +7833,21 @@ namespace llaminar2
         std::span<const MoELayeredExpertOwnershipChange>
             participant_changes)
     {
-        if ((previous.ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments ||
-             candidate.ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments) &&
-            !participant_changes.empty())
-            throw std::logic_error(
-                "Joint movement requires complete fixed targets, not scalar participant overrides");
         using ExpertKey = std::pair<int, int>;
         std::map<ExpertKey, int> participant_destinations;
         for (const auto &change : participant_changes)
         {
+            // Objectives may belong to a closed cycle excluded from this
+            // bounded subset. Only an actual matching destination below claims
+            // that axis; cohort rows never acquire a scalar owner from this list.
             if (change.layer_idx < 0 || change.expert_id < 0 ||
                 change.previous_participant < 0 ||
                 change.current_participant < 0 ||
                 change.previous_participant == change.current_participant ||
-                !candidate.layered_ownership.containsModelLayer(change.layer_idx) ||
-                change.expert_id >=
-                    candidate.layered_ownership.expertCount() ||
-                change.current_participant >=
-                    candidate.layered_ownership.participantCount() ||
+                change.layer_idx < candidate.firstModelLayer() ||
+                change.layer_idx - candidate.firstModelLayer() >= candidate.layerCount() ||
+                change.expert_id >= candidate.expertCount() ||
+                !candidate.placementOwnerMap().participantForId(change.current_participant) ||
                 !participant_destinations
                      .emplace(
                          ExpertKey{change.layer_idx, change.expert_id},
@@ -7857,24 +7992,10 @@ namespace llaminar2
     std::vector<MoEOverlayTierMigrationCycle> buildMoEOverlayMigrationCycles(
         std::vector<MoEOverlayTierMigration> &migrations)
     {
-        auto cycles = decomposeMoEOverlayMigrationCycles(migrations);
-        for (const auto &cycle : cycles)
-        {
-            bool advances_tier = false;
-            bool advances_participant = false;
-            for (const size_t index : cycle.migration_indices)
-            {
-                advances_tier |= advancesTierResidency(migrations[index].axis);
-                advances_participant |= advancesParticipantPlacement(migrations[index].axis);
-            }
-            const auto axis = advances_tier && advances_participant
-                ? MoEOptimizationMovementAxis::Combined
-                : (advances_tier ? MoEOptimizationMovementAxis::TierResidency
-                                 : MoEOptimizationMovementAxis::ParticipantPlacement);
-            for (const size_t index : cycle.migration_indices)
-                migrations[index].axis = axis;
-        }
-        return cycles;
+        // Physical closure may combine independent logical objectives. Keep
+        // each command's authored axis; migrationCycleAxis computes the union
+        // only where a scheduler or economy decision needs the whole cycle.
+        return decomposeMoEOverlayMigrationCycles(migrations);
     }
 
     std::vector<MoEOverlayTierShadowRequirement> buildMoEOverlayShadowRequirements(

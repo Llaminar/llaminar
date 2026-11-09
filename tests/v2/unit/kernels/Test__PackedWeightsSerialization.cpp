@@ -9,15 +9,15 @@
  * physical-byte BOM while scalar/SIMD replay consumes identical native bytes.
  */
 
-#include "tensors/NativeVnniIQ2SScale.h"
-#include "tensors/NativeVnniIQ4XSScale.h"
+#include "tensors/NativeQuantisedIQ2SScale.h"
+#include "tensors/NativeQuantisedIQ4XSScale.h"
 #include "loaders/gpu_pipeline/GpuPackedWeightsFormat.h"
 #include <gtest/gtest.h>
 
 #include "kernels/PackedWeightsSerialization.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "kernels/cpu/gemm/CPUPackedWeights.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 #include "kernels/KernelFactory.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "../../utils/CPUProjectionTestWorkspace.h"
@@ -29,7 +29,7 @@
 #include <limits>
 
 using namespace llaminar2;
-using namespace llaminar2::cpu::native_vnni;
+using namespace llaminar2::cpu::native_quantised;
 using namespace llaminar2::packed_weights_serialization;
 
 namespace {
@@ -47,14 +47,14 @@ void fillPatternSigned(int8_t* data, size_t size)
         data[i] = static_cast<int8_t>(((i * 7 + 13) & 0xFF) - 128);
 }
 
-/// Build a CPUNativeVNNIPackedWeights with given metadata and deterministic data.
-CPUNativeVNNIPackedWeights buildTestPacked(
+/// Build a CPUNativeQuantisedPackedWeights with given metadata and deterministic data.
+CPUNativeQuantisedPackedWeights buildTestPacked(
     int N, int K, uint8_t codebook_id, int blocks_per_row,
     int payload_bytes_val, bool is_nibble_lut, bool is_asymmetric,
     bool is_superblock, int data_stride, int interleaved_block_stride,
     size_t interleaved_sz, size_t payload_sz, size_t int8_flat_sz)
 {
-    CPUNativeVNNIPackedWeights packed;
+    CPUNativeQuantisedPackedWeights packed;
     packed.N                        = N;
     packed.K                        = K;
     packed.N_padded                 = ((N + 63) / 64) * 64;
@@ -62,8 +62,8 @@ CPUNativeVNNIPackedWeights buildTestPacked(
     packed.codebook_id              = codebook_id;
     packed.payload_bytes            = payload_bytes_val;
     packed.encoding = is_nibble_lut
-                          ? CPUNativeVNNIEncoding::NibbleLUT
-                          : CPUNativeVNNIEncoding::ExpandedInt8;
+                          ? CPUNativeQuantisedEncoding::NibbleLUT
+                          : CPUNativeQuantisedEncoding::ExpandedInt8;
     packed.is_asymmetric            = is_asymmetric;
     packed.is_superblock            = is_superblock;
     packed.data_stride              = data_stride;
@@ -107,7 +107,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_BasicQ4_0)
 
     auto result = deserialize(blob.data(), blob.size());
     ASSERT_NE(result, nullptr);
-    ASSERT_EQ(result->format(), PackedWeightsFormat::CPU_NATIVE_VNNI);
+    ASSERT_EQ(result->format(), PackedWeightsFormat::CPU_NATIVE_QUANTISED);
 
     const auto* cpu_result = dynamic_cast<const CPUPackedWeights*>(result.get());
     ASSERT_NE(cpu_result, nullptr);
@@ -146,7 +146,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_BasicQ4_0)
 
 TEST(Test__PackedWeightsSerialization, CompactMultiScalePreservesEveryNativeMetadataBit)
 {
-    for (const auto &entry : native_vnni_formats::kAllSourceFormats)
+    for (const auto &entry : native_quantised_formats::kAllSourceFormats)
     {
         const auto &format = *entry.metadata;
         if (!hasCompactMultiScaleVnniPayload(format.codebook_id))
@@ -155,7 +155,7 @@ TEST(Test__PackedWeightsSerialization, CompactMultiScalePreservesEveryNativeMeta
         auto packed = buildTestPacked(
             67, 544, format.codebook_id, 17, format.payload_bytes,
             false, true, true, 1024, 1536, 2 * 17 * 1536, 0, 0);
-        packed.encoding = CPUNativeVNNIEncoding::CompactMultiScale;
+        packed.encoding = CPUNativeQuantisedEncoding::CompactMultiScale;
         CPUPackedWeights owner(std::move(packed));
         const auto blob = serialize(owner);
         ASSERT_FALSE(blob.empty());
@@ -484,7 +484,7 @@ TEST(Test__PackedWeightsSerialization, Q6SourceFactorsRoundTripAndRejectVersion3
 {
     auto packed = buildTestPacked(67, 288, 8, 9, 24, false, true, true,
         1536, 1792, 2 * 9 * 1792, 0, 0);
-    packed.encoding = CPUNativeVNNIEncoding::Q6KNativeDualScale;
+    packed.encoding = CPUNativeQuantisedEncoding::Q6KNativeDualScale;
     CPUPackedWeights owner(std::move(packed));
     auto blob = serialize(owner);
     auto restored = deserialize(blob.data(), blob.size());
@@ -505,12 +505,12 @@ TEST(Test__PackedWeightsSerialization, IQ2SRawCoefficientWordsPreserveAllBytes)
 {
     for(unsigned value=0;value<256;++value)
     {
-        const auto word=llaminar2::native_vnni_iq2s_scale::pack(static_cast<uint8_t>(value));
+        const auto word=llaminar2::native_quantised_iq2s_scale::pack(static_cast<uint8_t>(value));
         EXPECT_EQ(word,value);
-        EXPECT_TRUE(llaminar2::native_vnni_iq2s_scale::valid(word));
-        EXPECT_EQ(llaminar2::native_vnni_iq2s_scale::low(word),int(value&15u));
-        EXPECT_EQ(llaminar2::native_vnni_iq2s_scale::high(word),int(value>>4));
-        EXPECT_FALSE(llaminar2::native_vnni_iq2s_scale::valid(word|0x0100u));
+        EXPECT_TRUE(llaminar2::native_quantised_iq2s_scale::valid(word));
+        EXPECT_EQ(llaminar2::native_quantised_iq2s_scale::low(word),int(value&15u));
+        EXPECT_EQ(llaminar2::native_quantised_iq2s_scale::high(word),int(value>>4));
+        EXPECT_FALSE(llaminar2::native_quantised_iq2s_scale::valid(word|0x0100u));
     }
 }
 
@@ -519,7 +519,7 @@ TEST(Test__PackedWeightsSerialization, IQ2SSourceFactorsRoundTripAndRejectVersio
 {
     auto packed=buildTestPacked(67,288,13,9,9,false,true,true,
         1024,1536,2*9*1536,0,0);
-    packed.encoding=CPUNativeVNNIEncoding::CompactMultiScale;
+    packed.encoding=CPUNativeQuantisedEncoding::CompactMultiScale;
     for(int c=0;c<2;++c) for(int kb=0;kb<9;++kb) for(int n=0;n<64;++n)
     {
         const unsigned ordinal=unsigned(c*9*64+kb*64+n);
@@ -587,7 +587,7 @@ TEST(Test__PackedWeightsSerialization, IQ4XSSourceTupleRoundTripsAndRejectsVersi
 {
     auto packed = buildTestPacked(67, 288, 4, 9, 16, false, false, true,
         1024, 1408, 2 * 9 * 1408, 0, 0);
-    packed.encoding = CPUNativeVNNIEncoding::NibbleLUTSourceScale;
+    packed.encoding = CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
     for (int c = 0; c < 2; ++c) for (int kb = 0; kb < 9; ++kb) for (int n = 0; n < 64; ++n)
     {
         const unsigned ordinal = unsigned(c * 9 * 64 + kb * 64 + n);
@@ -640,7 +640,7 @@ TEST(Test__PackedWeightsSerialization, IQ4XSGpuWireTupleRejectsVersion2AndSource
 namespace
 {
     /** @return Every retained physical execution allocation, including hidden capacity. */
-    size_t retainedCPUProjectionBytes(const CPUNativeVNNIPackedWeights &packed)
+    size_t retainedCPUProjectionBytes(const CPUNativeQuantisedPackedWeights &packed)
     {
         return packed.native_interleaved.allocationBytes() +
             packed.payload.allocationBytes() + packed.int8_flat.allocationBytes();
@@ -652,12 +652,12 @@ namespace
      * @param format Original GGUF format and superblock identity.
      */
     void expectCanonicalCPUProjectionAllocation(const ITensorGemm &engine,
-        const NativeVnniFormatInfo &format)
+        const NativeQuantisedFormatInfo &format)
     {
-        const auto *packed = engine.exportCPUNativeVNNIPackedWeights();
+        const auto *packed = engine.exportCPUNativeQuantisedPackedWeights();
         ASSERT_NE(packed, nullptr);
         const auto geometry = resolveExpertPreparedProjectionMemoryGeometry(
-            engine.get_n(), engine.get_k(), ExpertWeightFormat::nativeVnni(
+            engine.get_n(), engine.get_k(), ExpertWeightFormat::nativeQuantised(
                 {format.codebook_id, format.is_superblock, true}));
         EXPECT_EQ(packed->payload.allocationBytes(), 0u);
         EXPECT_EQ(packed->int8_flat.allocationBytes(), 0u);
@@ -676,7 +676,7 @@ TEST(Test__PackedWeightsSerialization, Q4KPreparedAllocationMatchesCanonicalPhys
                 {static_cast<size_t>(n), static_cast<size_t>(k)}, 8923);
         auto engine = llaminar::v2::kernels::KernelFactory::prepareExpertGemmLocal(source, DeviceId::cpu());
         ASSERT_TRUE(engine);
-        expectCanonicalCPUProjectionAllocation(*engine, native_vnni_formats::Q4_K);
+        expectCanonicalCPUProjectionAllocation(*engine, native_quantised_formats::Q4_K);
     }
 }
 
@@ -693,17 +693,17 @@ TEST(Test__PackedWeightsSerialization, CPUPreparedBankAllocationAndArchiveReplay
     using Factory = llaminar2::test::TestTensorFactory;
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
     using Maker = std::function<std::unique_ptr<TensorBase>()>;
-    const std::array<std::pair<const NativeVnniFormatInfo *, Maker>, 10> cases{{
-        {&native_vnni_formats::Q4_0, [] { return Factory::createQ4_0Random({64, 256}, 91); }},
-        {&native_vnni_formats::Q4_1, [] { return Factory::createQ4_1Random({64, 256}, 92); }},
-        {&native_vnni_formats::IQ4_NL, [] { return Factory::createIQ4_NLRandom({64, 256}, 93); }},
-        {&native_vnni_formats::IQ4_XS, [] { return Factory::createIQ4_XSRandom({64, 256}, 94); }},
-        {&native_vnni_formats::Q4_K, [] { return Factory::createQ4_KRandom({64, 256}, 95); }},
-        {&native_vnni_formats::Q5_1, [] { return Factory::createQ5_1Random({64, 256}, 96); }},
-        {&native_vnni_formats::Q5_K, [] { return Factory::createQ5_KRandom({64, 256}, 97); }},
-        {&native_vnni_formats::Q2_K, [] { return Factory::createQ2_KRandom({64, 256}, 98); }},
-        {&native_vnni_formats::Q6_K, [] { return Factory::createQ6_KRandom({64, 256}, 99); }},
-        {&native_vnni_formats::IQ3_S, [] { return Factory::createIQ3_SRandom({64, 256}, 100); }},
+    const std::array<std::pair<const NativeQuantisedFormatInfo *, Maker>, 10> cases{{
+        {&native_quantised_formats::Q4_0, [] { return Factory::createQ4_0Random({64, 256}, 91); }},
+        {&native_quantised_formats::Q4_1, [] { return Factory::createQ4_1Random({64, 256}, 92); }},
+        {&native_quantised_formats::IQ4_NL, [] { return Factory::createIQ4_NLRandom({64, 256}, 93); }},
+        {&native_quantised_formats::IQ4_XS, [] { return Factory::createIQ4_XSRandom({64, 256}, 94); }},
+        {&native_quantised_formats::Q4_K, [] { return Factory::createQ4_KRandom({64, 256}, 95); }},
+        {&native_quantised_formats::Q5_1, [] { return Factory::createQ5_1Random({64, 256}, 96); }},
+        {&native_quantised_formats::Q5_K, [] { return Factory::createQ5_KRandom({64, 256}, 97); }},
+        {&native_quantised_formats::Q2_K, [] { return Factory::createQ2_KRandom({64, 256}, 98); }},
+        {&native_quantised_formats::Q6_K, [] { return Factory::createQ6_KRandom({64, 256}, 99); }},
+        {&native_quantised_formats::IQ3_S, [] { return Factory::createIQ3_SRandom({64, 256}, 100); }},
     }};
     for (const auto &[format, make_source] : cases)
     {
@@ -713,7 +713,7 @@ TEST(Test__PackedWeightsSerialization, CPUPreparedBankAllocationAndArchiveReplay
         auto engine = KernelFactory::prepareExpertGemmLocal(source, DeviceId::cpu());
         ASSERT_TRUE(engine);
         expectCanonicalCPUProjectionAllocation(*engine, *format);
-        const auto *packed = engine->exportCPUNativeVNNIPackedWeights();
+        const auto *packed = engine->exportCPUNativeQuantisedPackedWeights();
         ASSERT_NE(packed, nullptr);
         auto transferable = engine->cloneWeights();
         ASSERT_TRUE(transferable);
@@ -774,7 +774,7 @@ TEST(Test__PackedWeightsSerialization, CPUPreparedBankAllocationAndArchiveReplay
                 if (packed->is_asymmetric && minimum != 0.0f)
                     reference[column] += static_cast<float>(activation[block].sum_qs) * 1.0f * minimum;
             }
-            gemv_native_vnni_scalar(*packed, activation.data(), scalar.data(), n, k_blocks);
+            gemv_native_quantised_scalar(*packed, activation.data(), scalar.data(), n, k_blocks);
             EXPECT_EQ(std::memcmp(reference.data(), scalar.data(), sizeof(reference)), 0);
             CPUPackedWeights legacy_owner(std::move(legacy));
             const auto legacy_blob = serialize(legacy_owner);
@@ -793,7 +793,7 @@ TEST(Test__PackedWeightsSerialization, CPUPreparedBankAllocationAndArchiveReplay
         {
             if (!replay)
                 continue;
-            const auto *replayed = replay->exportCPUNativeVNNIPackedWeights();
+            const auto *replayed = replay->exportCPUNativeQuantisedPackedWeights();
             ASSERT_EQ(replayed->native_interleaved.size(), packed->native_interleaved.size());
             EXPECT_EQ(std::memcmp(replayed->native_interleaved.data(), packed->native_interleaved.data(),
                 packed->native_interleaved.size()), 0);

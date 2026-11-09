@@ -2270,15 +2270,15 @@ namespace llaminar2
 
             DeviceMoEExpertDescriptor desc;
             if (!params_.prepared_gate_gemm[static_cast<size_t>(expert_id)]
-                     ->exportNativeVNNIMatrixDesc(desc.gate) ||
+                     ->exportNativeQuantisedMatrixDesc(desc.gate) ||
                 !params_.prepared_up_gemm[static_cast<size_t>(expert_id)]
-                     ->exportNativeVNNIMatrixDesc(desc.up) ||
+                     ->exportNativeQuantisedMatrixDesc(desc.up) ||
                 !params_.prepared_down_gemm[static_cast<size_t>(expert_id)]
-                     ->exportNativeVNNIMatrixDesc(desc.down))
+                     ->exportNativeQuantisedMatrixDesc(desc.down))
             {
                 LOG_ERROR("[MoELocalExpertStage] Cannot publish MoE runtime placement bank for layer "
                           << params_.layer_idx << " expert " << expert_id
-                          << ": prepared GEMM engines did not export native-VNNI descriptors");
+                          << ": prepared GEMM engines did not export native-quantised descriptors");
                 return false;
             }
 

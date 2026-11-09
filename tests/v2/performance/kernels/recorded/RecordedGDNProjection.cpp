@@ -58,7 +58,7 @@ std::array<int,4> localWidths(const Request &r)
 /** @brief Declare the exact canonical pool layout for both native and half-prepared siblings. */
 void planGDNWeights(LoadOrchestrator &pool,const Request &r,DeviceId device)
 {
-    pool.addDevice(device.ordinal);const auto widths=localWidths(r);const auto &format=native_vnni_formats::Q8_0;
+    pool.addDevice(device.ordinal);const auto widths=localWidths(r);const auto &format=native_quantised_formats::Q8_0;
     for(std::size_t i=0;i<4;++i)
     {
         if(i<2)pool.planWeightForOwner(device.ordinal,r.sources[i].name,widths[i],r.k,format.payload_bytes,
@@ -359,8 +359,8 @@ public:
             nlohmann::json prepared;auto *engine=store->gemmKernel(refs[i]);
             if(i<2)
             {
-                DeviceNativeVNNIMatrixDesc descriptor{};
-                checked(engine && engine->inspectPreparedNativeVNNIMatrixDesc(descriptor) && descriptor.valid() &&
+                DeviceNativeQuantisedMatrixDesc descriptor{};
+                checked(engine && engine->inspectPreparedNativeQuantisedMatrixDesc(descriptor) && descriptor.valid() &&
                     descriptor.source_identity_present && descriptor.source_codebook_id==19 && descriptor.codebook_id==19,
                     "Recorded GDN native source identity changed before publication");
                 prepared=nativePreparedSourceMetadata(descriptor);
@@ -375,7 +375,7 @@ public:
             }
             const auto &info=*source_observation.info[i];sources.push_back({{"name",info.name},{"loader_normalized_n_k",info.dimensions},
                 {"gguf_type",int(info.type)},{"artifact_split_index",info.split_idx},{"offset",info.offset},{"bytes",info.size_bytes},
-                {"local_n",widths[i]},{"source_row_spans",intervals},{"prepared_format",i<2?"NativeVNNI_Q8_0":"FP16"},
+                {"local_n",widths[i]},{"source_row_spans",intervals},{"prepared_format",i<2?"NativeQuantised_Q8_0":"FP16"},
                 {"activation_operand",i<2?"single_q8":"half_rne"},{"binding_id",refs[i].binding_id},{"prepared_actual",prepared}});
         }
         return {{"schema","llaminar.recorded_gdn_projection.result.v1"},{"scope",cohort?"cohort_participant":"local_shape"},

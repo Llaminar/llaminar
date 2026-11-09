@@ -17,8 +17,8 @@ TEST(PhysicalPieceMeasurementContract, ActualProducerPreservesMixedFormatsUnderE
     plan.domains={hot,cold};plan.routed_tiers={{.name="hot",.domain="hot",.priority=0,.max_experts_per_layer=1},
         {.name="cold",.domain="cold",.priority=1,.max_experts_per_layer=1,.fallback=true}};
     plan.placements={{.layer=7,.routed_expert_tier={0,1}}};
-    const auto native=[](std::size_t index){const auto *m=native_vnni_formats::kAllSourceFormats[index].metadata;
-        return ExpertWeightFormat::nativeVnni({.codebook_id=m->codebook_id,.is_superblock=m->is_superblock,.present=true});};
+    const auto native=[](std::size_t index){const auto *m=native_quantised_formats::kAllSourceFormats[index].metadata;
+        return ExpertWeightFormat::nativeQuantised({.codebook_id=m->codebook_id,.is_superblock=m->is_superblock,.present=true});};
     MoEOverlayLayerWeightManifest source{7,{{{ExpertTierWeightProjection::Gate,512,256,native(0)},
         {ExpertTierWeightProjection::Up,512,256,ExpertWeightFormat::floating(TensorType::FP16)},
         {ExpertTierWeightProjection::Down,256,512,native(20)}}}};

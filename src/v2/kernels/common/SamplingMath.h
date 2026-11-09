@@ -92,7 +92,7 @@ namespace llaminar2::sampling_math
      * value-owned launch parameters only.
      */
     constexpr int kSpeculativeBatchMaxRows =
-        kDefaultNativeVNNIVerifierRowCapacity - 1;
+        kDefaultNativeQuantisedVerifierRowCapacity - 1;
     constexpr int kSpeculativeBatchMaxOutputTokens =
         kSpeculativeBatchMaxRows + 1;
     constexpr int kSpeculativeBatchMaxStopTokens = 8;

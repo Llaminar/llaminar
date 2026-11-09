@@ -149,17 +149,17 @@ namespace
         constexpr size_t rows = 256;
         constexpr size_t blocks_per_row = 8;
         const size_t words = weights.size() * rows * blocks_per_row;
-        ASSERT_NE(slot.d_native_vnni_scales, nullptr);
-        ASSERT_NE(slot.d_native_vnni_mins, nullptr);
+        ASSERT_NE(slot.d_native_quantised_scales, nullptr);
+        ASSERT_NE(slot.d_native_quantised_mins, nullptr);
         ASSERT_EQ(slot.scales_bytes, words * sizeof(uint16_t));
         ASSERT_EQ(slot.mins_bytes, words * sizeof(uint16_t));
         ASSERT_NE(stream, nullptr);
         std::vector<uint16_t> bases(words), coefficients(words);
         // load()/finalize() have already drained the producer streams. These
         // diagnostic copies and their completion remain outside graph capture.
-        ASSERT_TRUE(backend.deviceToHostOnStream(bases.data(), slot.d_native_vnni_scales,
+        ASSERT_TRUE(backend.deviceToHostOnStream(bases.data(), slot.d_native_quantised_scales,
             slot.scales_bytes, device.ordinal, stream));
-        ASSERT_TRUE(backend.deviceToHostOnStream(coefficients.data(), slot.d_native_vnni_mins,
+        ASSERT_TRUE(backend.deviceToHostOnStream(coefficients.data(), slot.d_native_quantised_mins,
             slot.mins_bytes, device.ordinal, stream));
         ASSERT_TRUE(backend.synchronizeStream(stream, device.ordinal));
         for (size_t group = 0; group < weights.size(); ++group)
@@ -383,7 +383,7 @@ namespace
                         const auto &source = *dynamic_cast<const IINT8Unpackable &>(*weights.front()).vnniFormatInfo();
                         const auto allocation = layout == GPUPreparedWeightPoolLayout::MigrationReusable
                             ? reusableDeviceVnniAllocationFormat(source)
-                            : NativeVnniReusableDeviceAllocationFormat{static_cast<uint8_t>(source.payload_bytes),
+                            : NativeQuantisedReusableDeviceAllocationFormat{static_cast<uint8_t>(source.payload_bytes),
                                 canonicalDeviceVnniFormat(source).is_asymmetric, source.has_emins};
                         job.format = codebookIdToRepackFormat(source.codebook_id, source.is_superblock).value();
                         job.is_asymmetric = canonicalDeviceVnniFormat(source).is_asymmetric;

@@ -487,7 +487,7 @@ configuration and x16 links for all four MI50s. The repaired prerequisite build
 passes in 12.21 seconds. Complete Unit passes 973/973 in 135.26 seconds; all
 thirteen repaired/new host-preflight registrations pass in 98.49 seconds. The
 earlier r105 Unit attempt exposed another test isolation defect: dry-run
-NativeVNNI fixtures still selected automatic real GPU discovery. Ordinary
+NativeQuantised fixtures still selected automatic real GPU discovery. Ordinary
 fixtures now select the CPU fitter explicitly; a focused original-script
 regression exercises automatic discovery through fake tools and is registered
 in preflight. Production policy selection and deadlines are unchanged. The

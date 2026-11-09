@@ -42,7 +42,7 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, RectangularCpuGpuSourcesUseOr
     ASSERT_TRUE(sender.acknowledgeChunkSent(chunk.header,&error));
 
     const auto downIdentity=remoteProjectionIdentity(fixture.transaction,DeviceId::cuda(0),DeviceId::cpu());
-    const auto down=makeGpuToCpuExpertTierWeightStreamManifest(native_vnni_formats::Q4_0,50,64,
+    const auto down=makeGpuToCpuExpertTierWeightStreamManifest(native_quantised_formats::Q4_0,50,64,
         downIdentity.expected_epoch,downIdentity.layer_idx,downIdentity.expert_id,downIdentity.projection,1)
         .forIntersection(ExpertTierWeightProjectionIntersection::between(originalGPU,originalCPU));
     const auto incoming=makeMoEOverlayRemoteCpuProjectionManifest(downIdentity,down,4096);
@@ -113,16 +113,16 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, NativeCpuRectanglesKeepStagin
     const auto intersection=ExpertTierWeightProjectionIntersection::between(
         P{R::ParticipantOutputSlice,256,256,13,128,32,96},
         P{R::ParticipantInputSlice,256,256,72,160,64,128});
-    for(const auto& format:native_vnni_formats::kAllSourceFormats) {
+    for(const auto& format:native_quantised_formats::kAllSourceFormats) {
         SCOPED_TRACE(format.quant_type);
-        cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
         packed.N=128;packed.K=96;packed.N_padded=128;packed.blocks_per_row=3;
         packed.payload_bytes=format.metadata->payload_bytes;
         packed.codebook_id=format.metadata->codebook_id;packed.is_superblock=format.metadata->is_superblock;
         packed.is_asymmetric=format.metadata->is_asymmetric;
-        packed.encoding=cpu::native_vnni::preparedEncodingForSource(*format.metadata);
-        packed.data_stride=cpu::native_vnni::preparedDataStride(packed.encoding);
-        packed.interleaved_block_stride=cpu::native_vnni::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric);
+        packed.encoding=cpu::native_quantised::preparedEncodingForSource(*format.metadata);
+        packed.data_stride=cpu::native_quantised::preparedDataStride(packed.encoding);
+        packed.interleaved_block_stride=cpu::native_quantised::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric);
         packed.native_interleaved.resize_uninitialized(size_t(6)*packed.interleaved_block_stride);
         for(size_t i=0;i<packed.native_interleaved.size();++i)packed.native_interleaved[i]=uint8_t(i*37+11);
         const auto manifest=makeMoEOverlayRemoteCpuProjectionManifest(identity,packed,73).forCPUIntersection(intersection);
@@ -189,23 +189,23 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, GpuArrivalAuthenticatesOrigin
         std::pair{whole,columns},std::pair{offset,columns}};
     auto fixture=makeTransaction();
     for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
-    for (const auto &format : native_vnni_formats::kAllSourceFormats)
+    for (const auto &format : native_quantised_formats::kAllSourceFormats)
     for (const auto &[source,destination] : cases)
     {
         SCOPED_TRACE(device.toString());
         SCOPED_TRACE(format.quant_type);
         SCOPED_TRACE(source.first_row);
         SCOPED_TRACE(destination.first_column);
-        cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
         packed.N=source.rows; packed.K=source.columns; packed.N_padded=(packed.N+63)/64*64;
         packed.blocks_per_row=packed.K/32;
         packed.payload_bytes=format.metadata->payload_bytes;
         packed.codebook_id=format.metadata->codebook_id;
         packed.is_superblock=format.metadata->is_superblock;
         packed.is_asymmetric=format.metadata->is_asymmetric;
-        packed.encoding=cpu::native_vnni::preparedEncodingForSource(*format.metadata);
-        packed.data_stride=cpu::native_vnni::preparedDataStride(packed.encoding);
-        packed.interleaved_block_stride=cpu::native_vnni::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric);
+        packed.encoding=cpu::native_quantised::preparedEncodingForSource(*format.metadata);
+        packed.data_stride=cpu::native_quantised::preparedDataStride(packed.encoding);
+        packed.interleaved_block_stride=cpu::native_quantised::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric);
         packed.native_interleaved.resize_uninitialized(size_t(packed.N_padded/64)*packed.blocks_per_row*packed.interleaved_block_stride);
         const auto identity=remoteProjectionIdentity(fixture.transaction,DeviceId::cpu(),device);
         const auto intersection=ExpertTierWeightProjectionIntersection::between(source,destination);
@@ -213,7 +213,7 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, GpuArrivalAuthenticatesOrigin
             identity.layer_idx,identity.expert_id,identity.projection,1).forIntersection(intersection);
         const auto manifest=makeMoEOverlayRemoteCpuProjectionManifest(identity,stream,4096);
         ASSERT_TRUE(manifest.valid());
-        const auto model_format=ExpertWeightFormat::nativeVnni({.codebook_id=format.metadata->codebook_id,
+        const auto model_format=ExpertWeightFormat::nativeQuantised({.codebook_id=format.metadata->codebook_id,
             .is_superblock=format.metadata->is_superblock,.present=true});
         EXPECT_TRUE(manifest.matchesGpuDestinationProjection(intersection,model_format,destination.rows,destination.columns));
         EXPECT_EQ(manifest.N,intersection.rows()); EXPECT_EQ(manifest.K,intersection.columns());
@@ -228,9 +228,9 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, GpuArrivalAuthenticatesOrigin
         auto foreign_destination=destination; foreign_destination.residence=R::ParticipantOutputSlice; ++foreign_destination.first_row; --foreign_destination.rows;
         EXPECT_FALSE(manifest.matchesGpuDestinationProjection(
             ExpertTierWeightProjectionIntersection::between(source,foreign_destination),model_format,destination.rows,destination.columns));
-        auto wrong_format=model_format; wrong_format.native_vnni.is_superblock=!wrong_format.native_vnni.is_superblock;
+        auto wrong_format=model_format; wrong_format.native_quantised.is_superblock=!wrong_format.native_quantised.is_superblock;
         EXPECT_FALSE(manifest.matchesGpuDestinationProjection(intersection,wrong_format,destination.rows,destination.columns));
-        wrong_format=model_format; ++wrong_format.native_vnni.codebook_id;
+        wrong_format=model_format; ++wrong_format.native_quantised.codebook_id;
         EXPECT_FALSE(manifest.matchesGpuDestinationProjection(intersection,wrong_format,destination.rows,destination.columns));
         EXPECT_FALSE(manifest.matchesGpuDestinationProjection(intersection,ExpertWeightFormat::floating(TensorType::FP32),destination.rows,destination.columns));
         auto changed=manifest; ++changed.source_projection.first_row; changed.manifest_hash=changed.computedHash();

@@ -531,7 +531,7 @@ namespace llaminar2
 
         /// @brief Upload persistent down-projection descriptors for grouped CUDA prefill.
         int uploadGroupedExpertDownDescriptorTable(
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_experts,
             int d_model,
             int intermediate,
@@ -540,8 +540,8 @@ namespace llaminar2
 
         /// @brief Upload persistent gate/up descriptor tables for grouped CUDA prefill.
         int uploadGroupedExpertGateUpDescriptorTables(
-            const DeviceNativeVNNIMatrixDesc *gate_descs,
-            const DeviceNativeVNNIMatrixDesc *up_descs,
+            const DeviceNativeQuantisedMatrixDesc *gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *up_descs,
             int num_experts,
             int d_model,
             int intermediate,
@@ -567,15 +567,15 @@ namespace llaminar2
 
         bool updateGroupedExpertDownDescriptorTable(
             int descriptor_table_id,
-            const DeviceNativeVNNIMatrixDesc *down_descs,
+            const DeviceNativeQuantisedMatrixDesc *down_descs,
             int num_experts,
             int d_model,
             int intermediate) override;
 
         bool updateGroupedExpertGateUpDescriptorTables(
             int descriptor_table_id,
-            const DeviceNativeVNNIMatrixDesc *gate_descs,
-            const DeviceNativeVNNIMatrixDesc *up_descs,
+            const DeviceNativeQuantisedMatrixDesc *gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *up_descs,
             int num_experts,
             int d_model,
             int intermediate) override;
@@ -1268,7 +1268,7 @@ namespace llaminar2
             const char *buffer_name,
             std::size_t slot,
             int num_experts,
-            DeviceNativeVNNIMatrixDesc **device_descs,
+            DeviceNativeQuantisedMatrixDesc **device_descs,
             const char *context);
 
         bool rebindGroupedDescriptorTablesToWorkspace(const char *context);
@@ -1370,11 +1370,11 @@ namespace llaminar2
 
         struct GroupedDownDescriptorTable
         {
-            DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *device_descs = nullptr;
             DeviceMoEFloatingMatrixDesc *device_floating_descs = nullptr;
             std::shared_ptr<GroupedDescriptorWorkspacePublication>
                 workspace_publication;
-            std::vector<DeviceNativeVNNIMatrixDesc> host_descs;
+            std::vector<DeviceNativeQuantisedMatrixDesc> host_descs;
             std::vector<DeviceMoEFloatingMatrixDesc> host_floating_descs;
             std::size_t workspace_slot = 0;
             int num_experts = 0;
@@ -1385,13 +1385,13 @@ namespace llaminar2
             uint32_t policy_codebook_mask = 0;
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::StaticDescriptorTable;
-            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
+            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
             bool valid = false;
 
             /** @return Whether the selected descriptor family has device storage. */
             [[nodiscard]] bool deviceReady() const noexcept
             {
-                return weight_format == DeviceMoEWeightFormat::NativeVNNI
+                return weight_format == DeviceMoEWeightFormat::NativeQuantised
                            ? device_descs != nullptr
                            : deviceMoEWeightFormatIsFloating(weight_format) &&
                                  device_floating_descs != nullptr;
@@ -1400,14 +1400,14 @@ namespace llaminar2
 
         struct GroupedGateUpDescriptorTable
         {
-            DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *device_gate_descs = nullptr;
+            DeviceNativeQuantisedMatrixDesc *device_up_descs = nullptr;
             DeviceMoEFloatingMatrixDesc *device_floating_gate_descs = nullptr;
             DeviceMoEFloatingMatrixDesc *device_floating_up_descs = nullptr;
             std::shared_ptr<GroupedDescriptorWorkspacePublication>
                 workspace_publication;
-            std::vector<DeviceNativeVNNIMatrixDesc> host_gate_descs;
-            std::vector<DeviceNativeVNNIMatrixDesc> host_up_descs;
+            std::vector<DeviceNativeQuantisedMatrixDesc> host_gate_descs;
+            std::vector<DeviceNativeQuantisedMatrixDesc> host_up_descs;
             std::vector<DeviceMoEFloatingMatrixDesc> host_floating_gate_descs;
             std::vector<DeviceMoEFloatingMatrixDesc> host_floating_up_descs;
             std::size_t workspace_slot = 0;
@@ -1419,13 +1419,13 @@ namespace llaminar2
             uint32_t policy_codebook_mask = 0;
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::StaticDescriptorTable;
-            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
+            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
             bool valid = false;
 
             /** @return Whether both selected descriptor tables are resident. */
             [[nodiscard]] bool deviceReady() const noexcept
             {
-                return weight_format == DeviceMoEWeightFormat::NativeVNNI
+                return weight_format == DeviceMoEWeightFormat::NativeQuantised
                            ? device_gate_descs != nullptr && device_up_descs != nullptr
                            : deviceMoEWeightFormatIsFloating(weight_format) &&
                                  device_floating_gate_descs != nullptr &&

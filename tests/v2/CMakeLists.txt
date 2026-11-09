@@ -144,14 +144,13 @@ else()
 endif()
 
 # =============================================================================
-# Release-mode guard: only build performance test targets
+# Release-mode performance defaults and explicit native test selection
 # =============================================================================
 # When V2_PERF_TESTS_ONLY is ON (set by parent for Release builds), we override
-# add_executable so that only targets with the v2_perf_ prefix are created.
-# All other test executables (v2_test_*, v2_integration_*, v2_unit_*,
-# v2_orchestration_*, v2_e2e_*) become no-ops, keeping the Release build lean.
-# The add_v2_test() and discover_v2_parity_tests() functions also early-return
-# for non-perf tests when this flag is set.
+# add_executable so performance targets and explicitly selected original native
+# test owners are created. Other test executables remain no-ops. Selected native
+# owners are excluded from default all; add_v2_test follows their COMMAND target
+# identities without changing compile definitions or the production core ABI.
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/V2TestTargetSelection.cmake)
 
 # =============================================================================
@@ -234,11 +233,6 @@ endif()
 #   - Sets environment variables for optimal performance
 
 function(add_v2_test TEST_NAME)
-    # In Release mode (V2_PERF_TESTS_ONLY), skip non-performance tests
-    if(V2_PERF_TESTS_ONLY AND NOT "${TEST_NAME}" MATCHES "^V2_Perf_")
-        return()
-    endif()
-
     cmake_parse_arguments(
         ARG                             # Prefix for parsed args
         "NO_MODELS;NO_MPI"              # Explicit model/process requirements
@@ -246,6 +240,12 @@ function(add_v2_test TEST_NAME)
         "COMMAND;LABELS;RESOURCE_LOCK;ENVIRONMENT;REQUIRED_FILES"  # Multi-value keywords
         ${ARGN}                         # Arguments to parse
     )
+    # Release aliases are admitted only through their explicitly selected
+    # original native owner; default performance-only behavior is unchanged.
+    v2_test_registration_selected("${TEST_NAME}" V2_TEST_SELECTED ${ARG_COMMAND})
+    if(NOT V2_TEST_SELECTED)
+        return()
+    endif()
     list(APPEND ARG_LABELS "ProcessOwned")
 
     # Retain target identities before MPI wrapping or Debug path rewriting.
@@ -1072,7 +1072,7 @@ add_v2_test(V2_Integration_MoEProjectionPreparedIdentity
     NO_MODELS
 )
 
-# Test: typed NativeVNNI and floating routed-expert descriptor publication
+# Test: typed NativeQuantised and floating routed-expert descriptor publication
 add_executable(v2_unit_device_moe_expert_descriptor_builder
     unit/execution/moe/Test__DeviceMoEExpertDescriptorBuilder.cpp
 )
@@ -1083,7 +1083,7 @@ target_link_libraries(v2_unit_device_moe_expert_descriptor_builder
 )
 add_v2_test(V2_Unit_DeviceMoEExpertDescriptorBuilder
     COMMAND $<TARGET_FILE:v2_unit_device_moe_expert_descriptor_builder>
-    LABELS "V2;Unit;Execution;MoE;Descriptors;FloatingPoint;NativeVNNI"
+    LABELS "V2;Unit;Execution;MoE;Descriptors;FloatingPoint;NativeQuantised"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -1449,6 +1449,12 @@ add_v2_routed_expert_policy_unit(
     v2_unit_moe_overlay_node_local_route_transport
     V2_Unit_MoEOverlayNodeLocalRouteTransport
     unit/execution/moe/Test__MoEOverlayNodeLocalRouteTransport.cpp
+)
+add_v2_test(V2_Integration_MoEPrefillTransportDiagnosticSelection
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_node_local_route_transport>
+        --gtest_filter=Test__MoEOverlayNodeLocalRouteTransport.Diagnostic*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Transport;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
 )
 add_v2_routed_expert_policy_unit(
     v2_unit_moe_overlay_canonical_host_return
@@ -2112,7 +2118,7 @@ add_v2_test(V2_Unit_CacheInfo
     MPI_PROCS 1
 )
 
-# Test: shared NativeVNNI row-regime and geometry-aware GPU tile policy.
+# Test: shared NativeQuantised row-regime and geometry-aware GPU tile policy.
 # This is host-only even in GPU-enabled builds; unit tests must never allocate
 # a device or launch a kernel.
 add_executable(v2_test_prefill_graph_bucket_defaults
@@ -2125,54 +2131,54 @@ target_link_libraries(v2_test_prefill_graph_bucket_defaults
 )
 add_v2_test(V2_Unit_PrefillGraphBucketDefaults
     COMMAND $<TARGET_FILE:v2_test_prefill_graph_bucket_defaults>
-    LABELS "V2;Unit;Utils;NativeVNNI;MTP;Dispatch;Regression"
+    LABELS "V2;Unit;Utils;NativeQuantised;MTP;Dispatch;Regression"
     MPI_PROCS 1
 )
 
-# Test: allocation-free NativeVNNI generated-policy cache semantics. This is
+# Test: allocation-free NativeQuantised generated-policy cache semantics. This is
 # host-only and performs no CUDA or ROCm work.
-add_executable(v2_test_native_vnni_dispatch_cache
-    unit/kernels/Test__NativeVNNIDispatchCache.cpp
+add_executable(v2_test_native_quantised_dispatch_cache
+    unit/kernels/Test__NativeQuantisedDispatchCache.cpp
 )
-target_link_libraries(v2_test_native_vnni_dispatch_cache
+target_link_libraries(v2_test_native_quantised_dispatch_cache
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_NativeVNNIDispatchCache
-    COMMAND $<TARGET_FILE:v2_test_native_vnni_dispatch_cache>
-    LABELS "V2;Unit;Kernels;NativeVNNI;MTP;Dispatch;Cache;Regression"
+add_v2_test(V2_Unit_NativeQuantisedDispatchCache
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_dispatch_cache>
+    LABELS "V2;Unit;Kernels;NativeQuantised;MTP;Dispatch;Cache;Regression"
     MPI_PROCS 1
 )
 
 # Prefill task ownership is a pure geometry policy, independent of ISA or devices.
-add_executable(v2_test_native_vnni_prefill_schedule
-    unit/kernels/Test__NativeVNNIPrefillSchedule.cpp)
-target_include_directories(v2_test_native_vnni_prefill_schedule PRIVATE
+add_executable(v2_test_native_quantised_prefill_schedule
+    unit/kernels/Test__NativeQuantisedPrefillSchedule.cpp)
+target_include_directories(v2_test_native_quantised_prefill_schedule PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
-target_link_libraries(v2_test_native_vnni_prefill_schedule PRIVATE
+target_link_libraries(v2_test_native_quantised_prefill_schedule PRIVATE
     GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_NativeVNNIPrefillSchedule
-    COMMAND $<TARGET_FILE:v2_test_native_vnni_prefill_schedule>
-    LABELS "V2;Unit;CPU;NativeVNNI;Prefill;Scheduling;Regression"
+add_v2_test(V2_Unit_NativeQuantisedPrefillSchedule
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_prefill_schedule>
+    LABELS "V2;Unit;CPU;NativeQuantised;Prefill;Scheduling;Regression"
     MPI_PROCS 1
     NO_MODELS)
 add_v2_test(V2_Integration_CPU_PrefillSchedule
-    COMMAND $<TARGET_FILE:v2_test_native_vnni_prefill_schedule>
-    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;Prefill;Scheduling;Regression"
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_prefill_schedule>
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;Prefill;Scheduling;Regression"
     MPI_PROCS 1
     NO_MODELS)
 
-# Compact NativeVNNI bit arithmetic is exhaustively tested without a backend.
-add_executable(v2_test_native_vnni_packed_bits
-    unit/kernels/Test__NativeVNNIPackedBits.cpp)
-target_include_directories(v2_test_native_vnni_packed_bits PRIVATE
+# Compact NativeQuantised bit arithmetic is exhaustively tested without a backend.
+add_executable(v2_test_native_quantised_packed_bits
+    unit/kernels/Test__NativeQuantisedPackedBits.cpp)
+target_include_directories(v2_test_native_quantised_packed_bits PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
-target_link_libraries(v2_test_native_vnni_packed_bits PRIVATE
+target_link_libraries(v2_test_native_quantised_packed_bits PRIVATE
     GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_NativeVNNIPackedBits
-    COMMAND $<TARGET_FILE:v2_test_native_vnni_packed_bits>
-    LABELS "V2;Unit;Kernels;NativeVNNI;ByteExact;Regression"
+add_v2_test(V2_Unit_NativeQuantisedPackedBits
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_packed_bits>
+    LABELS "V2;Unit;Kernels;NativeQuantised;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -2186,7 +2192,7 @@ target_link_libraries(v2_test_cuda_prefill_staging_schedule PRIVATE
     GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_CUDAPrefillStagingSchedule
     COMMAND $<TARGET_FILE:v2_test_cuda_prefill_staging_schedule>
-    LABELS "V2;Unit;Kernels;NativeVNNI;Prefill;Regression"
+    LABELS "V2;Unit;Kernels;NativeQuantised;Prefill;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -2201,7 +2207,7 @@ target_link_libraries(v2_test_cuda_canonical_kpart_fold PRIVATE
 target_compile_features(v2_test_cuda_canonical_kpart_fold PRIVATE cxx_std_20)
 add_v2_test(V2_Unit_CUDACanonicalKpartFold
     COMMAND $<TARGET_FILE:v2_test_cuda_canonical_kpart_fold>
-    LABELS "V2;Unit;Kernels;NativeVNNI;ByteExact;Regression"
+    LABELS "V2;Unit;Kernels;NativeQuantised;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -2437,7 +2443,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
     # the same process; the Python integration gate joins their exact FP32 CSVs
     # and byte sidecars while retaining both sets as diagnostic artifacts.
     set(CROSS_VENDOR_MOE_ARITHMETIC_SOURCE
-        integration/kernels/moe/CrossVendorNativeVNNIArithmeticEmitter.cpp)
+        integration/kernels/moe/CrossVendorNativeQuantisedArithmeticEmitter.cpp)
     add_executable(v2_cross_vendor_moe_arithmetic_cuda
         ${CROSS_VENDOR_MOE_ARITHMETIC_SOURCE})
     target_compile_definitions(v2_cross_vendor_moe_arithmetic_cuda PRIVATE
@@ -2454,11 +2460,11 @@ if(HAVE_CUDA AND HAVE_ROCM)
 
     add_v2_test(V2_Integration_CrossVendor_MoE_AllCodebooks_ArithmeticParity
         COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/integration/kernels/moe/compare_cross_vendor_native_vnni_arithmetic.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/integration/kernels/moe/compare_cross_vendor_native_quantised_arithmetic.py
             --cuda-emitter $<TARGET_FILE:v2_cross_vendor_moe_arithmetic_cuda>
             --rocm-emitter $<TARGET_FILE:v2_cross_vendor_moe_arithmetic_rocm>
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}/cross_vendor_moe_arithmetic_evidence
-        LABELS "V2;Integration;CUDA;ROCm;CrossVendor;Kernels;MoE;ExpertOverlay;Parity;AllFormats;AllCodebooks;NativeVNNI;PreparedWeights;DecodeEquivalent;DeviceResident;Regression"
+        LABELS "V2;Integration;CUDA;ROCm;CrossVendor;Kernels;MoE;ExpertOverlay;Parity;AllFormats;AllCodebooks;NativeQuantised;PreparedWeights;DecodeEquivalent;DeviceResident;Regression"
         MPI_PROCS 1
         TIMEOUT 900
         NO_MODELS
@@ -2963,9 +2969,9 @@ add_v2_test(V2_Unit_UPIBackend
 # linking a GTest registration TU here would silently add unrelated suites.
 if(HAVE_CUDA OR HAVE_ROCM)
 add_library(v2_expert_transfer_parity_support OBJECT
-    integration/kernels/moe/NativeVNNIExpertTransferParitySupport.cpp
+    integration/kernels/moe/NativeQuantisedExpertTransferParitySupport.cpp
     integration/kernels/moe/MixedFormatExpertTransferPublication.cpp
-    integration/kernels/moe/NativeVNNIExpertTransferGroupedParity.cpp)
+    integration/kernels/moe/NativeQuantisedExpertTransferGroupedParity.cpp)
 target_link_libraries(v2_expert_transfer_parity_support PUBLIC
     llaminar2_core GTest::gtest)
 add_executable(v2_integration_cross_tier_expert_arithmetic
@@ -3384,17 +3390,17 @@ add_v2_test(V2_Unit_TensorLayout
     MPI_PROCS 1
 )
 
-# Test: NativeVNNI intrinsic format metadata
+# Test: NativeQuantised intrinsic format metadata
 # Backend-independent regression for codebook IDs consumed by CUDA/ROCm/CPU sweep generators.
-add_executable(v2_test_native_vnni_format_info unit/tensors/Test__NativeVnniFormatInfo.cpp)
-target_link_libraries(v2_test_native_vnni_format_info
+add_executable(v2_test_native_quantised_format_info unit/tensors/Test__NativeQuantisedFormatInfo.cpp)
+target_link_libraries(v2_test_native_quantised_format_info
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_NativeVnniFormatInfo
-    COMMAND $<TARGET_FILE:v2_test_native_vnni_format_info>
-    LABELS "V2;Unit;TensorOperations;NativeVNNI;Quantization;Codebook;Regression"
+add_v2_test(V2_Unit_NativeQuantisedFormatInfo
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_format_info>
+    LABELS "V2;Unit;TensorOperations;NativeQuantised;Quantization;Codebook;Regression"
     MPI_PROCS 1
 )
 
@@ -3406,20 +3412,20 @@ add_v2_test(V2_Unit_NativeVnniFormatInfo
 # loads exactly one runtime and binds to one physical accelerator, avoiding
 # CUDA/HIP startup interaction in-process.
 if(HAVE_CUDA)
-    add_library(v2_native_vnni_leaf_primary_scorer_cuda SHARED
-        performance/kernels/native_vnni_dispatch/CUDANativeVNNILeafPrimaryScorer.cu
+    add_library(v2_native_quantised_leaf_primary_scorer_cuda SHARED
+        performance/kernels/native_quantised_dispatch/CUDANativeQuantisedLeafPrimaryScorer.cu
     )
-    target_include_directories(v2_native_vnni_leaf_primary_scorer_cuda PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch
+    target_include_directories(v2_native_quantised_leaf_primary_scorer_cuda PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_quantised_dispatch
     )
-    target_link_libraries(v2_native_vnni_leaf_primary_scorer_cuda PRIVATE
+    target_link_libraries(v2_native_quantised_leaf_primary_scorer_cuda PRIVATE
         CUDA::cudart
     )
-    target_compile_options(v2_native_vnni_leaf_primary_scorer_cuda PRIVATE
+    target_compile_options(v2_native_quantised_leaf_primary_scorer_cuda PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;--ftz=false;--prec-div=true;--prec-sqrt=true>
     )
-    set_target_properties(v2_native_vnni_leaf_primary_scorer_cuda PROPERTIES
-        OUTPUT_NAME llaminar_native_vnni_leaf_primary_scorer_cuda
+    set_target_properties(v2_native_quantised_leaf_primary_scorer_cuda PROPERTIES
+        OUTPUT_NAME llaminar_native_quantised_leaf_primary_scorer_cuda
         CXX_VISIBILITY_PRESET hidden
         CUDA_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN YES
@@ -3428,24 +3434,24 @@ endif()
 
 if(HAVE_ROCM)
     set_source_files_properties(
-        performance/kernels/native_vnni_dispatch/ROCmNativeVNNILeafPrimaryScorer.hip
+        performance/kernels/native_quantised_dispatch/ROCmNativeQuantisedLeafPrimaryScorer.hip
         PROPERTIES LANGUAGE HIP
     )
-    add_library(v2_native_vnni_leaf_primary_scorer_rocm SHARED
-        performance/kernels/native_vnni_dispatch/ROCmNativeVNNILeafPrimaryScorer.hip
+    add_library(v2_native_quantised_leaf_primary_scorer_rocm SHARED
+        performance/kernels/native_quantised_dispatch/ROCmNativeQuantisedLeafPrimaryScorer.hip
     )
-    target_include_directories(v2_native_vnni_leaf_primary_scorer_rocm PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch
+    target_include_directories(v2_native_quantised_leaf_primary_scorer_rocm PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_quantised_dispatch
     )
-    target_link_libraries(v2_native_vnni_leaf_primary_scorer_rocm PRIVATE
+    target_link_libraries(v2_native_quantised_leaf_primary_scorer_rocm PRIVATE
         hip::host
         hip::device
     )
-    target_compile_options(v2_native_vnni_leaf_primary_scorer_rocm PRIVATE
+    target_compile_options(v2_native_quantised_leaf_primary_scorer_rocm PRIVATE
         $<$<COMPILE_LANGUAGE:HIP>:-O3;-fno-fast-math;-ffp-contract=off>
     )
-    set_target_properties(v2_native_vnni_leaf_primary_scorer_rocm PROPERTIES
-        OUTPUT_NAME llaminar_native_vnni_leaf_primary_scorer_rocm
+    set_target_properties(v2_native_quantised_leaf_primary_scorer_rocm PROPERTIES
+        OUTPUT_NAME llaminar_native_quantised_leaf_primary_scorer_rocm
         CXX_VISIBILITY_PRESET hidden
         HIP_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN YES
@@ -3459,117 +3465,46 @@ endif()
 # The same integration also requires persistent matrix/scratch reuse, captured
 # graph replay, one terminal stream synchronization, and zero intermediate syncs.
 if(NOT V2_PERF_TESTS_ONLY AND HAVE_CUDA)
-    add_test(NAME V2_Integration_NativeVNNILeafPrimaryScorer_CUDA
+    add_test(NAME V2_Integration_NativeQuantisedLeafPrimaryScorer_CUDA
         COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/integration/kernels/Test__NativeVNNILeafPrimaryScorer.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/integration/kernels/Test__NativeQuantisedLeafPrimaryScorer.py
             --backend cuda
-            --library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_cuda>
+            --library $<TARGET_FILE:v2_native_quantised_leaf_primary_scorer_cuda>
             --device 0
     )
-    set_tests_properties(V2_Integration_NativeVNNILeafPrimaryScorer_CUDA PROPERTIES
-        LABELS "V2;Integration;CUDA;NativeVNNI;MTP;Dispatch;Trainer;GPUAccelerated;Exact;Regression"
+    set_tests_properties(V2_Integration_NativeQuantisedLeafPrimaryScorer_CUDA PROPERTIES
+        LABELS "V2;Integration;CUDA;NativeQuantised;MTP;Dispatch;Trainer;GPUAccelerated;Exact;Regression"
         RESOURCE_LOCK cuda_gpu_0
         TIMEOUT 30
     )
 endif()
 
 if(NOT V2_PERF_TESTS_ONLY AND HAVE_ROCM)
-    add_test(NAME V2_Integration_NativeVNNILeafPrimaryScorer_ROCm
+    add_test(NAME V2_Integration_NativeQuantisedLeafPrimaryScorer_ROCm
         COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/integration/kernels/Test__NativeVNNILeafPrimaryScorer.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/integration/kernels/Test__NativeQuantisedLeafPrimaryScorer.py
             --backend rocm
-            --library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_rocm>
+            --library $<TARGET_FILE:v2_native_quantised_leaf_primary_scorer_rocm>
             --device 0
     )
-    set_tests_properties(V2_Integration_NativeVNNILeafPrimaryScorer_ROCm PROPERTIES
-        LABELS "V2;Integration;ROCm;NativeVNNI;MTP;Dispatch;Trainer;GPUAccelerated;Exact;Regression"
+    set_tests_properties(V2_Integration_NativeQuantisedLeafPrimaryScorer_ROCm PROPERTIES
+        LABELS "V2;Integration;ROCm;NativeQuantised;MTP;Dispatch;Trainer;GPUAccelerated;Exact;Regression"
         RESOURCE_LOCK rocm_gpu_0
         TIMEOUT 30
     )
 endif()
 
-# Production-shaped scorer benchmark. Keep this in the performance tier: it
-# launches the complete 32-leaf GPU search and intentionally carries no serial
-# Python oracle. The integration suite above owns exactness; this target makes
-# capture/replay economics visible before an hours-long corpus fit is started.
-if(HAVE_CUDA)
-    add_test(NAME V2_Perf_NativeVNNIPolicyScorer_CUDA
-        COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/Perf__NativeVNNIPolicyScorer.py
-            --backend cuda
-            --library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_cuda>
-            --device 0
-    )
-    set_tests_properties(V2_Perf_NativeVNNIPolicyScorer_CUDA PROPERTIES
-        LABELS "V2;Performance;CUDA;NativeVNNI;Dispatch;Trainer;GPUAccelerated"
-        RESOURCE_LOCK cuda_gpu_0
-        TIMEOUT 300
-    )
-endif()
+# Exact-overlay refreshes use measured candidate winners. Generic tree-search
+# and profiler-surrogate fitting campaigns are retired; the independent native
+# scorer arithmetic/replay integration tests above remain diagnostic coverage.
 
-# Real profiler-surrogate training belongs in Performance, never Unit. This
-# launches the exact deterministic CUDA histogram learner used to construct
-# leakage-controlled prediction surfaces, verifies byte-stable predictions,
-# and guards the per-surface wall-clock budget independently of policy-tree CV.
-if(HAVE_CUDA)
-    add_test(NAME V2_Perf_NativeVNNIProfilerSurrogate_CUDA
-        COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/Perf__NativeVNNIProfilerSurrogate.py
-            --device 0
-            --peer-device 1
-            --target-seconds 5
-    )
-    set_tests_properties(V2_Perf_NativeVNNIProfilerSurrogate_CUDA PROPERTIES
-        LABELS "V2;Performance;CUDA;NativeVNNI;Dispatch;Trainer;Profiler;GPUAccelerated;Determinism"
-        RESOURCE_LOCK "cuda_gpu_0;cuda_gpu_1"
-        TIMEOUT 120
-    )
-endif()
-
-if(HAVE_ROCM)
-    add_test(NAME V2_Perf_NativeVNNIPolicyScorer_ROCm
-        COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/Perf__NativeVNNIPolicyScorer.py
-            --backend rocm
-            --library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_rocm>
-            --device 0
-    )
-    set_tests_properties(V2_Perf_NativeVNNIPolicyScorer_ROCm PROPERTIES
-        LABELS "V2;Performance;ROCm;NativeVNNI;Dispatch;Trainer;GPUAccelerated"
-        RESOURCE_LOCK rocm_gpu_0
-        TIMEOUT 300
-    )
-endif()
-
-# End-to-end grouped-CV economics. Unlike the per-fold scorer tests above, this
-# runs production fold construction, all profiler-influence variants, dynamic
-# scheduling across every local accelerator, and deterministic CV reduction.
-# It reports a 108-domain projection so tuning can target a complete fit in
-# minutes rather than optimizing an isolated graph while orchestration remains
-# expensive. The projection is diagnostic until the target is achieved; the
-# harness itself still hard-fails runtime, coverage, and worker-lifecycle bugs.
-if(HAVE_CUDA AND HAVE_ROCM)
-    add_test(NAME V2_Perf_NativeVNNIPolicyCrossValidation_MixedGPU
-        COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/Perf__NativeVNNIPolicyCrossValidation.py
-            --cuda-library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_cuda>
-            --rocm-library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_rocm>
-    )
-    set_tests_properties(
-        V2_Perf_NativeVNNIPolicyCrossValidation_MixedGPU PROPERTIES
-        LABELS "V2;Performance;CUDA;ROCm;NativeVNNI;Dispatch;Trainer;CrossValidation;GPUAccelerated"
-        RESOURCE_LOCK "cuda_gpu_0;cuda_gpu_1;rocm_gpu_0;rocm_gpu_1;rocm_gpu_2;rocm_gpu_3"
-        TIMEOUT 600
-    )
-endif()
-
-add_test(NAME V2_Unit_NativeVNNICodebookCsvValidator
+add_test(NAME V2_Unit_NativeQuantisedCodebookCsvValidator
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_codebook_csv.py
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/fixtures/native_vnni_codebook_aliases.csv
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_quantised_codebook_csv.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/fixtures/native_quantised_codebook_aliases.csv
 )
-set_tests_properties(V2_Unit_NativeVNNICodebookCsvValidator PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;Quantization;Codebook;CSV;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedCodebookCsvValidator PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;Quantization;Codebook;CSV;Regression"
     TIMEOUT 30
 )
 
@@ -4189,6 +4124,14 @@ add_v2_test(V2_Integration_ReleaseTestTargetSelection
         --cmake ${CMAKE_COMMAND} --ninja ${CMAKE_MAKE_PROGRAM}
     LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ReleaseExplicitNativeTestSelection
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_test_target_selection.py
+        --cmake ${CMAKE_COMMAND} --ninja ${CMAKE_MAKE_PROGRAM}
+        TestTargetSelection.test_explicit_release_native_owner_and_aliases
+        TestTargetSelection.test_explicit_release_native_owner_rejects_unknown_or_foreign_targets
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 # Actual included modules must obey the same Release/Integration target policy.
 foreach(_native_module_selection_kind Unit Integration)
     set(_native_module_selection_labels "V2;${_native_module_selection_kind};BuildSystem;Regression;DeviceFree")
@@ -5031,17 +4974,17 @@ add_v2_test(V2_Integration_GroupedDp4aGeometry
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 
 # The actual diagnostic order authority is independently device-free.
-add_executable(v2_unit_native_vnni_geometry_timing_order
-    unit/kernels/Test__NativeVNNIGeometryTimingOrder.cpp)
-target_compile_features(v2_unit_native_vnni_geometry_timing_order PRIVATE cxx_std_23)
-target_link_libraries(v2_unit_native_vnni_geometry_timing_order PRIVATE GTest::gtest_main)
-add_v2_test(V2_Unit_NativeVNNIGeometryTimingOrder
-    COMMAND $<TARGET_FILE:v2_unit_native_vnni_geometry_timing_order>
-    LABELS "V2;Unit;NativeVNNI;Timing;DeviceFree;Regression"
+add_executable(v2_unit_native_quantised_geometry_timing_order
+    unit/kernels/Test__NativeQuantisedGeometryTimingOrder.cpp)
+target_compile_features(v2_unit_native_quantised_geometry_timing_order PRIVATE cxx_std_23)
+target_link_libraries(v2_unit_native_quantised_geometry_timing_order PRIVATE GTest::gtest_main)
+add_v2_test(V2_Unit_NativeQuantisedGeometryTimingOrder
+    COMMAND $<TARGET_FILE:v2_unit_native_quantised_geometry_timing_order>
+    LABELS "V2;Unit;NativeQuantised;Timing;DeviceFree;Regression"
     NO_MPI NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_NativeVNNIGeometryTimingOrder
-    COMMAND $<TARGET_FILE:v2_unit_native_vnni_geometry_timing_order>
-    LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;Timing;DeviceFree;Regression"
+add_v2_test(V2_Integration_NativeQuantisedGeometryTimingOrder
+    COMMAND $<TARGET_FILE:v2_unit_native_quantised_geometry_timing_order>
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;Timing;DeviceFree;Regression"
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 
 # Immutable launch ownership is device-free even in a CPU-only build.
@@ -5053,11 +4996,11 @@ target_compile_features(v2_unit_rocm_dense_prefill_overlay PRIVATE cxx_std_23)
 target_link_libraries(v2_unit_rocm_dense_prefill_overlay PRIVATE GTest::gtest_main)
 add_v2_test(V2_Unit_ROCmDensePrefillOverlay
     COMMAND $<TARGET_FILE:v2_unit_rocm_dense_prefill_overlay>
-    LABELS "V2;Unit;NativeVNNI;Prefill;Policy;DeviceFree;Regression"
+    LABELS "V2;Unit;NativeQuantised;Prefill;Policy;DeviceFree;Regression"
     NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_ROCmDensePrefillOverlayAdmission
     COMMAND $<TARGET_FILE:v2_unit_rocm_dense_prefill_overlay>
-    LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;Prefill;Policy;DeviceFree;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;Prefill;Policy;DeviceFree;Regression"
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 
 if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
@@ -5065,29 +5008,29 @@ if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
     # sources, not the entire engine. Unrelated backend failures therefore do
     # not prevent rapid captured validation of a GEMM register-lifetime fix.
     set(V2_ROCM_REGISTER_LIFETIME_SOURCES
-        integration/kernels/rocm/Test__NativeVNNIRegisterLifetime.cpp
-        ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeVNNIGemmDispatch.cpp
+        integration/kernels/rocm/Test__NativeQuantisedRegisterLifetime.cpp
+        ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeQuantisedGemmDispatch.cpp
         ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.cpp
-        ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip
+        ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip
         ${CMAKE_SOURCE_DIR}/backends/rocm/HipDeviceGuard.cpp
         ${CMAKE_SOURCE_DIR}/backends/rocm/ROCmRuntimeStartup.cpp
         ${CMAKE_SOURCE_DIR}/utils/PerfStatsCollector.cpp)
     foreach(V2_NATIVE_SHARD RANGE 0 7)
         list(APPEND V2_ROCM_REGISTER_LIFETIME_SOURCES
-            ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeVNNIGemmShard${V2_NATIVE_SHARD}.hip)
+            ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeQuantisedGemmShard${V2_NATIVE_SHARD}.hip)
     endforeach()
-    add_executable(v2_integration_rocm_native_vnni_register_lifetime
+    add_executable(v2_integration_rocm_native_quantised_register_lifetime
         ${V2_ROCM_REGISTER_LIFETIME_SOURCES})
-    target_include_directories(v2_integration_rocm_native_vnni_register_lifetime
+    target_include_directories(v2_integration_rocm_native_quantised_register_lifetime
         PRIVATE ${CMAKE_SOURCE_DIR} ${ROCM_PATH}/include)
-    target_link_libraries(v2_integration_rocm_native_vnni_register_lifetime
+    target_link_libraries(v2_integration_rocm_native_quantised_register_lifetime
         PRIVATE hip::host GTest::gtest_main fort ${CMAKE_DL_LIBS})
-    target_compile_features(v2_integration_rocm_native_vnni_register_lifetime
+    target_compile_features(v2_integration_rocm_native_quantised_register_lifetime
         PRIVATE cxx_std_23)
-    set_target_properties(v2_integration_rocm_native_vnni_register_lifetime PROPERTIES
+    set_target_properties(v2_integration_rocm_native_quantised_register_lifetime PROPERTIES
         HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
-    add_v2_test(V2_Integration_ROCmNativeVNNIRegisterLifetime
-        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_register_lifetime>
+    add_v2_test(V2_Integration_ROCmNativeQuantisedRegisterLifetime
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_quantised_register_lifetime>
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;AllFormats;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120
     )
@@ -5627,196 +5570,196 @@ set_tests_properties(V2_Integration_MTPControllerObservationTrainingEvidence PRO
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MTP;Trainer;Regression" TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MTPControllerObservationTrainingEvidence)
 
-add_test(NAME V2_Unit_NativeVNNIDispatchRefreshScript
+add_test(NAME V2_Unit_NativeQuantisedDispatchRefreshScript
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_dispatch_refresh.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_dispatch_refresh.py
 )
-set_tests_properties(V2_Unit_NativeVNNIDispatchRefreshScript PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Trainer;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedDispatchRefreshScript PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;Dispatch;Trainer;Regression"
     PROCESSORS 16
     TIMEOUT 60
 )
 # A dry-run fixture must not probe the host's real accelerators. Discovery
 # exercises fixture-owned command responses through the original shell script.
-add_v2_test(V2_Integration_NativeVNNIRefreshDeviceFreePolicy
+add_v2_test(V2_Integration_NativeQuantisedRefreshDeviceFreePolicy
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
         -s ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts
-        -p test_native_vnni_dispatch_refresh.py
+        -p test_native_quantised_dispatch_refresh.py
         -k test_dry_run_policy_discovery_is_fixture_owned
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;Dispatch;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Dispatch;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeVNNIRefreshDeviceFreePolicy)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedRefreshDeviceFreePolicy)
 
-add_test(NAME V2_Unit_NativeVNNICorpusBundle
+add_test(NAME V2_Unit_NativeQuantisedCorpusBundle
     COMMAND ${Python3_EXECUTABLE} -m pytest -q
-            tests/v2/unit/scripts/test_native_vnni_corpus_bundle.py
+            tests/v2/unit/scripts/test_native_quantised_corpus_bundle.py
 )
-set_tests_properties(V2_Unit_NativeVNNICorpusBundle PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Corpus;GitLFS;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedCorpusBundle PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;Dispatch;Corpus;GitLFS;Regression"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../.."
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIDispatchPipeline
+add_test(NAME V2_Unit_NativeQuantisedDispatchPipeline
     COMMAND ${Python3_EXECUTABLE} -m pytest -q
-            tests/v2/unit/scripts/test_native_vnni_dispatch_pipeline.py
+            tests/v2/unit/scripts/test_native_quantised_dispatch_pipeline.py
 )
-set_tests_properties(V2_Unit_NativeVNNIDispatchPipeline PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Trainer;Corpus;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedDispatchPipeline PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;Dispatch;Trainer;Corpus;Regression"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../.."
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillReplayRecipe
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillReplayRecipe
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_replay_recipe.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_replay_recipe.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillReplayRecipe PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;Corpus;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillReplayRecipe PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;Prefill;Dispatch;Trainer;Corpus;Regression"
     TIMEOUT 120
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillBurnedSeal
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillBurnedSeal
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_burned_seal.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_burned_seal.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillBurnedSeal PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;Corpus;Certification;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillBurnedSeal PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;Prefill;Dispatch;Trainer;Corpus;Certification;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillCandidateExpansion
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillCandidateExpansion
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_candidate_expansion.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_candidate_expansion.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillCandidateExpansion PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;CandidateExpansion;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillCandidateExpansion PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;Prefill;Dispatch;Trainer;CandidateExpansion;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillCandidateExpansionRebase
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillCandidateExpansionRebase
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_candidate_expansion_rebase.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_candidate_expansion_rebase.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillCandidateExpansionRebase PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;CandidateExpansion;Checkpoint;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillCandidateExpansionRebase PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;Prefill;Dispatch;Trainer;CandidateExpansion;Checkpoint;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillCheckpointMigration
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillCheckpointMigration
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_checkpoint_migration.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_checkpoint_migration.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillCheckpointMigration PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;Checkpoint;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillCheckpointMigration PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;Prefill;Dispatch;Trainer;Checkpoint;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillDevelopmentLineage
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillDevelopmentLineage
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_development_lineage.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_development_lineage.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillDevelopmentLineage PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;Lineage;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillDevelopmentLineage PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;Prefill;Dispatch;Trainer;Lineage;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillGenericRefinement
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillGenericRefinement
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_generic_refinement.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_generic_refinement.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillGenericRefinement PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;Refinement;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillGenericRefinement PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;Prefill;Dispatch;Trainer;Refinement;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillRouteManifest
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillRouteManifest
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_route_manifest.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_route_manifest.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillRouteManifest PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;RouteManifest;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillRouteManifest PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;Prefill;Dispatch;Trainer;RouteManifest;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillTrainingPlan
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillTrainingPlan
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_training_plan.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_training_plan.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillTrainingPlan PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;MeasurementPlan;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillTrainingPlan PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;Prefill;Dispatch;Trainer;MeasurementPlan;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CUDANativeVNNIDecodeAdapter
+add_test(NAME V2_Unit_CUDANativeQuantisedDecodeAdapter
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cuda_native_vnni_decode_adapter.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cuda_native_quantised_decode_adapter.py
 )
-set_tests_properties(V2_Unit_CUDANativeVNNIDecodeAdapter PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CUDA;Decode;Dispatch;Trainer;Evidence;Regression"
+set_tests_properties(V2_Unit_CUDANativeQuantisedDecodeAdapter PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CUDA;Decode;Dispatch;Trainer;Evidence;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNICompatibleCSVs
+add_test(NAME V2_Unit_NativeQuantisedCompatibleCSVs
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_compatible_csvs.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_compatible_csvs.py
 )
-set_tests_properties(V2_Unit_NativeVNNICompatibleCSVs PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Trainer;Corpus;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedCompatibleCSVs PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;Dispatch;Trainer;Corpus;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNICommonObservationMigration
+add_test(NAME V2_Unit_NativeQuantisedCommonObservationMigration
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_common_observation_migration.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_common_observation_migration.py
 )
-set_tests_properties(V2_Unit_NativeVNNICommonObservationMigration PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Trainer;Corpus;Migration;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedCommonObservationMigration PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;Dispatch;Trainer;Corpus;Migration;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIGPUMeasurementPlan
+add_test(NAME V2_Unit_NativeQuantisedGPUMeasurementPlan
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_gpu_measurement_plan.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_gpu_measurement_plan.py
 )
-set_tests_properties(V2_Unit_NativeVNNIGPUMeasurementPlan PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CUDA;ROCm;Dispatch;Trainer;MeasurementPlan;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedGPUMeasurementPlan PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CUDA;ROCm;Dispatch;Trainer;MeasurementPlan;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIQwenReleaseGeometry
+add_test(NAME V2_Unit_NativeQuantisedQwenReleaseGeometry
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_qwen_release_geometry.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_qwen_release_geometry.py
 )
-set_tests_properties(V2_Unit_NativeVNNIQwenReleaseGeometry PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Trainer;Qwen;Geometry;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedQwenReleaseGeometry PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;Dispatch;Trainer;Qwen;Geometry;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIHFGGUFMoeInventory
+add_test(NAME V2_Unit_NativeQuantisedHFGGUFMoeInventory
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_hf_gguf_moe_inventory.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_hf_gguf_moe_inventory.py
 )
-set_tests_properties(V2_Unit_NativeVNNIHFGGUFMoeInventory PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MoE;Prefill;GGUF;Trainer;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedHFGGUFMoeInventory PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;MoE;Prefill;GGUF;Trainer;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIQwenMoEPrefillPatterns
+add_test(NAME V2_Unit_NativeQuantisedQwenMoEPrefillPatterns
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_qwen_moe_prefill_patterns.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_qwen_moe_prefill_patterns.py
 )
-set_tests_properties(V2_Unit_NativeVNNIQwenMoEPrefillPatterns PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MoE;Prefill;GGUF;Matrix;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedQwenMoEPrefillPatterns PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;MoE;Prefill;GGUF;Matrix;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIProductionMoEPrefillSweep
+add_test(NAME V2_Unit_NativeQuantisedProductionMoEPrefillSweep
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_production_moe_prefill_sweep.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_production_moe_prefill_sweep.py
 )
-set_tests_properties(V2_Unit_NativeVNNIProductionMoEPrefillSweep PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CUDA;ROCm;MoE;Prefill;GGUF;Trainer;Resume;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedProductionMoEPrefillSweep PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CUDA;ROCm;MoE;Prefill;GGUF;Trainer;Resume;Regression"
     TIMEOUT 30
 )
 
@@ -5825,13 +5768,13 @@ add_test(NAME V2_Unit_KernelShardScalingReport
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_kernel_shard_scaling.py
 )
 set_tests_properties(V2_Unit_KernelShardScalingReport PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Benchmark;Scaling;Regression"
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;Benchmark;Scaling;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIProductionDensePrefillSweep
+add_test(NAME V2_Unit_NativeQuantisedProductionDensePrefillSweep
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_production_dense_prefill_sweep.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_production_dense_prefill_sweep.py
 )
 
 add_test(NAME V2_Unit_Aime25HttpBenchmark
@@ -5842,17 +5785,17 @@ set_tests_properties(V2_Unit_Aime25HttpBenchmark PROPERTIES
     LABELS "V2;Unit;Benchmark;HTTP;Server;MultiTurn;AIME25;Math;Resume;Regression"
     TIMEOUT 30
 )
-set_tests_properties(V2_Unit_NativeVNNIProductionDensePrefillSweep PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CUDA;ROCm;Dense;Prefill;AllFormat;Trainer;Resume;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedProductionDensePrefillSweep PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CUDA;ROCm;Dense;Prefill;AllFormat;Trainer;Resume;Regression"
     TIMEOUT 30
 )
 
 # Functional evidence-contract coverage only: no benchmark or device launch.
 # Auto's physical streaming family differs from the forced cooperative tiles;
 # accepting it must not permit forged launches, spills, or byte mismatches.
-add_test(NAME V2_Integration_NativeVNNIDensePrefillEvidenceIdentity
+add_test(NAME V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_production_dense_prefill_sweep.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_production_dense_prefill_sweep.py
             ProductionDensePrefillSweepTest.test_rocm_auto_streaming_observation_is_distinct_from_forced_tiles
             ProductionDensePrefillSweepTest.test_rocm_streaming_observation_rejects_invented_or_forced_launch
             ProductionDensePrefillSweepTest.test_rocm_q8_aliases_authenticate_their_int8_producers
@@ -5866,17 +5809,17 @@ add_test(NAME V2_Integration_NativeVNNIDensePrefillEvidenceIdentity
             ProductionDensePrefillSweepTest.test_one_non_winning_byte_mismatch_invalidates_the_entire_cell
             ProductionDensePrefillSweepTest.test_cuda_spilling_primary_or_reducer_never_enters_evidence
 )
-set_tests_properties(V2_Integration_NativeVNNIDensePrefillEvidenceIdentity PROPERTIES
-    LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;Dense;Prefill;Evidence;Regression"
+set_tests_properties(V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;Dense;Prefill;Evidence;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIGPUPrefillTrainerPolicy
+add_test(NAME V2_Unit_NativeQuantisedGPUPrefillTrainerPolicy
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_gpu_prefill_trainer_policy.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_gpu_prefill_trainer_policy.py
 )
-set_tests_properties(V2_Unit_NativeVNNIGPUPrefillTrainerPolicy PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CUDA;ROCm;Prefill;Trainer;SourcePolicy;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedGPUPrefillTrainerPolicy PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CUDA;ROCm;Prefill;Trainer;SourcePolicy;Regression"
     TIMEOUT 30
 )
 
@@ -5885,16 +5828,16 @@ add_test(NAME V2_Unit_ROCmMoEGroupedPrefillTrainer
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_moe_grouped_prefill_trainer.py
 )
 set_tests_properties(V2_Unit_ROCmMoEGroupedPrefillTrainer PROPERTIES
-    LABELS "V2;Unit;MoE;MTP;ROCm;NativeVNNI;Dispatch;Trainer;Regression"
+    LABELS "V2;Unit;MoE;MTP;ROCm;NativeQuantised;Dispatch;Trainer;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_ROCmNativeVNNIDecodeAdapter
+add_test(NAME V2_Unit_ROCmNativeQuantisedDecodeAdapter
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_vnni_decode_adapter.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_quantised_decode_adapter.py
 )
-set_tests_properties(V2_Unit_ROCmNativeVNNIDecodeAdapter PROPERTIES
-    LABELS "V2;Unit;MTP;ROCm;NativeVNNI;Decode;Evidence;Trainer;Regression"
+set_tests_properties(V2_Unit_ROCmNativeQuantisedDecodeAdapter PROPERTIES
+    LABELS "V2;Unit;MTP;ROCm;NativeQuantised;Decode;Evidence;Trainer;Regression"
     TIMEOUT 30
 )
 
@@ -5903,16 +5846,16 @@ set_tests_properties(V2_Unit_ROCmNativeVNNIDecodeAdapter PROPERTIES
 # capture/resource receipts, compacted empty planes and installable promotion.
 add_test(NAME V2_Integration_ROCmNativeQ8GeometryEvidence
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_vnni_decode_adapter.py
-            ROCmNativeVNNIDecodeAdapterTest.test_fixed_arithmetic_geometry_uses_five_distinct_common_candidates
-            ROCmNativeVNNIDecodeAdapterTest.test_geometry_requires_explicit_generation_raw_samples_and_diagnostic_mode
-            ROCmNativeVNNIDecodeAdapterTest.test_geometry_rejects_requested_only_or_changed_physical_evidence
-            ROCmNativeVNNIDecodeAdapterTest.test_geometry_rejects_installable_context_and_timing_generation_aliases
-            ROCmNativeVNNIDecodeAdapterTest.test_geometry_rejects_coordinated_baseline_and_candidate_tree_mutation
-            ROCmNativeVNNIDecodeAdapterTest.test_geometry_common_observation_roundtrip_preserves_actual_launch_receipts
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_quantised_decode_adapter.py
+            ROCmNativeQuantisedDecodeAdapterTest.test_fixed_arithmetic_geometry_uses_five_distinct_common_candidates
+            ROCmNativeQuantisedDecodeAdapterTest.test_geometry_requires_explicit_generation_raw_samples_and_diagnostic_mode
+            ROCmNativeQuantisedDecodeAdapterTest.test_geometry_rejects_requested_only_or_changed_physical_evidence
+            ROCmNativeQuantisedDecodeAdapterTest.test_geometry_rejects_installable_context_and_timing_generation_aliases
+            ROCmNativeQuantisedDecodeAdapterTest.test_geometry_rejects_coordinated_baseline_and_candidate_tree_mutation
+            ROCmNativeQuantisedDecodeAdapterTest.test_geometry_common_observation_roundtrip_preserves_actual_launch_receipts
 )
 set_tests_properties(V2_Integration_ROCmNativeQ8GeometryEvidence PROPERTIES
-    LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;ROCm;Decode;Evidence;DeviceFree;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;ROCm;Decode;Evidence;DeviceFree;Regression"
     TIMEOUT 30
 )
 
@@ -5920,199 +5863,242 @@ set_tests_properties(V2_Integration_ROCmNativeQ8GeometryEvidence PROPERTIES
 # A fixed-order or host-submit batch must never pass as paired capture evidence.
 add_test(NAME V2_Integration_ROCmNativeQ8PairedTimingEvidence
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_vnni_decode_adapter.py
-            ROCmNativeVNNIDecodeAdapterTest.test_shared_geometry_order_balances_positions_and_both_pair_directions
-            ROCmNativeVNNIDecodeAdapterTest.test_paired_geometry_retains_every_round_interval_and_separate_batch_regime
-            ROCmNativeVNNIDecodeAdapterTest.test_paired_geometry_rejects_coordinate_count_and_normalization_forgeries
-            ROCmNativeVNNIDecodeAdapterTest.test_paired_geometry_cannot_mix_one_and_32_operation_surfaces
-            ROCmNativeVNNIDecodeAdapterTest.test_paired_summary_uses_matching_rounds_instead_of_unpaired_medians
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_quantised_decode_adapter.py
+            ROCmNativeQuantisedDecodeAdapterTest.test_shared_geometry_order_balances_positions_and_both_pair_directions
+            ROCmNativeQuantisedDecodeAdapterTest.test_paired_geometry_retains_every_round_interval_and_separate_batch_regime
+            ROCmNativeQuantisedDecodeAdapterTest.test_paired_geometry_rejects_coordinate_count_and_normalization_forgeries
+            ROCmNativeQuantisedDecodeAdapterTest.test_paired_geometry_cannot_mix_one_and_32_operation_surfaces
+            ROCmNativeQuantisedDecodeAdapterTest.test_paired_summary_uses_matching_rounds_instead_of_unpaired_medians
 )
 set_tests_properties(V2_Integration_ROCmNativeQ8PairedTimingEvidence PROPERTIES
-    LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;ROCm;Decode;Timing;DeviceFree;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;ROCm;Decode;Timing;DeviceFree;Regression"
     TIMEOUT 30
 )
 
 
-add_test(NAME V2_Unit_ROCmNativeVNNIDecodeTrainer
+add_test(NAME V2_Unit_ROCmNativeQuantisedDecodeTrainer
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_vnni_decode_trainer.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_quantised_decode_trainer.py
 )
-set_tests_properties(V2_Unit_ROCmNativeVNNIDecodeTrainer PROPERTIES
-    LABELS "V2;Unit;MTP;ROCm;NativeVNNI;Decode;Dispatch;Trainer;Regression"
+set_tests_properties(V2_Unit_ROCmNativeQuantisedDecodeTrainer PROPERTIES
+    LABELS "V2;Unit;MTP;ROCm;NativeQuantised;Decode;Dispatch;Trainer;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CUDANativeVNNIDecodeTrainer
+add_test(NAME V2_Unit_CUDANativeQuantisedDecodeTrainer
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cuda_native_vnni_decode_trainer.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cuda_native_quantised_decode_trainer.py
 )
 
-add_test(NAME V2_Unit_NativeVNNIPairedRequests
+add_test(NAME V2_Unit_NativeQuantisedPairedRequests
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_paired_requests.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_paired_requests.py
 )
-set_tests_properties(V2_Unit_NativeVNNIPairedRequests PROPERTIES
-    LABELS "V2;Unit;MTP;CUDA;NativeVNNI;Dispatch;Trainer;PairedTiming;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedPairedRequests PROPERTIES
+    LABELS "V2;Unit;MTP;CUDA;NativeQuantised;Dispatch;Trainer;PairedTiming;Regression"
     TIMEOUT 30
 )
 
-add_executable(v2_test_native_vnni_paired_request_manifest
-    unit/native_vnni_dispatch/Test__NativeVNNIPairedRequestManifest.cpp)
-target_include_directories(v2_test_native_vnni_paired_request_manifest PRIVATE
+add_executable(v2_test_native_quantised_paired_request_manifest
+    unit/native_quantised_dispatch/Test__NativeQuantisedPairedRequestManifest.cpp)
+target_include_directories(v2_test_native_quantised_paired_request_manifest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
-target_link_libraries(v2_test_native_vnni_paired_request_manifest
+target_link_libraries(v2_test_native_quantised_paired_request_manifest
     GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_NativeVNNIPairedRequestManifest
-    COMMAND $<TARGET_FILE:v2_test_native_vnni_paired_request_manifest>
-    LABELS "V2;Unit;MTP;CUDA;NativeVNNI;Dispatch;Trainer;JSON;Regression"
+add_v2_test(V2_Unit_NativeQuantisedPairedRequestManifest
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_paired_request_manifest>
+    LABELS "V2;Unit;MTP;CUDA;NativeQuantised;Dispatch;Trainer;JSON;Regression"
     MPI_PROCS 1
 )
-set_tests_properties(V2_Unit_CUDANativeVNNIDecodeTrainer PROPERTIES
-    LABELS "V2;Unit;MTP;CUDA;NativeVNNI;Decode;Dispatch;Trainer;Regression"
+set_tests_properties(V2_Unit_CUDANativeQuantisedDecodeTrainer PROPERTIES
+    LABELS "V2;Unit;MTP;CUDA;NativeQuantised;Decode;Dispatch;Trainer;Regression"
     PROCESSORS 4
     TIMEOUT 60
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIVerifierAdapter
+add_test(NAME V2_Unit_CPUNativeQuantisedVerifierAdapter
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_verifier_adapter.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_verifier_adapter.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIVerifierAdapter PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Evidence;ISA;Trainer;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedVerifierAdapter PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeQuantised;Decode;Evidence;ISA;Trainer;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIDecodeAdapter
+add_test(NAME V2_Unit_CPUNativeQuantisedDecodeAdapter
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_decode_adapter.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_decode_adapter.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIDecodeAdapter PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Evidence;ISA;Trainer;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedDecodeAdapter PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeQuantised;Decode;Evidence;ISA;Trainer;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIDecodeTrainer
+add_v2_test(V2_Unit_CPUExecutionExact
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_decode_trainer.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_execution_exact.py
+    LABELS "V2;Unit;CPU;NativeQuantised;Dispatch;Trainer;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+# Same-producer native GPU shape reuse retains all original evidence identities.
+add_v2_test(V2_Unit_GPUCompletedSweepReuse
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_completed_sweep.py
+    LABELS "V2;Unit;CUDA;ROCm;NativeQuantised;Dispatch;Trainer;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+# Model-only sweep projection and partial GPU publication stay device-free.
+add_v2_test(V2_Unit_NativeQuantisedModernSweepScope
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_native_quantised_modern_sweep_scope.py
+    LABELS "V2;Unit;CPU;CUDA;ROCm;NativeQuantised;Dispatch;Trainer;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Unit_GPUExactModernScope
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_exact_modern_scope.py
+    LABELS "V2;Unit;CUDA;ROCm;NativeQuantised;Dispatch;Trainer;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+# Metadata-only adaptive contest admission and additive expert scope discovery.
+add_v2_test(V2_Unit_NativeQuantisedAdaptiveExpertSweep
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_adaptive_expert_sweep.py
+    LABELS "V2;Unit;CPU;NativeQuantised;Dispatch;Trainer;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Unit_NativeQuantisedModernCPUPlan
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_modern_cpu_plan.py
+    LABELS "V2;Unit;CPU;NativeQuantised;Dispatch;Trainer;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Unit_CPUSweepCompletedReceiptReuse
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_cpu_sweep_reuse.py
+    LABELS "V2;Unit;CPU;NativeQuantised;Dispatch;Trainer;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_test(NAME V2_Unit_CPUNativeQuantisedDecodeTrainer
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_decode_trainer.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIDecodeTrainer PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Dispatch;ISA;Trainer;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedDecodeTrainer PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeQuantised;Decode;Dispatch;ISA;Trainer;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIDecodeSealedPlan
+add_test(NAME V2_Unit_CPUNativeQuantisedDecodeSealedPlan
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_decode_sealed_plan.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_decode_sealed_plan.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIDecodeSealedPlan PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Dispatch;PairedTiming;Sealed;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedDecodeSealedPlan PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeQuantised;Decode;Dispatch;PairedTiming;Sealed;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIVerifierTrainer
+add_test(NAME V2_Unit_CPUNativeQuantisedVerifierTrainer
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_verifier_trainer.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_verifier_trainer.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIVerifierTrainer PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Dispatch;ISA;Trainer;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedVerifierTrainer PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeQuantised;Decode;Dispatch;ISA;Trainer;Regression"
     PROCESSORS 4
     TIMEOUT 60
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIGroupedSealedPlan
+add_test(NAME V2_Unit_CPUNativeQuantisedGroupedSealedPlan
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_grouped_sealed_plan.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_grouped_sealed_plan.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIGroupedSealedPlan PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Dispatch;PairedTiming;Sealed;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedGroupedSealedPlan PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeQuantised;Decode;Dispatch;PairedTiming;Sealed;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillAdapter
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillAdapter
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_adapter.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_adapter.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillAdapter PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Prefill;Evidence;ISA;Trainer;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillAdapter PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeQuantised;Prefill;Evidence;ISA;Trainer;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillPartial
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillPartial
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_partial.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_partial.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillPartial PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Prefill;Evidence;Resume;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillPartial PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeQuantised;Prefill;Evidence;Resume;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_CPUNativeVNNIPrefillTrainer
+add_test(NAME V2_Unit_CPUNativeQuantisedPrefillTrainer
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_trainer.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_trainer.py
 )
-set_tests_properties(V2_Unit_CPUNativeVNNIPrefillTrainer PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Prefill;Dispatch;ISA;Trainer;Regression"
+set_tests_properties(V2_Unit_CPUNativeQuantisedPrefillTrainer PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeQuantised;Prefill;Dispatch;ISA;Trainer;Regression"
     TIMEOUT 120
 )
 
-add_test(NAME V2_Unit_NativeVNNIGroupedOracleExtent
+add_test(NAME V2_Unit_NativeQuantisedGroupedOracleExtent
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_grouped_oracle_extent.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_grouped_oracle_extent.py
 )
-set_tests_properties(V2_Unit_NativeVNNIGroupedOracleExtent PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;CUDA;ROCm;MoE;NativeVNNI;Trainer;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedGroupedOracleExtent PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;CUDA;ROCm;MoE;NativeQuantised;Trainer;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIShapeManifest
+add_test(NAME V2_Unit_NativeQuantisedShapeManifest
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_shape_manifest.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_shape_manifest.py
 )
-set_tests_properties(V2_Unit_NativeVNNIShapeManifest PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;CUDA;ROCm;NativeVNNI;Dispatch;Trainer;Certification;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedShapeManifest PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;CUDA;ROCm;NativeQuantised;Dispatch;Trainer;Certification;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIPrefillMatrix
+add_test(NAME V2_Unit_NativeQuantisedPrefillMatrix
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_prefill_matrix.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_prefill_matrix.py
 )
-set_tests_properties(V2_Unit_NativeVNNIPrefillMatrix PROPERTIES
-    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Prefill;Dispatch;Trainer;Matrix;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedPrefillMatrix PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeQuantised;Prefill;Dispatch;Trainer;Matrix;Regression"
     TIMEOUT 30
 )
 
-add_v2_test(V2_Integration_NativeVNNITPShardOwnerTier
+add_v2_test(V2_Integration_NativeQuantisedTPShardOwnerTier
     COMMAND ${Python3_EXECUTABLE}
-        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_prefill_matrix.py
-        NativeVNNIPrefillMatrixTest.test_tp_local_shards_keep_large_model_owner_tier
-    LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;CPU;Geometry;DeviceFree;Regression"
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_prefill_matrix.py
+        NativeQuantisedPrefillMatrixTest.test_tp_local_shards_keep_large_model_owner_tier
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;CPU;Geometry;DeviceFree;Regression"
     MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
 
-add_v2_test(V2_Integration_NativeVNNIHistoricalProductionOwnership
+add_v2_test(V2_Integration_NativeQuantisedHistoricalProductionOwnership
     COMMAND ${Python3_EXECUTABLE}
-        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_trainer.py
-        CPUNativeVNNIPrefillTrainerTest.test_historical_split_keeps_original_production_ownership
-        CPUNativeVNNIPrefillTrainerTest.test_v12_split_remains_readable_for_digest_bound_refinement
-    LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;CPU;Geometry;DeviceFree;Regression"
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_trainer.py
+        CPUNativeQuantisedPrefillTrainerTest.test_historical_split_keeps_original_production_ownership
+        CPUNativeQuantisedPrefillTrainerTest.test_v12_split_remains_readable_for_digest_bound_refinement
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;CPU;Geometry;DeviceFree;Regression"
     MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
 
-add_test(NAME V2_Unit_NativeVNNICommonDispatchPolicy
+add_test(NAME V2_Unit_NativeQuantisedCommonDispatchPolicy
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_common_dispatch_policy.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_common_dispatch_policy.py
 )
-set_tests_properties(V2_Unit_NativeVNNICommonDispatchPolicy PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Dispatch;Trainer;Certification;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedCommonDispatchPolicy PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;MTP;Dispatch;Trainer;Certification;Regression"
     PROCESSORS 4
     TIMEOUT 60
 )
 
-add_test(NAME V2_Unit_NativeVNNIPolicyAccelerator
+add_test(NAME V2_Unit_NativeQuantisedPolicyAccelerator
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_policy_accelerator.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_policy_accelerator.py
 )
-set_tests_properties(V2_Unit_NativeVNNIPolicyAccelerator PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Dispatch;Trainer;GPUAccelerated;ProcessIsolation;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedPolicyAccelerator PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;MTP;Dispatch;Trainer;GPUAccelerated;ProcessIsolation;Regression"
     TIMEOUT 30
 )
 
@@ -6120,58 +6106,67 @@ set_tests_properties(V2_Unit_NativeVNNIPolicyAccelerator PROPERTIES
 # shards keep the slowest focused shard comfortably below the unit-test timeout,
 # while PROCESSORS tells the canonical fully parallel CTest gate about each
 # shard's internal process-pool work.
-set(NATIVE_VNNI_PROFILER_EVIDENCE_SHARD_COUNT 8)
-math(EXPR NATIVE_VNNI_PROFILER_EVIDENCE_LAST_SHARD
-     "${NATIVE_VNNI_PROFILER_EVIDENCE_SHARD_COUNT} - 1")
-foreach(SHARD_INDEX RANGE 0 ${NATIVE_VNNI_PROFILER_EVIDENCE_LAST_SHARD})
-    add_test(NAME V2_Unit_NativeVNNIProfilerEvidence_${SHARD_INDEX}
+set(NATIVE_QUANTISED_PROFILER_EVIDENCE_SHARD_COUNT 8)
+math(EXPR NATIVE_QUANTISED_PROFILER_EVIDENCE_LAST_SHARD
+     "${NATIVE_QUANTISED_PROFILER_EVIDENCE_SHARD_COUNT} - 1")
+foreach(SHARD_INDEX RANGE 0 ${NATIVE_QUANTISED_PROFILER_EVIDENCE_LAST_SHARD})
+    add_test(NAME V2_Unit_NativeQuantisedProfilerEvidence_${SHARD_INDEX}
         COMMAND ${CMAKE_COMMAND} -E env
                 LLAMINAR_UNIT_SHARD_INDEX=${SHARD_INDEX}
-                LLAMINAR_UNIT_SHARD_COUNT=${NATIVE_VNNI_PROFILER_EVIDENCE_SHARD_COUNT}
+                LLAMINAR_UNIT_SHARD_COUNT=${NATIVE_QUANTISED_PROFILER_EVIDENCE_SHARD_COUNT}
                 ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_profiler_evidence.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_profiler_evidence.py
     )
-    set_tests_properties(V2_Unit_NativeVNNIProfilerEvidence_${SHARD_INDEX} PROPERTIES
-        LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Performance;Profiler;Evidence;Trainer;Regression"
+    set_tests_properties(V2_Unit_NativeQuantisedProfilerEvidence_${SHARD_INDEX} PROPERTIES
+        LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;MTP;Performance;Profiler;Evidence;Trainer;Regression"
         PROCESSORS 4
         TIMEOUT 60
     )
 endforeach()
 
-add_test(NAME V2_Unit_NativeVNNIProfilerDiagnostics
+add_test(NAME V2_Unit_NativeQuantisedProfilerDiagnostics
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_profiler_diagnostics.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_profiler_diagnostics.py
 )
-set_tests_properties(V2_Unit_NativeVNNIProfilerDiagnostics PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Performance;Profiler;Diagnostics;Trainer;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedProfilerDiagnostics PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;MTP;Performance;Profiler;Diagnostics;Trainer;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIPairedConfirmation
+add_test(NAME V2_Unit_NativeQuantisedPairedConfirmation
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_paired_confirmation.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_paired_confirmation.py
 )
-set_tests_properties(V2_Unit_NativeVNNIPairedConfirmation PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CUDA;MTP;Performance;Trainer;Certification;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedPairedConfirmation PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;CUDA;MTP;Performance;Trainer;Certification;Regression"
     TIMEOUT 30
 )
 
-add_executable(v2_test_native_vnni_trainer_evidence
-    unit/utils/Test__NativeVNNITrainerEvidence.cpp
+add_executable(v2_test_native_quantised_trainer_evidence
+    unit/utils/Test__NativeQuantisedTrainerEvidence.cpp
     unit/utils/Test__BenchmarkGeometrySelection.cpp
 )
-target_include_directories(v2_test_native_vnni_trainer_evidence PRIVATE
+target_include_directories(v2_test_native_quantised_trainer_evidence PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}
 )
-target_link_libraries(v2_test_native_vnni_trainer_evidence
+target_link_libraries(v2_test_native_quantised_trainer_evidence
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_NativeVNNITrainerEvidence
-    COMMAND $<TARGET_FILE:v2_test_native_vnni_trainer_evidence>
-    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Trainer;Evidence;Regression"
+add_v2_test(V2_Unit_NativeQuantisedTrainerEvidence
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_trainer_evidence>
+    LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;MTP;Trainer;Evidence;Regression"
     MPI_PROCS 1
+)
+
+# Authored native-clock fixtures guard adaptive admission; no GPU or model is touched.
+add_v2_test(V2_Integration_NativeQuantisedTournamentAdmission
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_trainer_evidence>
+        --gtest_filter=Test__NativeQuantisedTrainerEvidence.TournamentRetainsBaselineWinnerAndCredibleRunnerUp:Test__NativeQuantisedTrainerEvidence.TournamentRejectsIncompleteOrFailedCandidateMatrices
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;Trainer;Evidence;Regression"
+    MPI_PROCS 1
+    NO_MPI NO_MODELS TIMEOUT 30
 )
 
 # Explicit probe selectors must not silently fall back or discard bad shapes.
@@ -6179,7 +6174,7 @@ add_v2_test(V2_Unit_NativeVNNITrainerEvidence
 # claim accelerator ownership in preflight, so this test stays in the host lane.
 # It is functional tooling admission, not a GPU performance ratchet.
 add_v2_test(V2_Integration_BenchmarkGeometrySelection
-    COMMAND $<TARGET_FILE:v2_test_native_vnni_trainer_evidence>
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_trainer_evidence>
             --gtest_filter=BenchmarkGeometrySelection.*
     LABELS "V2;Integration;ProductionTestPreflight;Benchmark;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
@@ -6292,7 +6287,7 @@ target_link_libraries(v2_test_rocm_moe_grouped_prefill_dispatch
 )
 add_v2_test(V2_Unit_ROCmMoEGroupedPrefillDispatch
     COMMAND $<TARGET_FILE:v2_test_rocm_moe_grouped_prefill_dispatch>
-    LABELS "V2;Unit;MoE;MTP;ROCm;NativeVNNI;Dispatch;Generated;Regression"
+    LABELS "V2;Unit;MoE;MTP;ROCm;NativeQuantised;Dispatch;Generated;Regression"
     MPI_PROCS 1
 )
 
@@ -6332,79 +6327,79 @@ set_tests_properties(V2_Unit_MoELLEPTraceCorpusEvaluatorScript PROPERTIES
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_NativeVNNIGeneratedDispatchCodebooks
+add_test(NAME V2_Unit_NativeQuantisedGeneratedDispatchCodebooks
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_generated_dispatch_ids.py
-            ${CMAKE_SOURCE_DIR}/kernels/cuda/gemm/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc
-            ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc
-            ${CMAKE_SOURCE_DIR}/kernels/cpu/gemm/CPUNativeVNNIDecodePolicyGenerated.inc
-            ${CMAKE_SOURCE_DIR}/kernels/cpu/gemm/CPUNativeVNNIVerifierRowsPolicyGenerated.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_quantised_generated_dispatch_ids.py
+            ${CMAKE_SOURCE_DIR}/kernels/cuda/gemm/CUDANativeQuantisedGemvDispatchHeuristicGenerated.inc
+            ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeQuantisedDecodeDispatchGenerated.inc
+            ${CMAKE_SOURCE_DIR}/kernels/cpu/gemm/CPUNativeQuantisedDecodePolicyGenerated.inc
+            ${CMAKE_SOURCE_DIR}/kernels/cpu/gemm/CPUNativeQuantisedVerifierRowsPolicyGenerated.inc
 )
-set_tests_properties(V2_Unit_NativeVNNIGeneratedDispatchCodebooks PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;Quantization;Codebook;Dispatch;Regression"
+set_tests_properties(V2_Unit_NativeQuantisedGeneratedDispatchCodebooks PROPERTIES
+    LABELS "V2;Unit;NativeQuantised;Quantization;Codebook;Dispatch;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_ROCmNativeVNNITrainerCsvValidator
+add_test(NAME V2_Unit_ROCmNativeQuantisedTrainerCsvValidator
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_vnni_trainer_csv.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_quantised_trainer_csv.py
             --require-alias-group
             --require-policy-prefill-m
             --require-prefill-m 600
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_vnni_decode_alias_smoke.csv
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_vnni_prefill_alias_smoke.csv
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_quantised_decode_alias_smoke.csv
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_quantised_prefill_alias_smoke.csv
 )
-set_tests_properties(V2_Unit_ROCmNativeVNNITrainerCsvValidator PROPERTIES
-    LABELS "V2;Unit;ROCm;GEMM;GEMV;NativeVNNI;Codebook;Trainer;Regression"
+set_tests_properties(V2_Unit_ROCmNativeQuantisedTrainerCsvValidator PROPERTIES
+    LABELS "V2;Unit;ROCm;GEMM;GEMV;NativeQuantised;Codebook;Trainer;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_ROCmNativeVNNITrainerGenerator
+add_test(NAME V2_Unit_ROCmNativeQuantisedTrainerGenerator
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_vnni_trainer_generator.py
-            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/analyze_rocm_native_vnni_trainer.py
-            --dispatch-validator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_generated_dispatch_ids.py
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_vnni_prefill_alias_smoke.csv
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_quantised_trainer_generator.py
+            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/analyze_rocm_native_quantised_trainer.py
+            --dispatch-validator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_quantised_generated_dispatch_ids.py
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_quantised_prefill_alias_smoke.csv
 )
-set_tests_properties(V2_Unit_ROCmNativeVNNITrainerGenerator PROPERTIES
-    LABELS "V2;Unit;ROCm;GEMM;NativeVNNI;Codebook;Trainer;Dispatch;Regression"
+set_tests_properties(V2_Unit_ROCmNativeQuantisedTrainerGenerator PROPERTIES
+    LABELS "V2;Unit;ROCm;GEMM;NativeQuantised;Codebook;Trainer;Dispatch;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator
+add_test(NAME V2_Unit_ROCmNativeQuantisedDecodeTrainerGenerator
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_vnni_decode_trainer_generator.py
-            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/analyze_rocm_native_vnni_decode_trainer.py
-            --dispatch-validator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_generated_dispatch_ids.py
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_vnni_decode_alias_smoke.csv
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_quantised_decode_trainer_generator.py
+            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/analyze_rocm_native_quantised_decode_trainer.py
+            --dispatch-validator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_quantised_generated_dispatch_ids.py
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_quantised_decode_alias_smoke.csv
 )
-set_tests_properties(V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator PROPERTIES
-    LABELS "V2;Unit;ROCm;GEMV;NativeVNNI;Codebook;Trainer;Dispatch;Regression"
+set_tests_properties(V2_Unit_ROCmNativeQuantisedDecodeTrainerGenerator PROPERTIES
+    LABELS "V2;Unit;ROCm;GEMV;NativeQuantised;Codebook;Trainer;Dispatch;Regression"
     TIMEOUT 30
 )
 
-add_test(NAME V2_Unit_ROCmNativeVNNIBatchedDecodeTrainerGenerator
+add_test(NAME V2_Unit_ROCmNativeQuantisedBatchedDecodeTrainerGenerator
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_vnni_batched_decode_trainer_generator.py
-            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/analyze_rocm_native_vnni_batched_decode_trainer.py
-            --dispatch-validator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_generated_dispatch_ids.py
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_vnni_batched_decode_smoke.csv
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_quantised_batched_decode_trainer_generator.py
+            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/analyze_rocm_native_quantised_batched_decode_trainer.py
+            --dispatch-validator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_quantised_generated_dispatch_ids.py
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_quantised_batched_decode_smoke.csv
 )
-set_tests_properties(V2_Unit_ROCmNativeVNNIBatchedDecodeTrainerGenerator PROPERTIES
-    LABELS "V2;Unit;ROCm;GEMV;NativeVNNI;Codebook;Trainer;Dispatch;Regression"
+set_tests_properties(V2_Unit_ROCmNativeQuantisedBatchedDecodeTrainerGenerator PROPERTIES
+    LABELS "V2;Unit;ROCm;GEMV;NativeQuantised;Codebook;Trainer;Dispatch;Regression"
     TIMEOUT 30
 )
 
-# The NativeVNNI Python suite exercises process pools, NumPy/BLAS code, compiler
+# The NativeQuantised Python suite exercises process pools, NumPy/BLAS code, compiler
 # probes, and subprocess-based artifact validation.  Raw add_test() calls
 # otherwise consume one CTest slot, which lets the canonical `ctest --parallel`
 # gate launch roughly sixty CPU-active trainer tests on 56 physical cores.
 # Match add_v2_test()'s accounting so the suite remains parallel without
 # oversubscribing both hardware threads on every physical core.
-get_property(NATIVE_VNNI_UNIT_TESTS DIRECTORY PROPERTY TESTS)
-foreach(NATIVE_VNNI_UNIT_TEST IN LISTS NATIVE_VNNI_UNIT_TESTS)
-    if(NATIVE_VNNI_UNIT_TEST MATCHES "^V2_Unit_.*NativeVNNI")
-        set_tests_properties(${NATIVE_VNNI_UNIT_TEST} PROPERTIES PROCESSORS 4)
+get_property(NATIVE_QUANTISED_UNIT_TESTS DIRECTORY PROPERTY TESTS)
+foreach(NATIVE_QUANTISED_UNIT_TEST IN LISTS NATIVE_QUANTISED_UNIT_TESTS)
+    if(NATIVE_QUANTISED_UNIT_TEST MATCHES "^V2_Unit_.*NativeQuantised")
+        set_tests_properties(${NATIVE_QUANTISED_UNIT_TEST} PROPERTIES PROCESSORS 4)
     endif()
 endforeach()
 
@@ -6414,54 +6409,54 @@ endforeach()
 # CTest slots. The numerical-Python tests are also affinity-bound below, so
 # their affinity-aware process-pool defaults cannot silently exceed the same
 # reservation advertised to CTest.
-set(NATIVE_VNNI_HEAVY_UNIT_TESTS
-    V2_Unit_CUDANativeVNNIDecodeTrainer
-    V2_Unit_CPUNativeVNNIVerifierTrainer
-    V2_Unit_NativeVNNICommonDispatchPolicy
-    V2_Unit_NativeVNNIProductionMoEPrefillSweep
+set(NATIVE_QUANTISED_HEAVY_UNIT_TESTS
+    V2_Unit_CUDANativeQuantisedDecodeTrainer
+    V2_Unit_CPUNativeQuantisedVerifierTrainer
+    V2_Unit_NativeQuantisedCommonDispatchPolicy
+    V2_Unit_NativeQuantisedProductionMoEPrefillSweep
 )
-foreach(SHARD_INDEX RANGE 0 ${NATIVE_VNNI_PROFILER_EVIDENCE_LAST_SHARD})
-    list(APPEND NATIVE_VNNI_HEAVY_UNIT_TESTS
-         V2_Unit_NativeVNNIProfilerEvidence_${SHARD_INDEX})
+foreach(SHARD_INDEX RANGE 0 ${NATIVE_QUANTISED_PROFILER_EVIDENCE_LAST_SHARD})
+    list(APPEND NATIVE_QUANTISED_HEAVY_UNIT_TESTS
+         V2_Unit_NativeQuantisedProfilerEvidence_${SHARD_INDEX})
 endforeach()
-set_tests_properties(${NATIVE_VNNI_HEAVY_UNIT_TESTS} PROPERTIES PROCESSORS 16)
+set_tests_properties(${NATIVE_QUANTISED_HEAVY_UNIT_TESTS} PROPERTIES PROCESSORS 16)
 
 # Importing NumPy, SciPy, and scikit-learn loads two independent OpenBLAS
 # runtimes plus libgomp. Left unconstrained, one tiny Python unit process on the
 # canonical host creates 127 numerical-library threads before an
-# affinity-aware NativeVNNI process pool is considered. Several such tests can
+# affinity-aware NativeQuantised process pool is considered. Several such tests can
 # therefore turn a five-second focused regression into a timeout even though
 # their CTest PROCESSORS declarations are otherwise correct.
 #
 # Keep process-level parallelism authoritative for these pure-policy tests:
 # CTest assigns the advertised CPU set, every child inherits that affinity,
-# and the NativeVNNI worker-count helpers derive their physical-core cap from
+# and the NativeQuantised worker-count helpers derive their physical-core cap from
 # that exact set. Numerical libraries stay single-threaded inside each worker,
 # preventing a nested threads-times-processes explosion while preserving every
 # parallel-policy assertion in the tests themselves.
-set(NATIVE_VNNI_NUMERICAL_PYTHON_UNIT_TESTS
-    V2_Unit_CPUNativeVNNIDecodeSealedPlan
-    V2_Unit_CPUNativeVNNIDecodeTrainer
-    V2_Unit_CPUNativeVNNIGroupedSealedPlan
-    V2_Unit_CPUNativeVNNIPrefillTrainer
-    V2_Unit_CPUNativeVNNIPrefillTrainingPlan
-    V2_Unit_CPUNativeVNNIVerifierTrainer
-    V2_Unit_CUDANativeVNNIDecodeTrainer
-    V2_Unit_NativeVNNICommonDispatchPolicy
-    V2_Unit_NativeVNNIDispatchRefreshScript
-    V2_Unit_NativeVNNIPairedRequests
-    V2_Unit_NativeVNNIProductionMoEPrefillSweep
-    V2_Unit_NativeVNNIProfilerDiagnostics
-    V2_Unit_ROCmNativeVNNIDecodeTrainer
+set(NATIVE_QUANTISED_NUMERICAL_PYTHON_UNIT_TESTS
+    V2_Unit_CPUNativeQuantisedDecodeSealedPlan
+    V2_Unit_CPUNativeQuantisedDecodeTrainer
+    V2_Unit_CPUNativeQuantisedGroupedSealedPlan
+    V2_Unit_CPUNativeQuantisedPrefillTrainer
+    V2_Unit_CPUNativeQuantisedPrefillTrainingPlan
+    V2_Unit_CPUNativeQuantisedVerifierTrainer
+    V2_Unit_CUDANativeQuantisedDecodeTrainer
+    V2_Unit_NativeQuantisedCommonDispatchPolicy
+    V2_Unit_NativeQuantisedDispatchRefreshScript
+    V2_Unit_NativeQuantisedPairedRequests
+    V2_Unit_NativeQuantisedProductionMoEPrefillSweep
+    V2_Unit_NativeQuantisedProfilerDiagnostics
+    V2_Unit_ROCmNativeQuantisedDecodeTrainer
 )
-foreach(SHARD_INDEX RANGE 0 ${NATIVE_VNNI_PROFILER_EVIDENCE_LAST_SHARD})
-    list(APPEND NATIVE_VNNI_NUMERICAL_PYTHON_UNIT_TESTS
-         V2_Unit_NativeVNNIProfilerEvidence_${SHARD_INDEX})
+foreach(SHARD_INDEX RANGE 0 ${NATIVE_QUANTISED_PROFILER_EVIDENCE_LAST_SHARD})
+    list(APPEND NATIVE_QUANTISED_NUMERICAL_PYTHON_UNIT_TESTS
+         V2_Unit_NativeQuantisedProfilerEvidence_${SHARD_INDEX})
 endforeach()
-set_tests_properties(${NATIVE_VNNI_NUMERICAL_PYTHON_UNIT_TESTS} PROPERTIES
+set_tests_properties(${NATIVE_QUANTISED_NUMERICAL_PYTHON_UNIT_TESTS} PROPERTIES
     PROCESSOR_AFFINITY TRUE
 )
-set_property(TEST ${NATIVE_VNNI_NUMERICAL_PYTHON_UNIT_TESTS}
+set_property(TEST ${NATIVE_QUANTISED_NUMERICAL_PYTHON_UNIT_TESTS}
     APPEND PROPERTY ENVIRONMENT
     "OMP_NUM_THREADS=1"
     "OMP_DYNAMIC=false"
@@ -7156,7 +7151,7 @@ if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
     add_v2_test(V2_Integration_CPU_NativeQ6Arithmetic
         COMMAND $<TARGET_FILE:v2_test_avx2_vnni_parity>
             --gtest_filter=AVX2VNNIParity.Q6KNativeDualScaleEncodingIsByteExactForAllRuntimeRows
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;Q6_K;MTP;AVX2;AVX512;ByteExact;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;Q6_K;MTP;AVX2;AVX512;ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS)
 endif()
@@ -8880,11 +8875,11 @@ target_include_directories(v2_test_moe_verifier_fixtures PRIVATE ${CMAKE_CURRENT
 add_v2_test(V2_Unit_MoEVerifierFixtures
     COMMAND $<TARGET_FILE:v2_test_moe_verifier_fixtures>
     MPI_PROCS 1 NO_MODELS
-    LABELS "V2;Unit;MoE;MTP;IQ4_XS;NativeVNNI;Regression")
+    LABELS "V2;Unit;MoE;MTP;IQ4_XS;NativeQuantised;Regression")
 add_v2_test(V2_Integration_MoEVerifierFixtureNondegeneracy
     COMMAND $<TARGET_FILE:v2_test_moe_verifier_fixtures>
     MPI_PROCS 1 NO_MODELS
-    LABELS "V2;Integration;ProductionTestPreflight;MoE;MTP;IQ4_XS;NativeVNNI;Regression")
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;MTP;IQ4_XS;NativeQuantised;Regression")
 add_executable(v2_test_quantized_tensor_tail_decode_regression unit/tensors/Test__QuantizedTensorTailDecodeRegression.cpp)
 target_link_libraries(v2_test_quantized_tensor_tail_decode_regression
     llaminar2_core
@@ -9125,11 +9120,11 @@ target_link_libraries(v2_test_q6_source_scale
     llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_Q6SourceScale
     COMMAND $<TARGET_FILE:v2_test_q6_source_scale>
-    LABELS "V2;Unit;CPU;DeviceFree;NativeVNNI;Q6_K;Regression"
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Q6_K;Regression"
     MPI_PROCS 1 NO_MODELS)
 add_v2_test(V2_Integration_CPUQ6SourceScalePreservation
     COMMAND $<TARGET_FILE:v2_test_q6_source_scale>
-    LABELS "V2;Integration;CPU;DeviceFree;NativeVNNI;Q6_K;ByteExact;Regression"
+    LABELS "V2;Integration;CPU;DeviceFree;NativeQuantised;Q6_K;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS)
 
 # Test: Q6_K SIMD Equivalency
@@ -10115,10 +10110,10 @@ add_v2_test(V2_Perf_PrefixCacheMTP
 # Times CUDA/ROCm verifier rows plus ROCm production M=8/32/256 routing and
 # routed-expert publication. Native-bit parity and graph-vs-serial economy are
 # mandatory before the harness reports a successful CSV row.
-set(LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG
-    "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/manifests/qwen35_qwen36_release_models_v1.json")
-set(LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST
-    "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/manifests/qwen_moe_gguf_codebook_patterns_v1.json")
+set(LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG
+    "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_quantised_dispatch/manifests/qwen35_qwen36_release_models_v1.json")
+set(LLAMINAR_NATIVE_QUANTISED_MOE_GGUF_PATTERN_MANIFEST
+    "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_quantised_dispatch/manifests/qwen_moe_gguf_codebook_patterns_v1.json")
 add_executable(v2_perf_moe_verifier_prefill
     performance/kernels/moe/Perf__MoEVerifierPrefill.cpp
     performance/kernels/moe/Perf__ROCmMoEVerifierPrefill.cpp
@@ -10131,16 +10126,16 @@ add_executable(v2_perf_moe_verifier_prefill
 set_property(TARGET v2_perf_moe_verifier_prefill PROPERTY LINKER_LANGUAGE CXX)
 if(HAVE_ROCM)
     set_source_files_properties(
-        performance/kernels/native_vnni_dispatch/ROCmTrainerVerification.hip
+        performance/kernels/native_quantised_dispatch/ROCmTrainerVerification.hip
         PROPERTIES LANGUAGE HIP
     )
     target_sources(v2_perf_moe_verifier_prefill PRIVATE
-        performance/kernels/native_vnni_dispatch/ROCmTrainerVerification.hip
+        performance/kernels/native_quantised_dispatch/ROCmTrainerVerification.hip
     )
 endif()
 if(HAVE_CUDA)
     target_sources(v2_perf_moe_verifier_prefill PRIVATE
-        performance/kernels/native_vnni_dispatch/CUDATrainerVerification.cu
+        performance/kernels/native_quantised_dispatch/CUDATrainerVerification.cu
     )
 endif()
 target_link_libraries(v2_perf_moe_verifier_prefill
@@ -10153,8 +10148,8 @@ target_include_directories(v2_perf_moe_verifier_prefill PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor
 )
 target_compile_definitions(v2_perf_moe_verifier_prefill PRIVATE
-    LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST}"
-    LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}"
+    LLAMINAR_NATIVE_QUANTISED_MOE_GGUF_PATTERN_MANIFEST_PATH="${LLAMINAR_NATIVE_QUANTISED_MOE_GGUF_PATTERN_MANIFEST}"
+    LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG}"
 )
 if(HAVE_CUDA)
     target_link_libraries(v2_perf_moe_verifier_prefill CUDA::cudart)
@@ -10180,8 +10175,8 @@ add_v2_test(V2_Perf_MoEVerifierPrefill
 # multi-hour corpus run.
 if(HAVE_CUDA)
     add_executable(v2_integration_cuda_trainer_verification
-        integration/native_vnni_dispatch/Test__CUDATrainerVerification.cpp
-        performance/kernels/native_vnni_dispatch/CUDATrainerVerification.cu
+        integration/native_quantised_dispatch/Test__CUDATrainerVerification.cpp
+        performance/kernels/native_quantised_dispatch/CUDATrainerVerification.cu
     )
     target_link_libraries(v2_integration_cuda_trainer_verification PRIVATE
         GTest::gtest
@@ -10190,7 +10185,7 @@ if(HAVE_CUDA)
     )
     add_v2_test(V2_Integration_CUDATrainerFullBufferByteCertificate
         COMMAND $<TARGET_FILE:v2_integration_cuda_trainer_verification>
-        LABELS "V2;Integration;CUDA;NativeVNNI;Trainer;ByteExact;FullBuffer;StreamOrdered;Regression"
+        LABELS "V2;Integration;CUDA;NativeQuantised;Trainer;ByteExact;FullBuffer;StreamOrdered;Regression"
         MPI_PROCS 1
     )
     if(TEST V2_Integration_CUDATrainerFullBufferByteCertificate)
@@ -10204,8 +10199,8 @@ endif()
 
 if(HAVE_ROCM)
     add_executable(v2_integration_rocm_trainer_verification
-        integration/native_vnni_dispatch/Test__ROCmTrainerVerification.cpp
-        performance/kernels/native_vnni_dispatch/ROCmTrainerVerification.hip
+        integration/native_quantised_dispatch/Test__ROCmTrainerVerification.cpp
+        performance/kernels/native_quantised_dispatch/ROCmTrainerVerification.hip
     )
     target_link_libraries(v2_integration_rocm_trainer_verification PRIVATE
         GTest::gtest
@@ -10214,7 +10209,7 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_ROCmTrainerFullBufferByteCertificate
         COMMAND $<TARGET_FILE:v2_integration_rocm_trainer_verification>
-        LABELS "V2;Integration;ROCm;NativeVNNI;Trainer;ByteExact;FullBuffer;StreamOrdered;Regression"
+        LABELS "V2;Integration;ROCm;NativeQuantised;Trainer;ByteExact;FullBuffer;StreamOrdered;Regression"
         MPI_PROCS 1
     )
     if(TEST V2_Integration_ROCmTrainerFullBufferByteCertificate)
@@ -10248,7 +10243,7 @@ if(HAVE_CUDA)
         COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
                 --gtest_filter=Perf__MoEVerifierPrefill.CUDA_StagedIQ2SIQ4MetadataIsSerialRowByteInvariant
                 --gtest_brief=1
-        LABELS "V2;Integration;CUDA;MoE;Prefill;NativeVNNI;ByteExact;PowerLaw;DeviceResident;GraphCapture;Regression"
+        LABELS "V2;Integration;CUDA;MoE;Prefill;NativeQuantised;ByteExact;PowerLaw;DeviceResident;GraphCapture;Regression"
         MPI_PROCS 1
         RESOURCE_LOCK RealModel_Perf
     )
@@ -10446,15 +10441,15 @@ add_v2_test(V2_Integration_CUDAGemmParity
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_AllFormats
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
-            --gtest_filter=Test__CUDAGemmParity.NativeVNNISpecializedRuntimeM_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.NativeVNNILMHeadM16_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_LargeKKPARMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_Qwen36MoEQKVMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedSwiGLUDown_AllNativeFormatsMatchSerialDecode:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI:Test__CUDAGemmParity.MTP_FP32FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FP16BF16FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FloatingSwiGLUDown_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI
+            --gtest_filter=Test__CUDAGemmParity.NativeQuantisedSpecializedRuntimeM_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.NativeQuantisedLMHeadM16_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_LargeKKPARMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_Qwen36MoEQKVMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedSwiGLUDown_AllNativeFormatsMatchSerialDecode:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeQuantised:Test__CUDAGemmParity.MTP_FP32FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FP16BF16FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FloatingSwiGLUDown_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeQuantised
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;FP32;FP16;BF16;Regression"
+    LABELS "V2;Integration;CUDA;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeQuantised;FP32;FP16;BF16;Regression"
     MPI_PROCS 1
 )
 if(HAVE_CUDA)
 add_v2_test(V2_Integration_CUDAVerifierCPUReferenceWorkspaceAdmission
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
-        --gtest_filter=Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI
+        --gtest_filter=Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeQuantised
     LABELS "V2;Integration;ProductionTestPreflight;CUDA;CPU;MTP;GroupedVerifierRows;AllFormats;PhysicalMemoryAuthority;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 120)
 endif()
@@ -10528,7 +10523,7 @@ if(HAVE_CUDA)
         llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
     add_v2_test(V2_Integration_CUDAIQ4PackedLookup
         COMMAND $<TARGET_FILE:v2_integration_cuda_iq4_packed_lookup>
-        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;IQ4_NL;IQ4_XS;NativeVNNI;Regression"
+        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;IQ4_NL;IQ4_XS;NativeQuantised;Regression"
         MPI_PROCS 1
         NO_MODELS
         TIMEOUT 30
@@ -10539,26 +10534,26 @@ if(HAVE_CUDA)
         llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
     add_v2_test(V2_Integration_CUDACanonicalKpartFoldAllCodebooks
         COMMAND $<TARGET_FILE:v2_integration_cuda_canonical_kpart_fold>
-        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;AllFormats;NativeVNNI;Regression"
+        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;AllFormats;NativeQuantised;Regression"
         MPI_PROCS 1
         NO_MODELS
         TIMEOUT 60
     )
-    add_executable(v2_integration_cuda_native_vnni_wide
-        integration/kernels/cuda/Test__CUDANativeVNNIWide.cpp)
-    target_link_libraries(v2_integration_cuda_native_vnni_wide PRIVATE
+    add_executable(v2_integration_cuda_native_quantised_wide
+        integration/kernels/cuda/Test__CUDANativeQuantisedWide.cpp)
+    target_link_libraries(v2_integration_cuda_native_quantised_wide PRIVATE
         llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
-    add_v2_test(V2_Integration_CUDANativeVNNIWideAllCodebooks
-        COMMAND $<TARGET_FILE:v2_integration_cuda_native_vnni_wide>
-                --gtest_filter=CUDANativeVNNIWide.CapturedAllCodebooksAndTileTailsMatchSinglePartition
-        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;AllFormats;NativeVNNI;Regression"
+    add_v2_test(V2_Integration_CUDANativeQuantisedWideAllCodebooks
+        COMMAND $<TARGET_FILE:v2_integration_cuda_native_quantised_wide>
+                --gtest_filter=CUDANativeQuantisedWide.CapturedAllCodebooksAndTileTailsMatchSinglePartition
+        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;AllFormats;NativeQuantised;Regression"
         MPI_PROCS 1
         NO_MODELS
         TIMEOUT 60
     )
     add_v2_test(V2_Integration_CUDAGroupedRegisterLifetimeAllFormats
-        COMMAND $<TARGET_FILE:v2_integration_cuda_native_vnni_wide>
-                --gtest_filter=CUDANativeVNNIWide.CapturedGroupedRegisterBoundsMatchSerialAllFormats
+        COMMAND $<TARGET_FILE:v2_integration_cuda_native_quantised_wide>
+                --gtest_filter=CUDANativeQuantisedWide.CapturedGroupedRegisterBoundsMatchSerialAllFormats
         LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;AllFormats;Regression;ProductionTestPreflight"
         MPI_PROCS 1
         NO_MODELS
@@ -10588,17 +10583,17 @@ if(HAVE_CUDA)
     else()
         set(V2_CUDA_TINY_PROJECTION_TARGET v2_integration_cuda_tiny_projection)
     endif()
-    add_executable(v2_integration_cuda_native_vnni_prefill_staging
-        integration/kernels/cuda/Test__CUDANativeVNNIPrefillStaging.cpp)
+    add_executable(v2_integration_cuda_native_quantised_prefill_staging
+        integration/kernels/cuda/Test__CUDANativeQuantisedPrefillStaging.cpp)
     # Native first-use cases authenticate every visible CUDA participant.
-    v2_test_device_scope(v2_integration_cuda_native_vnni_prefill_staging FullInventory)
-    target_link_libraries(v2_integration_cuda_native_vnni_prefill_staging PRIVATE
+    v2_test_device_scope(v2_integration_cuda_native_quantised_prefill_staging FullInventory)
+    target_link_libraries(v2_integration_cuda_native_quantised_prefill_staging PRIVATE
         llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
-    target_include_directories(v2_integration_cuda_native_vnni_prefill_staging PRIVATE
+    target_include_directories(v2_integration_cuda_native_quantised_prefill_staging PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2)
-    add_v2_test(V2_Integration_CUDANativeVNNIPrefillStaging
-        COMMAND $<TARGET_FILE:v2_integration_cuda_native_vnni_prefill_staging>
-        LABELS "V2;Integration;CUDA;GEMM;Prefill;GraphCapture;ByteExact;NativeVNNI;Regression"
+    add_v2_test(V2_Integration_CUDANativeQuantisedPrefillStaging
+        COMMAND $<TARGET_FILE:v2_integration_cuda_native_quantised_prefill_staging>
+        LABELS "V2;Integration;CUDA;GEMM;Prefill;GraphCapture;ByteExact;NativeQuantised;Regression"
         MPI_PROCS 1
         NO_MODELS
         TIMEOUT 90
@@ -10641,40 +10636,40 @@ if(HAVE_CUDA)
         LABELS "V2;Performance;CUDA;GEMM;GraphCapture;Economy"
         MPI_PROCS 1 NO_MODELS)
 endif()
-add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillHeuristic
+add_v2_test(V2_Integration_CUDA_NativeQuantised_PrefillHeuristic
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
-            --gtest_filter=Test__CUDAGemmParity.NativeVNNIPrefillHeuristicAllFormatsMatchesCPU
+            --gtest_filter=Test__CUDAGemmParity.NativeQuantisedPrefillHeuristicAllFormatsMatchesCPU
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;GEMM;Prefill;Heuristic;AllFormats;NativeVNNI;Parity;Regression"
+    LABELS "V2;Integration;CUDA;GEMM;Prefill;Heuristic;AllFormats;NativeQuantised;Parity;Regression"
     MPI_PROCS 1
 )
-add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillBucketMInvariantAllFormats
+add_v2_test(V2_Integration_CUDA_NativeQuantised_PrefillBucketMInvariantAllFormats
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
-            --gtest_filter=Test__CUDAGemmParity.NativeVNNIPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets
+            --gtest_filter=Test__CUDAGemmParity.NativeQuantisedPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;GEMM;Prefill;GraphBucket;GraphCapture;BatchInvariant;MTotality;AllFormats;NativeVNNI;ByteExact;Regression"
+    LABELS "V2;Integration;CUDA;GEMM;Prefill;GraphBucket;GraphCapture;BatchInvariant;MTotality;AllFormats;NativeQuantised;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
-add_v2_test(V2_Integration_CUDA_NativeVNNI_Qwen36AsymmetricTileOverlay
+add_v2_test(V2_Integration_CUDA_NativeQuantised_Qwen36AsymmetricTileOverlay
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
             --gtest_filter=Test__CUDAGemmParity.AsymmetricQwen36GDNProjectionUsesProfiledByteExactTile:Test__CUDAGemmParity.AsymmetricQwen36MoEExpertProjectionUsesProfiledMTotalByteExactTile
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;GEMM;Prefill;GroupedVerifierRows;MTotality;AllFormats;Qwen36;GDN;MoE;NativeVNNI;Dispatch;ByteExact;Regression"
+    LABELS "V2;Integration;CUDA;GEMM;Prefill;GroupedVerifierRows;MTotality;AllFormats;Qwen36;GDN;MoE;NativeQuantised;Dispatch;ByteExact;Regression"
     MPI_PROCS 1
 )
-add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillHeuristicQwen36
+add_v2_test(V2_Integration_CUDA_NativeQuantised_PrefillHeuristicQwen36
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_batch_invariance>
-            --gtest_filter=Test__CUDAGemmBatchInvariance.NativeVNNI_Qwen36DensePromptPrefillUsesTotalHeuristic
+            --gtest_filter=Test__CUDAGemmBatchInvariance.NativeQuantised_Qwen36DensePromptPrefillUsesTotalHeuristic
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;GEMM;Prefill;Heuristic;NativeVNNI;Qwen36;PerfStats;Regression"
+    LABELS "V2;Integration;CUDA;GEMM;Prefill;Heuristic;NativeQuantised;Qwen36;PerfStats;Regression"
     MPI_PROCS 1
 )
-add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillWorkspaceEnvelope
+add_v2_test(V2_Integration_CUDA_NativeQuantised_PrefillWorkspaceEnvelope
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_batch_invariance>
-            --gtest_filter=Test__CUDAGemmBatchInvariance.NativeVNNIPrefillWorkspaceEnvelopeCoversAllCodebooksAndBuckets
+            --gtest_filter=Test__CUDAGemmBatchInvariance.NativeQuantisedPrefillWorkspaceEnvelopeCoversAllCodebooksAndBuckets
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;GEMM;Prefill;GraphBucket;Workspace;MTotality;AllFormats;NativeVNNI;Regression"
+    LABELS "V2;Integration;CUDA;GEMM;Prefill;GraphBucket;Workspace;MTotality;AllFormats;NativeQuantised;Regression"
     MPI_PROCS 1
 )
 
@@ -10776,7 +10771,7 @@ add_v2_test(V2_Integration_CUDA_MoEOverlayCPUArithmeticAllFormats
     COMMAND $<TARGET_FILE:v2_integration_cross_tier_expert_arithmetic>
             --gtest_filter=Test__CrossTierExpertArithmeticParity.CPUAndCUDAAllQuantizedExpertFormatsAreByteExactAcrossM:Test__CrossTierExpertArithmeticParity.CPUAndCUDAFloatingExpertDecodeIsByteExact
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;CPU;MoE;ExpertOverlay;CPUCold;Promotion;AllFormats;NativeVNNI;GroupedDecode;GroupedVerifierRows;Prefill;NumericalParity;ByteExact;Regression"
+    LABELS "V2;Integration;CUDA;CPU;MoE;ExpertOverlay;CPUCold;Promotion;AllFormats;NativeQuantised;GroupedDecode;GroupedVerifierRows;Prefill;NumericalParity;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
     TIMEOUT 120
@@ -10792,7 +10787,7 @@ if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
         COMMAND $<TARGET_FILE:v2_integration_cross_tier_expert_arithmetic>
                 --gtest_filter=Test__CrossTierExpertArithmeticParity.CPUAndCUDAAllQuantizedExpertFormatsAreByteExactAcrossM:Test__CrossTierExpertArithmeticParity.CPUAndCUDAFloatingExpertDecodeIsByteExact
                 --gtest_brief=1
-        LABELS "V2;Integration;CUDA;CPU;MoE;ExpertOverlay;CPUCold;Promotion;AllFormats;NativeVNNI;AVX2;GroupedDecode;GroupedVerifierRows;Prefill;NumericalParity;ByteExact;Regression"
+        LABELS "V2;Integration;CUDA;CPU;MoE;ExpertOverlay;CPUCold;Promotion;AllFormats;NativeQuantised;AVX2;GroupedDecode;GroupedVerifierRows;Prefill;NumericalParity;ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
         TIMEOUT 120
@@ -10890,7 +10885,7 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_MoEExpertPaths
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
             --gtest_filter=Test__CUDAMoERouteScratch.SerialGraphRolesShareImmutableLargestParticipantArena:Test__CUDAMoEPrefillPolicy.UnseenMIsTotalThroughTheGenericCapturePolicy:Test__CUDAMoEKernel.Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraphBucket:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAndCaptures:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentMatchesSerialDecodeRouter:Test__CUDAMoEKernel.VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAndCapture:Test__CUDAMoEKernel.SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows:Test__CUDAMoEKernel.SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce:Test__CUDAMoEKernel.CanonicalRootedRankBankPublicationIsMTotalAndSerialRowExact:Test__CUDAMoEKernel.LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerialRows:Test__CUDAMoEKernel.SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode:Test__CUDAMoEKernel.SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatchDecodeAndCapture:Test__CUDAMoEKernel.SharedExpertVerifierPrefillQwen36AllNativeFormatsRuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ3SDown_RuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedAndMaskedLocalTPVerifierPrefill_AllNativeFormats_RuntimeMMatchRowDecode:Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows:Test__CUDAMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;LocalTP;Regression"
+    LABELS "V2;Integration;CUDA;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeQuantised;LocalTP;Regression"
     MPI_PROCS 1
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA2_MoEReplicatedMTP
@@ -10909,13 +10904,13 @@ add_v2_test(V2_Integration_CUDA2VerifierCollectiveScratchAdmission
 add_v2_test(V2_Integration_CUDA2ReplicatedMoENonzeroVerifierWitness
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
         --gtest_filter=Test__CUDAMoEKernel.ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByteIdentical
-    LABELS "V2;Integration;ProductionTestPreflight;CUDA;CUDA2;LocalTP;MTP;MoE;AllFormats;NativeVNNI;GraphCapture;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;CUDA2;LocalTP;MTP;MoE;AllFormats;NativeQuantised;GraphCapture;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 120)
 add_v2_test(V2_Integration_CUDA_MoEGroupedPrefillQ4KM39SerialParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
             --gtest_filter=Test__CUDAMoEKernel.FixedTopologyRuntimeGroupedPrefillQ4KM39MatchesSerialRowsAndCaptures
             --gtest_brief=1
-    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;Q4_K;NativeVNNI;Prefill;GroupedPrefill;GraphCapture;TensorCore;IMMA;SerialRowOracle;ByteExact;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;Q4_K;NativeQuantised;Prefill;GroupedPrefill;GraphCapture;TensorCore;IMMA;SerialRowOracle;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
     TIMEOUT 120
@@ -11400,91 +11395,91 @@ add_executable(v2_perf_cuda_blockwise_tensorcore_gemm_sweep performance/kernels/
 target_link_libraries(v2_perf_cuda_blockwise_tensorcore_gemm_sweep llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Perf_CUDABlockwiseTensorCoreGemmSweep
     COMMAND $<TARGET_FILE:v2_perf_cuda_blockwise_tensorcore_gemm_sweep>
-    LABELS "V2;Performance;CUDA;GEMV;Decode;NativeVNNI;Codebook;Qwen;Tuning;Sweep;Trainer"
+    LABELS "V2;Performance;CUDA;GEMV;Decode;NativeQuantised;Codebook;Qwen;Tuning;Sweep;Trainer"
     MPI_PROCS 1
 )
 
-# NativeVNNI decode/verifier trainer. This executable sweeps exact CUDA launch
+# NativeQuantised decode/verifier trainer. This executable sweeps exact CUDA launch
 # schedules for serial M=1 and grouped runtime-M rows, emits replayable evidence
 # CSVs, and is intentionally run through the Performance gate rather than Unit.
-# Every NativeVNNI trainer backend consumes this one resolved exact-overlay
+# Every NativeQuantised trainer backend consumes this one resolved exact-overlay
 # inventory. Keep the paths centralized here; backend-specific target blocks
 # must never grow private model/shape lists.
-set(LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST
-    "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/manifests/native_vnni_decode_shapes_v5.json")
+set(LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST
+    "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_quantised_dispatch/manifests/native_quantised_decode_shapes_v5.json")
 
 # Device-free parity of the same C++ and Python resolved trainer inventory.
 if(NOT V2_PERF_TESTS_ONLY)
-    add_executable(v2_test_native_vnni_shape_manifest_projection
-        unit/native_vnni_dispatch/NativeVNNIShapeManifestProjection.cpp)
-    target_include_directories(v2_test_native_vnni_shape_manifest_projection PRIVATE
+    add_executable(v2_test_native_quantised_shape_manifest_projection
+        unit/native_quantised_dispatch/NativeQuantisedShapeManifestProjection.cpp)
+    target_include_directories(v2_test_native_quantised_shape_manifest_projection PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
-    target_compile_definitions(v2_test_native_vnni_shape_manifest_projection PRIVATE
-        LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"
-        LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}")
+    target_compile_definitions(v2_test_native_quantised_shape_manifest_projection PRIVATE
+        LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST}"
+        LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG}")
     foreach(V2_MANIFEST_SUITE IN ITEMS Unit Integration)
-        add_v2_test(V2_${V2_MANIFEST_SUITE}_NativeVNNIShapeManifestCppParity
+        add_v2_test(V2_${V2_MANIFEST_SUITE}_NativeQuantisedShapeManifestCppParity
             COMMAND ${Python3_EXECUTABLE} -B
-                ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_manifest_cpp_parity.py
-                --binary $<TARGET_FILE:v2_test_native_vnni_shape_manifest_projection>
-            LABELS "V2;${V2_MANIFEST_SUITE};NativeVNNI;CPU;DeviceFree;Dispatch;Catalog;Regression"
+                ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_manifest_cpp_parity.py
+                --binary $<TARGET_FILE:v2_test_native_quantised_shape_manifest_projection>
+            LABELS "V2;${V2_MANIFEST_SUITE};NativeQuantised;CPU;DeviceFree;Dispatch;Catalog;Regression"
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     endforeach()
-    if(TEST V2_Integration_NativeVNNIShapeManifestCppParity)
-        set_property(TEST V2_Integration_NativeVNNIShapeManifestCppParity APPEND PROPERTY LABELS ProductionTestPreflight)
-        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeVNNIShapeManifestCppParity)
+    if(TEST V2_Integration_NativeQuantisedShapeManifestCppParity)
+        set_property(TEST V2_Integration_NativeQuantisedShapeManifestCppParity APPEND PROPERTY LABELS ProductionTestPreflight)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedShapeManifestCppParity)
     endif()
 endif()
 
-add_executable(v2_perf_cuda_native_vnni_decode_trainer
-    performance/kernels/cuda/gemm/Perf__CUDANativeVNNIDecodeTrainer.cpp)
-target_link_libraries(v2_perf_cuda_native_vnni_decode_trainer
+add_executable(v2_perf_cuda_native_quantised_decode_trainer
+    performance/kernels/cuda/gemm/Perf__CUDANativeQuantisedDecodeTrainer.cpp)
+target_link_libraries(v2_perf_cuda_native_quantised_decode_trainer
     llaminar2_core GTest::gtest GTest::gtest_main)
-target_include_directories(v2_perf_cuda_native_vnni_decode_trainer PRIVATE
+target_include_directories(v2_perf_cuda_native_quantised_decode_trainer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
-target_compile_definitions(v2_perf_cuda_native_vnni_decode_trainer PRIVATE
-    LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"
-    LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}")
-add_v2_test(V2_Perf_CUDANativeVNNIDecodeTrainer
-    COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_decode_trainer>
-    LABELS "V2;Performance;CUDA;GEMV;Decode;MTP;GroupedVerifierRows;NativeVNNI;AllFormats;BatchInvariant;Trainer"
+target_compile_definitions(v2_perf_cuda_native_quantised_decode_trainer PRIVATE
+    LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST}"
+    LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG}")
+add_v2_test(V2_Perf_CUDANativeQuantisedDecodeTrainer
+    COMMAND $<TARGET_FILE:v2_perf_cuda_native_quantised_decode_trainer>
+    LABELS "V2;Performance;CUDA;GEMV;Decode;MTP;GroupedVerifierRows;NativeQuantised;AllFormats;BatchInvariant;Trainer"
     MPI_PROCS 1
 )
 if(HAVE_CUDA)
     # Regression for exact K-partitions that leave trailing empty splits. The
     # trainer poisons partial workspace first, so every split must explicitly
     # publish before the ordered reducer runs in eager and captured execution.
-    add_v2_test(V2_Integration_CUDANativeVNNIExactKPartTailPublication
-        COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_decode_trainer>
+    add_v2_test(V2_Integration_CUDANativeQuantisedExactKPartTailPublication
+        COMMAND $<TARGET_FILE:v2_perf_cuda_native_quantised_decode_trainer>
                 --gtest_filter=*TrainerCsv_StrongDecode_AllFormats
-        LABELS "V2;Integration;CUDA;MTP;NativeVNNI;KPart;GraphCapture;Regression"
+        LABELS "V2;Integration;CUDA;MTP;NativeQuantised;KPart;GraphCapture;Regression"
         MPI_PROCS 1
     )
-    if(TEST V2_Integration_CUDANativeVNNIExactKPartTailPublication)
-        set_tests_properties(V2_Integration_CUDANativeVNNIExactKPartTailPublication PROPERTIES
+    if(TEST V2_Integration_CUDANativeQuantisedExactKPartTailPublication)
+        set_tests_properties(V2_Integration_CUDANativeQuantisedExactKPartTailPublication PROPERTIES
             ENVIRONMENT
-                "LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q8_0;LLAMINAR_CUDA_NVNNI_DECODE_SHAPES=35BMoE_Expert_Down;LLAMINAR_CUDA_NVNNI_DECODE_M=1;LLAMINAR_CUDA_NVNNI_DECODE_CANDIDATES=cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb15;LLAMINAR_CUDA_NVNNI_DECODE_EXECUTION_MODES=eager,graph_captured;LLAMINAR_CUDA_NVNNI_DECODE_WARMUPS=2;LLAMINAR_CUDA_NVNNI_DECODE_SAMPLES=5;LLAMINAR_CUDA_NVNNI_DECODE_CSV=/tmp/llaminar_cuda_exact_kpart_tail.csv;LLAMINAR_CUDA_NVNNI_DECODE_TIMING_CSV=/tmp/llaminar_cuda_exact_kpart_tail.timing.csv"
+                "LLAMINAR_CUDA_NATIVE_QUANTISED_DECODE_FORMATS=Q8_0;LLAMINAR_CUDA_NATIVE_QUANTISED_DECODE_SHAPES=35BMoE_Expert_Down;LLAMINAR_CUDA_NATIVE_QUANTISED_DECODE_M=1;LLAMINAR_CUDA_NATIVE_QUANTISED_DECODE_CANDIDATES=cuda.native_quantised.decode.fast_m1.kpar.tn128.cpt1.kb15;LLAMINAR_CUDA_NATIVE_QUANTISED_DECODE_EXECUTION_MODES=eager,graph_captured;LLAMINAR_CUDA_NATIVE_QUANTISED_DECODE_WARMUPS=2;LLAMINAR_CUDA_NATIVE_QUANTISED_DECODE_SAMPLES=5;LLAMINAR_CUDA_NATIVE_QUANTISED_DECODE_CSV=/tmp/llaminar_cuda_exact_kpart_tail.csv;LLAMINAR_CUDA_NATIVE_QUANTISED_DECODE_TIMING_CSV=/tmp/llaminar_cuda_exact_kpart_tail.timing.csv"
             RESOURCE_LOCK cuda_gpu_0
             TIMEOUT 30
         )
     endif()
 endif()
 
-add_executable(v2_perf_cuda_native_vnni_gemm performance/kernels/cuda/gemm/Perf__CUDANativeVNNIGemm.cpp)
+add_executable(v2_perf_cuda_native_quantised_gemm performance/kernels/cuda/gemm/Perf__CUDANativeQuantisedGemm.cpp)
 if(HAVE_CUDA)
-    target_sources(v2_perf_cuda_native_vnni_gemm PRIVATE
-        performance/kernels/native_vnni_dispatch/CUDATrainerVerification.cu
+    target_sources(v2_perf_cuda_native_quantised_gemm PRIVATE
+        performance/kernels/native_quantised_dispatch/CUDATrainerVerification.cu
     )
 endif()
-target_link_libraries(v2_perf_cuda_native_vnni_gemm llaminar2_core GTest::gtest GTest::gtest_main)
-target_include_directories(v2_perf_cuda_native_vnni_gemm PRIVATE
+target_link_libraries(v2_perf_cuda_native_quantised_gemm llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_perf_cuda_native_quantised_gemm PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
-target_compile_definitions(v2_perf_cuda_native_vnni_gemm PRIVATE
-    LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"
-    LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}")
-add_v2_test(V2_Perf_CUDANativeVNNIGemm
-    COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_gemm>
-    LABELS "V2;Performance;CUDA;GEMM;Prefill;NativeVNNI;Codebook;Qwen;Tuning;StreamK;Sweep"
+target_compile_definitions(v2_perf_cuda_native_quantised_gemm PRIVATE
+    LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST}"
+    LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG}")
+add_v2_test(V2_Perf_CUDANativeQuantisedGemm
+    COMMAND $<TARGET_FILE:v2_perf_cuda_native_quantised_gemm>
+    LABELS "V2;Performance;CUDA;GEMM;Prefill;NativeQuantised;Codebook;Qwen;Tuning;StreamK;Sweep"
     MPI_PROCS 1
 )
 if(HAVE_CUDA)
@@ -11493,27 +11488,27 @@ if(HAVE_CUDA)
         set(V2_CUDA_DENSE_PREFILL_TEST
             V2_Integration_CUDADensePrefillInstalledAllFormats_Group${V2_CUDA_DENSE_PREFILL_GROUP})
         add_v2_test(${V2_CUDA_DENSE_PREFILL_TEST}
-            COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_gemm>
+            COMMAND $<TARGET_FILE:v2_perf_cuda_native_quantised_gemm>
                 --gtest_filter=InstalledCUDADensePrefill/CUDAInstalledDensePrefillTest.AllSourceFormats/${V2_CUDA_DENSE_PREFILL_GROUP}
-            LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;Prefill;AllFormats;GraphCapture;Regression"
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeQuantised;Prefill;AllFormats;GraphCapture;Regression"
             MPI_PROCS 1 TIMEOUT 120 NO_MODELS)
         list(APPEND V2_CUDA_DENSE_PREFILL_INSTALLED_TESTS ${V2_CUDA_DENSE_PREFILL_TEST})
     endforeach()
-    add_v2_test(V2_Integration_CUDANativeVNNIPrefillCompilerResourcesAllCodebooks
-        COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_gemm>
-                --gtest_filter=CUDANativeVNNIGemmPerf.CompilerResources_AllCodebooksAndCandidates
-        LABELS "V2;Integration;CUDA;GEMM;Prefill;NativeVNNI;AllFormats;Resources;Occupancy;NoSpills;Regression"
+    add_v2_test(V2_Integration_CUDANativeQuantisedPrefillCompilerResourcesAllCodebooks
+        COMMAND $<TARGET_FILE:v2_perf_cuda_native_quantised_gemm>
+                --gtest_filter=CUDANativeQuantisedGemmPerf.CompilerResources_AllCodebooksAndCandidates
+        LABELS "V2;Integration;CUDA;GEMM;Prefill;NativeQuantised;AllFormats;Resources;Occupancy;NoSpills;Regression"
         MPI_PROCS 1
         NO_MODELS
     )
     add_v2_test(V2_Integration_CUDAExactPrefillPrecedesBK256Heuristic
-        COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_gemm>
-            --gtest_filter=CUDANativeVNNIGemmPerf.ExactOverlayPrecedesQ40BK256Heuristic
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;Prefill;GraphCapture;Regression"
+        COMMAND $<TARGET_FILE:v2_perf_cuda_native_quantised_gemm>
+            --gtest_filter=CUDANativeQuantisedGemmPerf.ExactOverlayPrecedesQ40BK256Heuristic
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeQuantised;Prefill;GraphCapture;Regression"
         MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
-    if(TEST V2_Integration_CUDANativeVNNIPrefillCompilerResourcesAllCodebooks)
+    if(TEST V2_Integration_CUDANativeQuantisedPrefillCompilerResourcesAllCodebooks)
         set_tests_properties(
-            V2_Integration_CUDANativeVNNIPrefillCompilerResourcesAllCodebooks
+            V2_Integration_CUDANativeQuantisedPrefillCompilerResourcesAllCodebooks
             PROPERTIES
                 RESOURCE_LOCK cuda_gpu_0
                 TIMEOUT 30
@@ -18069,14 +18064,14 @@ foreach(V2_CPU_WORKSPACE_ISA IN LISTS V2_CPU_PROJECTION_WORKSPACE_ISAS)
     list(APPEND V2_CPU_PROJECTION_WORKSPACE_PREFLIGHT_TESTS ${V2_CPU_WORKSPACE_TEST})
 endforeach()
 
-# Integration Test: CPU NativeVNNI GEMV/GEMM Correctness (Q4_0, IQ4_NL)
-add_executable(v2_integration_cpu_native_vnni_verifier_workers
-    integration/kernels/cpu/native_vnni/Test__CPUNativeVNNIVerifierWorkers.cpp
-    integration/kernels/cpu/native_vnni/Test__CPUNativeVNNIProjectionCapacity.cpp
-    integration/kernels/cpu/native_vnni/Test__CPUQueryRowWork.cpp)
-target_link_libraries(v2_integration_cpu_native_vnni_verifier_workers PRIVATE
+# Integration Test: CPU NativeQuantised GEMV/GEMM Correctness (Q4_0, IQ4_NL)
+add_executable(v2_integration_cpu_native_quantised_verifier_workers
+    integration/kernels/cpu/native_quantised/Test__CPUNativeQuantisedVerifierWorkers.cpp
+    integration/kernels/cpu/native_quantised/Test__CPUNativeQuantisedProjectionCapacity.cpp
+    integration/kernels/cpu/native_quantised/Test__CPUQueryRowWork.cpp)
+target_link_libraries(v2_integration_cpu_native_quantised_verifier_workers PRIVATE
     llaminar2_core GTest::gtest GTest::gtest_main)
-target_include_directories(v2_integration_cpu_native_vnni_verifier_workers PRIVATE
+target_include_directories(v2_integration_cpu_native_quantised_verifier_workers PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
 foreach(V2_VERIFIER_WORKER_ISA AVX2 AVX512)
     if(V2_VERIFIER_WORKER_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
@@ -18084,41 +18079,41 @@ foreach(V2_VERIFIER_WORKER_ISA AVX2 AVX512)
     endif()
     string(TOLOWER "${V2_VERIFIER_WORKER_ISA}" V2_VERIFIER_WORKER_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPU_QueryRowWork_${V2_VERIFIER_WORKER_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers>
             --gtest_filter=AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkRotation.*:CPUQueryRowWorkAdmission.*
             --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;CPU;QwenFlashNext;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA}")
-    add_v2_test(V2_Integration_CPU_NativeVNNIProjectionCapacity_${V2_VERIFIER_WORKER_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
-            --gtest_filter=CPUNativeVNNIProjectionCapacity.*
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MoE;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
+    add_v2_test(V2_Integration_CPU_NativeQuantisedProjectionCapacity_${V2_VERIFIER_WORKER_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers>
+            --gtest_filter=CPUNativeQuantisedProjectionCapacity.*
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MoE;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA}")
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPU_NativeVNNIProjectionCapacity_${V2_VERIFIER_WORKER_ISA})
-    add_v2_test(V2_Integration_CPU_NativeVNNIVerifierWorkers_${V2_VERIFIER_WORKER_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers> --gtest_brief=1
-            --gtest_filter=-CPUNativeVNNIVerifierWorkers.DisabledDiagnosticsDoNotAllocate:CPUNativeVNNIVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection:AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkRotation.*:CPUQueryRowWorkAdmission.*
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPU_NativeQuantisedProjectionCapacity_${V2_VERIFIER_WORKER_ISA})
+    add_v2_test(V2_Integration_CPU_NativeQuantisedVerifierWorkers_${V2_VERIFIER_WORKER_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers> --gtest_brief=1
+            --gtest_filter=-CPUNativeQuantisedVerifierWorkers.DisabledDiagnosticsDoNotAllocate:CPUNativeQuantisedVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection:AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkRotation.*:CPUQueryRowWorkAdmission.*
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel.cpu_native_vnni_verifier_worker_tasks")
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel.cpu_native_quantised_verifier_worker_tasks")
     # The same all-format FFN proof runs without kernel collection. This catches
     # dormant diagnostic strings/maps allocating before the collector's guard.
-    add_v2_test(V2_Integration_CPU_NativeVNNIDisabledDiagnostics_${V2_VERIFIER_WORKER_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
-            --gtest_filter=CPUNativeVNNIVerifierWorkers.DisabledDiagnosticsDoNotAllocate
+    add_v2_test(V2_Integration_CPU_NativeQuantisedDisabledDiagnostics_${V2_VERIFIER_WORKER_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers>
+            --gtest_filter=CPUNativeQuantisedVerifierWorkers.DisabledDiagnosticsDoNotAllocate
             --gtest_brief=1
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;NoAllocation;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;NoAllocation;Regression"
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=moe")
-    add_v2_test(V2_Integration_CPU_NativeVNNIMixedFormatFFN_${V2_VERIFIER_WORKER_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
-            --gtest_filter=CPUNativeVNNIVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection
+    add_v2_test(V2_Integration_CPU_NativeQuantisedMixedFormatFFN_${V2_VERIFIER_WORKER_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers>
+            --gtest_filter=CPUNativeQuantisedVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection
             --gtest_brief=1
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;MixedFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;NoAllocation;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;AllFormats;MixedFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;NoAllocation;Regression"
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=moe")
@@ -18131,57 +18126,81 @@ foreach(V2_IQ2S_FUSED_ISA AVX2 AVX512)
     endif()
     string(TOLOWER "${V2_IQ2S_FUSED_ISA}" V2_IQ2S_FUSED_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPUIQ2SFusedMoEOriginalEquation_${V2_IQ2S_FUSED_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
-                --gtest_filter=CPUNativeVNNIVerifierWorkers.IQ2SOriginalSourceEquationInFusedExpertTransaction
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers>
+                --gtest_filter=CPUNativeQuantisedVerifierWorkers.IQ2SOriginalSourceEquationInFusedExpertTransaction
         LABELS "V2;Integration;ProductionTestPreflight;CPU;${V2_IQ2S_FUSED_ISA};MoE;IQ2_S;OriginalEquation;Regression"
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_IQ2S_FUSED_RUNTIME_ISA}")
 endforeach()
 
-add_executable(v2_integration_cpu_native_vnni_fused_completion
-    integration/kernels/cpu/native_vnni/Test__CPUNativeVNNIFusedCompletion.cpp)
-target_link_libraries(v2_integration_cpu_native_vnni_fused_completion PRIVATE
+add_executable(v2_integration_cpu_native_quantised_fused_completion
+    integration/kernels/cpu/native_quantised/Test__CPUNativeQuantisedFusedCompletion.cpp)
+target_link_libraries(v2_integration_cpu_native_quantised_fused_completion PRIVATE
     llaminar2_core GTest::gtest GTest::gtest_main)
-target_include_directories(v2_integration_cpu_native_vnni_fused_completion PRIVATE
+target_include_directories(v2_integration_cpu_native_quantised_fused_completion PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
 foreach(V2_FUSED_COMPLETION_ISA AVX2 AVX512)
     if(V2_FUSED_COMPLETION_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
         continue()
     endif()
     string(TOLOWER "${V2_FUSED_COMPLETION_ISA}" V2_FUSED_COMPLETION_RUNTIME_ISA)
-    add_v2_test(V2_Integration_CPU_NativeVNNIFusedProjectionEvidenceIdentity_${V2_FUSED_COMPLETION_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_fused_completion>
-            --gtest_filter=CPUNativeVNNIFusedCompletion.ProjectionEvidenceUsesGeometryAndPolicyInsteadOfBundleOrdinal
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;PerfStats;Economy;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
+    add_v2_test(V2_Integration_CPU_NativeQuantisedFusedProjectionEvidenceIdentity_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+            --gtest_filter=CPUNativeQuantisedFusedCompletion.ProjectionEvidenceUsesGeometryAndPolicyInsteadOfBundleOrdinal
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;PerfStats;Economy;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=2")
-    add_v2_test(V2_Integration_CPU_NativeVNNIOrderedNibbleReplay_${V2_FUSED_COMPLETION_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_fused_completion>
-            --gtest_filter=CPUNativeVNNIFusedCompletion.GPUAlignedOrderedNibbleAllFormatReplay
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;AllFormats;MoE;Prefill;Decode;${V2_FUSED_COMPLETION_ISA};ByteExact;Replay;Regression"
+    add_v2_test(V2_Integration_CPU_NativeQuantisedExecutionExactPolicy_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+            --gtest_filter=CPUNativeQuantisedExecutionExactPolicy.*
+        LABELS "V2;Unit;Integration;ProductionTestPreflight;CPU;NativeQuantised;Dispatch;MTP;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=1")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedOrderedNibbleReplay_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+            --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedOrderedNibbleAllFormatReplay
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;Decode;${V2_FUSED_COMPLETION_ISA};ByteExact;Replay;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
-    add_v2_test(V2_Integration_CPU_NativeVNNIFusedCompletion_${V2_FUSED_COMPLETION_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_fused_completion> --gtest_brief=1
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
+    add_v2_test(V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+            --gtest_filter=CPUNativeQuantisedFusedCompletion.UnsignedCoefficientDomainContract:CPUNativeQuantisedFusedCompletion.UnsignedWeightDotAllFormatByteLifecycle
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedSamePanelPairRunReplay_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+            --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedPrefillSamePanelPairRunReplay
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedFusedLivePrefix_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+            --gtest_filter=CPUNativeQuantisedFusedCompletion.LivePrefixStorageLargeSmallReset
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedFusedCompletion_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion> --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;AllFormats;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}")
 endforeach()
 
-add_executable(v2_integration_cpu_native_vnni_gemv integration/kernels/cpu/native_vnni/Test__CPUNativeVNNI_GEMV.cpp)
-target_link_libraries(v2_integration_cpu_native_vnni_gemv
+add_executable(v2_integration_cpu_native_quantised_gemv integration/kernels/cpu/native_quantised/Test__CPUNativeQuantised_GEMV.cpp)
+target_link_libraries(v2_integration_cpu_native_quantised_gemv
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-target_include_directories(v2_integration_cpu_native_vnni_gemv PRIVATE
+target_include_directories(v2_integration_cpu_native_quantised_gemv PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes (TestTensorFactory)
 )
-add_v2_test(V2_Integration_CPUNativeVNNI_GEMV
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-    LABELS "V2;Integration;GEMM;GEMV;NativeVNNI;CPU;Q4_0;IQ4_NL;Decode"
+add_v2_test(V2_Integration_CPUNativeQuantised_GEMV
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+    LABELS "V2;Integration;GEMM;GEMV;NativeQuantised;CPU;Q4_0;IQ4_NL;Decode"
     MPI_PROCS 1
 )
 set(V2_CPU_MOVABLE_FLOATING_EXPERT_PREFLIGHT_TESTS)
@@ -18191,8 +18210,8 @@ foreach(V2_FLOATING_EXPERT_ISA IN ITEMS scalar avx2)
     set(V2_FLOATING_EXPERT_TEST
         "V2_Integration_CPU_MovableFloatingExpertAllFormats_${V2_FLOATING_EXPERT_ISA_LABEL}")
     add_v2_test(${V2_FLOATING_EXPERT_TEST}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-                --gtest_filter=CPUNativeVNNIGemvTest.GPUAlignedFloatingExpertsAllFormatsMatchCanonicalDenseTree
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+                --gtest_filter=CPUNativeQuantisedGemvTest.GPUAlignedFloatingExpertsAllFormatsMatchCanonicalDenseTree
                 --gtest_brief=1
         LABELS "V2;Integration;CPU;MoE;MTP;ExpertOverlay;FloatingPoint;FP16;BF16;FP32;${V2_FLOATING_EXPERT_ISA_LABEL};ByteExact;Regression"
         MPI_PROCS 1
@@ -18204,8 +18223,8 @@ foreach(V2_FLOATING_EXPERT_ISA IN ITEMS scalar avx2)
 endforeach()
 if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
     add_v2_test(V2_Integration_CPU_MovableFloatingExpertAllFormats_AVX512
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-                --gtest_filter=CPUNativeVNNIGemvTest.GPUAlignedFloatingExpertsAllFormatsMatchCanonicalDenseTree
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+                --gtest_filter=CPUNativeQuantisedGemvTest.GPUAlignedFloatingExpertsAllFormatsMatchCanonicalDenseTree
                 --gtest_brief=1
         LABELS "V2;Integration;CPU;MoE;MTP;ExpertOverlay;FloatingPoint;FP16;BF16;FP32;AVX512;ByteExact;Regression"
         MPI_PROCS 1
@@ -18215,11 +18234,11 @@ if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
     list(APPEND V2_CPU_MOVABLE_FLOATING_EXPERT_PREFLIGHT_TESTS
         V2_Integration_CPU_MovableFloatingExpertAllFormats_AVX512)
 endif()
-add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillHeuristic
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillFullKAllFormatsRuntimeMMatchesSerialDecode:CPUNativeVNNIGemvTest.NativeVNNIPrefillKPartAllFormatsRuntimeMMatchesSerialDecode
+add_v2_test(V2_Integration_CPU_NativeQuantised_PrefillHeuristic
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+            --gtest_filter=CPUNativeQuantisedGemvTest.NativeQuantisedPrefillFullKAllFormatsRuntimeMMatchesSerialDecode:CPUNativeQuantisedGemvTest.NativeQuantisedPrefillKPartAllFormatsRuntimeMMatchesSerialDecode
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;GEMM;Prefill;Heuristic;AllFormats;NativeVNNI;DecodeEquivalent;Regression"
+    LABELS "V2;Integration;CPU;GEMM;Prefill;Heuristic;AllFormats;NativeQuantised;DecodeEquivalent;Regression"
     MPI_PROCS 1
 )
 foreach(V2_PREFILL_ISA AVX2 AVX512)
@@ -18227,28 +18246,28 @@ foreach(V2_PREFILL_ISA AVX2 AVX512)
         continue()
     endif()
     string(TOLOWER "${V2_PREFILL_ISA}" V2_PREFILL_RUNTIME_ISA)
-    add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillFourRows_${V2_PREFILL_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-                --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillFourRowsAllFormatsMatchSerialRows
+    add_v2_test(V2_Integration_CPU_NativeQuantised_PrefillFourRows_${V2_PREFILL_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+                --gtest_filter=CPUNativeQuantisedGemvTest.NativeQuantisedPrefillFourRowsAllFormatsMatchSerialRows
                 --gtest_brief=1
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;Prefill;NativeVNNI;AllFormats;${V2_PREFILL_ISA};ByteExact;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;Prefill;NativeQuantised;AllFormats;${V2_PREFILL_ISA};ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_PREFILL_RUNTIME_ISA}")
-    add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillWaveBalancing_${V2_PREFILL_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-                --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillWaveBalancingAllFormatsMatchesSerialRows
+    add_v2_test(V2_Integration_CPU_NativeQuantised_PrefillWaveBalancing_${V2_PREFILL_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+                --gtest_filter=CPUNativeQuantisedGemvTest.NativeQuantisedPrefillWaveBalancingAllFormatsMatchesSerialRows
                 --gtest_brief=1
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;Prefill;NativeVNNI;AllFormats;${V2_PREFILL_ISA};ByteExact;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;Prefill;NativeQuantised;AllFormats;${V2_PREFILL_ISA};ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_PREFILL_RUNTIME_ISA}")
 endforeach()
 set(V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS
-    V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX2)
+    V2_Integration_CPU_NativeQuantised_PrefillCacheKTile_AVX2)
 if(USE_ONEDNN AND ONEDNN_FOUND)
     add_executable(v2_integration_cpu_floating_skinny
-        integration/kernels/cpu/native_vnni/Test__CPUFloatingSkinny.cpp)
+        integration/kernels/cpu/native_quantised/Test__CPUFloatingSkinny.cpp)
     target_link_libraries(v2_integration_cpu_floating_skinny PRIVATE
         llaminar2_core GTest::gtest GTest::gtest_main)
     add_v2_test(V2_Integration_CPU_FloatingSkinnySerialRows
@@ -18261,22 +18280,22 @@ if(USE_ONEDNN AND ONEDNN_FOUND)
         V2_Integration_CPU_FloatingSkinnySerialRows)
 endif()
 if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-    add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX512
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-                --gtest_filter=CPUActivationWordPacking.*:CPUNativeVNNIGemvTest.NativeVNNIPrefillCacheKTilesAllFormatsRemainSerialRowByteExact
+    add_v2_test(V2_Integration_CPU_NativeQuantised_PrefillCacheKTile_AVX512
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+                --gtest_filter=CPUActivationWordPacking.*:CPUNativeQuantisedGemvTest.NativeQuantisedPrefillCacheKTilesAllFormatsRemainSerialRowByteExact
                 --gtest_brief=1
-        LABELS "V2;Integration;CPU;GEMM;Prefill;CacheTiling;AVX512;AllFormats;MTotality;NativeVNNI;ByteExact;Regression"
+        LABELS "V2;Integration;CPU;GEMM;Prefill;CacheTiling;AVX512;AllFormats;MTotality;NativeQuantised;ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
     )
     list(APPEND V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS
-        V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX512)
+        V2_Integration_CPU_NativeQuantised_PrefillCacheKTile_AVX512)
 endif()
-add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX2
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUActivationWordPacking.*:CPUNativeVNNIGemvTest.NativeVNNIPrefillCacheKTilesAllFormatsRemainSerialRowByteExact
+add_v2_test(V2_Integration_CPU_NativeQuantised_PrefillCacheKTile_AVX2
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+            --gtest_filter=CPUActivationWordPacking.*:CPUNativeQuantisedGemvTest.NativeQuantisedPrefillCacheKTilesAllFormatsRemainSerialRowByteExact
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;GEMM;Prefill;CacheTiling;AVX2;AllFormats;MTotality;NativeVNNI;ByteExact;Regression"
+    LABELS "V2;Integration;CPU;GEMM;Prefill;CacheTiling;AVX2;AllFormats;MTotality;NativeQuantised;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
     ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2"
@@ -18287,10 +18306,10 @@ foreach(V2_FUSED_ISA AVX2 AVX512)
     endif()
     string(TOLOWER "${V2_FUSED_ISA}" V2_FUSED_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPU_FusedVerifierSchedules_${V2_FUSED_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-                --gtest_filter=CPUNativeVNNIGemvTest.MTP_FusedFullKForcedPoliciesAllFormatsRuntimeMMatchSerialDecodeRows
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+                --gtest_filter=CPUNativeQuantisedGemvTest.MTP_FusedFullKForcedPoliciesAllFormatsRuntimeMMatchSerialDecodeRows
                 --gtest_brief=1
-        LABELS "V2;Integration;CPU;NativeVNNI;MTP;AllFormats;${V2_FUSED_ISA};ByteExact;Regression"
+        LABELS "V2;Integration;CPU;NativeQuantised;MTP;AllFormats;${V2_FUSED_ISA};ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_RUNTIME_ISA}"
@@ -18298,23 +18317,23 @@ foreach(V2_FUSED_ISA AVX2 AVX512)
     list(APPEND V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS
         V2_Integration_CPU_FusedVerifierSchedules_${V2_FUSED_ISA})
 endforeach()
-add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillBucketMInvariantAllFormats
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillProductionAutoAllFormatsAllRowsByteExactAcrossMAndBuckets
+add_v2_test(V2_Integration_CPU_NativeQuantised_PrefillBucketMInvariantAllFormats
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+            --gtest_filter=CPUNativeQuantisedGemvTest.NativeQuantisedPrefillProductionAutoAllFormatsAllRowsByteExactAcrossMAndBuckets
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;GEMM;Prefill;GraphBucket;BatchInvariant;MTotality;AllFormats;NativeVNNI;ByteExact;Regression"
+    LABELS "V2;Integration;CPU;GEMM;Prefill;GraphBucket;BatchInvariant;MTotality;AllFormats;NativeQuantised;ByteExact;Regression"
     MPI_PROCS 1
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_AllFormats
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.MTP_FusedExpertDown_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_SmallM_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_ForcedWideRows_AllFormatsRuntimeMMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.MTP_FP16BF16FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.NativeVNNIPrefillFullKAllFormatsRuntimeMMatchesSerialDecode
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+            --gtest_filter=CPUNativeQuantisedGemvTest.MTP_FusedExpertDown_AllFormatsMatchSerialDecodeRows:CPUNativeQuantisedGemvTest.MTP_SmallM_AllFormatsMatchSerialDecodeRows:CPUNativeQuantisedGemvTest.MTP_ForcedWideRows_AllFormatsRuntimeMMatchSerialDecodeRows:CPUNativeQuantisedGemvTest.MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows:CPUNativeQuantisedGemvTest.MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeQuantisedGemvTest.MTP_FP16BF16FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeQuantisedGemvTest.NativeQuantisedPrefillFullKAllFormatsRuntimeMMatchesSerialDecode
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;oneDNN;Regression"
+    LABELS "V2;Integration;CPU;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeQuantised;oneDNN;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
 
-# A short MoE down projection has one NativeVNNI block in each canonical
+# A short MoE down projection has one NativeQuantised block in each canonical
 # device-ordered partition. Exercise the real layer-batched entry point under
 # both CPU ISAs so compiler contraction cannot make grouped MTP rows differ
 # from serial decode. This is correctness coverage; economy remains in the
@@ -18327,14 +18346,14 @@ set(V2_CPU_GPU_ALIGNED_EXPERT_PREFLIGHT_TESTS
 # Independent scalar rounding oracle: grouped/serial agreement alone cannot
 # catch a shared compiler contraction defect in their inlined block primitive.
 add_executable(v2_integration_cpu_activation_sums
-    integration/kernels/cpu/native_vnni/Test__CPUActivationSums.cpp)
+    integration/kernels/cpu/native_quantised/Test__CPUActivationSums.cpp)
 target_link_libraries(v2_integration_cpu_activation_sums PRIVATE
     GTest::gtest GTest::gtest_main)
 target_include_directories(v2_integration_cpu_activation_sums PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2)
 add_v2_test(V2_Integration_CPU_ActivationSums
     COMMAND $<TARGET_FILE:v2_integration_cpu_activation_sums>
-    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;AllFormats;ByteExact;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -18358,7 +18377,7 @@ foreach(router_isa IN ITEMS avx2 avx512)
 endforeach()
 
 add_executable(v2_integration_cpu_contribution_rounding
-    integration/kernels/cpu/native_vnni/Test__CPUContributionRounding.cpp)
+    integration/kernels/cpu/native_quantised/Test__CPUContributionRounding.cpp)
 target_link_libraries(v2_integration_cpu_contribution_rounding PRIVATE
     GTest::gtest GTest::gtest_main)
 target_compile_features(v2_integration_cpu_contribution_rounding PRIVATE cxx_std_23)
@@ -18367,7 +18386,7 @@ target_include_directories(v2_integration_cpu_contribution_rounding PRIVATE
 add_v2_test(V2_Integration_CPU_ContributionRounding_AVX2
     COMMAND $<TARGET_FILE:v2_integration_cpu_contribution_rounding>
             --gtest_filter=CPUContributionRounding.AVX2
-    LABELS "V2;Integration;CPU;AVX2;NativeVNNI;MTP;ExpertOverlay;ByteExact;Regression"
+    LABELS "V2;Integration;CPU;AVX2;NativeQuantised;MTP;ExpertOverlay;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
     ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2"
@@ -18376,7 +18395,7 @@ if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
     add_v2_test(V2_Integration_CPU_ContributionRounding_AVX512
         COMMAND $<TARGET_FILE:v2_integration_cpu_contribution_rounding>
                 --gtest_filter=CPUContributionRounding.AVX512
-        LABELS "V2;Integration;CPU;AVX512;NativeVNNI;MTP;ExpertOverlay;ByteExact;Regression"
+        LABELS "V2;Integration;CPU;AVX512;NativeQuantised;MTP;ExpertOverlay;ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
     )
@@ -18384,10 +18403,10 @@ if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
         V2_Integration_CPU_ContributionRounding_AVX512)
 endif()
 add_v2_test(V2_Integration_CPU_CompactMultiScaleIntegerDot
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.CompactMultiScaleAVX2DotExhaustiveSignedByteDomain:CPUNativeVNNIGemvTest.CompactGridPairsMatchEveryScalarEntry:CPUNativeVNNIGemvTest.CompactGridSignsMatchEveryByteMask
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+            --gtest_filter=CPUNativeQuantisedGemvTest.CompactMultiScaleAVX2DotExhaustiveSignedByteDomain:CPUNativeQuantisedGemvTest.CompactGridPairsMatchEveryScalarEntry:CPUNativeQuantisedGemvTest.CompactGridSignsMatchEveryByteMask
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;AVX2;NativeVNNI;ExpertOverlay;ByteExact;Regression"
+    LABELS "V2;Integration;CPU;AVX2;NativeQuantised;ExpertOverlay;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -18398,8 +18417,8 @@ foreach(V2_ORDERED_EXPERT_ISA IN ITEMS avx2 avx512)
     string(TOUPPER "${V2_ORDERED_EXPERT_ISA}" V2_ORDERED_EXPERT_ISA_LABEL)
     set(V2_ORDERED_EXPERT_TEST "V2_Integration_CPU_GPUAlignedExpertMultiBlockTree_AllFormats_${V2_ORDERED_EXPERT_ISA_LABEL}")
     add_v2_test(${V2_ORDERED_EXPERT_TEST}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-                --gtest_filter=CPUNativeVNNIGemvTest.GPUAlignedExpertMultiBlockPartitionsAllFormatsRuntimeMMatchSerialDecode:CPUNativeVNNIGemvTest.CompactOrderedPartitionsMatchIndependentScalarDecoder
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+                --gtest_filter=CPUNativeQuantisedGemvTest.GPUAlignedExpertMultiBlockPartitionsAllFormatsRuntimeMMatchSerialDecode:CPUNativeQuantisedGemvTest.CompactOrderedPartitionsMatchIndependentScalarDecoder
                 --gtest_brief=1
         LABELS "V2;Integration;CPU;MoE;MTP;ExpertOverlay;GPUAlignedExpert;${V2_ORDERED_EXPERT_ISA_LABEL};AllFormats;AllCodebooks;BatchInvariant;ByteExact;Regression"
         MPI_PROCS 1
@@ -18409,8 +18428,8 @@ foreach(V2_ORDERED_EXPERT_ISA IN ITEMS avx2 avx512)
     list(APPEND V2_CPU_GPU_ALIGNED_EXPERT_PREFLIGHT_TESTS ${V2_ORDERED_EXPERT_TEST})
     set(V2_EXPERT_PREFILL_TEST "V2_Integration_CPU_ExpertPrefillScheduling_AllFormats_${V2_ORDERED_EXPERT_ISA_LABEL}")
     add_v2_test(${V2_EXPERT_PREFILL_TEST}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-                --gtest_filter=CPUNativeVNNIGemvTest.ExpertPrefillSchedulingAllFormatsMatchesSerialDecode:CPUNativeVNNIGemvTest.ExpertPrefillSchedulingDoesNotChangeVerifierPolicy
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+                --gtest_filter=CPUNativeQuantisedGemvTest.ExpertPrefillSchedulingAllFormatsMatchesSerialDecode:CPUNativeQuantisedGemvTest.ExpertPrefillSchedulingDoesNotChangeVerifierPolicy
                 --gtest_brief=1
         LABELS "V2;Integration;CPU;MoE;MTP;ExpertOverlay;${V2_ORDERED_EXPERT_ISA_LABEL};AllFormats;AllCodebooks;BatchInvariant;ByteExact;Regression"
         MPI_PROCS 1
@@ -18420,8 +18439,8 @@ foreach(V2_ORDERED_EXPERT_ISA IN ITEMS avx2 avx512)
     list(APPEND V2_CPU_GPU_ALIGNED_EXPERT_PREFLIGHT_TESTS ${V2_EXPERT_PREFILL_TEST})
 endforeach()
 add_v2_test(V2_Integration_CPU_GPUAlignedExpertOneBlockTree_AllFormats_AVX2
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.GPUAlignedExpertOneBlockPartitionsAllFormatsRuntimeMMatchSerialDecode
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+            --gtest_filter=CPUNativeQuantisedGemvTest.GPUAlignedExpertOneBlockPartitionsAllFormatsRuntimeMMatchSerialDecode
             --gtest_brief=1
     LABELS "V2;Integration;CPU;MoE;MTP;ExpertOverlay;GPUAlignedExpert;AVX2;AllFormats;AllCodebooks;BatchInvariant;ByteExact;Regression"
     MPI_PROCS 1
@@ -18430,8 +18449,8 @@ add_v2_test(V2_Integration_CPU_GPUAlignedExpertOneBlockTree_AllFormats_AVX2
 )
 if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
     add_v2_test(V2_Integration_CPU_GPUAlignedExpertOneBlockTree_AllFormats_AVX512
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-                --gtest_filter=CPUNativeVNNIGemvTest.GPUAlignedExpertOneBlockPartitionsAllFormatsRuntimeMMatchSerialDecode
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+                --gtest_filter=CPUNativeQuantisedGemvTest.GPUAlignedExpertOneBlockPartitionsAllFormatsRuntimeMMatchSerialDecode
                 --gtest_brief=1
         LABELS "V2;Integration;CPU;MoE;MTP;ExpertOverlay;GPUAlignedExpert;AVX512;AllFormats;AllCodebooks;BatchInvariant;ByteExact;Regression"
         MPI_PROCS 1
@@ -18443,79 +18462,79 @@ if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
 endif()
 
 # Model-free preparation proof for the permanent CPU ExpertOverlay byte stream.
-add_executable(v2_integration_cpu_native_vnni_weight_packing
-    integration/kernels/cpu/native_vnni/Test__CPUNativeVNNIWeightPacking.cpp)
-target_link_libraries(v2_integration_cpu_native_vnni_weight_packing
+add_executable(v2_integration_cpu_native_quantised_weight_packing
+    integration/kernels/cpu/native_quantised/Test__CPUNativeQuantisedWeightPacking.cpp)
+target_link_libraries(v2_integration_cpu_native_quantised_weight_packing
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-target_include_directories(v2_integration_cpu_native_vnni_weight_packing PRIVATE
+target_include_directories(v2_integration_cpu_native_quantised_weight_packing PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-add_v2_test(V2_Integration_CPU_NativeVNNIWeightPackingAllFormats
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_weight_packing>
+add_v2_test(V2_Integration_CPU_NativeQuantisedWeightPackingAllFormats
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_weight_packing>
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;NativeVNNI;WeightPacking;AllFormats;ByteExact;Regression"
+    LABELS "V2;Integration;CPU;NativeQuantised;WeightPacking;AllFormats;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
 add_v2_test(V2_Integration_CPUNativeWeightWindowContract
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_weight_packing>
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_weight_packing>
             --gtest_filter=NativeWindowPackingContract.*:NativeWindowWriterContract.*
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;NativeVNNI;WeightPacking;AllFormats;ByteExact;Contract;Regression"
+    LABELS "V2;Integration;CPU;NativeQuantised;WeightPacking;AllFormats;ByteExact;Contract;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
 add_v2_test(V2_Integration_CPUNativeResidentRankContract
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_weight_packing>
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_weight_packing>
             --gtest_filter=NativeWindowWriterContract.ResidentParentsPreserveOriginalRankIncludingSingletonOuterAxes:NativeWindowWriterContract.NativeResidentParentsPreserveRankWithoutInventingQ8_1Parents
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;NativeVNNI;Contract;Regression"
+    LABELS "V2;Integration;CPU;NativeQuantised;Contract;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
 add_v2_test(V2_Integration_CPUNativeHalfConversionContract
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_weight_packing>
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_weight_packing>
             --gtest_filter=NativeWindowWriterContract.GenericFP32HalfKeepsWholeSelectionVectorAndScalarTailAcrossWindows:NativeWindowWriterContract.ModelHalfMatchesActualOriginalOverrideAcrossNativeAndFloatingSources:NativeWindowWriterContract.ModelHalfRejectsOriginalNonfiniteAndHalfOverflowBeforePublication
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;NativeVNNI;FP16;Contract;Regression"
+    LABELS "V2;Integration;CPU;NativeQuantised;FP16;Contract;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
 add_v2_test(V2_Integration_CPUNativeSourceAssemblyContract
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_weight_packing>
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_weight_packing>
         --gtest_filter=NativeSourceAssemblyContract.* --gtest_brief=1
     LABELS "V2;Integration;ProductionTestPreflight;CPU;Weights;AllFormats;Assembly;Contract;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=2;OMP_DYNAMIC=false")
-add_v2_test(V2_Integration_CPUNativeVNNIVerifierISAResolver
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.MTP_UncertifiedVerifierThreadRegimeHardFails:CPUNativeVNNIGemvTest.MTP_VerifierRoutePublishesBuildAndRuntimeISA
+add_v2_test(V2_Integration_CPUNativeQuantisedVerifierISAResolver
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+            --gtest_filter=CPUNativeQuantisedGemvTest.MTP_UncertifiedVerifierThreadRegimeHardFails:CPUNativeQuantisedGemvTest.MTP_VerifierRoutePublishesBuildAndRuntimeISA
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;GEMM;MTP;GroupedVerifierRows;NativeVNNI;ISA;Dispatch;PerfStats;Regression"
+    LABELS "V2;Integration;CPU;GEMM;MTP;GroupedVerifierRows;NativeQuantised;ISA;Dispatch;PerfStats;Regression"
     MPI_PROCS 1
 )
 
-# Performance Test: CPU NativeVNNI GEMV/GEMM Sweep (Q4_0, all model shapes)
-add_executable(v2_perf_cpu_native_vnni_sweep performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_Sweep.cpp)
-target_link_libraries(v2_perf_cpu_native_vnni_sweep
+# Performance Test: CPU NativeQuantised GEMV/GEMM Sweep (Q4_0, all model shapes)
+add_executable(v2_perf_cpu_native_quantised_sweep performance/kernels/cpu/native_quantised/Perf__CPUNativeQuantised_Sweep.cpp)
+target_link_libraries(v2_perf_cpu_native_quantised_sweep
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-target_include_directories(v2_perf_cpu_native_vnni_sweep PRIVATE
+target_include_directories(v2_perf_cpu_native_quantised_sweep PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes (TestTensorFactory)
 )
-add_v2_test(V2_Perf_CPUNativeVNNI_Sweep
-    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_sweep>
-    LABELS "V2;Performance;GEMM;GEMV;NativeVNNI;CPU;Q4_0;Decode;Prefill;Qwen;Tuning"
+add_v2_test(V2_Perf_CPUNativeQuantised_Sweep
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_sweep>
+    LABELS "V2;Performance;GEMM;GEMV;NativeQuantised;CPU;Q4_0;Decode;Prefill;Qwen;Tuning"
     MPI_PROCS 1
 )
 
 # Performance Test: AVX2 vs AVX512 VNNI throughput comparison
-add_executable(v2_perf_avx2_vs_avx512 performance/kernels/cpu/native_vnni/Perf__AVX2vsAVX512.cpp)
+add_executable(v2_perf_avx2_vs_avx512 performance/kernels/cpu/native_quantised/Perf__AVX2vsAVX512.cpp)
 target_link_libraries(v2_perf_avx2_vs_avx512
     llaminar2_core
     GTest::gtest
@@ -18526,30 +18545,30 @@ target_include_directories(v2_perf_avx2_vs_avx512 PRIVATE
 )
 add_v2_test(V2_Perf_AVX2vsAVX512
     COMMAND $<TARGET_FILE:v2_perf_avx2_vs_avx512>
-    LABELS "V2;Performance;GEMM;GEMV;NativeVNNI;CPU;AVX2;AVX512;Parity"
+    LABELS "V2;Performance;GEMM;GEMV;NativeQuantised;CPU;AVX2;AVX512;Parity"
     MPI_PROCS 1
 )
 
-# Performance Test: CPU NativeVNNI Dispatch Parameter Sweep (tile heuristic tuning)
-add_executable(v2_perf_cpu_native_vnni_dispatch_sweep performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_DispatchSweep.cpp)
-target_link_libraries(v2_perf_cpu_native_vnni_dispatch_sweep
+# Performance Test: CPU NativeQuantised Dispatch Parameter Sweep (tile heuristic tuning)
+add_executable(v2_perf_cpu_native_quantised_dispatch_sweep performance/kernels/cpu/native_quantised/Perf__CPUNativeQuantised_DispatchSweep.cpp)
+target_link_libraries(v2_perf_cpu_native_quantised_dispatch_sweep
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-target_include_directories(v2_perf_cpu_native_vnni_dispatch_sweep PRIVATE
+target_include_directories(v2_perf_cpu_native_quantised_dispatch_sweep PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes (TestTensorFactory)
 )
-add_v2_test(V2_Perf_CPUNativeVNNI_DispatchSweep
-    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_dispatch_sweep>
-    LABELS "V2;Performance;GEMM;GEMV;NativeVNNI;CPU;Dispatch;Tuning;Qwen"
+add_v2_test(V2_Perf_CPUNativeQuantised_DispatchSweep
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_dispatch_sweep>
+    LABELS "V2;Performance;GEMM;GEMV;NativeQuantised;CPU;Dispatch;Tuning;Qwen"
     MPI_PROCS 1
 )
 
-# Performance Test: CPU NativeVNNI GEMV Decode Sweep (native Q8_0 vs packed VNNI, all models)
-add_executable(v2_perf_cpu_native_vnni_gemv performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_GEMV.cpp)
+# Performance Test: CPU NativeQuantised GEMV Decode Sweep (native Q8_0 vs packed VNNI, all models)
+add_executable(v2_perf_cpu_native_quantised_gemv performance/kernels/cpu/native_quantised/Perf__CPUNativeQuantised_GEMV.cpp)
 add_executable(v2_perf_cpu_fused_verifier
-    performance/kernels/cpu/native_vnni/Perf__CPUFusedVerifier.cpp)
+    performance/kernels/cpu/native_quantised/Perf__CPUFusedVerifier.cpp)
 target_link_libraries(v2_perf_cpu_fused_verifier PRIVATE
     llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_perf_cpu_fused_verifier PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -18563,12 +18582,12 @@ if(NOT V2_PERF_TESTS_ONLY)
         endif()
         string(TOLOWER "${_layout_isa}" _layout_runtime_isa)
         foreach(_layout_slice gate down)
-            set(_layout_test V2_Integration_CPU_NativeVNNIFusedProjectionLayout_${_layout_slice}_${_layout_isa})
+            set(_layout_test V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_${_layout_slice}_${_layout_isa})
             add_v2_test(${_layout_test}
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_cpu_fused_fixture_layout.py
                     --binary $<TARGET_FILE:v2_perf_cpu_fused_verifier>
                     --slice ${_layout_slice} --isa ${_layout_runtime_isa}
-                LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeVNNI;MoE;Prefill;Layout;ByteExact;Regression;${_layout_isa}"
+                LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;MoE;Prefill;Layout;ByteExact;Regression;${_layout_isa}"
                 MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
         endforeach()
     endforeach()
@@ -18576,26 +18595,26 @@ endif()
 
 add_v2_test(V2_Perf_CPUFusedVerifier
     COMMAND $<TARGET_FILE:v2_perf_cpu_fused_verifier>
-    LABELS "V2;Performance;CPU;NativeVNNI;MTP;AllFormats"
+    LABELS "V2;Performance;CPU;NativeQuantised;MTP;AllFormats"
     MPI_PROCS 1
     NO_MODELS
 )
-target_link_libraries(v2_perf_cpu_native_vnni_gemv
+target_link_libraries(v2_perf_cpu_native_quantised_gemv
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-target_include_directories(v2_perf_cpu_native_vnni_gemv PRIVATE
+target_include_directories(v2_perf_cpu_native_quantised_gemv PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes (TestTensorFactory)
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor  # For nlohmann/json.hpp
 )
-target_compile_definitions(v2_perf_cpu_native_vnni_gemv PRIVATE
-    LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"
-    LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}"
+target_compile_definitions(v2_perf_cpu_native_quantised_gemv PRIVATE
+    LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST}"
+    LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG}"
 )
-add_v2_test(V2_Perf_CPUNativeVNNI_GEMV
-    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
-    LABELS "V2;Performance;GEMV;NativeVNNI;CPU;Q8_0;Decode;Qwen;Tuning"
+add_v2_test(V2_Perf_CPUNativeQuantised_GEMV
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_gemv>
+    LABELS "V2;Performance;GEMV;NativeQuantised;CPU;Q8_0;Decode;Qwen;Tuning"
     MPI_PROCS 1
 )
 
@@ -18603,56 +18622,56 @@ add_v2_test(V2_Perf_CPUNativeVNNI_GEMV
 # never serially synthesizes and repacks multi-gigabyte source tensors. This
 # focused integration gate proves every supported source format still receives
 # the exact production prepared geometry before timing or paired certification.
-add_v2_test(V2_Integration_CPUNativeVNNIDispatchEvidencePreparedLayout
-    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
+add_v2_test(V2_Integration_CPUNativeQuantisedDispatchEvidencePreparedLayout
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_gemv>
             --gtest_filter=*DispatchEvidencePreparedWeights_MatchProductionLayout_AllFormats
-    LABELS "V2;Integration;CPU;NativeVNNI;AllFormats;Dispatch;Regression"
+    LABELS "V2;Integration;CPU;NativeQuantised;AllFormats;Dispatch;Regression"
     MPI_PROCS 1
     TIMEOUT 30
 )
 
-# Performance Test: CPU NativeVNNI thread scaling across production regimes.
-add_executable(v2_perf_cpu_native_vnni_thread_scaling
-    performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_ThreadScaling.cpp)
-target_link_libraries(v2_perf_cpu_native_vnni_thread_scaling
+# Performance Test: CPU NativeQuantised thread scaling across production regimes.
+add_executable(v2_perf_cpu_native_quantised_thread_scaling
+    performance/kernels/cpu/native_quantised/Perf__CPUNativeQuantised_ThreadScaling.cpp)
+target_link_libraries(v2_perf_cpu_native_quantised_thread_scaling
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-target_include_directories(v2_perf_cpu_native_vnni_thread_scaling PRIVATE
+target_include_directories(v2_perf_cpu_native_quantised_thread_scaling PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-add_v2_test(V2_Perf_CPUNativeVNNI_ThreadScaling
-    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_thread_scaling>
-    LABELS "V2;Performance;GEMM;GEMV;NativeVNNI;CPU;MTP;GroupedVerifierRows;ThreadScaling"
+add_v2_test(V2_Perf_CPUNativeQuantised_ThreadScaling
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_thread_scaling>
+    LABELS "V2;Performance;GEMM;GEMV;NativeQuantised;CPU;MTP;GroupedVerifierRows;ThreadScaling"
     MPI_PROCS 1
     TIMEOUT 120
 )
 
-add_v2_test(V2_Perf_CPUNativeVNNI_VerifierRows
-    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
+add_v2_test(V2_Perf_CPUNativeQuantised_VerifierRows
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_gemv>
             --gtest_filter=*MTP_VerifierRows_GroupedVsSerial_Synthetic
-    LABELS "V2;Performance;GEMV;NativeVNNI;CPU;MTP;Verifier;Qwen;Tuning"
+    LABELS "V2;Performance;GEMV;NativeQuantised;CPU;MTP;Verifier;Qwen;Tuning"
     MPI_PROCS 1
     TIMEOUT 120
 )
-set_property(TEST V2_Perf_CPUNativeVNNI_VerifierRows
+set_property(TEST V2_Perf_CPUNativeQuantised_VerifierRows
     APPEND PROPERTY ENVIRONMENT
-    "LLAMINAR_CPU_NVNNI_VERIFIER_WARMUP=3"
-    "LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=10"
+    "LLAMINAR_CPU_NATIVE_QUANTISED_VERIFIER_WARMUP=3"
+    "LLAMINAR_CPU_NATIVE_QUANTISED_VERIFIER_ITERS=10"
 )
 
-add_v2_test(V2_Perf_CPUNativeVNNI_MoEGateUpFusion
-    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
+add_v2_test(V2_Perf_CPUNativeQuantised_MoEGateUpFusion
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_gemv>
             --gtest_filter=*MoE_SingleTokenGateUp_FusedProjectionSpeedup
-    LABELS "V2;Performance;GEMV;NativeVNNI;CPU;MoE;Decode;Qwen;Tuning"
+    LABELS "V2;Performance;GEMV;NativeQuantised;CPU;MoE;Decode;Qwen;Tuning"
     MPI_PROCS 1
     TIMEOUT 120
 )
-set_property(TEST V2_Perf_CPUNativeVNNI_MoEGateUpFusion
+set_property(TEST V2_Perf_CPUNativeQuantised_MoEGateUpFusion
     APPEND PROPERTY ENVIRONMENT
-    "LLAMINAR_CPU_NVNNI_MOE_GATEUP_WARMUP=2"
-    "LLAMINAR_CPU_NVNNI_MOE_GATEUP_ITERS=5"
+    "LLAMINAR_CPU_NATIVE_QUANTISED_MOE_GATEUP_WARMUP=2"
+    "LLAMINAR_CPU_NATIVE_QUANTISED_MOE_GATEUP_ITERS=5"
 )
 
 # Performance Test: CPU Flash Attention Sweep (all models, TP degrees, decode + prefill)
@@ -18867,9 +18886,9 @@ add_v2_test(V2_Perf_CPUGatedDeltaNetPrefill
     TIMEOUT 120
 )
 
-# Performance Test: NativeVNNI vs oneDNN Reference (INT8 matmul baseline comparison)
+# Performance Test: NativeQuantised vs oneDNN Reference (INT8 matmul baseline comparison)
 if(ONEDNN_LIB)
-    add_executable(v2_perf_onednn_reference performance/kernels/cpu/native_vnni/Perf__OneDNN_Reference.cpp)
+    add_executable(v2_perf_onednn_reference performance/kernels/cpu/native_quantised/Perf__OneDNN_Reference.cpp)
     target_link_libraries(v2_perf_onednn_reference
         llaminar2_core
         GTest::gtest
@@ -18881,7 +18900,7 @@ if(ONEDNN_LIB)
     )
     add_v2_test(V2_Perf_OneDNN_Reference
         COMMAND $<TARGET_FILE:v2_perf_onednn_reference>
-        LABELS "V2;Performance;GEMV;NativeVNNI;CPU;OneDNN;Reference"
+        LABELS "V2;Performance;GEMV;NativeQuantised;CPU;OneDNN;Reference"
         MPI_PROCS 1
     )
     message(STATUS "oneDNN reference benchmark: ${ONEDNN_LIB}")
@@ -19774,7 +19793,7 @@ add_v2_test(V2_Unit_VNNIOverflowAnalysis
 )
 
 # =============================================================================
-# ROCm Quantised GEMM Kernel Tests (INT8 + native-VNNI)
+# ROCm Quantised GEMM Kernel Tests (INT8 + native-quantised)
 # =============================================================================
 if(HAVE_ROCM)
     # Test: ROCm Quantised GEMM Kernel (INT8×INT8→INT32 VNNI)
@@ -19848,11 +19867,11 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;GEMM;MTP;SmallM"
         MPI_PROCS 1
     )
-    add_v2_test(V2_Integration_ROCm_NativeVNNI_PrefillBucketMInvariantAllFormats
+    add_v2_test(V2_Integration_ROCm_NativeQuantised_PrefillBucketMInvariantAllFormats
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
-                --gtest_filter=Test__ROCmQuantisedGemmSmallM.NativeVNNIPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.NativeQuantisedPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;GEMM;Prefill;GraphBucket;BatchInvariant;MTotality;AllFormats;NativeVNNI;ByteExact;Regression"
+        LABELS "V2;Integration;ROCm;GEMM;Prefill;GraphBucket;BatchInvariant;MTotality;AllFormats;NativeQuantised;ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
     )
@@ -19885,21 +19904,21 @@ if(HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
                 --gtest_filter=Test__ROCmQuantisedGemmSmallM.ROCmMoERoutedVerifierRuntimeM_AllNativeCodegroupsMatchSerialDecode
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllCodegroups;NativeVNNI;Regression"
+        LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllCodegroups;NativeQuantised;Regression"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_DenseQKV
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
                 --gtest_filter=Test__ROCmQuantisedGemmSmallM.FusedIQ3SQwen36QKVRuntimeMMatchesSerialM1DecodeRowsStrict
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;GEMM;Attention;MTP;GroupedVerifierRows;DecodeEquivalent;IQ3_S;NativeVNNI;Regression"
+        LABELS "V2;Integration;ROCm;GEMM;Attention;MTP;GroupedVerifierRows;DecodeEquivalent;IQ3_S;NativeQuantised;Regression"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_GDNProjection
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
                 --gtest_filter=Test__ROCmQuantisedGemmSmallM.GDNIQ4XSQwen36MoEQkvZPairRuntimeMMatchesSerialM1DecodeRowsStrict:Test__ROCmQuantisedGemmSmallM.MixedCodebookQwen36GDNQkvZPairRuntimeMMatchesSerialM1DecodeRowsStrict:Test__ROCmQuantisedGemmSmallM.Qwen36MoEGDNProjectionStageQ6KVerifierRowsMatchSerialDecodeStrict:Test__ROCmQuantisedGemmSmallM.GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysicalFormatSubgroups
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;GEMM;GDN;MTP;GroupedVerifierRows;DecodeEquivalent;IQ4_XS;NativeVNNI;Regression"
+        LABELS "V2;Integration;ROCm;GEMM;GDN;MTP;GroupedVerifierRows;DecodeEquivalent;IQ4_XS;NativeQuantised;Regression"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_Qwen35GDNOutputProjection
@@ -19927,97 +19946,97 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added focused ROCm small-M GEMM integration tests")
 
-    # Unit Test: Native-VNNI Packing (CPU-only)
-    # Validates packNativeVNNI() output for every supported quantization format.
+    # Unit Test: NativeQuantised Packing (CPU-only)
+    # Validates packNativeQuantised() output for every supported quantization format.
     # Tests codebook_id, payload/scales/mins sizes, FP16 scale validity, dimension sweeps.
-    add_executable(v2_unit_native_vnni_packing
-        unit/kernels/rocm/Test__NativeVNNI_Packing.cpp
+    add_executable(v2_unit_native_quantised_packing
+        unit/kernels/rocm/Test__NativeQuantised_Packing.cpp
     )
-    target_link_libraries(v2_unit_native_vnni_packing
+    target_link_libraries(v2_unit_native_quantised_packing
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Unit_NativeVNNI_Packing
-        COMMAND $<TARGET_FILE:v2_unit_native_vnni_packing>
-        LABELS "V2;Unit;ROCm;GEMV;NativeVNNI;Quantized;gfx906"
+    add_v2_test(V2_Unit_NativeQuantised_Packing
+        COMMAND $<TARGET_FILE:v2_unit_native_quantised_packing>
+        LABELS "V2;Unit;ROCm;GEMV;NativeQuantised;Quantized;gfx906"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added native-VNNI packing unit tests (16 formats)")
+    message(STATUS "V2 Tests: Added native-quantised packing unit tests (16 formats)")
 
-    # Integration Test: Native-VNNI GEMV Accuracy
-    # Runs M=1 GEMV on GPU for every native-VNNI format and compares output
+    # Integration Test: NativeQuantised GEMV Accuracy
+    # Runs M=1 GEMV on GPU for every native-quantised format and compares output
     # against CPU FP32 reference (dequantized weights × FP32 input).
-    add_executable(v2_integration_rocm_native_vnni_gemv
-        integration/kernels/rocm/Test__NativeVNNI_GEMV.cpp
+    add_executable(v2_integration_rocm_native_quantised_gemv
+        integration/kernels/rocm/Test__NativeQuantised_GEMV.cpp
     )
-    target_link_libraries(v2_integration_rocm_native_vnni_gemv
+    target_link_libraries(v2_integration_rocm_native_quantised_gemv
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Integration_ROCm_NativeVNNI_GEMV
-        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemv>
-        LABELS "V2;Integration;ROCm;GEMV;NativeVNNI;Quantized;gfx906;IQ;Accuracy"
+    add_v2_test(V2_Integration_ROCm_NativeQuantised_GEMV
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_quantised_gemv>
+        LABELS "V2;Integration;ROCm;GEMV;NativeQuantised;Quantized;gfx906;IQ;Accuracy"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_AllFormats
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
                 --gtest_filter=Test__ROCmQuantisedGemmSmallM.ProductionPreparedAllQuantizedFormatsRuntimeMMatchSerialDecodeBytes:Test__ROCmQuantisedGemmSmallM.FusedQ4KQKVRuntimeMMatchesSerialM1DecodeRowsStrict:Test__ROCmQuantisedGemmSmallM.MixedCodebookProjectionRuntimeMMatchesSerialM1DecodeRowsStrict
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;PreparedWeights;DeviceResident;NativeVNNI;Regression"
+        LABELS "V2;Integration;ROCm;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;PreparedWeights;DeviceResident;NativeQuantised;Regression"
         MPI_PROCS 1
         NO_MODELS
     )
-    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_NativeVNNIRuntimeM
-        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemv>
-                --gtest_filter=NativeVNNIGEMVTest.RuntimeM_AllNativeFormatsDirectAndSplitKMatchSerialGEMVsAndCapture
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_NativeQuantisedRuntimeM
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_quantised_gemv>
+                --gtest_filter=NativeQuantisedGEMVTest.RuntimeM_AllNativeFormatsDirectAndSplitKMatchSerialGEMVsAndCapture
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;GEMV;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;RuntimeM;GraphCapture;DeviceResident;NativeVNNI;Regression"
+        LABELS "V2;Integration;ROCm;GEMV;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;RuntimeM;GraphCapture;DeviceResident;NativeQuantised;Regression"
         MPI_PROCS 1
     )
-    add_v2_test(V2_Integration_ROCm_NativeVNNI_SerialM1RouteTelemetry
+    add_v2_test(V2_Integration_ROCm_NativeQuantised_SerialM1RouteTelemetry
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
                 --gtest_filter=Test__ROCmQuantisedGemmSmallM.ProductionSerialM1RouteTelemetryMatchesResolver
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;GEMM;MTP;SerialDecode;RouteProof;PerfStats;NativeVNNI;Regression"
+        LABELS "V2;Integration;ROCm;GEMM;MTP;SerialDecode;RouteProof;PerfStats;NativeQuantised;Regression"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added native-VNNI GEMV integration tests (16 formats)")
+    message(STATUS "V2 Tests: Added native-quantised GEMV integration tests (16 formats)")
 
-    # Integration Test: Native-VNNI GEMM — ALL dispatch paths
+    # Integration Test: NativeQuantised GEMM — ALL dispatch paths
     # Exercises every kernel variant (streaming, N128, N64, M16/M32/M64, 2/3-wave)
     # against hipBLAS FP32 SGEMM reference for all 15 quantized formats across multiple M values and shapes.
-    add_executable(v2_integration_rocm_native_vnni_gemm
-        integration/kernels/rocm/Test__NativeVNNI_GEMM.cpp
+    add_executable(v2_integration_rocm_native_quantised_gemm
+        integration/kernels/rocm/Test__NativeQuantised_GEMM.cpp
     )
-    target_link_libraries(v2_integration_rocm_native_vnni_gemm
+    target_link_libraries(v2_integration_rocm_native_quantised_gemm
         llaminar2_core
         roc::hipblas
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Integration_ROCm_NativeVNNI_GEMM
-        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemm>
-        LABELS "V2;Integration;ROCm;GEMM;NativeVNNI;Quantized;gfx906;Accuracy"
+    add_v2_test(V2_Integration_ROCm_NativeQuantised_GEMM
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_quantised_gemm>
+        LABELS "V2;Integration;ROCm;GEMM;NativeQuantised;Quantized;gfx906;Accuracy"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_ROCm_NativeQ8PreparedFamily
-        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemm>
-            --gtest_filter=NativeVNNIGEMMTest.NativeQ8PreparedFamilyDoesNotConsumeInt8ExactRow
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;NativeVNNI;PreparedWeights;GraphCapture;ByteExact;Regression"
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_quantised_gemm>
+            --gtest_filter=NativeQuantisedGEMMTest.NativeQ8PreparedFamilyDoesNotConsumeInt8ExactRow
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;NativeQuantised;PreparedWeights;GraphCapture;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     if(TEST V2_Integration_ROCm_NativeQ8PreparedFamily)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_NativeQ8PreparedFamily)
     endif()
-    add_v2_test(V2_Integration_ROCm_NativeVNNI_PrefillHeuristic
-        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemm>
-                --gtest_filter=AllDispatchPaths/NativeVNNIGEMMTest.MatchesFP32Reference/*M32*
+    add_v2_test(V2_Integration_ROCm_NativeQuantised_PrefillHeuristic
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_quantised_gemm>
+                --gtest_filter=AllDispatchPaths/NativeQuantisedGEMMTest.MatchesFP32Reference/*M32*
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;GEMM;Prefill;Heuristic;AllFormats;NativeVNNI;Accuracy;Regression"
+        LABELS "V2;Integration;ROCm;GEMM;Prefill;Heuristic;AllFormats;NativeQuantised;Accuracy;Regression"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added native-VNNI GEMM integration tests (all dispatch paths)")
+    message(STATUS "V2 Tests: Added native-quantised GEMM integration tests (all dispatch paths)")
 
     # Performance Test: ROCm Quantised GEMM Kernel Benchmarks
     # Measures throughput and accuracy for Qwen model dimensions (0.5B, 7B, 14B, 32B)
@@ -20206,10 +20225,10 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm IQ4 decode microbenchmark")
 
-    # Performance Test: Native-VNNI decode throughput/trainer (all NativeVNNI GPU formats)
+    # Performance Test: NativeQuantised decode throughput/trainer (all NativeQuantised GPU formats)
     # Measures per-format bandwidth efficiency at model-realistic dimensions.
-    add_executable(v2_perf_native_vnni_throughput
-        performance/kernels/rocm/Perf__NativeVNNI_Throughput.cpp
+    add_executable(v2_perf_native_quantised_throughput
+        performance/kernels/rocm/Perf__NativeQuantised_Throughput.cpp
         performance/kernels/rocm/GpuVerification.hip
     )
     # The host C++ compiler and OpenMP::OpenMP_CXX own this executable's
@@ -20217,8 +20236,8 @@ if(HAVE_ROCM)
     # embedded device kernels and spill guard), but must not select the HIP
     # driver for the final host link: its implicit SDK RPATH/libomp would
     # override the selected runtime and the caller's repaired HIP binding.
-    set_target_properties(v2_perf_native_vnni_throughput PROPERTIES LINKER_LANGUAGE CXX)
-    target_link_libraries(v2_perf_native_vnni_throughput
+    set_target_properties(v2_perf_native_quantised_throughput PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_libraries(v2_perf_native_quantised_throughput
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
@@ -20226,89 +20245,89 @@ if(HAVE_ROCM)
         roc::hipblas
         rocprofiler-sdk-roctx::rocprofiler-sdk-roctx
     )
-    target_include_directories(v2_perf_native_vnni_throughput PRIVATE
+    target_include_directories(v2_perf_native_quantised_throughput PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
-    target_compile_definitions(v2_perf_native_vnni_throughput PRIVATE
-        LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"
-        LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}")
-    add_v2_test(V2_Perf_NativeVNNI_Throughput
-        COMMAND $<TARGET_FILE:v2_perf_native_vnni_throughput>
-                --gtest_filter=-NativeVNNIPerfTest.NativeQ8SerialGeometryDiagnostic
-        LABELS "V2;Performance;ROCm;GEMV;Decode;NativeVNNI;Codebook;Quantized;gfx906;Benchmark;Bandwidth;Trainer"
+    target_compile_definitions(v2_perf_native_quantised_throughput PRIVATE
+        LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST}"
+        LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG}")
+    add_v2_test(V2_Perf_NativeQuantised_Throughput
+        COMMAND $<TARGET_FILE:v2_perf_native_quantised_throughput>
+                --gtest_filter=-NativeQuantisedPerfTest.NativeQ8SerialGeometryDiagnostic
+        LABELS "V2;Performance;ROCm;GEMV;Decode;NativeQuantised;Codebook;Quantized;gfx906;Benchmark;Bandwidth;Trainer"
         MPI_PROCS 1
     )
     # Trace the actual mixed C++/HIP trainer with the same native-loader and
     # same-filename shadow controls as the application. This runs no benchmark,
     # model, accelerator initialization or compiler in the installed runner.
-    add_test(NAME V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding
+    add_test(NAME V2_Integration_ROCmNativeQuantisedTrainerOpenMPRuntimeBinding
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_openmp_runtime_binding.py
-                --binary $<TARGET_FILE:v2_perf_native_vnni_throughput>
+                --binary $<TARGET_FILE:v2_perf_native_quantised_throughput>
                 --expected-soname ${LLAMINAR_OPENMP_RUNTIME_SONAME}
                 --wrong-runtime-fixture $<TARGET_FILE:v2_integration_openmp_shadow_runtime>)
-    set_tests_properties(V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding PROPERTIES
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;Trainer;BuildSystem;DeviceFree;Regression"
+    set_tests_properties(V2_Integration_ROCmNativeQuantisedTrainerOpenMPRuntimeBinding PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;Trainer;BuildSystem;DeviceFree;Regression"
         TIMEOUT 60)
     set_property(GLOBAL PROPERTY
-        V2_TEST_BUILD_TARGETS_V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding
-        "v2_perf_native_vnni_throughput;v2_integration_openmp_shadow_runtime")
-    message(STATUS "V2 Tests: Added Native-VNNI decode throughput/trainer benchmark (all GPU codebooks, multi-GPU)")
+        V2_TEST_BUILD_TARGETS_V2_Integration_ROCmNativeQuantisedTrainerOpenMPRuntimeBinding
+        "v2_perf_native_quantised_throughput;v2_integration_openmp_shadow_runtime")
+    message(STATUS "V2 Tests: Added NativeQuantised decode throughput/trainer benchmark (all GPU codebooks, multi-GPU)")
 
-    # Performance Test: Native-VNNI GEMM (Q4_0 + IQ4_NL, M>1 prefill)
-    # Benchmarks native-VNNI GEMM kernel against INT8 V3/V7 baseline.
+    # Performance Test: NativeQuantised GEMM (Q4_0 + IQ4_NL, M>1 prefill)
+    # Benchmarks native-quantised GEMM kernel against INT8 V3/V7 baseline.
     # Reports speedup, correctness (cosine similarity), and GFLOPS.
     # GpuVerification.hip has the GPU cosine kernel (compiled by HIP compiler).
-    add_executable(v2_perf_native_vnni_gemm
-        performance/kernels/rocm/Perf__NativeVNNI_GEMM.cpp
+    add_executable(v2_perf_native_quantised_gemm
+        performance/kernels/rocm/Perf__NativeQuantised_GEMM.cpp
         performance/kernels/rocm/GpuVerification.hip
     )
-    target_link_libraries(v2_perf_native_vnni_gemm
+    target_link_libraries(v2_perf_native_quantised_gemm
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
         OpenMP::OpenMP_CXX
         roc::hipblas
     )
-    target_compile_options(v2_perf_native_vnni_gemm PRIVATE -fopenmp)
-    target_link_options(v2_perf_native_vnni_gemm PRIVATE -fopenmp)
-    add_v2_test(V2_Perf_NativeVNNI_GEMM
-        COMMAND $<TARGET_FILE:v2_perf_native_vnni_gemm>
-        LABELS "V2;Performance;ROCm;GEMM;NativeVNNI;Quantized;gfx906;Benchmark;Prefill"
+    target_compile_options(v2_perf_native_quantised_gemm PRIVATE -fopenmp)
+    target_link_options(v2_perf_native_quantised_gemm PRIVATE -fopenmp)
+    add_v2_test(V2_Perf_NativeQuantised_GEMM
+        COMMAND $<TARGET_FILE:v2_perf_native_quantised_gemm>
+        LABELS "V2;Performance;ROCm;GEMM;NativeQuantised;Quantized;gfx906;Benchmark;Prefill"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added Native-VNNI GEMM benchmark (Q4_0 + IQ4_NL)")
+    message(STATUS "V2 Tests: Added NativeQuantised GEMM benchmark (Q4_0 + IQ4_NL)")
 
-    # Performance Test: Native-VNNI prefill sweep/trainer (all NativeVNNI GPU formats)
+    # Performance Test: NativeQuantised prefill sweep/trainer (all NativeQuantised GPU formats)
     # Per-shape tuning sweep over N_TILE, M_TILE, MIN_BLOCKS, UNROLL_G.
     # Outputs codebook-tagged candidate rows and best variant per shape for dispatch heuristic tuning.
-    add_executable(v2_perf_native_vnni_sweep
-        performance/kernels/rocm/Perf__NativeVNNI_Sweep.cpp
-        performance/kernels/native_vnni_dispatch/ROCmTrainerVerification.hip
+    add_executable(v2_perf_native_quantised_sweep
+        performance/kernels/rocm/Perf__NativeQuantised_Sweep.cpp
+        performance/kernels/native_quantised_dispatch/ROCmTrainerVerification.hip
     )
-    target_link_libraries(v2_perf_native_vnni_sweep
+    target_link_libraries(v2_perf_native_quantised_sweep
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
         OpenMP::OpenMP_CXX
     )
-    target_include_directories(v2_perf_native_vnni_sweep PRIVATE
+    target_include_directories(v2_perf_native_quantised_sweep PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
-    target_compile_definitions(v2_perf_native_vnni_sweep PRIVATE
-        LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"
-        LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}")
-    target_compile_options(v2_perf_native_vnni_sweep PRIVATE -fopenmp)
-    target_link_options(v2_perf_native_vnni_sweep PRIVATE -fopenmp)
-    add_v2_test(V2_Perf_NativeVNNI_Sweep
-        COMMAND $<TARGET_FILE:v2_perf_native_vnni_sweep>
-        LABELS "V2;Performance;ROCm;GEMM;Prefill;NativeVNNI;Codebook;Quantized;gfx906;Benchmark;Sweep;Trainer"
+    target_compile_definitions(v2_perf_native_quantised_sweep PRIVATE
+        LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST}"
+        LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG}")
+    target_compile_options(v2_perf_native_quantised_sweep PRIVATE -fopenmp)
+    target_link_options(v2_perf_native_quantised_sweep PRIVATE -fopenmp)
+    add_v2_test(V2_Perf_NativeQuantised_Sweep
+        COMMAND $<TARGET_FILE:v2_perf_native_quantised_sweep>
+        LABELS "V2;Performance;ROCm;GEMM;Prefill;NativeQuantised;Codebook;Quantized;gfx906;Benchmark;Sweep;Trainer"
         MPI_PROCS 1
     )
     # Functional producer/resource/captured-byte proof only; the trainer's
     # timing sweeps remain in Performance and are never a preflight gate.
     add_v2_test(V2_Integration_ROCmVNNIPrefillProducerIdentity
-        COMMAND $<TARGET_FILE:v2_perf_native_vnni_sweep>
-                --gtest_filter=NativeVNNISweepTest.CapturedProducerIdentityAllFormats
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;Prefill;AllFormat;Regression"
+        COMMAND $<TARGET_FILE:v2_perf_native_quantised_sweep>
+                --gtest_filter=NativeQuantisedSweepTest.CapturedProducerIdentityAllFormats
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;Prefill;AllFormat;Regression"
         TIMEOUT 120
         MPI_PROCS 1
         NO_MODELS
@@ -20320,36 +20339,36 @@ if(HAVE_ROCM)
         set(V2_ROCM_DENSE_PREFILL_TEST
             V2_Integration_ROCmDensePrefillInstalledAllFormats_Group${V2_ROCM_DENSE_PREFILL_GROUP})
         add_v2_test(${V2_ROCM_DENSE_PREFILL_TEST}
-            COMMAND $<TARGET_FILE:v2_perf_native_vnni_sweep>
+            COMMAND $<TARGET_FILE:v2_perf_native_quantised_sweep>
                     --gtest_filter=InstalledDensePrefill/InstalledDensePrefillOverlayTest.AllSourceFormats/${V2_ROCM_DENSE_PREFILL_GROUP}
-            LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;Prefill;AllFormats;GraphCapture;Regression"
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;Prefill;AllFormats;GraphCapture;Regression"
             TIMEOUT 120 MPI_PROCS 1 NO_MODELS)
         list(APPEND V2_ROCM_DENSE_PREFILL_INSTALLED_TESTS ${V2_ROCM_DENSE_PREFILL_TEST})
     endforeach()
-    message(STATUS "V2 Tests: Added Native-VNNI prefill sweep benchmark (all GPU codebooks)")
+    message(STATUS "V2 Tests: Added NativeQuantised prefill sweep benchmark (all GPU codebooks)")
 
-    # Performance Test: Q8_0 Native-VNNI GEMV Tuning
-    # Compares INT8-VNNI vs Native-VNNI decode paths for Q8_0 weights.
+    # Performance Test: Q8_0 NativeQuantised GEMV Tuning
+    # Compares INT8-VNNI vs NativeQuantised decode paths for Q8_0 weights.
     # Sweeps TARGET_WAVES_PER_CU and KB to find optimal dispatch for Q8_0.
-    add_executable(v2_perf_q8_0_native_vnni_gemv_tuning
-        performance/kernels/rocm/Perf__Q8_0_NativeVNNI_GemvTuning.cpp
+    add_executable(v2_perf_q8_0_native_quantised_gemv_tuning
+        performance/kernels/rocm/Perf__Q8_0_NativeQuantised_GemvTuning.cpp
         performance/kernels/rocm/GpuVerification.hip
     )
-    target_link_libraries(v2_perf_q8_0_native_vnni_gemv_tuning
+    target_link_libraries(v2_perf_q8_0_native_quantised_gemv_tuning
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
         OpenMP::OpenMP_CXX
         roc::hipblas
     )
-    target_compile_options(v2_perf_q8_0_native_vnni_gemv_tuning PRIVATE -fopenmp)
-    target_link_options(v2_perf_q8_0_native_vnni_gemv_tuning PRIVATE -fopenmp)
-    add_v2_test(V2_Perf_Q8_0_NativeVNNI_GemvTuning
-        COMMAND $<TARGET_FILE:v2_perf_q8_0_native_vnni_gemv_tuning>
-        LABELS "V2;Performance;ROCm;GEMV;NativeVNNI;Q8_0;Quantized;gfx906;Benchmark;Tuning"
+    target_compile_options(v2_perf_q8_0_native_quantised_gemv_tuning PRIVATE -fopenmp)
+    target_link_options(v2_perf_q8_0_native_quantised_gemv_tuning PRIVATE -fopenmp)
+    add_v2_test(V2_Perf_Q8_0_NativeQuantised_GemvTuning
+        COMMAND $<TARGET_FILE:v2_perf_q8_0_native_quantised_gemv_tuning>
+        LABELS "V2;Performance;ROCm;GEMV;NativeQuantised;Q8_0;Quantized;gfx906;Benchmark;Tuning"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added Q8_0 Native-VNNI GEMV tuning benchmark")
+    message(STATUS "V2 Tests: Added Q8_0 NativeQuantised GEMV tuning benchmark")
 
     # Performance Microbenchmark: IQ Decode Strategy Lab
     # Isolated decode-only benchmark for IQ grid-index quantization formats.
@@ -20459,30 +20478,30 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added blockwise VNNI GEMM per-shape tuning benchmark")
 
-    # Performance Test: Blockwise Native-VNNI (sub-Q8) correctness & throughput
-    # Compares blockwise activation quantization native-VNNI (Q4_0 through IQ1_M)
+    # Performance Test: Blockwise NativeQuantised (sub-Q8) correctness & throughput
+    # Compares blockwise activation quantization native-quantised (Q4_0 through IQ1_M)
     # against INT8-VNNI baseline across all Qwen shapes for decode (GEMV M=1) and
     # prefill (GEMM M=32..256). Reports correctness (cosine vs FP32 hipBLAS ref),
     # throughput (μs), and speedup.
-    add_executable(v2_perf_blockwise_native_vnni
-        performance/kernels/rocm/Perf__BlockwiseNativeVNNI.cpp
+    add_executable(v2_perf_blockwise_native_quantised
+        performance/kernels/rocm/Perf__BlockwiseNativeQuantised.cpp
         performance/kernels/rocm/GpuVerification.hip
     )
-    target_link_libraries(v2_perf_blockwise_native_vnni
+    target_link_libraries(v2_perf_blockwise_native_quantised
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
         OpenMP::OpenMP_CXX
         roc::hipblas
     )
-    target_compile_options(v2_perf_blockwise_native_vnni PRIVATE -fopenmp)
-    target_link_options(v2_perf_blockwise_native_vnni PRIVATE -fopenmp)
-    add_v2_test(V2_Perf_BlockwiseNativeVNNI
-        COMMAND $<TARGET_FILE:v2_perf_blockwise_native_vnni>
-        LABELS "V2;Performance;ROCm;GEMV;GEMM;NativeVNNI;Blockwise;Quantized;gfx906;Benchmark"
+    target_compile_options(v2_perf_blockwise_native_quantised PRIVATE -fopenmp)
+    target_link_options(v2_perf_blockwise_native_quantised PRIVATE -fopenmp)
+    add_v2_test(V2_Perf_BlockwiseNativeQuantised
+        COMMAND $<TARGET_FILE:v2_perf_blockwise_native_quantised>
+        LABELS "V2;Performance;ROCm;GEMV;GEMM;NativeQuantised;Blockwise;Quantized;gfx906;Benchmark"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added blockwise native-VNNI correctness & throughput benchmark")
+    message(STATUS "V2 Tests: Added blockwise native-quantised correctness & throughput benchmark")
 
     # Performance-only captured production quantization, with exact byte/scale/
     # sum checks and an isolated single-shape hardware-counter entrypoint.
@@ -21586,7 +21605,7 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmMoEProjectionBoundary
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_projection_boundary>
             --gtest_filter=ROCmMoEProjectionBoundary.CapturedAllFormatsAndColumnDegreesAreByteExact:ROCmMoEProjectionBoundary.CapturedProductionWidthRetainsFullMatrixArithmetic
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;ByteExact;AllFormats;TensorParallel;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeQuantised;GraphCapture;ByteExact;AllFormats;TensorParallel;Regression"
         MPI_PROCS 1
         NO_MODELS
         TIMEOUT 120)
@@ -21711,7 +21730,7 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
         COMMAND $<TARGET_FILE:v2_integration_cross_tier_expert_arithmetic>
                 --gtest_filter=Test__CrossTierExpertArithmeticParity.CPUAndROCmAllQuantizedExpertFormatsAreByteExactAcrossM:Test__CrossTierExpertArithmeticParity.CPUAndROCmFloatingExpertDecodeIsByteExact
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;CPU;MoE;ExpertOverlay;CPUCold;Promotion;AllFormats;NativeVNNI;GroupedDecode;GroupedVerifierRows;Prefill;NumericalParity;ByteExact;Regression;gfx906"
+        LABELS "V2;Integration;ROCm;CPU;MoE;ExpertOverlay;CPUCold;Promotion;AllFormats;NativeQuantised;GroupedDecode;GroupedVerifierRows;Prefill;NumericalParity;ByteExact;Regression;gfx906"
         MPI_PROCS 1
         NO_MODELS
         TIMEOUT 120
@@ -21723,7 +21742,7 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
             COMMAND $<TARGET_FILE:v2_integration_cross_tier_expert_arithmetic>
                     --gtest_filter=Test__CrossTierExpertArithmeticParity.CPUAndROCmAllQuantizedExpertFormatsAreByteExactAcrossM:Test__CrossTierExpertArithmeticParity.CPUAndROCmFloatingExpertDecodeIsByteExact
                     --gtest_brief=1
-            LABELS "V2;Integration;ROCm;CPU;MoE;ExpertOverlay;CPUCold;Promotion;AllFormats;NativeVNNI;AVX2;GroupedDecode;GroupedVerifierRows;Prefill;NumericalParity;ByteExact;Regression;gfx906"
+            LABELS "V2;Integration;ROCm;CPU;MoE;ExpertOverlay;CPUCold;Promotion;AllFormats;NativeQuantised;AVX2;GroupedDecode;GroupedVerifierRows;Prefill;NumericalParity;ByteExact;Regression;gfx906"
             MPI_PROCS 1
             NO_MODELS
             TIMEOUT 120
@@ -21764,9 +21783,9 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
     endif()
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_MoEExpertPaths
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-                --gtest_filter=Test__ROCmMoERouteScratch.SerialGraphRolesShareImmutableLargestParticipantArena:Test__ROCmMoEKernel.SoftmaxTopKQwen36ActiveRowsAreByteExactAcrossPaddedGraphBucket:Test__ROCmMoEKernel.VerifierRowsBF16RouteUsesDecodeEquivalentRouter:Test__ROCmMoEKernel.VerifierRowsRouteUsesDecodeEquivalentRouterAndMatchesHostReference:Test__ROCmMoEKernel.VerifierRowsRouteMatchesSerialDecodeRouter:Test__ROCmMoEKernel.SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows:Test__ROCmMoEKernel.SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce:Test__ROCmMoEKernel.CanonicalRootedRankBankPublicationIsMTotalAndSerialRowExact:Test__ROCmMoEKernel.LocalTPRCCLVerifierRowAllreduceRuntimeMMatchesSerialRows:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFormats_RuntimeMMatchSerialStageDecode:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchSerialStageDecode:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowByRowDecode:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchesRowByRowDecode:Test__ROCmMoEKernel.GroupedPrefillMaskedTopK8MatchesRowDecode:Test__ROCmMoEKernel.RoutedOnlyGroupedPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowDecode:Test__ROCmMoEKernel.MaskedLocalTPGroupedPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowDecode:Test__ROCmMoEKernel.RoutedOnlyGroupedPrefill_Qwen36ShapeRuntimeMBoundariesMatchRowDecode:Test__ROCmMoEKernel.MaskedLocalTPGroupedPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMBoundariesMatchRowDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_RuntimeMBoundariesMatchRuntimeDecode:Test__ROCmMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer3RealWeights_M3MatchesRuntimeDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer27RealWeights_M3MatchesRuntimeDecode
+                --gtest_filter=Test__ROCmMoERouteScratch.SerialGraphRolesShareImmutableLargestParticipantArena:Test__ROCmMoEKernel.SoftmaxTopKQwen36ActiveRowsAreByteExactAcrossPaddedGraphBucket:Test__ROCmMoEKernel.VerifierRowsBF16RouteUsesDecodeEquivalentRouter:Test__ROCmMoEKernel.VerifierRowsRouteUsesDecodeEquivalentRouterAndMatchesHostReference:Test__ROCmMoEKernel.VerifierRowsRouteMatchesSerialDecodeRouter:Test__ROCmMoEKernel.SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows:Test__ROCmMoEKernel.SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce:Test__ROCmMoEKernel.CanonicalRootedRankBankPublicationIsMTotalAndSerialRowExact:Test__ROCmMoEKernel.LocalTPRCCLVerifierRowAllreduceRuntimeMMatchesSerialRows:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36AllNativeQuantisedFormats_RuntimeMMatchSerialStageDecode:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchSerialStageDecode:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36AllNativeQuantisedFormats_RuntimeMMatchesRowByRowDecode:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchesRowByRowDecode:Test__ROCmMoEKernel.GroupedPrefillMaskedTopK8MatchesRowDecode:Test__ROCmMoEKernel.RoutedOnlyGroupedPrefill_Qwen36AllNativeQuantisedFormats_RuntimeMMatchesRowDecode:Test__ROCmMoEKernel.MaskedLocalTPGroupedPrefill_Qwen36AllNativeQuantisedFormats_RuntimeMMatchesRowDecode:Test__ROCmMoEKernel.RoutedOnlyGroupedPrefill_Qwen36ShapeRuntimeMBoundariesMatchRowDecode:Test__ROCmMoEKernel.MaskedLocalTPGroupedPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMBoundariesMatchRowDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_RuntimeMBoundariesMatchRuntimeDecode:Test__ROCmMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer3RealWeights_M3MatchesRuntimeDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer27RealWeights_M3MatchesRuntimeDecode
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;LocalTP;RealModel;Regression"
+        LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeQuantised;LocalTP;RealModel;Regression"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_ROCmVerifierExpertPreparationAdmission
@@ -21776,8 +21795,8 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     add_v2_test(V2_Integration_ROCmComposedVerifierFiniteMetadata
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-            --gtest_filter=Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowByRowDecode:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchesRowByRowDecode
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MTP;MoE;AllFormats;NativeVNNI;Regression"
+            --gtest_filter=Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36AllNativeQuantisedFormats_RuntimeMMatchesRowByRowDecode:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchesRowByRowDecode
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MTP;MoE;AllFormats;NativeQuantised;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     add_v2_test(V2_Integration_ROCmCanonicalPublicationBoundedGrid
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
@@ -23354,7 +23373,7 @@ add_v2_test(V2_Integration_PlanCommandPublication_Local
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 
 if(HAVE_CUDA)
-    # Exact NativeVNNI admission consumes the concrete CUDA launch policy and
+    # Exact NativeQuantised admission consumes the concrete CUDA launch policy and
     # therefore belongs in device-backed preflight rather than the Unit gate.
     add_executable(v2_integration_cuda_workspace_memory_estimator
         integration/planning/Test__CUDAWorkspaceMemoryEstimator.cpp)
@@ -24987,7 +25006,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
                     --gtest_filter=Backends/MoELiveRows.CanonicalQ5PartitionGeometry/${_live_rows_backend}:Backends/MoEProjectionPhases.CanonicalQ5PartitionSlices/${_live_rows_backend}
                     --gtest_brief=1
-                LABELS "V2;Integration;ProductionTestPreflight;${_live_rows_backend};MoE;NativeVNNI;PreparedWeights;GraphCapture;ByteExact;Regression"
+                LABELS "V2;Integration;ProductionTestPreflight;${_live_rows_backend};MoE;NativeQuantised;PreparedWeights;GraphCapture;ByteExact;Regression"
                 MPI_PROCS 1
                 NO_MODELS
                 TIMEOUT 120)
@@ -25898,7 +25917,7 @@ add_v2_test(V2_Unit_GDNLinkedTPRegression
     MPI_PROCS 1
 )
 
-# Mixed NativeVNNI GDN projections retain each prepared decoder while sharing
+# Mixed NativeQuantised GDN projections retain each prepared decoder while sharing
 # activation quantization. Separate runtime executables replay the same shared
 # poisoned-output fixture over all source formats and full/local model shapes.
 if(HAVE_CUDA)
@@ -26293,6 +26312,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
     )
 endif()
 if(HAVE_ROCM)
+add_v2_test(V2_Integration_Qwen35MoEMixedPhaseRouteTransport
+    COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
+        --gtest_filter=Test__Qwen35MoEGraphNativeProductionLowering.DistributedLocalTPContinuationMapsPrefillAndKeepsNativeDecode
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;Qwen35MoE;ExpertOverlay;ROCm;RCCL;GraphCapture;Transport;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
 add_v2_test(V2_Integration_Qwen35MoENoP2PMappedRouteTransport
     COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
         --gtest_filter=Test__Qwen35MoEGraphNativeProductionLowering.DistributedLocalTPContinuationUsesMappedSparseWithoutP2P
@@ -26332,6 +26358,35 @@ foreach(V2_CANONICAL_JOIN_BACKEND IN ITEMS CUDA ROCm)
             TIMEOUT 30
         )
         list(APPEND V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS ${V2_REMOTE_TICKET_TEST})
+        set(V2_LOCAL_TP_NATIVE_TICKET_TEST
+            V2_Integration_Qwen35MoELocalTPNativeTicketCutpoint_${V2_CANONICAL_JOIN_BACKEND})
+        add_v2_test(${V2_LOCAL_TP_NATIVE_TICKET_TEST}
+            COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
+                    --gtest_filter=Test__Qwen35MoEGraphNativeProductionLowering.LocalTPCPUTicketNativeCollective${V2_CANONICAL_JOIN_BACKEND}
+            LABELS "V2;Integration;ProductionTestPreflight;${V2_CANONICAL_JOIN_BACKEND};CPU;MoE;ExpertOverlay;MPI;GraphCapture;Regression"
+            MPI_PROCS 1
+            NO_MODELS
+            TIMEOUT 30
+        )
+        list(APPEND V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS ${V2_LOCAL_TP_NATIVE_TICKET_TEST})
+        set(V2_EARLY_CPU_TICKET_TEST
+            V2_Integration_Qwen35MoEPrefillEarlyCPUTicket_${V2_CANONICAL_JOIN_BACKEND})
+        add_v2_test(${V2_EARLY_CPU_TICKET_TEST}
+            COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
+                    --gtest_filter=Test__Qwen35MoEGraphNativeProductionLowering.PrefillCPUTicketPrecedesSharedFFN${V2_CANONICAL_JOIN_BACKEND}
+            LABELS "V2;Integration;ProductionTestPreflight;${V2_CANONICAL_JOIN_BACKEND};CPU;MoE;ExpertOverlay;GraphCapture;Ordering;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+        list(APPEND V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS ${V2_EARLY_CPU_TICKET_TEST})
+        # The same actual production graph now reaches retained stage-owned
+        # composition admission, including passive follower reducers.
+        set(V2_LOCAL_TP_RETAINED_COMPOSITION_TEST
+            V2_Integration_Qwen35MoELocalTPRetainedComposition_${V2_CANONICAL_JOIN_BACKEND})
+        add_v2_test(${V2_LOCAL_TP_RETAINED_COMPOSITION_TEST}
+            COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
+                    --gtest_filter=Test__Qwen35MoEGraphNativeProductionLowering.LocalTPCPUTicketNativeCollective${V2_CANONICAL_JOIN_BACKEND}
+            LABELS "V2;Integration;ProductionTestPreflight;${V2_CANONICAL_JOIN_BACKEND};CPU;MoE;ExpertOverlay;MPI;GraphCapture;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+        list(APPEND V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS ${V2_LOCAL_TP_RETAINED_COMPOSITION_TEST})
     endif()
 endforeach()
 
@@ -27110,7 +27165,7 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_MoEExpertPaths
     COMMAND $<TARGET_FILE:v2_test_moe_expert_compute_stage>
             --gtest_filter=MoEExpertComputeStageTest.SharedExpert_RuntimeMVerifierAllNativeFormatsMatchSerialDecodeByteExact:MoEExpertComputeStageTest.MoEFFN_RuntimeMVerifierMatchesSerialDecode_*
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;Regression"
+    LABELS "V2;Integration;CPU;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeQuantised;Regression"
     MPI_PROCS 1
 )
 
@@ -27138,7 +27193,7 @@ target_link_libraries(v2_perf_cpu_moe_expert_verifier_rows
     llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Perf_CPUMoEExpertVerifierRows
     COMMAND $<TARGET_FILE:v2_perf_cpu_moe_expert_verifier_rows>
-    LABELS "V2;Performance;CPU;MoE;MTP;GroupedVerifierRows;NativeVNNI;Economy"
+    LABELS "V2;Performance;CPU;MoE;MTP;GroupedVerifierRows;NativeQuantised;Economy"
     MPI_PROCS 1
     TIMEOUT 120
 )
@@ -27457,6 +27512,49 @@ add_v2_test(V2_Perf_CPURootedPublicationTransport
     TIMEOUT 120
     RESOURCE_LOCK "ShmemSpin"
 )
+
+# Exact original owner replay for the large-copy mechanism. Native CPU/NUMA
+# integration is separate from Unit and never initializes an accelerator.
+add_v2_test(V2_Integration_CPURootedGatherParallelCopyReplay
+    COMMAND $<TARGET_FILE:v2_perf_cpu_rooted_publication_transport>
+        --gtest_filter=Perf__CPURootedPublicationTransport.OriginalNUMAVariableRecordGatherReplay
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Collective;ShmemSpin;Replay;Regression"
+    MPI_PROCS 2 NO_MODELS TIMEOUT 120
+    RESOURCE_LOCK "ShmemSpin"
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "OMP_NUM_THREADS=3" "OMP_DYNAMIC=FALSE"
+)
+
+# Terminal epoch replay runs the original admitted owner without payload timing.
+add_v2_test(V2_Integration_ShmemSpinAbsorbingAbortReplay
+    COMMAND $<TARGET_FILE:v2_perf_cpu_rooted_publication_transport>
+        --gtest_filter=Perf__CPURootedPublicationTransport.NativeEpochAbortWitnessReplay
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Collective;ShmemSpin;Replay;Regression"
+    MPI_PROCS 2 NO_MODELS TIMEOUT 60
+    RESOURCE_LOCK "ShmemSpin"
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "OMP_NUM_THREADS=3" "OMP_DYNAMIC=FALSE")
+
+# Pure actual-resolver/selection replay; original native 2/4/8 owners prove copies separately.
+add_v2_test(V2_Integration_ReplicatedPrefillGatherSelectionReplay
+    COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
+        --gtest_filter=Test__ShmemSpinBackend.ReplicatedPrefillTransportUsesOneFullRemoteChunk:Test__ShmemSpinBackend.ReplicatedPrefillCohortSelectionIsDegreeIndependent
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Collective;ShmemSpin;Replay;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=FALSE")
+
+# The existing lower-level protocol owner covers supported degree without a
+# two-rank-only skip; original-NUMA/PMA certification remains the replay above.
+set(V2_ROOTED_GATHER_DEGREE_PREFLIGHT_TESTS)
+foreach(V2_ROOTED_GATHER_NP IN ITEMS 2 4 8)
+    set(V2_ROOTED_GATHER_TEST V2_Integration_CPURootedGatherDegree${V2_ROOTED_GATHER_NP})
+    add_v2_test(${V2_ROOTED_GATHER_TEST}
+        COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
+            --gtest_filter=ShmemSpinMPITest.NativePackedGatherIsSizeTotalAndComposesWithOtherProtocols
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;Collective;ShmemSpin;Replay;Regression"
+        MPI_PROCS ${V2_ROOTED_GATHER_NP} NO_MODELS TIMEOUT 60
+        RESOURCE_LOCK "ShmemSpin"
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "OMP_NUM_THREADS=3" "OMP_DYNAMIC=FALSE")
+    list(APPEND V2_ROOTED_GATHER_DEGREE_PREFLIGHT_TESTS ${V2_ROOTED_GATHER_TEST})
+endforeach()
 
 # =============================================================================
 # GPU Weight Loading Pipeline - Phase 1 Foundation
@@ -27876,9 +27974,16 @@ add_v2_test(V2_Integration_GDNStateLayoutCliqueIdentity
 )
 
 set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_ReplicatedPrefillGatherSelectionReplay
+    V2_Integration_ShmemSpinAbsorbingAbortReplay
+    V2_Integration_CPURootedGatherParallelCopyReplay
+    ${V2_ROOTED_GATHER_DEGREE_PREFLIGHT_TESTS}
+    V2_Integration_MoEPrefillTransportDiagnosticSelection
     ${V2_PREPARED_GRAPH_TEMPLATE_PREFLIGHT_TESTS}
     ${V2_PIPELINE_MIXED_GDN_LAYOUT_PREFLIGHT_TESTS}
     ${V2_GDN_LIVE_STATE_LAYOUT_NATIVE_PREFLIGHT_TESTS}
+    V2_Integration_CPU_NativeQuantisedExecutionExactPolicy_AVX2
+    V2_Integration_CPU_NativeQuantisedExecutionExactPolicy_AVX512
     V2_Integration_GDNStateLayoutOwnerAndImportIdentity
     V2_Integration_GDNStateLayoutPrefixIdentity
     V2_Integration_GDNStateLayoutArchiveIdentity
@@ -28063,7 +28168,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     ${V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS}
     ${V2_OVERLAY_SINGLETON_LOCAL_PREFLIGHT_TESTS}
     ${V2_CPU_SPARSE_TICKET_PREFLIGHT_TESTS}
-    V2_Integration_CPU_NativeVNNIWeightPackingAllFormats
+    V2_Integration_CPU_NativeQuantisedWeightPackingAllFormats
     V2_Integration_CPUNativeWeightWindowContract
     V2_Integration_CPUNativeSourceAssemblyContract
     V2_Integration_CPUNativeResidentRankContract
@@ -28104,9 +28209,9 @@ add_v2_test(V2_Integration_CUDA_GDNTensorCaptureOwnership
     LABELS "V2;Integration;ProductionTestPreflight;CUDA;GEMM;GDN;GraphCapture;TransferEngine;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 120)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_GDNTensorCaptureOwnership)
-if(TEST V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding)
+if(TEST V2_Integration_ROCmNativeQuantisedTrainerOpenMPRuntimeBinding)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
-        V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding)
+        V2_Integration_ROCmNativeQuantisedTrainerOpenMPRuntimeBinding)
 endif()
 
 if(HAVE_CUDA OR HAVE_ROCM)
@@ -28173,8 +28278,8 @@ if(HAVE_CUDA)
     V2_Integration_CUDATinyProjectionAllFloatingFormats
     V2_Integration_CUDATinyProjectionSharedOperands
     V2_Integration_CUDATinyProjectionSharedWork
-    V2_Integration_CUDANativeVNNIPrefillStaging
-    V2_Integration_CUDANativeVNNIWideAllCodebooks
+    V2_Integration_CUDANativeQuantisedPrefillStaging
+    V2_Integration_CUDANativeQuantisedWideAllCodebooks
     V2_Integration_CUDACanonicalKpartFoldAllCodebooks
     V2_Integration_CUDAIQ4PackedLookup
     V2_Integration_CUDAActivationBlockSums
@@ -28187,8 +28292,8 @@ if(HAVE_CUDA)
     V2_Integration_CUDAFlashDecodeEmptyPrefix
     V2_Integration_GroupedVerifierRows_CUDA_Attention
     V2_Integration_CUDARequestBatchResidentKVAttention
-    V2_Integration_CUDA_NativeVNNI_PrefillBucketMInvariantAllFormats
-    V2_Integration_CUDANativeVNNIPrefillCompilerResourcesAllCodebooks
+    V2_Integration_CUDA_NativeQuantised_PrefillBucketMInvariantAllFormats
+    V2_Integration_CUDANativeQuantisedPrefillCompilerResourcesAllCodebooks
     V2_Integration_CUDAMoEPrefillCompilerResourcesAllCodebooks
     V2_Integration_CUDAMoEPairedGateUpRegisterLifetimeAllFormats
     V2_Integration_CUDA_DeviceCountedVerifierRows
@@ -28217,6 +28322,7 @@ if(HAVE_CUDA)
 endif()
 if(HAVE_ROCM)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_Qwen35MoEMixedPhaseRouteTransport
     V2_Integration_CanonicalRouteFold_ROCm
     V2_Integration_ROCmCanonicalRouteSlotAllreduce
     V2_Integration_FP32SubnormalContract_ROCm
@@ -28252,7 +28358,7 @@ if(HAVE_ROCM)
     V2_Integration_Q8FiniteScaleContract_ROCm
     # Ordinary cooperative/streaming prefill must retain serial-M1 arithmetic
     # across tile edges, ragged K partitions, and every source codebook too.
-    V2_Integration_ROCm_NativeVNNI_PrefillBucketMInvariantAllFormats
+    V2_Integration_ROCm_NativeQuantised_PrefillBucketMInvariantAllFormats
     V2_Integration_ROCm_TPCanonicalRankOrderGraphCapture
     V2_Integration_GroupedVerifierRows_ROCm_Qwen35GDNOutputProjection
     V2_Integration_ROCm_TPCapturedEpochTransactionGraphCapture
@@ -28361,7 +28467,7 @@ add_v2_test(V2_Integration_CPUFixedEpochGDNCacheGeneration
 add_v2_test(V2_Integration_Q6PackedArchiveGeneration
     COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
         --gtest_filter=Test__PackedWeightsSerialization.Q6SourceFactorsRoundTripAndRejectVersion3
-    LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;Serialization;Regression"
+    LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;Serialization;Regression"
     MPI_PROCS 1 NO_MODELS)
 add_v2_test(V2_Integration_PrefixCacheQ6ScaleArithmeticGeneration
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
@@ -28376,7 +28482,7 @@ if(HAVE_CUDA AND TARGET v2_integration_cuda_gemm_parity)
     add_v2_test(V2_Integration_CUDAQ6SourceScalePreservation
         COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
             --gtest_filter=Test__CUDAGemmParity.Q6_K_SourceScaleMetadataAndCapturedArithmeticAreExact
-        LABELS "V2;Integration;CUDA;NativeVNNI;Q6_K;ByteExact;Regression"
+        LABELS "V2;Integration;CUDA;NativeQuantised;Q6_K;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAQ6SourceScalePreservation)
 endif()
@@ -28384,12 +28490,12 @@ if(HAVE_ROCM AND TARGET v2_integration_rocm_vnni_repack_kernels)
     add_v2_test(V2_Integration_ROCmQ6SourceScaleRepack
         COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
             --gtest_filter=Test__VnniRepackKernels.Q6_K_SourceScaleFactorsPreserveOriginalWords
-        LABELS "V2;Integration;ROCm;NativeVNNI;Q6_K;ByteExact;Regression"
+        LABELS "V2;Integration;ROCm;NativeQuantised;Q6_K;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS)
     add_v2_test(V2_Integration_ROCmQ6SourceScaleGEMV
-        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemv>
-            --gtest_filter=NativeVNNIGEMVTest.Q6_K_SourceScaleFactorsMatchOriginalSourceEquation
-        LABELS "V2;Integration;ROCm;NativeVNNI;Q6_K;ByteExact;Regression"
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_quantised_gemv>
+            --gtest_filter=NativeQuantisedGEMVTest.Q6_K_SourceScaleFactorsMatchOriginalSourceEquation
+        LABELS "V2;Integration;ROCm;NativeQuantised;Q6_K;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_ROCmQ6SourceScaleRepack V2_Integration_ROCmQ6SourceScaleGEMV)
@@ -28448,11 +28554,11 @@ add_executable(v2_unit_iq4xs_original_equation unit/kernels/Test__IQ4XSOriginalE
 target_link_libraries(v2_unit_iq4xs_original_equation llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_IQ4XSOriginalEquation
     COMMAND $<TARGET_FILE:v2_unit_iq4xs_original_equation>
-    LABELS "V2;Unit;DeviceFree;CPU;NativeVNNI;IQ4_XS;OriginalEquation;Regression"
+    LABELS "V2;Unit;DeviceFree;CPU;NativeQuantised;IQ4_XS;OriginalEquation;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_IQ4XSOriginalEquation
     COMMAND $<TARGET_FILE:v2_unit_iq4xs_original_equation>
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;IQ4_XS;OriginalEquation;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;IQ4_XS;OriginalEquation;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_IQ4XSOriginalEquation)
 foreach(V2_IQ4XS_ISA AVX2 AVX512)
@@ -28461,9 +28567,9 @@ foreach(V2_IQ4XS_ISA AVX2 AVX512)
     endif()
     string(TOLOWER "${V2_IQ4XS_ISA}" V2_IQ4XS_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPUIQ4XSFusedMoEOriginalEquation_${V2_IQ4XS_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
-            --gtest_filter=CPUNativeVNNIVerifierWorkers.IQ4XSOriginalSourceEquationInFusedExpertTransaction
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;${V2_IQ4XS_ISA};NativeVNNI;MoE;IQ4_XS;OriginalEquation;Regression"
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers>
+            --gtest_filter=CPUNativeQuantisedVerifierWorkers.IQ4XSOriginalSourceEquationInFusedExpertTransaction
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;${V2_IQ4XS_ISA};NativeQuantised;MoE;IQ4_XS;OriginalEquation;Regression"
         MPI_PROCS 1 NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_IQ4XS_RUNTIME_ISA}")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUIQ4XSFusedMoEOriginalEquation_${V2_IQ4XS_ISA})
@@ -28472,15 +28578,15 @@ if(HAVE_CUDA AND TARGET v2_integration_iq4xs_source_equations)
     add_v2_test(V2_Integration_CUDAIQ4XSOriginalEquation
         COMMAND $<TARGET_FILE:v2_integration_iq4xs_source_equations>
             --gtest_filter=IQ4XSSourceCUDA.DenseOriginalEquation
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ4_XS;OriginalEquation;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeQuantised;IQ4_XS;OriginalEquation;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ4XSOriginalEquation)
 endif()
-if(HAVE_ROCM AND TARGET v2_integration_rocm_native_vnni_gemv)
+if(HAVE_ROCM AND TARGET v2_integration_rocm_native_quantised_gemv)
     add_v2_test(V2_Integration_ROCmIQ4XSOriginalEquation
         COMMAND $<TARGET_FILE:v2_integration_iq4xs_source_equations>
             --gtest_filter=IQ4XSSourceROCm.DenseOriginalEquation
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ4_XS;OriginalEquation;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;IQ4_XS;OriginalEquation;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ4XSOriginalEquation)
 endif()
@@ -28518,26 +28624,26 @@ add_executable(v2_unit_iq2s_original_equation unit/kernels/Test__IQ2SOriginalEqu
 target_link_libraries(v2_unit_iq2s_original_equation llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_IQ2SOriginalEquation
     COMMAND $<TARGET_FILE:v2_unit_iq2s_original_equation>
-    LABELS "V2;Unit;DeviceFree;CPU;NativeVNNI;IQ2_S;SourceFactors;Regression"
+    LABELS "V2;Unit;DeviceFree;CPU;NativeQuantised;IQ2_S;SourceFactors;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_IQ2SOriginalEquation
     COMMAND $<TARGET_FILE:v2_unit_iq2s_original_equation> --gtest_filter=IQ2SOriginalEquation.*
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;IQ2_S;SourceFactors;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;IQ2_S;SourceFactors;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_IQ2SOriginalEquation)
 if(HAVE_CUDA AND TARGET v2_integration_cuda_gemm_parity)
     add_v2_test(V2_Integration_CUDAIQ2SOriginalEquation
         COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
             --gtest_filter=Test__CUDAGemmParity.IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreExact
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ2_S;SourceFactors;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeQuantised;IQ2_S;SourceFactors;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ2SOriginalEquation)
 endif()
-if(HAVE_ROCM AND TARGET v2_integration_rocm_native_vnni_gemv)
+if(HAVE_ROCM AND TARGET v2_integration_rocm_native_quantised_gemv)
     add_v2_test(V2_Integration_ROCmIQ2SOriginalEquation
-        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemv>
-            --gtest_filter=NativeVNNIGEMVTest.IQ2_S_SourceFactorsMatchCapturedOriginalEquation
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ2_S;SourceFactors;Capture;Regression"
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_quantised_gemv>
+            --gtest_filter=NativeQuantisedGEMVTest.IQ2_S_SourceFactorsMatchCapturedOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;IQ2_S;SourceFactors;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ2SOriginalEquation)
 endif()
@@ -28545,7 +28651,7 @@ if(HAVE_ROCM AND TARGET v2_integration_rocm_vnni_repack_kernels)
     add_v2_test(V2_Integration_ROCmIQ2SOriginalMetadata
         COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
             --gtest_filter=Test__VnniRepackKernels.IQ2_S_SourceFactorsAndPayloadPreserveOffsetsAndTails
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ2_S;SourceFactors;Repack;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;IQ2_S;SourceFactors;Repack;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ2SOriginalMetadata)
 endif()
@@ -28555,7 +28661,7 @@ if(HAVE_ROCM AND TARGET v2_integration_rocm_vnni_repack_kernels)
     add_v2_test(V2_Integration_ROCmIQ4XSSourceTupleRepack
         COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
             --gtest_filter=Test__VnniRepackKernels.IQ4_XS_Parity
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ4_XS;SourceFactors;Repack;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;IQ4_XS;SourceFactors;Repack;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ4XSSourceTupleRepack)
 endif()
@@ -28580,7 +28686,7 @@ endif()
 add_v2_test(V2_Integration_IQ2SPackedArchiveGeneration
     COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
         --gtest_filter=Test__PackedWeightsSerialization.IQ2SRawCoefficientWordsPreserveAllBytes:Test__PackedWeightsSerialization.IQ2SSourceFactorsRoundTripAndRejectVersion4:Test__PackedWeightsSerialization.IQ2SGpuWireSourceFactorsRoundTripAndRejectVersion1
-    LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;IQ2_S;Serialization;Regression"
+    LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;IQ2_S;Serialization;Regression"
     MPI_PROCS 1 NO_MODELS)
 add_v2_test(V2_Integration_PrefixCacheIQ2SScaleArithmeticGeneration
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
@@ -28589,8 +28695,8 @@ add_v2_test(V2_Integration_PrefixCacheIQ2SScaleArithmeticGeneration
     MPI_PROCS 1 NO_MODELS)
 add_v2_test(V2_Integration_IQ2SMetadataProtocol
     COMMAND ${Python3_EXECUTABLE} -B
-        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_grouped_oracle_extent.py
-        NativeVNNISecondaryMetadataTypeTest
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_grouped_oracle_extent.py
+        NativeQuantisedSecondaryMetadataTypeTest
     LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;IQ2_S;Metadata;Regression"
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
@@ -28608,19 +28714,19 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantizedRow
 
 # IQ4_XS source-tuple mapping, movement, serialization and arithmetic-generation fences.
 add_v2_test(V2_Integration_IQ4XSTupleFormatContract
-    COMMAND $<TARGET_FILE:v2_test_native_vnni_format_info>
-        --gtest_filter=Test__NativeVnniFormatInfo.IQ4XSSourceTupleMappingAndCapacityAreExact:Test__NativeVnniFormatInfo.PackedRegionSizingMatchesCanonicalMetadata:Test__NativeVnniFormatInfo.MigrationStableAndReusableFormatsCoverEveryCodebook:Test__NativeVnniFormatInfo.RuntimeCaptureEnvelopeCoversEveryTierRepresentation
-    LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;IQ4_XS;Metadata;Regression"
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_format_info>
+        --gtest_filter=Test__NativeQuantisedFormatInfo.IQ4XSSourceTupleMappingAndCapacityAreExact:Test__NativeQuantisedFormatInfo.PackedRegionSizingMatchesCanonicalMetadata:Test__NativeQuantisedFormatInfo.MigrationStableAndReusableFormatsCoverEveryCodebook:Test__NativeQuantisedFormatInfo.RuntimeCaptureEnvelopeCoversEveryTierRepresentation
+    LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;IQ4_XS;Metadata;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 add_v2_test(V2_Integration_IQ4XSTupleTierRoundTrip
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
         --gtest_filter=ExpertTierWeightStream.IQ4XSTupleRoundTripAndPhysicalLayoutAreExact:ExpertTierWeightStream.IQ4XSExplicitExpandedMetadataRemainsAccepted
-    LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;IQ4_XS;Movement;Regression"
+    LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;IQ4_XS;Movement;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 add_v2_test(V2_Integration_IQ4XSTupleArchiveGeneration
     COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
         --gtest_filter=Test__PackedWeightsSerialization.IQ4XSSourceTupleRoundTripsAndRejectsVersion5:Test__PackedWeightsSerialization.IQ4XSGpuWireTupleRejectsVersion2AndSourceSubstitution
-    LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;IQ4_XS;Serialization;Regression"
+    LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;IQ4_XS;Serialization;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 add_v2_test(V2_Integration_PrefixCacheIQ4XSScaleArithmeticGeneration
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
@@ -28635,14 +28741,14 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
 
 add_v2_test(V2_Integration_IQ4XSTupleMetadataProtocol
     COMMAND ${Python3_EXECUTABLE} -B
-        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_grouped_oracle_extent.py
-        NativeVNNISecondaryMetadataTypeTest
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_grouped_oracle_extent.py
+        NativeQuantisedSecondaryMetadataTypeTest
     LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;IQ4_XS;Metadata;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 add_v2_test(V2_Integration_IQ4XSTupleDispatchIdentity
     COMMAND ${Python3_EXECUTABLE} -B
-        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_common_dispatch_policy.py
-        NativeVNNICommonDispatchPolicyTest.test_iq4xs_tuple_physical_identity_is_not_iq4nl_alias
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_common_dispatch_policy.py
+        NativeQuantisedCommonDispatchPolicyTest.test_iq4xs_tuple_physical_identity_is_not_iq4nl_alias
     LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;IQ4_XS;Dispatch;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
@@ -28652,7 +28758,7 @@ if(TARGET v2_integration_iq4xs_source_equations AND HAVE_CUDA)
     add_v2_test(V2_Integration_CUDA_IQ4XSSourceTupleDirectRowpar
         COMMAND $<TARGET_FILE:v2_integration_iq4xs_source_equations>
             --gtest_filter=IQ4XSSourceCUDA.DirectAndRowparVerifierCaptured
-        LABELS "V2;Integration;CUDA;NativeVNNI;IQ4_XS;SourceEquation;Capture;Regression"
+        LABELS "V2;Integration;CUDA;NativeQuantised;IQ4_XS;SourceEquation;Capture;Regression"
         TIMEOUT 120 NO_MODELS MPI_PROCS 1)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_IQ4XSSourceTupleDirectRowpar)
 endif()
@@ -28674,7 +28780,7 @@ add_v2_test(V2_Integration_IQ3STupleTransferDescriptorCapacity
 add_v2_test(V2_Integration_GPUPreparedWeightCoefficientPlaneAdmission
     COMMAND $<TARGET_FILE:v2_test_kernel_factory>
         --gtest_filter=GPUPreparedWeightBinding.RejectsMissingSourceCoefficientPlane
-    LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;Kernels;NativeVNNI;Regression"
+    LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;Kernels;NativeQuantised;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_IQ3STupleTransferDescriptorCapacity
@@ -28702,10 +28808,10 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
 add_executable(v2_unit_iq3s_original_equation unit/kernels/Test__IQ3SOriginalEquation.cpp)
 target_link_libraries(v2_unit_iq3s_original_equation llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_IQ3SOriginalEquation COMMAND $<TARGET_FILE:v2_unit_iq3s_original_equation>
-    LABELS "V2;Unit;DeviceFree;CPU;NativeVNNI;IQ3_S;OriginalEquation;Regression"
+    LABELS "V2;Unit;DeviceFree;CPU;NativeQuantised;IQ3_S;OriginalEquation;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_CPUIQ3SOriginalEquation COMMAND $<TARGET_FILE:v2_unit_iq3s_original_equation>
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;IQ3_S;OriginalEquation;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;IQ3_S;OriginalEquation;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUIQ3SOriginalEquation)
 foreach(V2_IQ3S_ISA AVX2 AVX512)
@@ -28714,9 +28820,9 @@ foreach(V2_IQ3S_ISA AVX2 AVX512)
     endif()
     string(TOLOWER "${V2_IQ3S_ISA}" V2_IQ3S_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPUIQ3SFusedMoEOriginalEquation_${V2_IQ3S_ISA}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
-            --gtest_filter=CPUNativeVNNIVerifierWorkers.IQ3SOriginalSourceEquationInFusedExpertTransaction
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;${V2_IQ3S_ISA};NativeVNNI;MoE;IQ3_S;OriginalEquation;Regression"
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers>
+            --gtest_filter=CPUNativeQuantisedVerifierWorkers.IQ3SOriginalSourceEquationInFusedExpertTransaction
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;${V2_IQ3S_ISA};NativeQuantised;MoE;IQ3_S;OriginalEquation;Regression"
         MPI_PROCS 1 NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_IQ3S_RUNTIME_ISA}")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUIQ3SFusedMoEOriginalEquation_${V2_IQ3S_ISA})
@@ -28725,10 +28831,10 @@ endforeach()
 add_executable(v2_unit_iq3s_source_scale unit/kernels/Test__IQ3SSourceScale.cpp)
 target_link_libraries(v2_unit_iq3s_source_scale llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_IQ3SSourceScale COMMAND $<TARGET_FILE:v2_unit_iq3s_source_scale>
-    LABELS "V2;Unit;DeviceFree;CPU;NativeVNNI;IQ3_S;SourceFactors;Regression"
+    LABELS "V2;Unit;DeviceFree;CPU;NativeQuantised;IQ3_S;SourceFactors;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_CPUIQ3SSourceScale COMMAND $<TARGET_FILE:v2_unit_iq3s_source_scale>
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;IQ3_S;SourceFactors;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;IQ3_S;SourceFactors;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUIQ3SSourceScale)
 if(HAVE_CUDA OR HAVE_ROCM)
@@ -28739,54 +28845,54 @@ endif()
 if(HAVE_CUDA)
     add_v2_test(V2_Integration_CUDAIQ3SOriginalEquation
         COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceCUDA.DenseOriginalEquation
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeQuantised;IQ3_S;SourceFactors;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ3SOriginalEquation)
     add_v2_test(V2_Integration_CUDAIQ3SFusedMoEOriginalEquation
         COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceCUDA.FusedOriginalEquation
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeQuantised;IQ3_S;SourceFactors;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ3SFusedMoEOriginalEquation)
     add_v2_test(V2_Integration_CUDAIQ3SGroupedPrefillOriginalEquation
         COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceCUDA.GroupedPrefillOriginalEquation
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeQuantised;IQ3_S;SourceFactors;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ3SGroupedPrefillOriginalEquation)
     add_v2_test(V2_Integration_CUDAIQ3SSourceScaleTierRoundTrip
         COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels> --gtest_filter=CUDAExpertTierWeightKernelsTest.IQ3SSourceTupleAllGridsAndSignsRoundTripCaptured
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ3_S;SourceFactors;Tier;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeQuantised;IQ3_S;SourceFactors;Tier;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ3SSourceScaleTierRoundTrip)
     add_v2_test(V2_Integration_CUDAIQ3SSourceScaleColdTierSetup
         COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels> --gtest_filter=CUDAIQ3SColdTierSetup.CPUOriginPromotionPreservesSourceWithoutWarmup
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ3_S;SourceFactors;Tier;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeQuantised;IQ3_S;SourceFactors;Tier;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ3SSourceScaleColdTierSetup)
 endif()
 if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmIQ3SOriginalEquation
         COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceROCm.DenseOriginalEquation
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;IQ3_S;SourceFactors;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SOriginalEquation)
     add_v2_test(V2_Integration_ROCmIQ3SFusedMoEOriginalEquation
         COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceROCm.FusedOriginalEquation
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;IQ3_S;SourceFactors;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SFusedMoEOriginalEquation)
     add_v2_test(V2_Integration_ROCmIQ3SGroupedPrefillOriginalEquation
         COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceROCm.GroupedPrefillOriginalEquation
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;IQ3_S;SourceFactors;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SGroupedPrefillOriginalEquation)
     add_v2_test(V2_Integration_ROCmIQ3SSourceScaleTierRoundTrip
         COMMAND $<TARGET_FILE:v2_integration_rocm_expert_tier_weight_kernels> --gtest_filter=ROCmExpertTierWeightKernelsTest.IQ3SSourceTupleAllGridsAndSignsRoundTripCaptured
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Tier;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;IQ3_S;SourceFactors;Tier;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SSourceScaleTierRoundTrip)
     add_v2_test(V2_Integration_ROCmIQ3SSourceScaleColdTierSetup
         COMMAND $<TARGET_FILE:v2_integration_rocm_expert_tier_weight_kernels> --gtest_filter=ROCmIQ3SColdTierSetup.CPUOriginPromotionPreservesSourceWithoutWarmup
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Tier;Capture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;IQ3_S;SourceFactors;Tier;Capture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SSourceScaleColdTierSetup)
 endif()
@@ -28794,7 +28900,7 @@ if(HAVE_ROCM AND TARGET v2_integration_rocm_vnni_repack_kernels)
     add_v2_test(V2_Integration_ROCmIQ3SSourceScaleRepack
         COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
             --gtest_filter=Test__VnniRepackKernels.IQ3_S_SourceFactorsAndPayloadPreserveOffsetsAndTails
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Repack;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;IQ3_S;SourceFactors;Repack;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SSourceScaleRepack)
 endif()
@@ -29402,10 +29508,10 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDACountedM1Fused
 # for every native codebook and reject a modified policy body.
 add_test(NAME V2_Integration_CUDACountedM1DispatchRefresh
     COMMAND ${Python3_EXECUTABLE}
-        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cuda_native_vnni_decode_trainer.py
-        CUDANativeVNNIDecodeTrainerTest.test_grouped_exact_refresh_preserves_other_keys_and_programs)
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cuda_native_quantised_decode_trainer.py
+        CUDANativeQuantisedDecodeTrainerTest.test_grouped_exact_refresh_preserves_other_keys_and_programs)
 set_tests_properties(V2_Integration_CUDACountedM1DispatchRefresh PROPERTIES
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CUDA;NativeVNNI;Dispatch;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CUDA;NativeQuantised;Dispatch;Regression"
     ENVIRONMENT "OPENBLAS_NUM_THREADS=1;OMP_NUM_THREADS=1;MKL_NUM_THREADS=1;NUMEXPR_NUM_THREADS=1"
     PROCESSORS 4 TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDACountedM1DispatchRefresh)
@@ -32071,7 +32177,7 @@ foreach(V2_DESCRIPTOR_BACKEND IN ITEMS CUDA ROCm)
             COMMAND $<TARGET_FILE:${V2_DESCRIPTOR_TARGET}>
                 --gtest_filter=Test__${V2_DESCRIPTOR_BACKEND}MoEKernel.RuntimeDecode512ExpertsCapturedUpperHalfDescriptors
                 --gtest_brief=1
-            LABELS "V2;Integration;ProductionTestPreflight;${V2_DESCRIPTOR_BACKEND};MoE;LLEP;Descriptors;NativeVNNI;GroupedDecode;GraphCapture;Regression"
+            LABELS "V2;Integration;ProductionTestPreflight;${V2_DESCRIPTOR_BACKEND};MoE;LLEP;Descriptors;NativeQuantised;GroupedDecode;GraphCapture;Regression"
             MPI_PROCS 1 NO_MODELS RESOURCE_LOCK ${V2_DESCRIPTOR_LOCK} TIMEOUT 120
             ENVIRONMENT ${V2_DESCRIPTOR_ENV})
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
@@ -32437,10 +32543,10 @@ foreach(verifier_m1_isa AVX2 AVX512)
     endif()
     string(TOLOWER "${verifier_m1_isa}" verifier_m1_runtime_isa)
     add_v2_test(V2_Integration_CPU_VerifierM1AllFormats_${verifier_m1_isa}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.MTP_M1ProjectionAndSwiGLUAllFormatsAreSerialByteExact:CPUNativeVNNIGemvTest.MTP_VerifierProjectionRejectsMalformedExtentsBeforeWrites
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+            --gtest_filter=CPUNativeQuantisedGemvTest.MTP_M1ProjectionAndSwiGLUAllFormatsAreSerialByteExact:CPUNativeQuantisedGemvTest.MTP_VerifierProjectionRejectsMalformedExtentsBeforeWrites
             --gtest_brief=1
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;MTP;NativeVNNI;AllFormats;ByteExact;${verifier_m1_isa};Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MTP;NativeQuantised;AllFormats;ByteExact;${verifier_m1_isa};Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${verifier_m1_runtime_isa};LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
@@ -32507,15 +32613,15 @@ foreach(V2_QKV_CHECK IN ITEMS Workspace Policy GraphPolicy PrefixIdentity Retain
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpGDNQKV${V2_QKV_CHECK})
 endforeach()
 
-# Apply after existing GDN capture/Unit and CPU NativeVNNI targets are defined.
+# Apply after existing GDN capture/Unit and CPU NativeQuantised targets are defined.
 # Existing targets retain their current scope/lock/startup conventions. No new
 # target or coverage filter replaces an existing registration.
-target_sources(v2_integration_cpu_native_vnni_gemv PRIVATE
-    integration/kernels/cpu/native_vnni/Test__GDNQKVBundle.cpp)
+target_sources(v2_integration_cpu_native_quantised_gemv PRIVATE
+    integration/kernels/cpu/native_quantised/Test__GDNQKVBundle.cpp)
 add_v2_test(V2_Integration_CPU_GDNQKVTwoTermOriginalBundle
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
         --gtest_filter=GDNQKVBundle.CPUOriginalSourcesCompactBundle
-    LABELS "V2;Integration;ProductionTestPreflight;CPU;GDN;NativeVNNI;Q8_0;FP16RNE;ByteExact;Workspace;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;GDN;NativeQuantised;Q8_0;FP16RNE;ByteExact;Workspace;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 120
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 add_v2_test(V2_Integration_GDNQKVTwoTermBindingContract
@@ -32704,14 +32810,14 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEGraphCPUPrepare
 add_v2_test(V2_Integration_CPUPreparedWeightPhysicalBOM
     COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
         --gtest_filter=Test__PackedWeightsSerialization.Q4KPreparedAllocationMatchesCanonicalPhysicalBOM:Test__PackedWeightsSerialization.CPUPreparedBankAllocationAndArchiveReplay
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;Admission;PhysicalMemory;Replay;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Admission;PhysicalMemory;Replay;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUPreparedWeightPhysicalBOM)
 add_v2_test(V2_Integration_CPUPreparedStorageAccounting
     COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
         --gtest_filter=CPUPreparedStorageAccounting.*
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;Admission;PhysicalMemory;Replay;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Admission;PhysicalMemory;Replay;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUPreparedStorageAccounting)
@@ -33946,12 +34052,12 @@ endif()
 if(NOT V2_PERF_TESTS_ONLY)
     target_sources(v2_test_qwen4exp_primitives PRIVATE
         unit/kernels/Test__Q8ResidualAllFormats.cpp)
-    target_sources(v2_integration_cpu_native_vnni_gemv PRIVATE
+    target_sources(v2_integration_cpu_native_quantised_gemv PRIVATE
         integration/kernels/Test__Q8ResidualAllFormatsCPU.cpp)
     add_v2_test(V2_Integration_TwoTermAllFormatsSourceMetadataAndTinyCPU
         COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
             --gtest_filter=Q8ResidualAllFormats.*
-        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;AllFormats;TwoTermQ8;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;AllFormats;TwoTermQ8;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
     if(TEST V2_Integration_TwoTermAllFormatsSourceMetadataAndTinyCPU)
@@ -33976,9 +34082,9 @@ if(NOT V2_PERF_TESTS_ONLY)
         foreach(V2_TT_CPU_CASE IN ITEMS NativeRowsThreadsAndLargeSmallReuse NativeLargeTiledRows HC103OriginalPreparedControlChain HC103OriginalPrimitiveTailsAndPublicationAdmission HC103FusedStageAndTypedOverload HC103TypedAdmissionAndStageIdentity HC103TypedBuilderAllFormats CountedNativeVerifierExtent CountedNativeVerifierRowGeometry CountedNativeVerifierFusedBankAdmission)
             set(V2_TT_ALIAS V2_Integration_CPU_TwoTermAllFormats_${V2_TT_ISA}_${V2_TT_CPU_CASE})
             add_v2_test(${V2_TT_ALIAS}
-                COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+                COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
                     --gtest_filter=Q8ResidualAllFormatsCPU.${V2_TT_CPU_CASE}
-                LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeVNNI;AllFormats;TwoTermQ8;ByteExact;Regression"
+                LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;AllFormats;TwoTermQ8;ByteExact;Regression"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 120
                 ENVIRONMENT ${V2_TT_CPU_ENV})
             if(TEST ${V2_TT_ALIAS})
@@ -34003,7 +34109,7 @@ if(NOT V2_PERF_TESTS_ONLY)
                 add_v2_test(${V2_COUNTED_ALIAS}
                     COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                         --gtest_filter=Q8ResidualAllFormatsDevice.${V2_TT_BACKEND}CountedNative${V2_COUNTED_CASE}
-                    LABELS "V2;Integration;ProductionTestPreflight;${V2_TT_BACKEND};NativeVNNI;AllFormats;CountedRows;Capture;ByteExact;Regression"
+                    LABELS "V2;Integration;ProductionTestPreflight;${V2_TT_BACKEND};NativeQuantised;AllFormats;CountedRows;Capture;ByteExact;Regression"
                     MPI_PROCS 1 NO_MODELS TIMEOUT 120 ENVIRONMENT ${V2_TT_GPU_ENV})
                 if(TEST ${V2_COUNTED_ALIAS})
                     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_COUNTED_ALIAS})
@@ -34024,7 +34130,7 @@ if(NOT V2_PERF_TESTS_ONLY)
                 add_v2_test(V2_Integration_ROCm_CountedBiasEpilogue
                     COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                         --gtest_filter=Q8ResidualAllFormatsDevice.ROCmCountedBiasEpilogue
-                    LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;AllFormats;CountedRows;ByteExact;Regression"
+                    LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;AllFormats;CountedRows;ByteExact;Regression"
                     MPI_PROCS 1 NO_MODELS TIMEOUT 120 ENVIRONMENT ${V2_TT_GPU_ENV})
                 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_CountedBiasEpilogue)
             endif()
@@ -34033,7 +34139,7 @@ if(NOT V2_PERF_TESTS_ONLY)
                 add_v2_test(${V2_TT_ALIAS}
                     COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                         --gtest_filter=Q8ResidualAllFormatsDevice.${V2_TT_BACKEND}${V2_TT_SUFFIX}
-                    LABELS "V2;Integration;ProductionTestPreflight;${V2_TT_BACKEND};NativeVNNI;AllFormats;TwoTermQ8;Capture;ByteExact;Regression"
+                    LABELS "V2;Integration;ProductionTestPreflight;${V2_TT_BACKEND};NativeQuantised;AllFormats;TwoTermQ8;Capture;ByteExact;Regression"
                     MPI_PROCS 1 NO_MODELS TIMEOUT 120
                     ENVIRONMENT ${V2_TT_GPU_ENV})
                 if(TEST ${V2_TT_ALIAS})
@@ -34073,7 +34179,7 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_qwen4exp_device_primitives)
             add_v2_test(${V2_TT_PROMOTED_ALIAS}
                 COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                     --gtest_filter=Q8ResidualAllFormatsDevice.${V2_TT_PROMOTED_BACKEND}ExpandedMinimumPromotion
-                LABELS "V2;Integration;ProductionTestPreflight;${V2_TT_PROMOTED_BACKEND};NativeVNNI;Migration;TwoTermQ8;Capture;ByteExact;Regression"
+                LABELS "V2;Integration;ProductionTestPreflight;${V2_TT_PROMOTED_BACKEND};NativeQuantised;Migration;TwoTermQ8;Capture;ByteExact;Regression"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 120
                 ENVIRONMENT ${V2_TT_PROMOTED_ENV})
             if(TEST ${V2_TT_PROMOTED_ALIAS})
@@ -34480,15 +34586,15 @@ endif()
 # before V2_CONFIGURED_TESTS / gate target inventory is finalized. This is an
 # Integration-only correctness/resource regression; Release owns the separate
 # diagnostic timing tournament being prepared by the trainer agent.
-if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_integration_rocm_native_vnni_gemv)
-    target_sources(v2_integration_rocm_native_vnni_gemv PRIVATE
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_integration_rocm_native_quantised_gemv)
+    target_sources(v2_integration_rocm_native_quantised_gemv PRIVATE
         integration/kernels/rocm/Test__NativeQ8SerialGeometry.cpp)
-    target_include_directories(v2_integration_rocm_native_vnni_gemv PRIVATE
+    target_include_directories(v2_integration_rocm_native_quantised_gemv PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR})
     add_v2_test(V2_Integration_ROCmNativeQ8SerialGeometry
-        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemv>
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_quantised_gemv>
             --gtest_filter=NativeQ8SerialGeometry.CapturedTailsAndEmptyPartitionsAreByteExact
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;Q8_0;SerialM1;GraphCapture;CompilerResources;ByteExact;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;Q8_0;SerialM1;GraphCapture;CompilerResources;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_ROCmNativeQ8SerialGeometry)
@@ -34611,12 +34717,12 @@ target_include_directories(v2_test_moe_prefill_measured_operation PRIVATE
 target_link_libraries(v2_test_moe_prefill_measured_operation PRIVATE GTest::gtest_main)
 add_v2_test(V2_Unit_MoEPrefillMeasuredOperation
     COMMAND $<TARGET_FILE:v2_test_moe_prefill_measured_operation>
-    LABELS "V2;Unit;MoE;NativeVNNI;Dispatch;Regression"
+    LABELS "V2;Unit;MoE;NativeQuantised;Dispatch;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_MoEPrefillMeasuredOperation
     COMMAND $<TARGET_FILE:v2_test_moe_prefill_measured_operation>
             --gtest_filter=MoEPrefillMeasuredOperation.*
-    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Dispatch;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeQuantised;Dispatch;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoEPrefillMeasuredOperation)
@@ -34643,11 +34749,11 @@ target_include_directories(v2_test_rocm_moe_route_owned_geometry PRIVATE ${CMAKE
 target_link_libraries(v2_test_rocm_moe_route_owned_geometry PRIVATE GTest::gtest_main)
 add_v2_test(V2_Unit_ROCmMoERouteOwnedGeometry
     COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
-    LABELS "V2;Unit;MoE;NativeVNNI;Geometry;Regression"
+    LABELS "V2;Unit;MoE;NativeQuantised;Geometry;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_ROCmMoERouteOwnedGeometryContract
     COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
-    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Geometry;Regression;DeviceFree"
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeQuantised;Geometry;Regression;DeviceFree"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
     target_sources(v2_integration_moe_live_rows PRIVATE
@@ -34656,7 +34762,7 @@ if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
     add_v2_test(V2_Integration_ROCmMoERouteOwnedGeometryAdmission
         COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
             --gtest_filter=ROCmMoERouteOwnedGeometryNative.*
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeQuantised;GraphCapture;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
 endif()
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoERouteOwnedGeometryContract)
@@ -34672,16 +34778,16 @@ target_compile_features(v2_unit_moe_projection_diagnostic PRIVATE cxx_std_20)
 target_include_directories(v2_unit_moe_projection_diagnostic PRIVATE
     ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
 target_compile_definitions(v2_unit_moe_projection_diagnostic PRIVATE
-    LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST}"
-    LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}")
+    LLAMINAR_NATIVE_QUANTISED_MOE_GGUF_PATTERN_MANIFEST_PATH="${LLAMINAR_NATIVE_QUANTISED_MOE_GGUF_PATTERN_MANIFEST}"
+    LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG}")
 target_link_libraries(v2_unit_moe_projection_diagnostic PRIVATE GTest::gtest_main)
 add_v2_test(V2_Unit_MoEProjectionDiagnostic
     COMMAND $<TARGET_FILE:v2_unit_moe_projection_diagnostic>
-    LABELS "V2;Unit;MoE;NativeVNNI;Trainer;DeviceFree;Regression"
+    LABELS "V2;Unit;MoE;NativeQuantised;Trainer;DeviceFree;Regression"
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 add_v2_test(V2_Integration_MoEProjectionDiagnostic
     COMMAND $<TARGET_FILE:v2_unit_moe_projection_diagnostic>
-    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Trainer;DeviceFree;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeQuantised;Trainer;DeviceFree;Regression"
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionDiagnostic)
 
@@ -34690,7 +34796,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionDiagn
 add_v2_test(V2_Integration_MoEProjectionPartitionContest
     COMMAND $<TARGET_FILE:v2_unit_moe_projection_diagnostic>
         --gtest_filter=MoEProjectionDiagnostic.PartitionContestPreservesExplicitIdentityAndDefault:MoEProjectionDiagnostic.RejectsUnknownPartitionContest:MoEProjectionDiagnostic.PartitionContestUsesBalancedTwoWayProjection
-    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Trainer;DeviceFree;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeQuantised;Trainer;DeviceFree;Regression"
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionPartitionContest)
 
@@ -34698,7 +34804,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionParti
 add_v2_test(V2_Integration_MoEProjectionAutomaticContest
     COMMAND $<TARGET_FILE:v2_unit_moe_projection_diagnostic>
         --gtest_filter=MoEProjectionDiagnostic.AutomaticContestPreservesOldContestsAndSourceIdentity:MoEProjectionDiagnostic.SyntheticFixturesPreserveEveryCanonicalSourceAlias:MoEProjectionDiagnostic.SyntheticFixturesRejectMixedAuthorityAndLossyBounds:MoEProjectionDiagnostic.AutomaticContestRejectsMultirowAndOversizedRouteCapacity
-    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Trainer;DeviceFree;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeQuantised;Trainer;DeviceFree;Regression"
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionAutomaticContest)
 
@@ -34706,20 +34812,197 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionAutom
 add_v2_test(V2_Integration_MoEProjectionPromoted23Fixture
     COMMAND $<TARGET_FILE:v2_unit_moe_projection_diagnostic>
         --gtest_filter=MoEProjectionDiagnostic.Promoted23RepresentationPreservesDefaultAndOriginalSource:MoEProjectionDiagnostic.Promoted23SourcesUseCanonicalMigrationContract:MoEProjectionDiagnostic.Promoted23RejectsUnknownAndMixedPreparationAuthority:MoEProjectionDiagnostic.Promoted23KeepsBoundedSyntheticOperation
-    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Trainer;DeviceFree;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeQuantised;Trainer;DeviceFree;Regression"
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionPromoted23Fixture)
 
 
 # Both the native trainer and its device-free parser bind the same catalogs.
-add_test(NAME V2_Integration_NativeVNNICatalogBindings
+add_test(NAME V2_Integration_NativeQuantisedCatalogBindings
     COMMAND ${Python3_EXECUTABLE}
-        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_shape_manifest.py
-        NativeVNNIShapeManifestTest.test_all_backend_trainers_share_one_overlay_inventory)
-set_tests_properties(V2_Integration_NativeVNNICatalogBindings PROPERTIES
-    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;Trainer;BuildSystem;DeviceFree;Regression"
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_shape_manifest.py
+        NativeQuantisedShapeManifestTest.test_all_backend_trainers_share_one_overlay_inventory)
+set_tests_properties(V2_Integration_NativeQuantisedCatalogBindings PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;Trainer;BuildSystem;DeviceFree;Regression"
     TIMEOUT 30)
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeVNNICatalogBindings)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedCatalogBindings)
+
+# Publication must authenticate the whole measured operation and preserve the
+# installed generic program and unrelated exact entries during a scoped refresh.
+add_v2_test(V2_Integration_CPUExecutionExactEvidence
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_execution_exact.py
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;Dispatch;Trainer;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUExecutionExactEvidence)
+
+# A completed superset must not trigger another native launch or acquire new provenance.
+add_v2_test(V2_Integration_GPUCompletedSweepReuse
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_completed_sweep.py
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;NativeQuantised;Dispatch;Trainer;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GPUCompletedSweepReuse)
+
+# Scope selection cannot remove retained runtime keys or relabel old plans.
+add_v2_test(V2_Integration_NativeQuantisedModernSweepScope
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_native_quantised_modern_sweep_scope.py
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;CUDA;ROCm;NativeQuantised;Dispatch;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_GPUExactModernScope
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_exact_modern_scope.py
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;NativeQuantised;Dispatch;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_NativeQuantisedModernSweepScope V2_Integration_GPUExactModernScope)
+
+# Screening clocks cannot acquire the promotion floor; complete unchanged
+# producer/request/artifact receipts must resume without another native launch.
+foreach(_adaptive_expert_class IN ITEMS Scope Evidence)
+    add_v2_test(V2_Integration_NativeQuantisedAdaptiveExpert${_adaptive_expert_class}
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_adaptive_expert_sweep.py
+            AdaptiveExpert${_adaptive_expert_class}Test
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;Dispatch;Trainer;Evidence;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_NativeQuantisedAdaptiveExpert${_adaptive_expert_class})
+endforeach()
+
+# Model selection and paid-work reuse preserve original execution identities.
+add_v2_test(V2_Integration_NativeQuantisedModernCPUPlan
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_modern_cpu_plan.py
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;Dispatch;Trainer;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_CPUSweepCompletedReceiptReuse
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_cpu_sweep_reuse.py
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;Dispatch;Trainer;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_NativeQuantisedModernCPUPlan
+    V2_Integration_CPUSweepCompletedReceiptReuse)
+
+# Reuse the real collector fixture with unequal row vectors and dirty retained
+# storage; target-only overrides must leave singleton peers on their own policy.
+foreach(_execution_exact_isa IN ITEMS AVX2 AVX512)
+    if(_execution_exact_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${_execution_exact_isa}" _execution_exact_runtime_isa)
+    add_v2_test(V2_Integration_CPU_ExecutionExactBatch_${_execution_exact_isa}
+        COMMAND $<TARGET_FILE:v2_perf_cpu_fused_verifier>
+            --gtest_filter=CPUExecutionExactBatch.MixedTargetPoliciesAndLargeSmallReuse
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;Prefill;Replay;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${_execution_exact_runtime_isa}" "OMP_NUM_THREADS=2"
+            "OMP_DYNAMIC=false" "OMP_PROC_BIND=false"
+            "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+            "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CPU_ExecutionExactBatch_${_execution_exact_isa})
+endforeach()
+
+add_v2_test(V2_Integration_ROCmNativeQuantisedExactRetention
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_quantised_decode_trainer.py
+        ROCmNativeQuantisedDecodeTrainerTest.test_exact_retention_never_synthesizes_generic_rules
+        ROCmNativeQuantisedDecodeTrainerTest.test_exact_cli_rejects_generic_fit_controls_before_inputs
+        ROCmNativeQuantisedDecodeTrainerTest.test_iq4_xs_exact_winner_uses_source_policy_and_all_physical_aliases
+        ROCmNativeQuantisedDecodeTrainerTest.test_retained_grouped_serial_reports_authenticate_actual_policy
+        ROCmNativeQuantisedDecodeTrainerTest.test_projected_alias_winners_match_serial_and_parallel_oracle
+        ROCmNativeQuantisedDecodeTrainerTest.test_adapt_only_preserves_incomplete_observations_without_policy
+    LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;Dispatch;Trainer;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmNativeQuantisedExactRetention)
+
+add_v2_test(V2_Integration_NativeQuantisedProfilerDispatchRoles
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_profiler_evidence.py
+        NativeQuantisedProfilerEvidenceTest.test_native_quantised_family_keeps_compute_and_reduction_roles
+        NativeQuantisedProfilerEvidenceTest.test_gpu_catalog_separates_compute_reduction_and_preparation
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;Profiler;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedProfilerDispatchRoles)
+
+add_v2_test(V2_Integration_NativeQuantisedExactWorkflow
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_dispatch_refresh.py
+        NativeQuantisedDispatchRefreshTest.test_retired_training_command_has_no_executable_generic_path
+        NativeQuantisedDispatchRefreshTest.test_retired_generic_flags_fail_before_discovery
+        NativeQuantisedDispatchRefreshTest.test_missing_later_backend_arguments_fail_before_any_launch
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;Dispatch;Trainer;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedExactWorkflow)
+
+add_v2_test(V2_Integration_NativeQuantisedAnalyzerRetirement
+    COMMAND ${Python3_EXECUTABLE} -m pytest -q
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_dispatch_pipeline.py
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;CUDA;ROCm;NativeQuantised;Trainer;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedAnalyzerRetirement)
+
+# Kernel/class renames do not change the serialized identities of retained
+# evidence. Keep the original published digests as the regression oracle.
+add_v2_test(V2_Integration_NativeQuantisedHistoricalSplitIdentity
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_prefill_trainer.py
+        CPUNativeQuantisedPrefillTrainerTest.test_v8_split_remains_readable_for_digest_bound_refinement
+        CPUNativeQuantisedPrefillTrainerTest.test_v9_split_remains_readable_for_digest_bound_refinement
+        CPUNativeQuantisedPrefillTrainerTest.test_v12_split_remains_readable_for_digest_bound_refinement
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;Evidence;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedHistoricalSplitIdentity)
+
+add_v2_test(V2_Integration_NativeQuantisedMoEExactOverlayRetention
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_production_moe_prefill_sweep.py
+        MoEExactOverlayRetentionTest
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;CUDA;ROCm;MoE;Retention;Replay;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedMoEExactOverlayRetention)
+
+# Source factors are raw typed coefficient words for several codebooks, even
+# when their arithmetic is symmetric. Trainer fixtures must obey those codecs.
+foreach(_source_factor_isa IN ITEMS AVX2 AVX512)
+    if(_source_factor_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${_source_factor_isa}" _source_factor_runtime_isa)
+    add_v2_test(V2_Integration_CPU_NativeQuantisedSourceFactors_${_source_factor_isa}
+        COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_gemv>
+            --gtest_filter=CPUNativeQuantisedGemvTest.DispatchEvidencePreparedWeights_MatchProductionLayout_AllFormats:CPUNativeQuantisedGemvTest.DispatchEvidenceSourceFactors_DecodeReplayRejectsReservedBits
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${_source_factor_runtime_isa}" "OMP_NUM_THREADS=2"
+            "OMP_DYNAMIC=false" "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
+            "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CPU_NativeQuantisedSourceFactors_${_source_factor_isa})
+endforeach()
+
+# Exact overlays must include the physically aligned QFN TP shards in every
+# applicable execution phase; nominal dimensions cannot stand in for tail ranks.
+add_v2_test(V2_Integration_NativeQuantisedQFNExactShardInventory
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_shape_manifest.py
+        NativeQuantisedShapeManifestTest.test_qfn_tp8_and_aligned_expert_tails_are_exact_overlay_obligations
+        NativeQuantisedShapeManifestTest.test_expert_catalog_preserves_operation_and_original_slice_identity
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;Trainer;Geometry;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_NativeQuantisedQFNExactPhaseInventory
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_prefill_matrix.py
+        NativeQuantisedPrefillMatrixTest.test_qfn_decode_mtp_and_prefill_use_shared_exact_geometries
+        NativeQuantisedPrefillMatrixTest.test_expert_live_row_exact_anchors_preserve_dense_prefill_budgets
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;Trainer;MTP;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_NativeQuantisedQFNExactShardInventory
+    V2_Integration_NativeQuantisedQFNExactPhaseInventory)
 
 # Exercise the real mixed-language trainer entrypoint and loader without a
 # model or accelerator. Its physical-core inventory requires initialized MPI.
@@ -34749,12 +35032,12 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
 add_v2_test(V2_Unit_ROCmMoERouteOwnedParallelPartitions
     COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
         --gtest_filter=ROCmMoERouteOwnedGeometry.ParallelSourcePartitionContract
-    LABELS "V2;Unit;MoE;NativeVNNI;Geometry;Regression;DeviceFree"
+    LABELS "V2;Unit;MoE;NativeQuantised;Geometry;Regression;DeviceFree"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_ROCmMoERouteOwnedParallelPartitionsContract
     COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
         --gtest_filter=ROCmMoERouteOwnedGeometry.ParallelSourcePartitionContract
-    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Geometry;Regression;DeviceFree"
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeQuantised;Geometry;Regression;DeviceFree"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_ROCmMoERouteOwnedParallelPartitionsContract)
@@ -34762,7 +35045,7 @@ if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
     add_v2_test(V2_Integration_ROCmMoERouteOwnedParallelPartitions
         COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
             --gtest_filter=ROCmMoERouteOwnedGeometryNative.*ParallelSourcePartition*
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeQuantised;GraphCapture;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_ROCmMoERouteOwnedParallelPartitions)
@@ -34772,12 +35055,12 @@ endif()
 add_v2_test(V2_Unit_ROCmMoERouteOwnedAllFormatPartitions
     COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
         --gtest_filter=ROCmMoERouteOwnedGeometry.ParallelSourcePartitionContract:ROCmMoERouteOwnedGeometry.AllFormatSharedLayoutHasDisjointGridAndPartials
-    LABELS "V2;Unit;MoE;NativeVNNI;Geometry;Regression;DeviceFree"
+    LABELS "V2;Unit;MoE;NativeQuantised;Geometry;Regression;DeviceFree"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_ROCmMoERouteOwnedAllFormatPartitionsContract
     COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
         --gtest_filter=ROCmMoERouteOwnedGeometry.ParallelSourcePartitionContract:ROCmMoERouteOwnedGeometry.AllFormatSharedLayoutHasDisjointGridAndPartials
-    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Geometry;Regression;DeviceFree"
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeQuantised;Geometry;Regression;DeviceFree"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_ROCmMoERouteOwnedAllFormatPartitionsContract)
@@ -34785,14 +35068,14 @@ if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
     add_v2_test(V2_Integration_ROCmMoERouteOwnedAllFormatPartitions
         COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
             --gtest_filter=ROCmMoERouteOwnedGeometryNative.CapturedParallelSourcePartitionsMatchSerialBytes:ROCmMoERouteOwnedGeometryNative.CapturedParallelSourcePartitionsPromotedQ5KMatchSerialBytes
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeQuantised;GraphCapture;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_ROCmMoERouteOwnedAllFormatPartitions)
     add_v2_test(V2_Integration_ROCmMoERouteOwnedIQ2AutomaticCapacity
         COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
             --gtest_filter=ROCmMoERouteOwnedGeometryNative.CapturedIQ2AutomaticCapacityBranchesMatchParallelBytes
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeQuantised;GraphCapture;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_ROCmMoERouteOwnedIQ2AutomaticCapacity)
@@ -34802,24 +35085,24 @@ endif()
 add_v2_test(V2_Unit_ROCmMoEImmutableOwnerPlan
     COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
         --gtest_filter=ROCmMoERouteOwnedGeometry.ImmutableOwnerPlan*
-    LABELS "V2;Unit;MoE;NativeVNNI;GraphCapture;Regression"
+    LABELS "V2;Unit;MoE;NativeQuantised;GraphCapture;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_ROCmMoEImmutableOwnerPlanContract
     COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
         --gtest_filter=ROCmMoERouteOwnedGeometry.ImmutableOwnerPlan*
-    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;GraphCapture;Regression;DeviceFree"
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeQuantised;GraphCapture;Regression;DeviceFree"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoEImmutableOwnerPlanContract)
 
 if(TARGET v2_integration_moe_projection_pipeline AND NOT V2_PERF_TESTS_ONLY)
     if(HAVE_CUDA)
         target_sources(v2_integration_moe_projection_pipeline PRIVATE
-            integration/backends/Test__PreparedNativeVNNIInspectionCUDA.cpp)
+            integration/backends/Test__PreparedNativeQuantisedInspectionCUDA.cpp)
     endif()
     if(HAVE_ROCM)
         target_sources(v2_integration_moe_projection_pipeline PRIVATE
-            integration/backends/Test__PreparedNativeVNNIInspectionROCm.cpp
-            integration/backends/Test__PreparedNativeVNNIInspection.cpp)
+            integration/backends/Test__PreparedNativeQuantisedInspectionROCm.cpp
+            integration/backends/Test__PreparedNativeQuantisedInspection.cpp)
     endif()
     if(HAVE_CUDA)
         target_link_libraries(v2_integration_moe_projection_pipeline PRIVATE CUDA::cudart)
@@ -34830,13 +35113,13 @@ if(TARGET v2_integration_moe_projection_pipeline AND NOT V2_PERF_TESTS_ONLY)
     foreach(inspection_backend CUDA ROCm)
         if((inspection_backend STREQUAL "CUDA" AND HAVE_CUDA) OR
            (inspection_backend STREQUAL "ROCm" AND HAVE_ROCM))
-            add_v2_test(V2_Integration_PreparedNativeVNNIInspection_${inspection_backend}
+            add_v2_test(V2_Integration_PreparedNativeQuantisedInspection_${inspection_backend}
                 COMMAND $<TARGET_FILE:v2_integration_moe_projection_pipeline>
-                    --gtest_filter=PreparedNativeVNNIInspection.${inspection_backend}
-                LABELS "V2;Integration;ProductionTestPreflight;${inspection_backend};NativeVNNI;GraphCapture;Regression"
+                    --gtest_filter=PreparedNativeQuantisedInspection.${inspection_backend}
+                LABELS "V2;Integration;ProductionTestPreflight;${inspection_backend};NativeQuantised;GraphCapture;Regression"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 120)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
-                V2_Integration_PreparedNativeVNNIInspection_${inspection_backend})
+                V2_Integration_PreparedNativeQuantisedInspection_${inspection_backend})
         endif()
     endforeach()
     if(HAVE_ROCM)
@@ -34844,7 +35127,7 @@ if(TARGET v2_integration_moe_projection_pipeline AND NOT V2_PERF_TESTS_ONLY)
             add_v2_test(V2_Integration_MoEImmutableOwnerBinding_ROCm${owner_participants}
                 COMMAND $<TARGET_FILE:v2_integration_moe_projection_pipeline>
                     --gtest_filter=MoEModelPartitionBinding.ROCm${owner_participants}
-                LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;LocalTP;ByteExact;Regression"
+                LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeQuantised;GraphCapture;LocalTP;ByteExact;Regression"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 120)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
                 V2_Integration_MoEImmutableOwnerBinding_ROCm${owner_participants})
@@ -34855,7 +35138,7 @@ if(HAVE_ROCM AND TARGET v2_integration_moe_live_rows AND NOT V2_PERF_TESTS_ONLY)
     add_v2_test(V2_Integration_ROCmMoEModelOwnerBinding
         COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
             --gtest_filter=ROCmMoERouteOwnedGeometryNative.CapturedModelOwnerBinding*
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;ByteExact;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeQuantised;GraphCapture;ByteExact;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoEModelOwnerBinding)
 endif()
@@ -34893,7 +35176,7 @@ if(NOT V2_PERF_TESTS_ONLY)
     add_v2_test(V2_Integration_NativeM1DeferredReductionContract
         COMMAND $<TARGET_FILE:v2_unit_captured_compute_isolation>
             --gtest_filter=NativeM1Reduction.*
-        LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;DeviceFree;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;DeviceFree;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeM1DeferredReductionContract)
     add_v2_test(V2_Integration_RecordedGDNIsolationContract
@@ -34977,23 +35260,23 @@ if(NOT V2_PERF_TESTS_ONLY)
     target_link_libraries(v2_unit_recorded_head_request PRIVATE GTest::gtest_main Threads::Threads)
     add_v2_test(V2_Unit_RecordedHeadRequest
         COMMAND $<TARGET_FILE:v2_unit_recorded_head_request>
-        LABELS "V2;Unit;Performance;NativeVNNI;DeviceFree"
+        LABELS "V2;Unit;Performance;NativeQuantised;DeviceFree"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     add_v2_test(V2_Integration_RecordedGDNInputContract
         COMMAND $<TARGET_FILE:v2_unit_recorded_head_request>
             --gtest_filter=RecordedGDNRequest.*
-        LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;Snapshot;DeviceFree;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;Snapshot;DeviceFree;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RecordedGDNInputContract)
     add_v2_test(V2_Integration_RecordedGDNMetadataContract
         COMMAND $<TARGET_FILE:v2_unit_recorded_head_request>
             --gtest_filter=RecordedGDNRequest.NativePreparedMetadataUsesSemanticBoolean
-        LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;DeviceFree;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;DeviceFree;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RecordedGDNMetadataContract)
     add_v2_test(V2_Integration_RecordedHeadInputContract
         COMMAND $<TARGET_FILE:v2_unit_recorded_head_request>
-        LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;Snapshot;DeviceFree;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;Snapshot;DeviceFree;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     if(TEST V2_Integration_RecordedHeadInputContract)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RecordedHeadInputContract)
@@ -35001,7 +35284,7 @@ if(NOT V2_PERF_TESTS_ONLY)
     add_v2_test(V2_Integration_RecordedHeadConcurrentContract
         COMMAND $<TARGET_FILE:v2_unit_recorded_head_request>
             --gtest_filter=RecordedHeadCohort.*
-        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;NativeVNNI;Snapshot;Scaling;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;NativeQuantised;Snapshot;Scaling;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RecordedHeadConcurrentContract)
 endif()
@@ -35021,7 +35304,7 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_qwen4exp_device_primitives)
             add_v2_test(V2_Integration_RecordedHeadPartitionPolicy_${_recorded_backend}
                 COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                     --gtest_filter=CapturedComputeIsolationNative.${_recorded_backend}OriginalPartitionPolicy
-                LABELS "V2;Integration;ProductionTestPreflight;${_recorded_backend};NativeVNNI;Snapshot;Capture;ByteExact;Regression"
+                LABELS "V2;Integration;ProductionTestPreflight;${_recorded_backend};NativeQuantised;Snapshot;Capture;ByteExact;Regression"
                 MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120
                 ENVIRONMENT ${_recorded_env})
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RecordedHeadPartitionPolicy_${_recorded_backend})
@@ -35033,7 +35316,7 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_unit_captured_compute_isolation)
     add_v2_test(V2_Integration_CapturedOutputPartitionPolicyContract
         COMMAND $<TARGET_FILE:v2_unit_captured_compute_isolation>
             --gtest_filter=CapturedComputeIsolation.OutputPartitionPolicyIsExplicitAndBounded
-        LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;DeviceFree;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;DeviceFree;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedOutputPartitionPolicyContract)
 endif()
@@ -35124,22 +35407,22 @@ if(NOT V2_PERF_TESTS_ONLY)
         llaminar2_core GTest::gtest_main OpenMP::OpenMP_CXX)
     add_v2_test(V2_Unit_OriginalOutputSlice
         COMMAND $<TARGET_FILE:v2_test_original_output_slice>
-        LABELS "V2;Unit;CPU;DeviceFree;PreparedWeights;NativeVNNI;TensorParallel;Regression"
+        LABELS "V2;Unit;CPU;DeviceFree;PreparedWeights;NativeQuantised;TensorParallel;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     add_v2_test(V2_Integration_OriginalOutputSliceContract
         COMMAND $<TARGET_FILE:v2_test_original_output_slice> --gtest_filter=OriginalOutputSlice.*
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;PreparedWeights;NativeVNNI;TensorParallel;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;PreparedWeights;NativeQuantised;TensorParallel;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OriginalOutputSliceContract)
     add_v2_test(V2_Unit_OriginalOutputSliceSource
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_original_output_slice_source.py
-        LABELS "V2;Unit;CPU;DeviceFree;SourcePolicy;NativeVNNI;Regression"
+        LABELS "V2;Unit;CPU;DeviceFree;SourcePolicy;NativeQuantised;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     add_v2_test(V2_Integration_OriginalOutputSliceSource
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_original_output_slice_source.py
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;SourcePolicy;NativeVNNI;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;SourcePolicy;NativeQuantised;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OriginalOutputSliceSource)
 endif()
@@ -35155,7 +35438,7 @@ if(TARGET v2_integration_cuda_gemm_batch_invariance)
     add_v2_test(V2_Integration_CUDA_OriginalOutputSliceCapturedAllFormats
         COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_batch_invariance>
             --gtest_filter=Test__CUDAGemmBatchInvariance.CapturedOriginalOutputSliceAllNativeFormats --gtest_brief=1
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;PreparedWeights;TensorParallel;QKV;GraphCapture;ByteExact;AllFormats;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeQuantised;PreparedWeights;TensorParallel;QKV;GraphCapture;ByteExact;AllFormats;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_OriginalOutputSliceCapturedAllFormats)
 endif()
@@ -35164,7 +35447,7 @@ if(TARGET v2_integration_rocm_quantised_gemm_small_m)
     add_v2_test(V2_Integration_ROCm_OriginalOutputSliceCapturedAllFormats
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
             --gtest_filter=Test__ROCmQuantisedGemmSmallM.CapturedOriginalOutputSliceAllNativeFormats --gtest_brief=1
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;PreparedWeights;TensorParallel;QKV;GraphCapture;ByteExact;AllFormats;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;PreparedWeights;TensorParallel;QKV;GraphCapture;ByteExact;AllFormats;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_OriginalOutputSliceCapturedAllFormats)
 endif()
@@ -35210,12 +35493,12 @@ endif()
 add_v2_test(V2_Unit_ROCmMoEAutomaticOwnerPolicy
     COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
         --gtest_filter=ROCmMoERouteOwnedGeometry.AutomaticOwnerPolicy*
-    LABELS "V2;Unit;DeviceFree;MoE;NativeVNNI;Policy;Regression"
+    LABELS "V2;Unit;DeviceFree;MoE;NativeQuantised;Policy;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_ROCmMoEAutomaticOwnerPolicyContract
     COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
         --gtest_filter=ROCmMoERouteOwnedGeometry.AutomaticOwnerPolicy*
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;NativeVNNI;Policy;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;NativeQuantised;Policy;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoEAutomaticOwnerPolicyContract)
 if(HAVE_ROCM AND TARGET v2_integration_moe_projection_pipeline AND NOT V2_PERF_TESTS_ONLY
@@ -35223,7 +35506,7 @@ if(HAVE_ROCM AND TARGET v2_integration_moe_projection_pipeline AND NOT V2_PERF_T
     add_v2_test(V2_Integration_ROCmMoEAutomaticOwnerDefault
         COMMAND $<TARGET_FILE:v2_integration_moe_projection_pipeline>
             --gtest_filter=MoEModelPartitionBinding.AutomaticMeasured*ROCm4
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MI50;LocalTP4;MoE;NativeVNNI;GraphCapture;LocalTP;ByteExact;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MI50;LocalTP4;MoE;NativeQuantised;GraphCapture;LocalTP;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoEAutomaticOwnerDefault)
 endif()
@@ -35293,9 +35576,9 @@ foreach(V2_HC103_BACKEND CUDA ROCm)
         endforeach()
     endif()
 endforeach()
-# Scalar owns primitive arithmetic; original NativeVNNI geometry rejects it.
+# Scalar owns primitive arithmetic; original NativeQuantised geometry rejects it.
 add_v2_test(V2_Integration_CPU_HC103OriginalScalarPrimitiveBoundary
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
         --gtest_also_run_disabled_tests
         --gtest_filter=Q8ResidualAllFormatsCPU.DISABLED_HC103OriginalScalarPrimitives:Q8ResidualAllFormatsCPU.DISABLED_HC103ScalarRejectsNativePreparedGeometry
     LABELS "V2;Integration;ProductionTestPreflight;CPU;Scalar;Qwen4Exp;Primitive;Policy;Admission;ByteExact;Regression"
@@ -35422,8 +35705,8 @@ if(NOT V2_PERF_TESTS_ONLY)
         V2_Integration_GDNNormSingleQ8Metadata V2_Integration_GDNNormSingleQ8Snapshots)
     if(HAVE_ROCM)
         add_v2_test(V2_Integration_ROCm_GDNNormSingleQ8Production
-            COMMAND $<TARGET_FILE:v2_perf_native_vnni_throughput>
-                --gtest_filter=NativeVNNIPerfTest.GatedNormSingleQ8ProductionOwnerAndAllFormatBytes
+            COMMAND $<TARGET_FILE:v2_perf_native_quantised_throughput>
+                --gtest_filter=NativeQuantisedPerfTest.GatedNormSingleQ8ProductionOwnerAndAllFormatBytes
             LABELS "V2;Integration;ProductionTestPreflight;ROCm;GDN;GEMM;Regression"
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
             ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0;LLAMINAR_PERF_STATS_TABLE=1;LLAMINAR_PERF_STATS_FILTER=gdn_output.normalization_submission")
@@ -36129,10 +36412,10 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_cpu_fixed_epoch_gdn)
 endif()
 
 # Explicit regression for logical row policies split by register-bounded physical geometry.
-if(NOT V2_PERF_TESTS_ONLY AND HAVE_CUDA AND TARGET v2_integration_cuda_native_vnni_wide)
+if(NOT V2_PERF_TESTS_ONLY AND HAVE_CUDA AND TARGET v2_integration_cuda_native_quantised_wide)
     add_v2_test(V2_Integration_CUDAGroupedPhysicalRowCursor
-        COMMAND $<TARGET_FILE:v2_integration_cuda_native_vnni_wide>
-            --gtest_filter=CUDANativeVNNIWide.CapturedGroupedPhysicalRowCursorMatchesSerial
+        COMMAND $<TARGET_FILE:v2_integration_cuda_native_quantised_wide>
+            --gtest_filter=CUDANativeQuantisedWide.CapturedGroupedPhysicalRowCursorMatchesSerial
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;GEMM;GraphCapture;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK cuda_gpu_0)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAGroupedPhysicalRowCursor)
@@ -36375,7 +36658,8 @@ endif()
 # them here after its set() so that the explicit suite retains every regression.
 if(NOT V2_PERF_TESTS_ONLY)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
-        V2_Integration_NativeModuleReleaseSelection)
+        V2_Integration_NativeModuleReleaseSelection
+        V2_Integration_ReleaseExplicitNativeTestSelection)
     foreach(_cpu_checkpoint_isa AVX2 AVX512)
         if(_cpu_checkpoint_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
             continue()
@@ -36383,10 +36667,13 @@ if(NOT V2_PERF_TESTS_ONLY)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
             V2_Integration_CPURouterQ8UniqueLiveSourceReplay_${_cpu_checkpoint_isa}
             V2_Integration_CPURouterQ8UniqueSourceStageReplay_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeVNNIFusedProjectionEvidenceIdentity_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeVNNIOrderedNibbleReplay_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeVNNIFusedProjectionLayout_gate_${_cpu_checkpoint_isa}
-            V2_Integration_CPU_NativeVNNIFusedProjectionLayout_down_${_cpu_checkpoint_isa})
+            V2_Integration_CPU_NativeQuantisedFusedProjectionEvidenceIdentity_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeQuantisedOrderedNibbleReplay_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeQuantisedFusedLivePrefix_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeQuantisedSamePanelPairRunReplay_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_gate_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeQuantisedFusedProjectionLayout_down_${_cpu_checkpoint_isa})
     endforeach()
 endif()
 
@@ -36822,6 +37109,32 @@ foreach(V2_PREFLIGHT_TEST IN LISTS V2_REGISTERED_PREFLIGHT_CANDIDATES)
 endforeach()
 endif()
 
+# Native peer setup must retire only its own expected AlreadyEnabled status.
+# Keep this outside the functional-only preflight block so an explicitly
+# selected Release owner receives the same native regressions and labels.
+foreach(_peer_reset_backend IN ITEMS CUDA ROCm)
+    if((_peer_reset_backend STREQUAL "CUDA" AND HAVE_CUDA) OR
+       (_peer_reset_backend STREQUAL "ROCm" AND HAVE_ROCM))
+        add_v2_test(V2_Integration_PeerPreparationResetLifecycle_${_peer_reset_backend}
+            COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                --gtest_filter=Test__ExpertTierGpuPeerTransfer${_peer_reset_backend}.RepeatedPreparationPreservesCapturedAuxiliaryReset
+                --gtest_brief=1
+            LABELS "V2;Integration;ProductionTestPreflight;${_peer_reset_backend};${_peer_reset_backend}2;MoE;GPUTransfer;GraphCapture;Lifecycle;ByteExact;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+        add_v2_test(V2_Integration_PeerPreparationErrorPreservation_${_peer_reset_backend}
+            COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                --gtest_filter=Test__ExpertTierGpuPeerTransfer${_peer_reset_backend}.PreparationPreservesUnrelatedPreexistingError
+                --gtest_brief=1
+            LABELS "V2;Integration;ProductionTestPreflight;${_peer_reset_backend};${_peer_reset_backend}2;MoE;GPUTransfer;Lifecycle;ErrorState;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+        if(TEST V2_Integration_PeerPreparationResetLifecycle_${_peer_reset_backend})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_PeerPreparationResetLifecycle_${_peer_reset_backend}
+                V2_Integration_PeerPreparationErrorPreservation_${_peer_reset_backend})
+        endif()
+    endif()
+endforeach()
+
 # Timing targets must also exist when Release excludes functional preflight.
 # Diagnostic target only; no automatic GPU timing in Unit/preflight.
 if(HAVE_CUDA OR HAVE_ROCM)
@@ -36938,9 +37251,9 @@ endif()
 # those environments run. All share one main; their existing MPI policies stay
 # inside the fixtures. The optional target check matches actual build selection.
 foreach(V2_MPI_GTEST_TARGET IN ITEMS
-        v2_perf_cpu_flash_attention_sweep v2_perf_cpu_native_vnni_sweep
-        v2_perf_cpu_native_vnni_gemv v2_perf_onednn_reference
-        v2_perf_cpu_native_vnni_dispatch_sweep v2_integration_cpu_native_vnni_gemv
+        v2_perf_cpu_flash_attention_sweep v2_perf_cpu_native_quantised_sweep
+        v2_perf_cpu_native_quantised_gemv v2_perf_onednn_reference
+        v2_perf_cpu_native_quantised_dispatch_sweep v2_integration_cpu_native_quantised_gemv
         v2_test_prefix_cache_coordinator)
     if(TARGET ${V2_MPI_GTEST_TARGET})
         target_sources(${V2_MPI_GTEST_TARGET} PRIVATE mpi_session_gtest_main.cpp)
@@ -38747,3 +39060,35 @@ add_v2_test(V2_Integration_ExpertGemmRegistryHashDistribution
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1"
 )
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertGemmRegistryHashDistribution)
+
+# The strong grouped trainer times candidates and uses serial decode only as
+# a numerical oracle. Adaptation must not demand unmeasured serial speed ratios.
+if(Python3_Interpreter_FOUND)
+    add_v2_test(V2_Integration_CPUNativeQuantisedVerifierNativeCSVContract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_quantised_verifier_adapter.py
+            CPUNativeQuantisedVerifierAdapterTest.test_current_native_header_requires_measured_evidence_not_serial_speedup
+            CPUNativeQuantisedVerifierAdapterTest.test_raw_sidecar_reconstructs_every_robust_timing_field
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Trainer;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeQuantisedVerifierNativeCSVContract)
+endif()
+
+
+# A same-lifetime PF_EXITING witness may precede disappearance and Z/X state.
+# Keep malformed live metadata fatal and never turn absent counters into zero.
+if(Python3_Interpreter_FOUND)
+    add_test(NAME V2_Integration_OwnedProcessExitMMReplay
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_resource_owned_process_tree.py
+            OwnedProcessTreeTests.test_exiting_mm_without_zombie_state_never_fabricates_memory
+            OwnedProcessTreeTests.test_exit_mm_during_status_read_requires_original_exit_flag
+            OwnedProcessTreeTests.test_missing_mm_without_exit_witness_remains_fatal
+            OwnedProcessTreeTests.test_pid_reuse_during_memory_read_discards_unbound_counters
+            OwnedProcessTreeTests.test_live_permission_and_malformed_memory_errors_are_not_hidden
+            OwnedProcessTreeTests.test_zombie_reports_unavailable_memory_without_fabricated_zero)
+    set_tests_properties(V2_Integration_OwnedProcessExitMMReplay PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Resources;ProcessOwnership;Replay;Regression"
+        TIMEOUT 15)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OwnedProcessExitMMReplay)
+endif()

@@ -189,7 +189,7 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch,
     using llaminar2::rocm::selectROCmMoEGroupedPrefillRouteStrategy;
 
     ROCmMoEGroupedPrefillRouteKey key{
-        .gateup_codebook = 19, // NativeVNNI Q8_0 execution id.
+        .gateup_codebook = 19, // NativeQuantised Q8_0 execution id.
         .down_codebook = 19,
         .hidden_size = 3072,
         .expert_width = 1024,

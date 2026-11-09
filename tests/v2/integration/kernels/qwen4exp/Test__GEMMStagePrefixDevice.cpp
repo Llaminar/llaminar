@@ -326,7 +326,7 @@ void proveQueryWork(DeviceId device,bool grouped,QueryWorkGeometry geometry={})
                 add(GemmWorkspaceBuffers::QUANT_A,k,1);add(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,k/32,4);
                 add(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,k/32,4,device.is_cuda());add(GemmWorkspaceBuffers::FULL_A_FP16,k,2);
                 for(const auto* name:{GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL,GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED,GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS,
-                    GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS,GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS})add(name,1,4,false,true);
+                    GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS,GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS})add(name,1,4,false,true);
                 std::vector<float> frameSource(physical*k),expected(output.numel(),-71.0f),actual(output.numel());
                 std::vector<std::array<std::int32_t,2>> words(requests);
                 checked(backend->synchronizeStream(stream,device.ordinal),"Query work setup fence failed");

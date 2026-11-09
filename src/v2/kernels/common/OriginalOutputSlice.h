@@ -10,7 +10,7 @@
  */
 #pragma once
 #include "backends/DeviceId.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -60,7 +60,7 @@ namespace llaminar2
                 throw std::invalid_argument("Original output slice disagrees with prepared engine/N/K");
         }
         /** @return Original source format, distinct from normalized execution bytes. */
-        NativeVnniSourceIdentity sourceIdentity() const noexcept { return source_identity_; }
+        NativeQuantisedSourceIdentity sourceIdentity() const noexcept { return source_identity_; }
         /** @return All frozen facts, including retained object addresses, for capture identity. */
         std::uint64_t recordingIdentity() const noexcept
         {
@@ -81,7 +81,7 @@ namespace llaminar2
         OriginalOutputSlice(std::shared_ptr<ITensorGemm> engine, std::shared_ptr<TensorBase> source,
             std::uint64_t binding_id, std::uint64_t model_id, PreparedWeightKind prepared_kind, DeviceId device,
             int original_columns, int first_column, int physical_columns, int reduction_columns,
-            NativeVnniSourceIdentity source_identity)
+            NativeQuantisedSourceIdentity source_identity)
             : source_owner_(std::move(source)), engine_owner_(std::move(engine)),
               binding_id_(binding_id), model_id_(model_id), prepared_kind_(prepared_kind),
               device_(device), original_columns_(original_columns), first_column_(first_column),
@@ -99,6 +99,6 @@ namespace llaminar2
         int first_column_; ///< Original source output origin.
         int physical_columns_; ///< Exact local output width.
         int reduction_columns_; ///< Exact original K, never a K slice.
-        NativeVnniSourceIdentity source_identity_; ///< Frozen source family, never physical decoder inference.
+        NativeQuantisedSourceIdentity source_identity_; ///< Frozen source family, never physical decoder inference.
     };
 }

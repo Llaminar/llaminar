@@ -29,11 +29,12 @@ class OwnedProcessTreeTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.proc = Path(temporary.name)
 
-    def process(self, pid, parent, *, start=None, rss=8, children=(), state='S'):
+    def process(self, pid, parent, *, start=None, rss=8, children=(), state='S', flags=0):
         """Build original stat/status/children records with explicit byte units."""
         directory = self.proc / str(pid)
         directory.mkdir(exist_ok=True)
         fields = [state, str(parent), *(['0'] * 17), str(start or pid * 10), '0']
+        fields[6] = str(flags)
         (directory / 'stat').write_text(f'{pid} (worker ) name) ' + ' '.join(fields))
         (directory / 'status').write_text(f'Pid:\t{pid}\nNSpid:\t{pid}\n' + ''.join(
             f'{field}:\t{rss} kB\n' for field in
@@ -172,6 +173,50 @@ class OwnedProcessTreeTests(unittest.TestCase):
         row = owned.OwnedProcessTree(10, proc=self.proc).snapshot()['processes'][0]
         self.assertFalse(row['memory_available'])
         self.assertNotIn('status', row)
+
+    def test_exiting_mm_without_zombie_state_never_fabricates_memory(self):
+        """PF_EXITING can precede both exit_mm memory removal and zombie state."""
+        for state in ('R', 'S', 'D'):
+            with self.subTest(state=state):
+                root = self.process(10, 1, state=state, flags=0x00000004)
+                (root / 'status').write_text('Pid:\t10\nNSpid:\t10\n')
+                tree = owned.OwnedProcessTree(10, proc=self.proc)
+                with patch.object(owned, 'read_process_status', side_effect=AssertionError('exiting mm read')):
+                    result = tree.snapshot()
+                row = result['processes'][0]
+                self.assertFalse(row['memory_available'])
+                self.assertEqual(row['memory_unavailable_reason'], 'observed_process_exit')
+                self.assertNotIn('status', row)
+                self.assertEqual(result['retired'], [])
+                shutil.rmtree(root)
+                self.assertEqual(tree.snapshot()['retired'], [{'pid': 10, 'start_ticks': 100}])
+
+    def test_exit_mm_during_status_read_requires_original_exit_flag(self):
+        """A racing missing mm is tolerated only with an actual trailing exit witness."""
+        root = self.process(10, 1)
+        tree = owned.OwnedProcessTree(10, proc=self.proc)
+        read = owned.read_process_status
+        def release_mm(path, pid):
+            self.process(10, 1, state='R', flags=0x00000004)
+            path.write_text('Pid:\t10\nNSpid:\t10\n')
+            return read(path, pid)
+        with patch.object(owned, 'read_process_status', release_mm):
+            row = tree.snapshot()['processes'][0]
+        self.assertEqual(row['state'], 'R')
+        self.assertFalse(row['memory_available'])
+        self.assertNotIn('status', row)
+
+    def test_missing_mm_without_exit_witness_remains_fatal(self):
+        """An unrelated task flag or malformed flag cannot excuse missing counters."""
+        root = self.process(10, 1, state='R', flags=0x400000)
+        (root / 'status').write_text('Pid:\t10\nNSpid:\t10\n')
+        with self.assertRaisesRegex(ValueError, 'host PID or memory fields'):
+            owned.OwnedProcessTree(10, proc=self.proc).snapshot()
+        fields = (root / 'stat').read_text().rsplit(') ', 1)
+        tail = fields[1].split(); tail[6] = '-4'
+        (root / 'stat').write_text(fields[0] + ') ' + ' '.join(tail))
+        with self.assertRaisesRegex(ValueError, 'task flags'):
+            owned.OwnedProcessTree(10, proc=self.proc)
 
     def test_live_permission_and_malformed_memory_errors_are_not_hidden(self):
         """A live unreadable owner is an observation failure, never retirement."""

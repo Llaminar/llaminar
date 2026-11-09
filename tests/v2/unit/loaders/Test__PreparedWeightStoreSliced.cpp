@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "loaders/PreparedWeightStore.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "../../utils/PreparedWeightTestHarness.h"
 
@@ -16,7 +16,7 @@
 #include <random>
 
 using namespace llaminar2;
-using namespace llaminar2::cpu::native_vnni;
+using namespace llaminar2::cpu::native_quantised;
 using namespace llaminar2::test;
 
 class PreparedWeightStoreSlicedTest : public ::testing::Test
@@ -102,7 +102,7 @@ TEST_F(PreparedWeightStoreSlicedTest, CreatesSlicedKernel)
     auto *kernel = fixture.store->slicedGemmKernel(fixture.ref, 0, 512);
     ASSERT_NE(kernel, nullptr);
 
-    auto *qgemm = dynamic_cast<CPUNativeVNNIGemmKernel *>(kernel);
+    auto *qgemm = dynamic_cast<CPUNativeQuantisedGemmKernel *>(kernel);
     ASSERT_NE(qgemm, nullptr);
     EXPECT_EQ(qgemm->get_n(), 512);
     EXPECT_EQ(qgemm->get_k(), 896);
@@ -116,7 +116,7 @@ TEST_F(PreparedWeightStoreSlicedTest, SlicedKernelSecondHalf)
     auto *kernel = fixture.store->slicedGemmKernel(fixture.ref, 512, 1024);
     ASSERT_NE(kernel, nullptr);
 
-    auto *qgemm = dynamic_cast<CPUNativeVNNIGemmKernel *>(kernel);
+    auto *qgemm = dynamic_cast<CPUNativeQuantisedGemmKernel *>(kernel);
     ASSERT_NE(qgemm, nullptr);
     EXPECT_EQ(qgemm->get_n(), 512);
     EXPECT_EQ(qgemm->get_k(), 896);
@@ -156,8 +156,8 @@ TEST_F(PreparedWeightStoreSlicedTest, FullKernelDifferentFromSliced)
     ASSERT_NE(sliced, nullptr);
     EXPECT_NE(full, sliced);
 
-    auto *full_qgemm = dynamic_cast<CPUNativeVNNIGemmKernel *>(full);
-    auto *sliced_qgemm = dynamic_cast<CPUNativeVNNIGemmKernel *>(sliced);
+    auto *full_qgemm = dynamic_cast<CPUNativeQuantisedGemmKernel *>(full);
+    auto *sliced_qgemm = dynamic_cast<CPUNativeQuantisedGemmKernel *>(sliced);
     ASSERT_NE(full_qgemm, nullptr);
     ASSERT_NE(sliced_qgemm, nullptr);
     EXPECT_EQ(full_qgemm->get_n(), sliced_qgemm->get_n());
@@ -271,7 +271,7 @@ TEST_F(PreparedWeightStoreSlicedTest, WorksWithQ4_0)
     auto *kernel = fixture.store->slicedGemmKernel(fixture.ref, 0, 512);
     ASSERT_NE(kernel, nullptr);
 
-    auto *qgemm = dynamic_cast<CPUNativeVNNIGemmKernel *>(kernel);
+    auto *qgemm = dynamic_cast<CPUNativeQuantisedGemmKernel *>(kernel);
     ASSERT_NE(qgemm, nullptr);
     EXPECT_EQ(qgemm->get_n(), 512);
 }

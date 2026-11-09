@@ -24,7 +24,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/IMoEKernel.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "transfer/TransferEngine.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -137,7 +137,7 @@ void runSparseExpertTicketParity(DeviceId device)
                         weights.back().get(),
                         gemm::FloatingPointGemmKernel::NumericalPolicy::GPUAlignedExpert));
                 else
-                    engines.push_back(std::make_unique<cpu::native_vnni::CPUNativeVNNIGemmKernel>(
+                    engines.push_back(std::make_unique<cpu::native_quantised::CPUNativeQuantisedGemmKernel>(
                         weights.back().get(), 0, -1,
                         CPUProjectionNumericalPolicy::GPUAlignedExpert));
                 projections[projection].push_back(engines.back().get());
@@ -218,7 +218,7 @@ void runSparseExpertTicketParity(DeviceId device)
         params.expert_weight_resolution_policy = MoELocalExpertStage::ExpertWeightResolutionPolicy::RegistryOnly;
         params.cpu_workspace_source = MoELocalExpertStage::CPUExpertWorkspaceSource{
             .gate = format.tensor_type, .up = format.tensor_type, .down = format.tensor_type,
-            .workers = cpu::native_vnni::nativeVNNIInvocationWorkerCount(),
+            .workers = cpu::native_quantised::nativeQuantisedInvocationWorkerCount(),
             .execution = CPUExecutionGeometry::local()};
         auto residency = std::make_shared<MoEOverlayParticipantResidency>(
             MoEOverlayParticipantResidency::Config{.participant_id = 1, .device = DeviceId::cpu(),

@@ -31,8 +31,8 @@ def method(text, signature):
 
 def require_rocm_group(test, text):
     """Require the real verifier gate and projection-local explicit source query."""
-    gate = ("g_rocm_native_vnni_decode_equivalent_scope && "
-            "all_projections_native_vnni && (m >= 2 || countedVerifierRows(m))")
+    gate = ("g_rocm_native_quantised_decode_equivalent_scope && "
+            "all_projections_native_quantised && (m >= 2 || countedVerifierRows(m))")
     test.assertTrue(gate in " ".join(text.split()),
                     "Native verifier grouping lost its mode, format or counted-M1 gate")
     authority = method(text, "bool countedVerifierRows(int m)")
@@ -43,7 +43,7 @@ def require_rocm_group(test, text):
     grouping = text[begin:end]
     test.assertIn("auto original_scope = projections[i].beginOriginalOutputSliceScope();", grouping)
     test.assertIn("projections[i].original_output_slice->sourceIdentity().codebook_id", grouping)
-    test.assertIn("rocmGemv_native_vnni_query_serial_m1_config_with_policy(", grouping)
+    test.assertIn("rocmGemv_native_quantised_query_serial_m1_config_with_policy(", grouping)
     test.assertIn("Ns[i], k, &policy_kb, &policy_target_waves", grouping)
     test.assertIn("groups[static_cast<size_t>(group_index)].push_back(static_cast<int>(i))", grouping)
 
@@ -52,7 +52,7 @@ class OriginalOutputSliceSource(unittest.TestCase):
     """Check the actual backend entry/loop closures and seeded missing-edge negatives."""
 
     def test_existing_two_int_direction_is_preserved(self):
-        for backend, name in (("cpu", "CPUNativeVNNIGemmKernel.h"),
+        for backend, name in (("cpu", "CPUNativeQuantisedGemmKernel.h"),
                               ("cuda", "CUDAQuantisedGemmKernel.cpp"),
                               ("rocm", "ROCmQuantisedGemmKernel.cpp")):
             text = source(f"src/v2/kernels/{backend}/gemm/{name}")
@@ -72,11 +72,11 @@ class OriginalOutputSliceSource(unittest.TestCase):
                      "slice.row_start > slice.source_rows - slice.row_count",
                      "slice.col_start != 0", "slice.col_count != slice.source_cols",
                      "slice.expert_ids.empty()", "kernel->get_n()", "kernel->get_k()",
-                     "IINT8Unpackable::fromTensor", "exportNativeVNNISourceIdentity",
+                     "IINT8Unpackable::fromTensor", "exportNativeQuantisedSourceIdentity",
                      "prepared_source.codebook_id != format->codebook_id",
                      "prepared_source.is_superblock != format->is_superblock"):
             self.assertIn(fact, body)
-        for forbidden in ("cuda", "hip", "TransferEngine::", "exportNativeVNNIMatrixDesc(", "raw_data("):
+        for forbidden in ("cuda", "hip", "TransferEngine::", "exportNativeQuantisedMatrixDesc(", "raw_data("):
             self.assertNotIn(forbidden, body)
         header = source("src/v2/kernels/common/OriginalOutputSlice.h")
         self.assertLess(header.index("private:"), header.index("OriginalOutputSlice(std::shared_ptr<ITensorGemm>"))
@@ -95,12 +95,12 @@ class OriginalOutputSliceSource(unittest.TestCase):
             "mutable PreparedGemmHandle/PreparedGemmWeights publication wrapper.", ""))
 
     def test_cpu_fused_members_keep_explicit_policy_and_physical_extent(self):
-        body = source("src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h")
+        body = source("src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h")
         self.assertIn(".policy_n = projections[i].original_output_slice", body)
         self.assertIn("fused_descs[i].policy_n = proj.original_output_slice", body)
         self.assertIn("descriptors[i].policy_n = projection.original_output_slice", body)
         self.assertIn("auto original_scope = projections[i].beginOriginalOutputSliceScope();", body)
-        implementation = source("src/v2/kernels/cpu/gemm/CPUNativeVNNIGemv.h")
+        implementation = source("src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemv.h")
         self.assertIn("const int policy_n = d.policy_n > 0 ? d.policy_n", implementation)
         self.assertIn("plan.n_chunks = (d.packed->N + 63) / 64", implementation)
         self.assertIn(".policy_n = d.policy_n", implementation)
@@ -120,7 +120,7 @@ class OriginalOutputSliceSource(unittest.TestCase):
         text = source("src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp")
         require_rocm_group(self, text)
         for bad in (text.replace("auto original_scope = projections[i].beginOriginalOutputSliceScope();", ""),
-                    text.replace("rocmGemv_native_vnni_query_serial_m1_config_with_policy(", "wrong_query("),
+                    text.replace("rocmGemv_native_quantised_query_serial_m1_config_with_policy(", "wrong_query("),
                     text.replace("(m >= 2 || countedVerifierRows(m))", "m >= 1"),
                     text.replace("return rows && rows->countOwner();", "return rows != nullptr;")):
             with self.assertRaises(AssertionError):

@@ -28,8 +28,8 @@
 #include <cstring>
 #include <vector>
 #include "kernels/rocm/gemm/ROCmMoERouteOwnedTuning.h"
-#include "tensors/NativeVnniFormatInfo.h"
-#include "../kernels/moe/NativeVNNIExpertTransferParityTest.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
+#include "../kernels/moe/NativeQuantisedExpertTransferParityTest.h"
 #include <gtest/gtest.h>
 #include <set>
 #include <map>
@@ -50,7 +50,7 @@ using namespace llaminar2::rocm;
 std::set<std::uint8_t> compiledPhysicalCodebooks()
 {
     std::set<std::uint8_t> result;
-    for (const auto &source : native_vnni_formats::kAllSourceFormats)
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
         result.insert(canonicalDeviceVnniFormat(*source.metadata).codebook_id);
         result.insert(migrationStableDeviceVnniFormat(*source.metadata).codebook_id);
@@ -59,15 +59,15 @@ std::set<std::uint8_t> compiledPhysicalCodebooks()
 }
 
 /** @brief Retain original source policy while inspecting every canonical/migration physical leaf. */
-std::map<std::uint8_t, NativeVnniExecutionFormatEnvelope> compiledPhysicalEnvelopes()
+std::map<std::uint8_t, NativeQuantisedExecutionFormatEnvelope> compiledPhysicalEnvelopes()
 {
-    std::map<std::uint8_t, NativeVnniExecutionFormatEnvelope> result;
-    for (const auto &source : native_vnni_formats::kAllSourceFormats)
+    std::map<std::uint8_t, NativeQuantisedExecutionFormatEnvelope> result;
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
         for (const auto physical : {canonicalDeviceVnniFormat(*source.metadata).codebook_id,
                                    migrationStableDeviceVnniFormat(*source.metadata).codebook_id})
         {
-            const NativeVnniSourceIdentity original{source.metadata->codebook_id, source.metadata->is_superblock, true};
-            if (!addNativeVnniExecutionFormat(result[physical], physical, original, false))
+            const NativeQuantisedSourceIdentity original{source.metadata->codebook_id, source.metadata->is_superblock, true};
+            if (!addNativeQuantisedExecutionFormat(result[physical], physical, original, false))
                 throw std::logic_error("canonical source could not construct its native resource envelope");
         }
     return result;
@@ -243,7 +243,7 @@ TEST(ROCmMoERouteOwnedGeometryNative, ParallelSourcePartitionAdmissionRejectsInc
             else EXPECT_THROW((void)admitMoERouteOwnedGateUpGeometry(MoERouteOwnedGateUpGeometry::TN64,
                 envelope, 0, P::FourWorkerPlanes, shape), std::invalid_argument);
         }
-        const NativeVnniExecutionFormatEnvelope corrected{1u << 5, 1u << 5};
+        const NativeQuantisedExecutionFormatEnvelope corrected{1u << 5, 1u << 5};
         for (auto geometry : {MoERouteOwnedGateUpGeometry::TN128, MoERouteOwnedGateUpGeometry::TN256})
             EXPECT_THROW((void)admitMoERouteOwnedGateUpGeometry(geometry,
                 corrected, 0, P::FourWorkerPlanes, shape), std::invalid_argument);
@@ -398,24 +398,24 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
                     "test.route_owned.geometry." + std::string(format.label) + "." + std::to_string(q5_down) +
                     ".mutable" + std::to_string(runtime_mutable) + ".iq4mixed" + std::to_string(iq4_mixed) +
                     ".k" + std::to_string(H) + ".f" + std::to_string(F) + ".partition_execution" + std::to_string(static_cast<int>(requested_execution)) + "." + std::to_string(i)));
-            DeviceNativeVNNIMatrixDesc gate{}, up{}, down{};
-            ASSERT_TRUE(prepared[0].kernel->exportNativeVNNIMatrixDesc(gate));
-            ASSERT_TRUE(prepared[1].kernel->exportNativeVNNIMatrixDesc(up));
-            ASSERT_TRUE(prepared[2].kernel->exportNativeVNNIMatrixDesc(down));
-            ASSERT_TRUE(areNativeVnniGateUpCodebooksCompatible(gate.codebook_id, up.codebook_id));
+            DeviceNativeQuantisedMatrixDesc gate{}, up{}, down{};
+            ASSERT_TRUE(prepared[0].kernel->exportNativeQuantisedMatrixDesc(gate));
+            ASSERT_TRUE(prepared[1].kernel->exportNativeQuantisedMatrixDesc(up));
+            ASSERT_TRUE(prepared[2].kernel->exportNativeQuantisedMatrixDesc(down));
+            ASSERT_TRUE(areNativeQuantisedGateUpCodebooksCompatible(gate.codebook_id, up.codebook_id));
             const auto original_gate = gate;
             const auto original_up = up;
             // Retain genuine CPU-prepared bytes and original TransferEngine
             // promotion owners through every descriptor/capture/replay. No
             // source-format relabel or test-only weight repacking is used.
-            using namespace native_vnni_transfer_parity_detail;
-            std::array<cpu::native_vnni::CPUNativeVNNIPackedWeights, 2> cpu_weights;
+            using namespace native_quantised_transfer_parity_detail;
+            std::array<cpu::native_quantised::CPUNativeQuantisedPackedWeights, 2> cpu_weights;
             std::optional<PromotedCPUProjection> promoted_gate, promoted_up;
             if (promote_asymmetric)
             {
                 for (std::size_t index = 0; index < cpu_weights.size(); ++index)
                 {
-                    ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(sources[index].get(), cpu_weights[index]));
+                    ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(sources[index].get(), cpu_weights[index]));
                     ASSERT_TRUE(cpu_weights[index].usesExpandedInt8());
                     ASSERT_TRUE(cpu_weights[index].is_asymmetric);
                 }
@@ -423,16 +423,16 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
                 promoted_up = promoteCPUProjection(backend, device, cpu_weights[1], ExpertTierWeightProjection::Up, 88802);
                 gate = promoted_gate->descriptor;
                 up = promoted_up->descriptor;
-                ASSERT_EQ(gate.codebook_id, kNativeVnniExpandedInt8MinCodebook);
-                ASSERT_EQ(up.codebook_id, kNativeVnniExpandedInt8MinCodebook);
+                ASSERT_EQ(gate.codebook_id, kNativeQuantisedExpandedInt8MinCodebook);
+                ASSERT_EQ(up.codebook_id, kNativeQuantisedExpandedInt8MinCodebook);
                 ASSERT_EQ(gate.source_codebook_id, original_gate.source_codebook_id);
                 ASSERT_EQ(gate.source_is_superblock, original_gate.source_is_superblock);
                 ASSERT_NE(gate.source_identity_present, 0u);
             }
             // Distinct route slots may borrow identical retained expert weights.
             // Host descriptor vectors outlive the metadata-upload retirement join.
-            const std::vector<DeviceNativeVNNIMatrixDesc> gates(E, gate), ups(E, up), downs(E, down);
-            const std::vector<DeviceNativeVNNIMatrixDesc> original_gates(E, original_gate), original_ups(E, original_up);
+            const std::vector<DeviceNativeQuantisedMatrixDesc> gates(E, gate), ups(E, up), downs(E, down);
+            const std::vector<DeviceNativeQuantisedMatrixDesc> original_gates(E, original_gate), original_ups(E, original_up);
             const auto requirements = MoEWorkspaceBuffers::rocmMoE(rows, H, F, E, TopK);
             DeviceWorkspaceManager workspace(device, requirements.total_bytes_with_alignment());
             ASSERT_TRUE(workspace.allocate(requirements));
@@ -445,10 +445,10 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
             Join metadata_join{backend, stream};
             const auto origin = runtime_mutable ? MoEDecodeDescriptorSource::RuntimePlacementTable
                                                 : MoEDecodeDescriptorSource::StaticDescriptorTable;
-            NativeVnniExecutionFormatEnvelope envelope;
+            NativeQuantisedExecutionFormatEnvelope envelope;
             for (const auto *desc : {&gate, &up})
-                ASSERT_TRUE(addNativeVnniExecutionFormat(envelope, desc->codebook_id,
-                    NativeVnniSourceIdentity{desc->source_codebook_id, desc->source_is_superblock != 0u,
+                ASSERT_TRUE(addNativeQuantisedExecutionFormat(envelope, desc->codebook_id,
+                    NativeQuantisedSourceIdentity{desc->source_codebook_id, desc->source_is_superblock != 0u,
                                             desc->source_identity_present != 0u}, runtime_mutable));
             const int gate_table = kernel->uploadGroupedExpertGateUpDescriptorTables(gates.data(), ups.data(), E, H, F, origin);
             const int down_table = kernel->uploadGroupedExpertDownDescriptorTable(downs.data(), E, H, F, origin);
@@ -545,12 +545,12 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
                     std::uint8_t cb = 255;
                     const auto mask = moeRouteOwnedGateUpLaunchCodebookMask(envelope.execution_codebook_mask);
                     for (std::uint8_t candidate = 0; candidate < 32; ++candidate)
-                        if ((mask & nativeVnniCodebookMaskBit(candidate)) &&
-                            node.name.find("IL23NativeVNNIFormatPrefill" + std::to_string(candidate) + "E") != std::string::npos)
+                        if ((mask & nativeQuantisedCodebookMaskBit(candidate)) &&
+                            node.name.find("IL23NativeQuantisedFormatPrefill" + std::to_string(candidate) + "E") != std::string::npos)
                             cb = candidate;
                     ASSERT_NE(cb, 255);
-                    ASSERT_EQ(seen & nativeVnniCodebookMaskBit(cb), 0u);
-                    seen |= nativeVnniCodebookMaskBit(cb);
+                    ASSERT_EQ(seen & nativeQuantisedCodebookMaskBit(cb), 0u);
+                    seen |= nativeQuantisedCodebookMaskBit(cb);
                     const int columns = cb == 13 && rows * TopK > 16 ? 128 : 64;
                     const int k_lanes = cb == 8 || (cb == 13 && rows * TopK <= 16) ? 4 : cb == 13 ? 2 : 1;
                     const auto expected_lds = moeRouteOwnedGateUpCodebookSharedBytes(cb) +
@@ -788,7 +788,7 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
                     for (std::size_t leaf_index = 0; leaf_index < captured.leaf_count; ++leaf_index)
                     {
                         const auto &leaf = captured.leaves[leaf_index];
-                        const auto bit = nativeVnniCodebookMaskBit(leaf.execution_codebook);
+                        const auto bit = nativeQuantisedCodebookMaskBit(leaf.execution_codebook);
                         ASSERT_EQ(seen & bit, 0u);
                         seen |= bit;
                         EXPECT_EQ(leaf.resources.function, admission.leafResources(leaf.execution_codebook).function);
@@ -821,10 +821,10 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
                     EXPECT_EQ(seen, admission.launchCodebookMask());
                     if (iq4_mixed)
                     {
-                        EXPECT_TRUE(envelope.execution_codebook_mask & nativeVnniCodebookMaskBit(4));
-                        EXPECT_TRUE(envelope.execution_codebook_mask & nativeVnniCodebookMaskBit(kNativeVnniIQ4XSSourceScaleCodebook));
-                        EXPECT_EQ(seen & nativeVnniCodebookMaskBit(4), 0u);
-                        EXPECT_NE(seen & nativeVnniCodebookMaskBit(kNativeVnniIQ4XSSourceScaleCodebook), 0u);
+                        EXPECT_TRUE(envelope.execution_codebook_mask & nativeQuantisedCodebookMaskBit(4));
+                        EXPECT_TRUE(envelope.execution_codebook_mask & nativeQuantisedCodebookMaskBit(kNativeQuantisedIQ4XSSourceScaleCodebook));
+                        EXPECT_EQ(seen & nativeQuantisedCodebookMaskBit(4), 0u);
+                        EXPECT_NE(seen & nativeQuantisedCodebookMaskBit(kNativeQuantisedIQ4XSSourceScaleCodebook), 0u);
                     }
                     if (captured.leaf_count != 1)
                     {

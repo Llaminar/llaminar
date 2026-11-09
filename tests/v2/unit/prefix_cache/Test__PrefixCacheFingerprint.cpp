@@ -353,10 +353,10 @@ namespace
         return material;
     }
 
-    DeviceNativeVNNIMatrixDesc fakeMatrixDesc(int seed)
+    DeviceNativeQuantisedMatrixDesc fakeMatrixDesc(int seed)
     {
         const auto base = static_cast<uintptr_t>(0x10000 + seed * 0x100);
-        DeviceNativeVNNIMatrixDesc desc;
+        DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = reinterpret_cast<const uint8_t *>(base);
         desc.scales = reinterpret_cast<const void *>(base + 0x40);
         desc.n = 16;

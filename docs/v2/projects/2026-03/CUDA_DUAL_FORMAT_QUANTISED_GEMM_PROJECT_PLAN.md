@@ -12,7 +12,7 @@ This plan is structural. It defines the packing split, cache shape, dispatch mod
 At the project level this mirrors the ROCm split that has historically been described as:
 
 - INT8-VNNI
-- native-VNNI
+- native-quantised
 
 For CUDA, the code should use CUDA-native names because the backend is not literally using VNNI instructions:
 
@@ -202,7 +202,7 @@ Execution sketch:
 - consume those fragments with DP4A
 - apply per-block scale and min corrections inline into FP32 accumulation
 
-This is the closest CUDA analogue to ROCm native-VNNI GEMV.
+This is the closest CUDA analogue to ROCm native-quantised GEMV.
 
 ### D. NativePayload GEMM
 

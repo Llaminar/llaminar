@@ -19,7 +19,7 @@ that the corresponding row is already certified.
 | Device-owned captured epoch admission and two-bank grace period | `DeviceMoEOverlayEpochABI.h`, `MoEOverlayDeviceEpochProtocol.*`, backend epoch kernels, runtime-table composition, and graph acquire/release stages define one model-role selector, acquisition guard, per-bank readers, candidate readiness, publication, abort, and reuse | Installed on CUDA and ROCm. Device-free adversarial epochs, real-device readers/publication, and the 122B mixed-vendor production cell prove request-pinned bank consumption; the broader depth/layout matrix remains |
 | Arbitrary-tier composite prepare/commit/abort polling | `MoEOverlayTierMigrationTransport.*`; `V2_Unit_MoEOverlayTierMigrationTransport` | Implemented and device-free proven |
 | Non-blocking histogram generations | `DecodeExpertHistogram::freezeAndRotateWindow()` and its concurrent-writer regressions | Implemented and device-free proven |
-| GPU/CPU stream manifest and layout conversion | `ExpertTierWeightStream.*`; its unit sweep covers all 21 catalogued NativeVNNI source formats | Implemented and device-free byte-layout proven |
+| GPU/CPU stream manifest and layout conversion | `ExpertTierWeightStream.*`; its unit sweep covers all 21 catalogued NativeQuantised source formats | Implemented and device-free byte-layout proven |
 | CUDA and ROCm GPU↔CPU conversion kernels | `CUDAExpertTierWeightKernels.cu`, `ROCmExpertTierWeightKernels.hip`, and the corresponding `V2_Integration_*_ExpertTierWeightKernels` suites | Implemented; real-device, all-format, byte-exact proof |
 | Persistent asynchronous CPU↔CPU, GPU↔CPU, and GPU↔GPU lanes | `MoEOverlayPhysicalResidencyFabric.*`, `ExpertTierWeightTransferLane.*`, `ExpertTierGpuBlobTransferLane.*`, and `ExpertTierMigrationOperations.*` | Implemented; real-device accelerator overlap and device-free parallel NUMA-copy proof with deterministic payloads |
 | CUDA-hot/CPU-cold and CUDA-hot/ROCm-warm/CPU-cold cycles | `V2_Integration_MoEOverlayCudaHotCpuColdMigration` and `V2_Integration_MoEOverlayThreeTierMigration` | Real-device protocol proof; no model is loaded |
@@ -28,7 +28,7 @@ that the corresponding row is already certified.
 | Live service and movement-economy certification | `MoEOverlayEconomyCalibrationController`, `MoEOverlayMigrationMeasurementLedger`, `MoEOverlayEconomyProfileComposer`, `MoEOverlayEconomyCertificationController`, the local GPU service-evidence publisher, and the private MPI evidence lane measure real non-publishable waves plus exact live prepared-expert service, merge owner-authenticated evidence, and seal the authority before proposals | Installed for local and distributed dynamic overlays; device-free lifecycle and real two-rank physical-fabric calibration are proven. The graph-native CUDA/CPU real-weight cell now certifies both CPU and CUDA service coordinates and has published repeated host/device epochs; completion of its two-axis movement proof and the aggregate matrix remains the current gate |
 | Live histogram-to-tier proposal, physical transfer, inactive-bank publication, and retirement | `MoEOverlayResidencyMaintenanceService` drives coordinator-frozen histogram generations through the local or distributed migration transport and `MoEOverlayPhysicalResidencyFabric` | Installed for local and distributed dynamic overlays; real-weight three-tier production parity proves repeated publication and retirement, while the wider topology/performance matrix remains |
 | Cross-rank prepare/commit/abort/retire consensus and remote projection data plane | `MoEOverlayDistributedResidencyProtocol.*`, `MoEOverlayMPIResidencyConsensus.*`, `MoEOverlayMPIRemoteProjectionTransport.*`, `MoEOverlayGpuRemoteProjectionEndpoint.*`, `MoEOverlayPhysicalResidencyFabric.*`, and the two-rank heterogeneous residency integrations | Implemented and composed in the production runner; CPU, GPU/CPU conversion, same-packed GPU, and cross-vendor GPU blob paths are proven below model level |
-| Exact model- and topology-aware capacity admission | `MoEOverlayCapacityResolver.*`, `MoEOverlayCapacityAdmission.*`, `MoEOverlayLocalCapacityPlanner.*`, and `OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel()` build the GGUF manifest, charge every named fixed/live/shadow/staging allocation per rank/device, search resident captured-prefill shapes, and install layer quotas before placement | Installed in production and device-free proven across all 21 NativeVNNI formats; real-weight CUDA/ROCm/CPU admission is proven, while the remaining target topology matrix must still be certified |
+| Exact model- and topology-aware capacity admission | `MoEOverlayCapacityResolver.*`, `MoEOverlayCapacityAdmission.*`, `MoEOverlayLocalCapacityPlanner.*`, and `OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel()` build the GGUF manifest, charge every named fixed/live/shadow/staging allocation per rank/device, search resident captured-prefill shapes, and install layer quotas before placement | Installed in production and device-free proven across all 21 NativeQuantised formats; real-weight CUDA/ROCm/CPU admission is proven, while the remaining target topology matrix must still be certified |
 | Universal multi-device MoE placement authority | Every multi-device MoE topology, including one domain with one tier, is normalized to an ExpertOverlay plan and uses one RCU authority for durable placement, same-tier skew correction, replicas, and request-scoped LLEP leases | The tiered-overlay host authority now composes cross-tier optimization and capacity-preserving same-tier participant swaps in one candidate epoch, including makespan-based economy and explicit `same_priority_moves` evidence. Legacy non-overlay LocalTP/NodeLocalTP cells still own an independent controller and must be normalized to this authority. |
 | Multi-tier current-batch LLEP | One authority-pinned request transaction minimizes ordinary-prefill makespan over already-resident endpoints and separately budgeted transient arrivals without mutating durable placement | **Target architecture; not installed.** Current CPU/GPU LLEP planning assumes one routed domain owns every expert in the layer. It proves one-tier transient movement, but cannot yet plan a topology-wide batch across multiple tier domains. |
 | All-GPU authority execution locus | ExpertOverlay remains the sole logical authority, while one topology-selected leader GPU and device-resident follower controllers own policy, epoch selection, and generation-loop decisions without a host mirror, regardless of tier count or GPU vendor mix | Installed for homogeneous CUDA/ROCm and the mixed-vendor CUDA2/ROCm4 two-tier topology. The 122B Dynamic proof records `policy_owner=device`, device-authored promotion/demotion/same-priority edges, and request-selected device banks. Remaining topology/depth cells are campaign work, not an alternate host authority |
@@ -1864,7 +1864,7 @@ inferring success from a tier name or a nonzero copy counter.
 One live participant owns each resident expert. Its prepared gate/up/down
 engines are the only transfer source for a promotion or demotion. GPU weights
 use the common separated accelerator packing consumed by CUDA and ROCm. CPU
-weights use the CPU NativeVNNI interleaved packing. Migration reorders an
+weights use the CPU NativeQuantised interleaved packing. Migration reorders an
 already-quantized representation and copies its metadata; it never dequantizes,
 requantizes, or asks the model loader to recreate an evicted expert.
 
@@ -2096,7 +2096,7 @@ byte. Completion is published from the exact destination stream/event.
 ### GPU to CPU
 
 The source GPU transforms its separated accelerator arrays into final CPU
-NativeVNNI interleaved bytes while producing bounded stream chunks. Payload
+NativeQuantised interleaved bytes while producing bounded stream chunks. Payload
 bytes are transposed into the 64-row CPU grouping and scale/min/compensation
 metadata is written at its final inline offsets. The destination CPU receives
 those chunks directly into its final NUMA-owned buffer; it performs no repack.
@@ -2108,7 +2108,7 @@ GPU protocol too; an unsupported codebook is a fatal planning error.
 
 ### CPU to GPU
 
-The source CPU streams its final NativeVNNI interleaved bytes. The destination
+The source CPU streams its final NativeQuantised interleaved bytes. The destination
 GPU receives bounded chunks into persistent staging and launches a conversion
 kernel on its exact maintenance stream as chunks become ready. That kernel
 deinterleaves payload bytes and extracts scale/min/extended-min metadata into
@@ -2634,7 +2634,7 @@ flowchart LR
 The fix does not add a readiness bit, recapture path, host decoder mirror, or
 per-epoch kernel decision.  Graph lowering selects one typed
 `MoEDecodeDescriptorSource` authority.  Descriptor-table setup then derives one
-immutable `NativeVnniExecutionFormatEnvelope` from authenticated source
+immutable `NativeQuantisedExecutionFormatEnvelope` from authenticated source
 identity.  An immutable table contains only its current execution formats; a
 runtime-placement table contains the union of every representation reachable
 without changing arithmetic identity: canonical compact GPU bytes and the
@@ -2691,7 +2691,7 @@ The stage no longer carries a `runtime_decode_uses_mutable_descriptors`
 boolean and repeatedly reconstructs policy.  Its typed descriptor source is
 chosen once by model lowering and passed unchanged through table upload, fused
 decode preparation, grouped prefill, and replay.  CUDA and ROCm use the same
-catalog helper, and a device-free totality test iterates all 21 NativeVNNI
+catalog helper, and a device-free totality test iterates all 21 NativeQuantised
 source formats from both their compact and migration-stable representations.
 The exact real-weight Qwen3.5 Dynamic CPU/CUDA production campaign passes after
 this consolidation, including its checkpoint CSV comparisons.
@@ -4799,7 +4799,7 @@ while the follower remains live before either publisher is released.
 
 ## Performance certification baseline (2026-08-13)
 
-The registered Release targets exercise all 21 NativeVNNI source formats, both
+The registered Release targets exercise all 21 NativeQuantised source formats, both
 Qwen MoE projection geometries (`N=512,K=2048` gate/up and
 `N=2048,K=512` down), both conversion directions, and kernel-only plus
 kernel-and-pinned-DMA modes. Every fixture first performs a byte-exact full

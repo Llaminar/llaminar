@@ -47,12 +47,12 @@ namespace llaminar2
 
     ModelConfig PlanningModelMetadata::executionModelConfig() const
     {
-        NativeVnniSourceIdentity terminal_head_source;
+        NativeQuantisedSourceIdentity terminal_head_source;
         // Tensor-directory provenance bounds measured defaults without loading
         // weights or inferring a quantizer from a model filename.
         for (const auto &tensor : profile_.tensors)
             if (tensor.name == "output.weight")
-                if (const auto *format = native_vnni_formats::forQuantType(tensor.quant_type))
+                if (const auto *format = native_quantised_formats::forQuantType(tensor.quant_type))
                     terminal_head_source = {.codebook_id = format->codebook_id,
                         .is_superblock = format->is_superblock, .present = true};
         return {

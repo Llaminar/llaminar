@@ -103,7 +103,7 @@ TEST(Qwen4ExpHCUpWorkspace, AllNativeSourceFormatsUseCanonicalCorrectionBanks)
 {
     for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
     for(const int rows:{1,15,512})
-    for(const auto &source:native_vnni_formats::kAllSourceFormats)
+    for(const auto &source:native_quantised_formats::kAllSourceFormats)
     {
         const auto actual=Qwen4ExpHCUpWorkspace::requirements(device,Precision::TwoTermQ8,true,
             WeightRole::HyperConnectionProjection,"blk.0.hc_attn_up.weight",source.quant_type,rows,65,256);

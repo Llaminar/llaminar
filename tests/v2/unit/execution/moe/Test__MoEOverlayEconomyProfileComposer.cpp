@@ -10,7 +10,7 @@
 
 #include "execution/moe/MoEOverlayEconomyProfileComposer.h"
 #include "execution/moe/MoEOverlayEconomyCalibrationPlanner.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <gtest/gtest.h>
 
@@ -117,10 +117,10 @@ namespace llaminar2::test
                 .projection = projection,
                 .N = N,
                 .K = K,
-                .format = ExpertWeightFormat::nativeVnni({
-                    .codebook_id = native_vnni_formats::Q4_0.codebook_id,
+                .format = ExpertWeightFormat::nativeQuantised({
+                    .codebook_id = native_quantised_formats::Q4_0.codebook_id,
                     .is_superblock =
-                        native_vnni_formats::Q4_0.is_superblock,
+                        native_quantised_formats::Q4_0.is_superblock,
                     .present = true,
                 }),
             };

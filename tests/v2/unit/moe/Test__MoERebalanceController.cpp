@@ -2573,7 +2573,7 @@ TEST(DeviceMoETransferFormats, IQ4XSSourceTupleRetainsSecondaryCapacityAndIdenti
     std::array<uint8_t, 32> payload{}, destination_payload{};
     std::array<uint16_t, 2> primary{0x3c01u, 0x8001u}, coefficient{35u, 63u};
     std::array<uint16_t, 2> destination_primary{}, destination_coefficient{};
-    DeviceNativeVNNIMatrixDesc source{};
+    DeviceNativeQuantisedMatrixDesc source{};
     source.payload = payload.data(); source.scales = primary.data(); source.mins = coefficient.data();
     source.n = 2; source.k = 32; source.blocks_per_row = 1;
     source.codebook_id = 24; source.source_codebook_id = 4;
@@ -2585,7 +2585,7 @@ TEST(DeviceMoETransferFormats, IQ4XSSourceTupleRetainsSecondaryCapacityAndIdenti
     ASSERT_TRUE(deviceMoEProjectionAllocationCapacity(source, width, auxiliary, emins));
     EXPECT_EQ(width, 16); EXPECT_EQ(auxiliary, 1); EXPECT_EQ(emins, 0);
 
-    DeviceNativeVNNIMatrixDesc destination = source;
+    DeviceNativeQuantisedMatrixDesc destination = source;
     destination.payload = destination_payload.data(); destination.scales = destination_primary.data();
     destination.mins = destination_coefficient.data(); destination.codebook_id = 4;
     destination.source_is_superblock = 0;
@@ -2623,7 +2623,7 @@ TEST(DeviceMoETransferFormats, IQ3SSourceTupleRetainsSecondaryCapacityAndIdentit
     std::array<uint8_t, 26> payload{}, destination_payload{};
     std::array<uint16_t, 2> primary{0x3c01u, 0x8001u}, coefficient{0u, 15u};
     std::array<uint16_t, 2> destination_primary{}, destination_coefficient{};
-    DeviceNativeVNNIMatrixDesc source{};
+    DeviceNativeQuantisedMatrixDesc source{};
     source.payload = payload.data(); source.scales = primary.data(); source.mins = coefficient.data();
     source.n = 2; source.k = 32; source.blocks_per_row = 1;
     source.codebook_id = 11; source.source_codebook_id = 11;
@@ -2640,7 +2640,7 @@ TEST(DeviceMoETransferFormats, IQ3SSourceTupleRetainsSecondaryCapacityAndIdentit
     EXPECT_EQ(deviceMoEMatrixMinsBytes(source, entry), 4u);
     EXPECT_EQ(deviceMoEMatrixEminsBytes(source, entry), 0u);
 
-    DeviceNativeVNNIMatrixDesc destination = source;
+    DeviceNativeQuantisedMatrixDesc destination = source;
     destination.payload = destination_payload.data(); destination.scales = destination_primary.data();
     destination.mins = destination_coefficient.data(); destination.codebook_id = 12;
     destination.source_codebook_id = 12;

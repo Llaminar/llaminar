@@ -9,7 +9,7 @@
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "backends/DeviceId.h"
 #include "kernels/common/NativeEmbeddingLayout.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "../../utils/EmbeddingVerifierFormats.h"
@@ -24,7 +24,7 @@
  * @file Test__WeightMemoryEstimator.cpp
  * @brief Unit coverage for native, GPU, and CPU weight memory sizing rules.
  *
- * The tests lock planner constants for GGUF block layouts and GPU native-VNNI
+ * The tests lock planner constants for GGUF block layouts and GPU native-quantised
  * packed payload layouts. They intentionally use synthetic profiles so memory
  * planning can be validated without loading multi-gigabyte model files.
  */
@@ -285,15 +285,15 @@ TEST(Test__WeightMemoryEstimator, ExactInputAndOutputAxesAllFormatsTP1Through8)
                     EXPECT_EQ(bytes.native_bytes, down.native_bytes / static_cast<size_t>(degree));
                     if (device.is_gpu())
                     {
-                        if (const auto *native = native_vnni_formats::forQuantType(format.quant_type))
+                        if (const auto *native = native_quantised_formats::forQuantType(format.quant_type))
                         {
-                            const auto pool = nativeVnniPackedRegionSizes(65, local_k, *native);
+                            const auto pool = nativeQuantisedPackedRegionSizes(65, local_k, *native);
                             const size_t expected = align(pool.payload_bytes) + align(pool.scales_bytes) +
                                 align(pool.mins_bytes) + align(pool.emins_bytes);
                             EXPECT_EQ(bytes.device_bytes, expected) << device.to_string();
                             if (degree == 2)
                             {
-                                const auto truncated = nativeVnniPackedRegionSizes(
+                                const auto truncated = nativeQuantisedPackedRegionSizes(
                                     d.elements() / down.K, down.K, *native);
                                 EXPECT_GT(expected, align(truncated.payload_bytes) + align(truncated.scales_bytes) +
                                     align(truncated.mins_bytes) + align(truncated.emins_bytes));
@@ -520,9 +520,9 @@ TEST(MoEExpertProjectionOwnership, AllFormatsRetainExactIndependentProjectionGeo
                         size_t expected_bytes = 0;
                         if (instances > 0)
                         {
-                            if (const auto *native = native_vnni_formats::forQuantType(format.quant_type))
+                            if (const auto *native = native_quantised_formats::forQuantType(format.quant_type))
                             {
-                                const auto packed = nativeVnniPackedRegionSizes(rows * instances, k, *native);
+                                const auto packed = nativeQuantisedPackedRegionSizes(rows * instances, k, *native);
                                 expected_bytes = align(packed.payload_bytes) + align(packed.scales_bytes) +
                                     align(packed.mins_bytes) + align(packed.emins_bytes);
                             }
@@ -690,7 +690,7 @@ TEST(Test__WeightMemoryEstimator, CUDAPackedBytesPerWeight_SmallK)
     EXPECT_LT(bpw, 1.3f);
 }
 
-TEST(Test__WeightMemoryEstimator, GPUPackedBytesPerWeight_UsesNativeVNNIFormat)
+TEST(Test__WeightMemoryEstimator, GPUPackedBytesPerWeight_UsesNativeQuantisedFormat)
 {
     EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("Q4_0", 4096), 18.0f / 32.0f, 0.001f);
     EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("IQ4_NL", 4096), 18.0f / 32.0f, 0.001f);
@@ -755,7 +755,7 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_CUDAPackedBytesGTNative)
     auto profile = createSimpleProfile();
     auto est = WeightMemoryEstimator::estimate(profile, DeviceId::cuda(0));
 
-    // GPU native-VNNI packed Q8_0 is payload + FP16 scale, matching native Q8_0 size.
+    // GPU native-quantised packed Q8_0 is payload + FP16 scale, matching native Q8_0 size.
     EXPECT_GE(est.device_bytes, est.native_bytes);
 }
 

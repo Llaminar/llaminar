@@ -18,12 +18,12 @@
  * preserving its code generation independently of nonlinear publication code.
  */
 #pragma once
-#include "CPUNativeVNNIGemv.h"
+#include "CPUNativeQuantisedGemv.h"
 #include "kernels/common/Q8ResidualCorrection.h"
 #include <span>
 #include <type_traits>
 #include "kernels/cpu/qwen4exp/CPUQwen4ExpSIMD.h"
-namespace llaminar2::cpu::native_vnni {
+namespace llaminar2::cpu::native_quantised {
 /** @brief Form one quantized residual against the first block's stored scale.
  * @param input Thirty-two original FP32 values.
  * @param primary Already published unchanged native primary Q8 block.
@@ -32,7 +32,7 @@ namespace llaminar2::cpu::native_vnni {
  */
 inline void quantizeResidualBlock(const float*input,const Q8_1Block&primary,Q8_1Block&residual,
  CPUProjectionNumericalPolicy policy) {
- alignas(64)float values[32];const auto scale=_mm256_set1_ps(nativeVNNIFP16ScaleToFP32(primary.d));
+ alignas(64)float values[32];const auto scale=_mm256_set1_ps(nativeQuantisedFP16ScaleToFP32(primary.d));
  for(int i=0;i<32;i+=8) {
   const auto bytes=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(primary.qs+i));
   const auto decoded=persistRoundedAVX2(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes)),scale));
@@ -47,10 +47,10 @@ inline void quantizeResidualBlock(const float*input,const Q8_1Block&primary,Q8_1
  * @param k Exact reduction width.
  * @throws std::invalid_argument For an unsupported source tuple or incomplete shape.
  */
-inline void validateCPUQ8ResidualSource(const CPUNativeVNNIPackedWeights&packed,int m,int n,int k) {
+inline void validateCPUQ8ResidualSource(const CPUNativeQuantisedPackedWeights&packed,int m,int n,int k) {
  validateQ8ResidualCorrectionGeometry(m,n,k);
  const auto &format=requireQ8ResidualSourceFormat(
-  NativeVnniSourceIdentity{packed.codebook_id,packed.is_superblock,true},m,n,k);
+  NativeQuantisedSourceIdentity{packed.codebook_id,packed.is_superblock,true},m,n,k);
  if(packed.N!=n||packed.K!=k||packed.blocks_per_row!=k/32||!packed.hasInterleavedData()||
     packed.is_asymmetric!=format.is_asymmetric||packed.payload_bytes!=format.payload_bytes||
     packed.encoding!=preparedEncodingForSource(format)||
@@ -78,7 +78,7 @@ inline void validateCPUQ8ResidualSource(const CPUNativeVNNIPackedWeights&packed,
  * four64-column fragments; the two final terms fold once without an MxN mirror.
  * Q8_0 retains its existing fused-store fast path outside this helper.
  */
-inline void cpuNativeResidualChunk(const CPUNativeVNNIPackedWeights &packed,
+inline void cpuNativeResidualChunk(const CPUNativeQuantisedPackedWeights &packed,
  const Q8_1Block *primary0,const Q8_1Block *residual0,
  const Q8_1Block *primary1,const Q8_1Block *residual1,
  float *destination0,float *destination1,int chunk,int valid,bool avx512)
@@ -142,7 +142,7 @@ __attribute__((noipa))
 #else
 __attribute__((noinline))
 #endif
-inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeVNNIPackedWeights&packed,
+inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeights&packed,
  float*output,int live,std::span<const Q8_1Block>primary,std::span<const Q8_1Block>residual,bool avx512) {
  const int n=packed.N,bpr=packed.blocks_per_row;
  const std::int64_t tiles=(static_cast<std::int64_t>(live)+1)/2,chunks=(static_cast<std::int64_t>(n)+63)/64;
@@ -152,7 +152,7 @@ inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeVNNIPackedWeights&pa
    const int valid=std::min<std::int64_t>(64,n-chunk*64);
    // Preserve the original Q8_0 kernel and its register-store fold exactly.
    // All other canonical encodings retain their own source arithmetic above.
-   if(packed.codebook_id!=native_vnni_formats::Q8_0.codebook_id||packed.is_superblock||
+   if(packed.codebook_id!=native_quantised_formats::Q8_0.codebook_id||packed.is_superblock||
       packed.is_asymmetric||!packed.usesExpandedInt8())
    {
     const bool second=row+1<live;
@@ -201,7 +201,7 @@ struct HCDownQ8Publication { float* activated; };
  * @tparam Publication Compile-time semantic input operation, never a runtime skip.
  */
 template<class Publication>
-inline void cpuQ8ResidualCorrectedProjectionImpl(const CPUNativeVNNIPackedWeights&packed,const float*input,
+inline void cpuQ8ResidualCorrectedProjectionImpl(const CPUNativeQuantisedPackedWeights&packed,const float*input,
  float*output,DeviceRowRange rows,std::span<Q8_1Block>primary,std::span<Q8_1Block>residual,Publication publication) {
  const int physical=rows.physicalRows(),n=packed.N,k=packed.K,bpr=packed.blocks_per_row;
  validateCPUQ8ResidualSource(packed,physical,n,k);
@@ -292,7 +292,7 @@ inline void cpuQ8ResidualCorrectedProjectionImpl(const CPUNativeVNNIPackedWeight
  * @param primary Admitted primary Q8 block bank.
  * @param residual Admitted residual Q8 block bank.
  */
-inline void cpuQ8ResidualCorrectedProjection(const CPUNativeVNNIPackedWeights& packed,const float* input,
+inline void cpuQ8ResidualCorrectedProjection(const CPUNativeQuantisedPackedWeights& packed,const float* input,
  float* output,DeviceRowRange rows,std::span<Q8_1Block> primary,std::span<Q8_1Block> residual) {
  cpuQ8ResidualCorrectedProjectionImpl(packed,input,output,rows,primary,residual,ActivatedQ8Publication{});
 }
@@ -305,7 +305,7 @@ inline void cpuQ8ResidualCorrectedProjection(const CPUNativeVNNIPackedWeights& p
  * @param primary Admitted primary Q8 block bank.
  * @param residual Admitted residual Q8 block bank.
  */
-inline void cpuHCResidualDownQ8Projection(const CPUNativeVNNIPackedWeights& packed,const float* input,float* activated,
+inline void cpuHCResidualDownQ8Projection(const CPUNativeQuantisedPackedWeights& packed,const float* input,float* activated,
  float* output,DeviceRowRange rows,std::span<Q8_1Block> primary,std::span<Q8_1Block> residual) {
  cpuQ8ResidualCorrectedProjectionImpl(packed,input,output,rows,primary,residual,HCDownQ8Publication{activated});
 }

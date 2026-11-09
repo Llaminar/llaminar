@@ -2,7 +2,7 @@
  * @file Test__MoEOverlayPhysicalResidencyFabric.cpp
  * @brief Device-free production-fabric tests for ExpertOverlay residency moves.
  *
- * These tests use the real CPU NativeVNNI prepared engines, physical inactive
+ * These tests use the real CPU NativeQuantised prepared engines, physical inactive
  * slot pools, participant RCU banks, composite transport, and publication
  * authority.  Only the GPU DMA lanes are absent; no scripted transfer provider
  * or identity-only GEMM stands in for the production CPU path.
@@ -146,13 +146,13 @@ namespace
 
     /**
      * @brief Gate/up/down shapes for one exact prepared-weight format.
-     * @param format NativeVNNI codebook or contiguous floating precision.
+     * @param format NativeQuantised codebook or contiguous floating precision.
      * @return Complete projection geometry matching a 64x32 routed MLP.
      */
     std::vector<CpuExpertSlotPool::ProjectionSpec> sourceProjectionSpecs(
-        ExpertWeightFormat format = ExpertWeightFormat::nativeVnni({
-            .codebook_id = native_vnni_formats::Q4_0.codebook_id,
-            .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+        ExpertWeightFormat format = ExpertWeightFormat::nativeQuantised({
+            .codebook_id = native_quantised_formats::Q4_0.codebook_id,
+            .is_superblock = native_quantised_formats::Q4_0.is_superblock,
             .present = true,
         }))
     {
@@ -259,9 +259,9 @@ namespace
         int layer_idx,
         int expert_id,
         std::uint8_t seed,
-        ExpertWeightFormat format = ExpertWeightFormat::nativeVnni({
-            .codebook_id = native_vnni_formats::Q4_0.codebook_id,
-            .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+        ExpertWeightFormat format = ExpertWeightFormat::nativeQuantised({
+            .codebook_id = native_quantised_formats::Q4_0.codebook_id,
+            .is_superblock = native_quantised_formats::Q4_0.is_superblock,
             .present = true,
         }))
     {
@@ -312,9 +312,9 @@ namespace
         int participant_id,
         int expert_id,
         std::uint8_t seed,
-        ExpertWeightFormat format = ExpertWeightFormat::nativeVnni({
-            .codebook_id = native_vnni_formats::Q4_0.codebook_id,
-            .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+        ExpertWeightFormat format = ExpertWeightFormat::nativeQuantised({
+            .codebook_id = native_quantised_formats::Q4_0.codebook_id,
+            .is_superblock = native_quantised_formats::Q4_0.is_superblock,
             .present = true,
         }))
     {
@@ -462,7 +462,7 @@ namespace
     /**
      * @brief Snapshot the exact live CPU bytes for a prepared payload.
      *
-     * Quantized experts expose every live NativeVNNI column's data, comp,
+     * Quantized experts expose every live NativeQuantised column's data, comp,
      * scale, min and grid fields. Inactive SIMD output columns are not weights
      * or transfer extents. Floating experts expose all exact row-major bytes.
      * The independent encoded-column inspector never calls the production
@@ -482,7 +482,7 @@ namespace
              ++projection)
         {
             if (const auto *packed =
-                    engines[projection]->exportCPUNativeVNNIPackedWeights())
+                    engines[projection]->exportCPUNativeQuantisedPackedWeights())
             {
                 // Native roots are N-padded for SIMD; only [0,N) columns
                 // execute or move. Inspect every live plane independently of
@@ -819,29 +819,29 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     struct FormatCase
     {
         GGUFTensorType gguf_type;
-        const NativeVnniFormatInfo *native_format;
+        const NativeQuantisedFormatInfo *native_format;
     };
     const std::array formats{
-        FormatCase{GGUFTensorType::Q4_0, &native_vnni_formats::Q4_0},
-        FormatCase{GGUFTensorType::Q4_1, &native_vnni_formats::Q4_1},
-        FormatCase{GGUFTensorType::Q5_0, &native_vnni_formats::Q5_0},
-        FormatCase{GGUFTensorType::Q5_1, &native_vnni_formats::Q5_1},
-        FormatCase{GGUFTensorType::Q8_0, &native_vnni_formats::Q8_0},
-        FormatCase{GGUFTensorType::Q2_K, &native_vnni_formats::Q2_K},
-        FormatCase{GGUFTensorType::Q3_K, &native_vnni_formats::Q3_K},
-        FormatCase{GGUFTensorType::Q4_K, &native_vnni_formats::Q4_K},
-        FormatCase{GGUFTensorType::Q5_K, &native_vnni_formats::Q5_K},
-        FormatCase{GGUFTensorType::Q6_K, &native_vnni_formats::Q6_K},
-        FormatCase{GGUFTensorType::Q8_K, &native_vnni_formats::Q8_K},
-        FormatCase{GGUFTensorType::IQ2_XXS, &native_vnni_formats::IQ2_XXS},
-        FormatCase{GGUFTensorType::IQ2_XS, &native_vnni_formats::IQ2_XS},
-        FormatCase{GGUFTensorType::IQ3_XXS, &native_vnni_formats::IQ3_XXS},
-        FormatCase{GGUFTensorType::IQ1_S, &native_vnni_formats::IQ1_S},
-        FormatCase{GGUFTensorType::IQ4_NL, &native_vnni_formats::IQ4_NL},
-        FormatCase{GGUFTensorType::IQ3_S, &native_vnni_formats::IQ3_S},
-        FormatCase{GGUFTensorType::IQ2_S, &native_vnni_formats::IQ2_S},
-        FormatCase{GGUFTensorType::IQ4_XS, &native_vnni_formats::IQ4_XS},
-        FormatCase{GGUFTensorType::IQ1_M, &native_vnni_formats::IQ1_M},
+        FormatCase{GGUFTensorType::Q4_0, &native_quantised_formats::Q4_0},
+        FormatCase{GGUFTensorType::Q4_1, &native_quantised_formats::Q4_1},
+        FormatCase{GGUFTensorType::Q5_0, &native_quantised_formats::Q5_0},
+        FormatCase{GGUFTensorType::Q5_1, &native_quantised_formats::Q5_1},
+        FormatCase{GGUFTensorType::Q8_0, &native_quantised_formats::Q8_0},
+        FormatCase{GGUFTensorType::Q2_K, &native_quantised_formats::Q2_K},
+        FormatCase{GGUFTensorType::Q3_K, &native_quantised_formats::Q3_K},
+        FormatCase{GGUFTensorType::Q4_K, &native_quantised_formats::Q4_K},
+        FormatCase{GGUFTensorType::Q5_K, &native_quantised_formats::Q5_K},
+        FormatCase{GGUFTensorType::Q6_K, &native_quantised_formats::Q6_K},
+        FormatCase{GGUFTensorType::Q8_K, &native_quantised_formats::Q8_K},
+        FormatCase{GGUFTensorType::IQ2_XXS, &native_quantised_formats::IQ2_XXS},
+        FormatCase{GGUFTensorType::IQ2_XS, &native_quantised_formats::IQ2_XS},
+        FormatCase{GGUFTensorType::IQ3_XXS, &native_quantised_formats::IQ3_XXS},
+        FormatCase{GGUFTensorType::IQ1_S, &native_quantised_formats::IQ1_S},
+        FormatCase{GGUFTensorType::IQ4_NL, &native_quantised_formats::IQ4_NL},
+        FormatCase{GGUFTensorType::IQ3_S, &native_quantised_formats::IQ3_S},
+        FormatCase{GGUFTensorType::IQ2_S, &native_quantised_formats::IQ2_S},
+        FormatCase{GGUFTensorType::IQ4_XS, &native_quantised_formats::IQ4_XS},
+        FormatCase{GGUFTensorType::IQ1_M, &native_quantised_formats::IQ1_M},
     };
 
     for (const auto &format : formats)
@@ -877,13 +877,13 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                     ? 32
                     : 64);
             EXPECT_EQ(
-                projection.format.native_vnni.codebook_id,
+                projection.format.native_quantised.codebook_id,
                 format.native_format->codebook_id);
             EXPECT_EQ(
-                projection.format.native_vnni.is_superblock,
+                projection.format.native_quantised.is_superblock,
                 format.native_format->is_superblock);
-            EXPECT_TRUE(projection.format.native_vnni.present);
-            EXPECT_TRUE(projection.format.isNativeVnni());
+            EXPECT_TRUE(projection.format.native_quantised.present);
+            EXPECT_TRUE(projection.format.isNativeQuantised());
         }
     }
 }
@@ -921,7 +921,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
             EXPECT_EQ(
                 projection.format.floatingTensorType(),
                 std::optional<TensorType>(format.tensor_type));
-            EXPECT_FALSE(projection.format.native_vnni.present);
+            EXPECT_FALSE(projection.format.native_quantised.present);
         }
     }
 }
@@ -937,7 +937,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageManifestExcludesForei
     ASSERT_EQ(owned.size(), 2u);
     EXPECT_EQ(owned.front().layer_idx, 32);
     EXPECT_EQ(owned.back().layer_idx, 33);
-    EXPECT_TRUE(owned.front().projections.front().format.isNativeVnni());
+    EXPECT_TRUE(owned.front().projections.front().format.isNativeQuantised());
     EXPECT_TRUE(owned.back().projections.front().format.isFloating());
     EXPECT_THROW((void)buildMoEOverlayLayerWeightManifestFromGGUF(model, 3, 2, 32), std::invalid_argument);
     EXPECT_THROW((void)buildMoEOverlayLayerWeightManifestFromGGUF(model, 2, 2, -1), std::invalid_argument);
@@ -1048,9 +1048,9 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
 {
     constexpr std::size_t kLayerCount = 2u;
     constexpr std::size_t kExpertCount = 3u;
-    const ExpertWeightFormat format = ExpertWeightFormat::nativeVnni({
-        .codebook_id = native_vnni_formats::Q4_0.codebook_id,
-        .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+    const ExpertWeightFormat format = ExpertWeightFormat::nativeQuantised({
+        .codebook_id = native_quantised_formats::Q4_0.codebook_id,
+        .is_superblock = native_quantised_formats::Q4_0.is_superblock,
         .present = true,
     });
     const auto plan = twoCpuTierPlan(
@@ -1213,169 +1213,169 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     const std::array format_cases{
         FormatCase{
             "Q4_0",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q4_0.codebook_id,
-                .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q4_0.codebook_id,
+                .is_superblock = native_quantised_formats::Q4_0.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q4_1",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q4_1.codebook_id,
-                .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q4_1.codebook_id,
+                .is_superblock = native_quantised_formats::Q4_1.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q5_0",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q5_0.codebook_id,
-                .is_superblock = native_vnni_formats::Q5_0.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q5_0.codebook_id,
+                .is_superblock = native_quantised_formats::Q5_0.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q5_1",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q5_1.codebook_id,
-                .is_superblock = native_vnni_formats::Q5_1.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q5_1.codebook_id,
+                .is_superblock = native_quantised_formats::Q5_1.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q8_0",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q8_0.codebook_id,
-                .is_superblock = native_vnni_formats::Q8_0.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q8_0.codebook_id,
+                .is_superblock = native_quantised_formats::Q8_0.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q8_1",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q8_1.codebook_id,
-                .is_superblock = native_vnni_formats::Q8_1.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q8_1.codebook_id,
+                .is_superblock = native_quantised_formats::Q8_1.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q2_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q2_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q2_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q2_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q2_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q3_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q3_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q3_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q3_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q3_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q4_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q4_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q4_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q4_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q4_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q5_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q5_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q5_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q5_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q5_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q6_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q6_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q6_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q6_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q6_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "Q8_K",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::Q8_K.codebook_id,
-                .is_superblock = native_vnni_formats::Q8_K.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::Q8_K.codebook_id,
+                .is_superblock = native_quantised_formats::Q8_K.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ2_XXS",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ2_XXS.codebook_id,
-                .is_superblock = native_vnni_formats::IQ2_XXS.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ2_XXS.codebook_id,
+                .is_superblock = native_quantised_formats::IQ2_XXS.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ2_XS",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ2_XS.codebook_id,
-                .is_superblock = native_vnni_formats::IQ2_XS.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ2_XS.codebook_id,
+                .is_superblock = native_quantised_formats::IQ2_XS.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ3_XXS",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ3_XXS.codebook_id,
-                .is_superblock = native_vnni_formats::IQ3_XXS.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ3_XXS.codebook_id,
+                .is_superblock = native_quantised_formats::IQ3_XXS.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ1_S",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ1_S.codebook_id,
-                .is_superblock = native_vnni_formats::IQ1_S.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ1_S.codebook_id,
+                .is_superblock = native_quantised_formats::IQ1_S.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ4_NL",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ4_NL.codebook_id,
-                .is_superblock = native_vnni_formats::IQ4_NL.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ4_NL.codebook_id,
+                .is_superblock = native_quantised_formats::IQ4_NL.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ3_S",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ3_S.codebook_id,
-                .is_superblock = native_vnni_formats::IQ3_S.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ3_S.codebook_id,
+                .is_superblock = native_quantised_formats::IQ3_S.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ2_S",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ2_S.codebook_id,
-                .is_superblock = native_vnni_formats::IQ2_S.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ2_S.codebook_id,
+                .is_superblock = native_quantised_formats::IQ2_S.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ4_XS",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ4_XS.codebook_id,
-                .is_superblock = native_vnni_formats::IQ4_XS.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ4_XS.codebook_id,
+                .is_superblock = native_quantised_formats::IQ4_XS.is_superblock,
                 .present = true,
             }),
         },
         FormatCase{
             "IQ1_M",
-            ExpertWeightFormat::nativeVnni({
-                .codebook_id = native_vnni_formats::IQ1_M.codebook_id,
-                .is_superblock = native_vnni_formats::IQ1_M.is_superblock,
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::IQ1_M.codebook_id,
+                .is_superblock = native_quantised_formats::IQ1_M.is_superblock,
                 .present = true,
             }),
         },
@@ -1388,7 +1388,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     };
     static_assert(
         format_cases.size() ==
-        native_vnni_formats::kAllSourceFormats.size() + 3u);
+        native_quantised_formats::kAllSourceFormats.size() + 3u);
 
     for (const auto &format_case : format_cases)
     {
@@ -1637,8 +1637,8 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
 TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageTransfersAndSealsEveryPreparedFormat)
 {
     std::vector<ExpertWeightFormat> formats;
-    for (const auto &source : native_vnni_formats::kAllSourceFormats)
-        formats.push_back(ExpertWeightFormat::nativeVnni({
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
+        formats.push_back(ExpertWeightFormat::nativeQuantised({
             .codebook_id = source.metadata->codebook_id,
             .is_superblock = source.metadata->is_superblock, .present = true,
         }));
@@ -1958,32 +1958,32 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PreparedGPUServiceMissingResidentC
 /** @test The independent equality oracle ignores only inactive padding and detects every live field class. */
 TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirtyPaddingAndEveryEncodedField)
 {
-    for(const auto& format:native_vnni_formats::kAllSourceFormats) {
+    for(const auto& format:native_quantised_formats::kAllSourceFormats) {
         SCOPED_TRACE(format.quant_type);
-        const auto source_format=ExpertWeightFormat::nativeVnni({.codebook_id=format.metadata->codebook_id,
+        const auto source_format=ExpertWeightFormat::nativeQuantised({.codebook_id=format.metadata->codebook_id,
             .is_superblock=format.metadata->is_superblock,.present=true});
         auto original=makeSourceExpert(0,0,19,source_format);
         auto changed=makeSourceExpert(1,0,19,source_format);
         const auto expected=livePreparedBytes(original);
         ASSERT_EQ(livePreparedBytes(changed),expected);
         auto engine=changed.gate();
-        const auto* packed=engine->exportCPUNativeVNNIPackedWeights();ASSERT_TRUE(packed);
+        const auto* packed=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_TRUE(packed);
         ASSERT_EQ(packed->N,32);ASSERT_GE(packed->N_padded,64);
         // This source fixture has never been published. Its actual slot owner
         // grants the retired-storage mutation API, not a const-cast/live write.
-        auto bytes=engine->exportRetiredCPUNativeVNNIStorage();ASSERT_FALSE(bytes.empty());
+        auto bytes=engine->exportRetiredCPUNativeQuantisedStorage();ASSERT_FALSE(bytes.empty());
         const size_t inactive_data_byte=size_t(packed->N)*4;
         const auto before=bytes[inactive_data_byte];bytes[inactive_data_byte]^=0x80;
         EXPECT_NE(bytes[inactive_data_byte],before);
         EXPECT_EQ(livePreparedBytes(changed),expected);
         std::vector<size_t> fields;
-        const bool q6=packed->encoding==cpu::native_vnni::CPUNativeVNNIEncoding::Q6KNativeDualScale;
+        const bool q6=packed->encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale;
         for(size_t byte=0;byte<(q6?16:size_t(packed->data_stride)/64);++byte)
             fields.push_back((byte/4)*256+byte%4);
         if(q6)for(size_t group=0;group<8;++group) {
             fields.push_back(1024+group*64);fields.push_back(1024+group*64+8);
         }
-        const bool compact=packed->encoding==cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale;
+        const bool compact=packed->encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale;
         for(size_t plane=0;plane<(compact?2:(size_t(packed->interleaved_block_stride)-packed->data_stride)/128);++plane)
             for(size_t byte=0;byte<2;++byte)fields.push_back(packed->data_stride+plane*128+byte);
         if(compact)for(size_t byte=0;byte<4;++byte)fields.push_back(packed->data_stride+256+byte);
@@ -1995,7 +1995,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirty
         EXPECT_EQ(livePreparedBytes(changed),expected);
         for(size_t role=0;role<3;++role) {
             const auto& engine=role==0?original.gate():role==1?original.up():original.down();
-            const auto* layout=engine->exportCPUNativeVNNIPackedWeights();ASSERT_TRUE(layout);
+            const auto* layout=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_TRUE(layout);
             EXPECT_EQ(expected[role].size(),size_t(layout->N)*(layout->K/32)*(layout->interleaved_block_stride/64));
         }
     }

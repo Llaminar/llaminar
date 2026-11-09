@@ -200,9 +200,9 @@ namespace llaminar2
                         digest.addScalar(projection.N);
                         digest.addScalar(projection.K);
                         digest.addScalar(projection.format.kind);
-                        digest.addScalar(projection.format.native_vnni.present);
-                        digest.addScalar(projection.format.native_vnni.codebook_id);
-                        digest.addScalar(projection.format.native_vnni.is_superblock);
+                        digest.addScalar(projection.format.native_quantised.present);
+                        digest.addScalar(projection.format.native_quantised.codebook_id);
+                        digest.addScalar(projection.format.native_quantised.is_superblock);
                     }
                     for (size_t index = 0; index < cohort->participants().size(); ++index)
                     {

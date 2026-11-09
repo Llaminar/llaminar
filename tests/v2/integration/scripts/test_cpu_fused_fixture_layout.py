@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 
 
-FAMILY = 'kernel.cpu_native_vnni_fused_verifier_rows_projection_launch'
+FAMILY = 'kernel.cpu_native_quantised_fused_verifier_rows_projection_launch'
 
 
 def records(stdout, prefix):
@@ -83,7 +83,7 @@ def main():
             raise AssertionError('Fixture layout change lost original projection accounting')
         exported = json.loads(stats.read_text())
         counters = [row for row in exported['records'] if row['domain'] == 'kernel'
-                    and row['name'] == 'cpu_native_vnni_fused_verifier_rows_projection_launch']
+                    and row['name'] == 'cpu_native_quantised_fused_verifier_rows_projection_launch']
         print(json.dumps(dict(argv=argv, slice=args.slice, isa=args.isa, output_layout=layout,
                               projection_counter=counters)), flush=True)
         if len(counters) != 1 or len(counters[0]['tags']) != 21 or counters[0]['count'] != expected_count or counters[0]['value'] != float(expected_count):

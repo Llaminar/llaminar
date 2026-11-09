@@ -14,7 +14,7 @@
 #include "../../utils/PlanningHostServiceFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include "../../utils/QuantizedVerifierFormats.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cmath>
@@ -166,7 +166,7 @@ TEST(PlanningForwardWeightWork, NativeFormatsAndCanonicalFP32OverridesRemainDist
     test::PlanningGGUFFixture file(false, true);
     PlanningModelSource source(file.path());
     std::vector<std::string> formats{"F32", "F16", "BF16"};
-    for (const auto &entry : native_vnni_formats::kAllSourceFormats) formats.emplace_back(entry.quant_type);
+    for (const auto &entry : native_quantised_formats::kAllSourceFormats) formats.emplace_back(entry.quant_type);
     for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
     {
         const auto candidate = admit(proposal(source, backend, OrchestrationStrategy::SingleDevice), source);

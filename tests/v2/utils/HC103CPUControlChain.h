@@ -17,7 +17,7 @@
 #include <bit>
 #include <chrono>
 #include <optional>
-#include "../performance/kernels/native_vnni_dispatch/NativeVNNIProfilerControl.h"
+#include "../performance/kernels/native_quantised_dispatch/NativeQuantisedProfilerControl.h"
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpHyperconnectionBuilder.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 namespace llaminar2::test::hc103_cpu {
@@ -97,7 +97,7 @@ inline void prove(const QuantizedVerifierFormatCase &format,int rows,int hidden,
  // Reject misuse before fixture preparation, never profile a paired sweep.
  std::string profileRequest,profileOutput;
  if(timing) {
-  using namespace native_vnni_dispatch;
+  using namespace native_quantised_dispatch;
   profileRequest=profilerRequestId();
   profileOutput=profilerEnvironment(kPerfStatsPathEnvironment);
   const auto batch=profilerEnvironment(kProfilerBatchPathEnvironment);
@@ -182,12 +182,12 @@ inline void prove(const QuantizedVerifierFormatCase &format,int rows,int hidden,
  std::vector<Q8_1Block> expectedPrimary(blocks),expectedResidual(blocks),savedPrimary(blocks),savedResidual(blocks);
  std::vector<float> rawDown(std::size_t(rows)*rank),read(std::size_t(rows)*hidden),expectedRead(read.size());
  const auto downRaw=down.raw,upRaw=up.raw;
- const auto *packedDown=down.kernel->exportCPUNativeVNNIPackedWeights();
- const auto *packedUp=up.kernel->exportCPUNativeVNNIPackedWeights();
+ const auto *packedDown=down.kernel->exportCPUNativeQuantisedPackedWeights();
+ const auto *packedUp=up.kernel->exportCPUNativeQuantisedPackedWeights();
  ASSERT_NE(packedDown,nullptr);ASSERT_NE(packedUp,nullptr);
  const auto *downAddress=packedDown->interleavedBase(),*upAddress=packedUp->interleavedBase();
- const std::vector<std::uint8_t> downPrepared(downAddress,downAddress+cpu::native_vnni::interleavedWorkspaceSize(*packedDown));
- const std::vector<std::uint8_t> upPrepared(upAddress,upAddress+cpu::native_vnni::interleavedWorkspaceSize(*packedUp));
+ const std::vector<std::uint8_t> downPrepared(downAddress,downAddress+cpu::native_quantised::interleavedWorkspaceSize(*packedDown));
+ const std::vector<std::uint8_t> upPrepared(upAddress,upAddress+cpu::native_quantised::interleavedWorkspaceSize(*packedUp));
  for(int team:teams) {
   Threads workers(team);CPUDeviceContext context(DeviceId::cpu(),team);
   for(int replay=0;replay<20;++replay) {
@@ -328,7 +328,7 @@ inline void prove(const QuantizedVerifierFormatCase &format,int rows,int hidden,
   };
   check();ASSERT_FALSE(::testing::Test::HasFailure());
   if(timing->observation!=ChainObservation::PairedEvents) {
-   using namespace native_vnni_dispatch;
+   using namespace native_quantised_dispatch;
    const bool candidateSide=timing->observation==ChainObservation::ProfileCandidate;
    LinuxPerfControl profiler(profileRequest,profileOutput);
    const auto threadIds=capturePersistentOpenMPThreadIds();

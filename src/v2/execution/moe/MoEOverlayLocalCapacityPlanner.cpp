@@ -697,7 +697,7 @@ namespace llaminar2
                  * Overlay capacity is resolved only after each rank has created
                  * its production backend contexts.  Local CUDA admission can
                  * therefore ask the kernel's dispatch authority for the exact
-                 * NativeVNNI scratch envelope instead of relying on the older
+                 * NativeQuantised scratch envelope instead of relying on the older
                  * device-free graph-family floor.  Remote ranks perform the same
                  * calculation against their own local devices.
                  */

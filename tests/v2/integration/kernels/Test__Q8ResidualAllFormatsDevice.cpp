@@ -12,7 +12,7 @@
  */
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/PerfStatsCollector.h"
-#include "moe/NativeVNNIExpertTransferParityTest.h"
+#include "moe/NativeQuantisedExpertTransferParityTest.h"
 #include "../../utils/Q8ResidualAllFormatOracle.h"
 #include "backends/ExplicitGPUStream.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -169,7 +169,7 @@ struct Planes {
 };
 /** @brief Terminal snapshot of actual source allocations, never a hot-path
  * source mirror. */
-Planes readPlanes(Storage &s, const DeviceNativeVNNIMatrixDesc &d) {
+Planes readPlanes(Storage &s, const DeviceNativeQuantisedMatrixDesc &d) {
   const auto physical = requireQ8ResidualNativeMatrix(d, 1, d.n, d.k);
   const auto blocks = std::size_t(d.n) * d.blocks_per_row;
   return {
@@ -184,7 +184,7 @@ Planes readPlanes(Storage &s, const DeviceNativeVNNIMatrixDesc &d) {
 }
 /** @brief Scalar coefficient interpretation independent of GPU integer dots and
  * FP32 contribution/reduction helpers. */
-std::vector<double> physicalWeights(const DeviceNativeVNNIMatrixDesc &d,
+std::vector<double> physicalWeights(const DeviceNativeQuantisedMatrixDesc &d,
                                     const Planes &p) {
   const auto physical = requireQ8ResidualNativeMatrix(d, 1, d.n, d.k);
   std::vector<double> w(std::size_t(d.n) * d.k);
@@ -205,7 +205,7 @@ std::vector<double> physicalWeights(const DeviceNativeVNNIMatrixDesc &d,
 }
 /** @brief Missing public-factory IQ view must fail before publishing any
  * operand or output. */
-void rejectMissingIQ(Storage &s, const DeviceNativeVNNIMatrixDesc &d,
+void rejectMissingIQ(Storage &s, const DeviceNativeQuantisedMatrixDesc &d,
                      DeviceRowRange rows, FP32Tensor &input, FP32Tensor &output,
                      DeviceWorkspaceManager &w) {
   if (!q8ResidualNeedsIQTables(d.codebook_id))
@@ -246,12 +246,12 @@ void rejectMissingIQ(Storage &s, const DeviceNativeVNNIMatrixDesc &d,
  */
 test::GpuPreparedGemm preparePromotedAsymmetric(TensorBase *source, DeviceId device,
                                                 IBackend *backend) {
-  namespace transfer = test::native_vnni_transfer_parity_detail;
+  namespace transfer = test::native_quantised_transfer_parity_detail;
   namespace factory = llaminar::v2::kernels;
   constexpr const char *name = "blk.2.ffn_down.weight";
   auto cold = test::makePreparedGemmFixture(source, DeviceId::cpu(), name, ModelContextId{871122});
   auto *coldEngine =
-      dynamic_cast<cpu::native_vnni::CPUNativeVNNIGemmKernel *>(cold.store->gemmKernel(cold.ref));
+      dynamic_cast<cpu::native_quantised::CPUNativeQuantisedGemmKernel *>(cold.store->gemmKernel(cold.ref));
   require(coldEngine && coldEngine->isValid(), "Actual cold CPU prepared expert is absent");
   const auto &packed = coldEngine->packedWeights();
   require(packed.usesExpandedInt8() && packed.is_asymmetric,
@@ -264,8 +264,8 @@ test::GpuPreparedGemm preparePromotedAsymmetric(TensorBase *source, DeviceId dev
   require(std::equal(before.begin(), before.end(), packed.native_interleaved.begin()),
           "Actual promotion mutated its cold CPU execution source");
   const auto &descriptor = allocation->descriptor;
-  require(descriptor.codebook_id == kNativeVnniExpandedInt8MinCodebook &&
-              descriptor.source_codebook_id == native_vnni_formats::Q5_1.codebook_id &&
+  require(descriptor.codebook_id == kNativeQuantisedExpandedInt8MinCodebook &&
+              descriptor.source_codebook_id == native_quantised_formats::Q5_1.codebook_id &&
               descriptor.source_is_superblock == 0 && descriptor.source_identity_present == 1 &&
               descriptor.mins && !descriptor.emins,
           "Production CPU promotion did not publish the original asymmetric physical23 contract");
@@ -421,14 +421,14 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
         auto *kernel = prepared.kernel;
         require(kernel, "Actual prepared native source absent");
         kernel->setGPUStream(s.stream);
-        DeviceNativeVNNIMatrixDesc desc{};
-        require(kernel->exportNativeVNNIMatrixDesc(desc),
+        DeviceNativeQuantisedMatrixDesc desc{};
+        require(kernel->exportNativeQuantisedMatrixDesc(desc),
                 "Prepared descriptor absent");
         ASSERT_EQ(desc.n, n);
         ASSERT_EQ(desc.k, k);
         EXPECT_EQ(desc.source_codebook_id, format.source_codebook_id);
         EXPECT_EQ(bool(desc.source_is_superblock), format.source_is_superblock);
-        EXPECT_EQ(desc.codebook_id, promotedAsymmetric ? kNativeVnniExpandedInt8MinCodebook
+        EXPECT_EQ(desc.codebook_id, promotedAsymmetric ? kNativeQuantisedExpandedInt8MinCodebook
                                                        : format.device_execution_codebook_id);
         EXPECT_EQ(desc.source_identity_present, 1);
         // Per-engine publication starts cold even when another earlier engine
@@ -879,8 +879,8 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
           EXPECT_EQ(input.gpu_data_ptr(), inputPointer);
           EXPECT_EQ(output.gpu_data_ptr(), outputPointer);
           EXPECT_EQ(oracle::originalBytes(*weight), raw);
-          DeviceNativeVNNIMatrixDesc after{};
-          require(kernel->exportNativeVNNIMatrixDesc(after),
+          DeviceNativeQuantisedMatrixDesc after{};
+          require(kernel->exportNativeQuantisedMatrixDesc(after),
                   "Native source disappeared");
           EXPECT_EQ(std::memcmp(&desc, &after, sizeof(desc)), 0);
           ASSERT_FALSE(::testing::Test::HasFailure());
@@ -1107,7 +1107,7 @@ void proveCountedNativeExtent(DeviceId device,const test::QuantizedVerifierForma
   // Partial-row KPAR packing is not inferred from allocation capacity.
   for(const auto*name:{GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL,GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED,
       GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS,GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS,
-      GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS})
+      GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS})
    addBank(name,sizeof(float),1,false,true);
   // Original ordinary M1 tensor calls, with actual bias, are an independent
   // live-output witness: neither expected value passes through GEMMStage.
@@ -1180,7 +1180,7 @@ void proveCountedNativeExtent(DeviceId device,const test::QuantizedVerifierForma
    // A mixed prepared bundle must reach the mixed raw bridge, rather than two
    // separately accepted single-format calls hiding its M1 admission boundary.
    EXPECT_TRUE(std::any_of(inventory[0].begin(),inventory[0].end(),[](const auto&node){
-    return node.name.find("gemv_native_vnni_small_m_batched_shared_mixed_kernel_t")!=std::string::npos;
+    return node.name.find("gemv_native_quantised_small_m_batched_shared_mixed_kernel_t")!=std::string::npos;
    }))<<"Counted M1 mixed bundle did not exercise the mixed producer";
   }
   const auto quantizers=std::count_if(inventory[0].begin(),inventory[0].end(),[](const auto&node){

@@ -10,7 +10,7 @@ The sole assertion is prefill Top-5 overlap 80% versus the declared 95%.
 Prefill cosine is 0.998758, KL 0.00187654 (limit 0.006), and Top-1 matches.
 
 The model filename names Q4_0 overall, but its actual terminal `output.weight`
-is Q8_0. Model activations remain FP32. NativeVNNI internally quantizes its
+is Q8_0. Model activations remain FP32. NativeQuantised internally quantizes its
 GEMM operand into transient Q8 blocks; this is independent of KV precision.
 No weight, activation, cache precision, or threshold has been changed.
 

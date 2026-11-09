@@ -1829,7 +1829,7 @@ The test hierarchy mirrors ownership:
 1. Extend the typed kernel interface only when the operation contract changes.
 2. Register backend dispatch through `KernelFactory`.
 3. Preserve exact arithmetic and backend symmetry where supported.
-4. Use the matching CPU, CUDA, ROCm, or NativeVNNI tuning skill for correctness
+4. Use the matching CPU, CUDA, ROCm, or NativeQuantised tuning skill for correctness
    and economy gates.
 
 ## 12. Source map

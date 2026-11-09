@@ -4,7 +4,7 @@
  *
  * Capacity resolution and concrete slot materialization must agree byte for
  * byte. This header is their single pure arithmetic authority. It covers every
- * catalogued NativeVNNI source codebook plus FP16, BF16, and FP32, and delegates
+ * catalogued NativeQuantised source codebook plus FP16, BF16, and FP32, and delegates
  * final allocator rounding to the allocator-owned `AlignedVector` and GPU
  * weight-pool contracts instead of copying those policies into callers.
  * Immutable source-native pools and migration-reusable slots select their exact
@@ -14,11 +14,11 @@
 #pragma once
 
 #include "ExpertWeightFormat.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "loaders/GPUVramPreflight.h"
 #include "loaders/GPUPreparedWeightPoolLayout.h"
 #include "tensors/AlignedVector.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <array>
 #include <cstddef>
@@ -48,16 +48,16 @@ namespace llaminar2
                        N,
                        K,
                        format.kind,
-                       format.native_vnni.codebook_id,
-                       format.native_vnni.is_superblock,
-                       format.native_vnni.present) <
+                       format.native_quantised.codebook_id,
+                       format.native_quantised.is_superblock,
+                       format.native_quantised.present) <
                    std::tie(
                        other.N,
                        other.K,
                        other.format.kind,
-                       other.format.native_vnni.codebook_id,
-                       other.format.native_vnni.is_superblock,
-                       other.format.native_vnni.present);
+                       other.format.native_quantised.codebook_id,
+                       other.format.native_quantised.is_superblock,
+                       other.format.native_quantised.present);
         }
     };
 
@@ -162,20 +162,20 @@ namespace llaminar2
             if (K % 32 != 0)
             {
                 throw std::invalid_argument(
-                    "CPU NativeVNNI expert projection K is not block aligned");
+                    "CPU NativeQuantised expert projection K is not block aligned");
             }
-            const auto *source = native_vnni_formats::forSourceIdentity(
-                format.native_vnni.codebook_id,
-                format.native_vnni.is_superblock);
+            const auto *source = native_quantised_formats::forSourceIdentity(
+                format.native_quantised.codebook_id,
+                format.native_quantised.is_superblock);
             if (!source)
             {
                 throw std::invalid_argument(
                     "CPU expert projection source codebook is not catalogued");
             }
             const auto encoding =
-                cpu::native_vnni::preparedEncodingForSource(*source);
+                cpu::native_quantised::preparedEncodingForSource(*source);
             const std::size_t stride =
-                cpu::native_vnni::preparedInterleavedBlockStride(
+                cpu::native_quantised::preparedInterleavedBlockStride(
                     encoding, source->is_asymmetric);
             const std::size_t padded_n =
                 checkedAdd(static_cast<std::size_t>(N), 63u, "CPU padded N") &
@@ -183,9 +183,9 @@ namespace llaminar2
             const std::size_t units = checkedMultiply(
                 padded_n / 64u,
                 static_cast<std::size_t>(K / 32),
-                "CPU NativeVNNI units");
+                "CPU NativeQuantised units");
             const std::size_t logical_bytes = checkedMultiply(
-                units, stride, "CPU NativeVNNI projection");
+                units, stride, "CPU NativeQuantised projection");
             return AlignedVector<std::uint8_t>::requiredAllocationBytes(
                 logical_bytes, page_alignment);
         }
@@ -288,9 +288,9 @@ namespace llaminar2
             return result;
         }
 
-        const auto *source = native_vnni_formats::forSourceIdentity(
-            format.native_vnni.codebook_id,
-            format.native_vnni.is_superblock);
+        const auto *source = native_quantised_formats::forSourceIdentity(
+            format.native_quantised.codebook_id,
+            format.native_quantised.is_superblock);
         if (!source)
         {
             throw std::invalid_argument(

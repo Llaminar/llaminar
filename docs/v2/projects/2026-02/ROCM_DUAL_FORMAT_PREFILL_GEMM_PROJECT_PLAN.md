@@ -45,7 +45,7 @@ We are explicitly prioritizing **VNNI-native** prefill kernels that leverage our
 - Tile sketch:
    - `M_TILE=32` via `BY=8, MR=4`
    - `N_TILE=512` via `64 lanes * CPT=8`
-   - `K_STEP=4` (native VNNI pack)
+   - `K_STEP=4` (native quantised pack)
 - Vectorization requirements:
    - Vectorized B global loads (paired `int4`/`int2` fragments per lane for CPT8)
    - Vectorized A pack loads (packed 4x int8 in `int32`, optionally prefetching as `int4` over kg)
@@ -365,7 +365,7 @@ Current supported subset under v2 remains Phase-2 compatible:
 
 ### Prefill Dispatch Contract (M>1)
 Given (M, N, K, weight format, epilogue config):
-1. If INT8 VNNI format and shape supported -> run native VNNI prefill GEMM.
+1. If INT8 VNNI format and shape supported -> run native quantised prefill GEMM.
 2. Else if ratio-VNNI format and shape supported -> run native ratio prefill GEMM.
 3. Else -> fallback CK path (existing stable behavior).
 
@@ -418,7 +418,7 @@ Integration Tasks:
 Exit Criteria:
 - Correctness parity vs CK across unit/integration prefill tests.
 - No decode regressions.
-- Prefill path selects native VNNI kernel for supported INT8 VNNI cases.
+- Prefill path selects native quantised kernel for supported INT8 VNNI cases.
 
 ---
 

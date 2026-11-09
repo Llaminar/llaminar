@@ -1,8 +1,8 @@
 /**
  * @file CPUPackedWeights.h
- * @brief Concrete IPackedWeights implementation for CPU NativeVNNI format.
+ * @brief Concrete IPackedWeights implementation for CPU NativeQuantised format.
  *
- * Wraps CPUNativeVNNIPackedWeights with the IPackedWeights transfer interface.
+ * Wraps CPUNativeQuantisedPackedWeights with the IPackedWeights transfer interface.
  * Supports NUMA-local cloning for cross-socket expert migration.
  *
  * ## Clone Semantics
@@ -18,19 +18,19 @@
 #pragma once
 
 #include "kernels/IPackedWeights.h"
-#include "CPUNativeVNNIWeightPacker.h"
+#include "CPUNativeQuantisedWeightPacker.h"
 #include "utils/Logger.h"
 
 #include <cstring>
 #include <utility>
 
-namespace llaminar2::cpu::native_vnni
+namespace llaminar2::cpu::native_quantised
 {
 
     /**
-     * @brief IPackedWeights implementation wrapping CPUNativeVNNIPackedWeights.
+     * @brief IPackedWeights implementation wrapping CPUNativeQuantisedPackedWeights.
      *
-     * Owns a CPUNativeVNNIPackedWeights by value. Supports:
+     * Owns a CPUNativeQuantisedPackedWeights by value. Supports:
      * - Move construction from existing packed data (zero-copy handoff)
      * - Copy construction (NUMA-local deep copy)
      * - Clone for cross-socket transfer
@@ -39,7 +39,7 @@ namespace llaminar2::cpu::native_vnni
     {
     public:
         /// Move-construct from existing packed data (zero-copy).
-        explicit CPUPackedWeights(CPUNativeVNNIPackedWeights &&packed)
+        explicit CPUPackedWeights(CPUNativeQuantisedPackedWeights &&packed)
             : packed_(std::move(packed))
         {
             packed_.clearWorkspace(); // workspace pointers are not transferable
@@ -47,7 +47,7 @@ namespace llaminar2::cpu::native_vnni
 
         /// Copy-construct from existing packed data (NUMA-local deep copy).
         /// The new buffers will be allocated on the calling thread's NUMA node.
-        explicit CPUPackedWeights(const CPUNativeVNNIPackedWeights &packed)
+        explicit CPUPackedWeights(const CPUNativeQuantisedPackedWeights &packed)
             : packed_(packed)
         {
             packed_.clearWorkspace();
@@ -57,7 +57,7 @@ namespace llaminar2::cpu::native_vnni
 
         // ── IPackedWeights interface ─────────────────────
 
-        PackedWeightsFormat format() const override { return PackedWeightsFormat::CPU_NATIVE_VNNI; }
+        PackedWeightsFormat format() const override { return PackedWeightsFormat::CPU_NATIVE_QUANTISED; }
         DeviceType deviceType() const override { return DeviceType::CPU; }
         int N() const override { return packed_.N; }
         int K() const override { return packed_.K; }
@@ -91,10 +91,10 @@ namespace llaminar2::cpu::native_vnni
          * @param destination Admitted placement for each independently owned buffer.
          * @return New independently owned packed storage.
          */
-        static std::unique_ptr<IPackedWeights> copyTo(const CPUNativeVNNIPackedWeights &source,
+        static std::unique_ptr<IPackedWeights> copyTo(const CPUNativeQuantisedPackedWeights &source,
             CPUWeightStoragePlacement destination)
         {
-            CPUNativeVNNIPackedWeights copy;
+            CPUNativeQuantisedPackedWeights copy;
             copy.N = source.N;
             copy.K = source.K;
             copy.N_padded = source.N_padded;
@@ -134,16 +134,16 @@ namespace llaminar2::cpu::native_vnni
         // ── Accessors ────────────────────────────────────
 
         /// Access the underlying packed weights (read-only).
-        const CPUNativeVNNIPackedWeights &packed() const { return packed_; }
+        const CPUNativeQuantisedPackedWeights &packed() const { return packed_; }
 
         /// Access the underlying packed weights (mutable, for attach).
-        CPUNativeVNNIPackedWeights &mutablePacked() { return packed_; }
+        CPUNativeQuantisedPackedWeights &mutablePacked() { return packed_; }
 
         /// Move out the underlying packed data (invalidates this object).
-        CPUNativeVNNIPackedWeights takePacked() { return std::move(packed_); }
+        CPUNativeQuantisedPackedWeights takePacked() { return std::move(packed_); }
 
     private:
-        CPUNativeVNNIPackedWeights packed_;
+        CPUNativeQuantisedPackedWeights packed_;
     };
 
     /**
@@ -157,7 +157,7 @@ namespace llaminar2::cpu::native_vnni
     {
     public:
         CPUPackedWeightsWithNativeBlocks(
-            CPUNativeVNNIPackedWeights &&packed,
+            CPUNativeQuantisedPackedWeights &&packed,
             std::vector<uint8_t> &&native_blocks,
             size_t native_block_size)
             : CPUPackedWeights(std::move(packed)),
@@ -172,7 +172,7 @@ namespace llaminar2::cpu::native_vnni
          * @param native_blocks Independently owned admitted source bytes.
          * @param native_block_size Source format block extent.
          */
-        CPUPackedWeightsWithNativeBlocks(CPUNativeVNNIPackedWeights &&packed,
+        CPUPackedWeightsWithNativeBlocks(CPUNativeQuantisedPackedWeights &&packed,
             AlignedVector<uint8_t> &&native_blocks, size_t native_block_size)
             : CPUPackedWeights(std::move(packed)), native_blocks_(std::move(native_blocks)),
               native_block_size_(native_block_size) {}
@@ -193,7 +193,7 @@ namespace llaminar2::cpu::native_vnni
         std::unique_ptr<IPackedWeights> clone() const override
         {
             auto cloned = std::make_unique<CPUPackedWeightsWithNativeBlocks>(
-                CPUNativeVNNIPackedWeights(packed()), // copy packed
+                CPUNativeQuantisedPackedWeights(packed()), // copy packed
                 AlignedVector<uint8_t>(native_blocks_), // copy native blocks
                 native_block_size_);
             return cloned;
@@ -212,4 +212,4 @@ namespace llaminar2::cpu::native_vnni
         size_t native_block_size_ = 0;
     };
 
-} // namespace llaminar2::cpu::native_vnni
+} // namespace llaminar2::cpu::native_quantised

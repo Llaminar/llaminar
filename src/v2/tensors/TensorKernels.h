@@ -26,11 +26,11 @@
 #include "../kernels/GDNDeviceStateBinding.h"
 #include "../kernels/gdn/GDNPreparedQK.h"
 #include "../kernels/attention/AttentionExecutionPolicy.h"
-#include "../kernels/common/DeviceNativeVNNIMatrixDesc.h"
+#include "../kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "../kernels/common/DeviceRowRange.h"
 #include "../kernels/common/DeviceRequestRowRanges.h"
 #include "../kernels/common/ProjectionRowWork.h"
-#include "NativeVnniFormatInfo.h"
+#include "NativeQuantisedFormatInfo.h"
 #include "TensorType.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
@@ -52,9 +52,9 @@ namespace llaminar2
         class IGDNPreparedRetainedInvocation;
     }
 
-    namespace cpu::native_vnni
+    namespace cpu::native_quantised
     {
-        struct CPUNativeVNNIPackedWeights;
+        struct CPUNativeQuantisedPackedWeights;
     }
 
     // Forward declarations
@@ -856,27 +856,27 @@ namespace llaminar2
         virtual bool weights_converted() const { return true; }
 
         /**
-         * @brief Export a device-readable native-VNNI weight descriptor.
+         * @brief Export a device-readable native-quantised weight descriptor.
          *
-         * Backends that store weights in native-VNNI form override this for
+         * Backends that store weights in native-quantised form override this for
          * grouped MoE decode kernels. Unsupported formats return false so the
          * caller can use the existing sequential fallback.
          */
-        virtual bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)
+        virtual bool exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out)
         {
             out = {};
             return false;
         }
 
         /**
-         * @brief Inspect already-prepared native-VNNI device metadata without materializing weights.
+         * @brief Inspect already-prepared native-quantised device metadata without materializing weights.
          * @param out Receives the original resident descriptor, cleared on absence.
          * @return True only when immutable native device bytes already exist.
          * @note This const observation performs no allocation, device selection, GPU call,
          *       transfer, synchronization, conversion, publication or mutable caching.
          *       CPU/floating/unprepared engines return false; callers must not substitute an active export.
          */
-        [[nodiscard]] virtual bool inspectPreparedNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) const
+        [[nodiscard]] virtual bool inspectPreparedNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) const
         { out = {}; return false; }
 
         /**
@@ -887,42 +887,42 @@ namespace llaminar2
          * Q8_0 versus normalized Q8_1/Q8_K for cross-tier migration.
          * Unsupported or provenance-free engines return false and clear @p out.
          */
-        virtual bool exportNativeVNNISourceIdentity(
-            NativeVnniSourceIdentity &out) const
+        virtual bool exportNativeQuantisedSourceIdentity(
+            NativeQuantisedSourceIdentity &out) const
         {
             out = {};
             return false;
         }
 
         /**
-         * @brief Borrow immutable CPU NativeVNNI execution bytes for migration.
+         * @brief Borrow immutable CPU NativeQuantised execution bytes for migration.
          *
          * CPU prepared kernels override this to expose their single authoritative
          * packed representation. The returned object remains owned by the engine
          * and is valid only while the caller retains that engine's shared lifetime.
-         * GPU and non-NativeVNNI engines return null.
+         * GPU and non-NativeQuantised engines return null.
          */
-        virtual const cpu::native_vnni::CPUNativeVNNIPackedWeights *
-        exportCPUNativeVNNIPackedWeights() const
+        virtual const cpu::native_quantised::CPUNativeQuantisedPackedWeights *
+        exportCPUNativeQuantisedPackedWeights() const
         {
             return nullptr;
         }
 
         /**
-         * @brief Borrow the mutable final CPU NativeVNNI byte range for a
+         * @brief Borrow the mutable final CPU NativeQuantised byte range for a
          * retired ExpertOverlay physical slot.
          *
          * This is an infrastructure-only mutation boundary. The caller must
          * own the slot through the ExpertOverlay residency fabric and may
          * write the returned range only after the old residency epoch's ticket
          * barrier has drained. Ordinary kernels, stages, and coherence callers
-         * must use @ref exportCPUNativeVNNIPackedWeights instead.
+         * must use @ref exportCPUNativeQuantisedPackedWeights instead.
          *
          * @return Engine-owned final execution bytes, or an empty span when
          *         the prepared engine cannot participate in slot recycling.
          */
         virtual std::span<std::uint8_t>
-        exportRetiredCPUNativeVNNIStorage() noexcept
+        exportRetiredCPUNativeQuantisedStorage() noexcept
         {
             return {};
         }
@@ -948,7 +948,7 @@ namespace llaminar2
          * @brief Borrow mutable bytes from a retired CPU floating-point slot.
          *
          * This is the floating analogue of
-         * @ref exportRetiredCPUNativeVNNIStorage. Only the ExpertOverlay
+         * @ref exportRetiredCPUNativeQuantisedStorage. Only the ExpertOverlay
          * physical residency fabric may write the range, after the old epoch's
          * inference-ticket barrier has drained.
          *
@@ -1808,7 +1808,7 @@ namespace llaminar2
          * Graph builders and weight services use this capability before
          * retiring large raw MoE slabs. It prevents floating-point GEMM engines,
          * which intentionally retain a tensor view, from being mistaken for
-         * self-contained packed NativeVNNI engines.
+         * self-contained packed NativeQuantised engines.
          */
         virtual bool canReleaseSourceWeightTensor() const { return false; }
 

@@ -16,7 +16,7 @@
 #include "DeviceMoERebalancePolicyShared.h"
 #include "DeviceMoELLEPPlannerScratch.h"
 #include "MoERuntimeTable.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -1503,7 +1503,7 @@ namespace llaminar2
      * @param has_emins Receives extended-minimum-plane presence.
      * @return Whether this physical format has a complete storage contract.
      */
-    inline bool deviceMoENativeVnniFormatForCodebook(
+    inline bool deviceMoENativeQuantisedFormatForCodebook(
         uint8_t codebook_id,
         uint8_t &payload_bytes_per_block,
         uint8_t &is_asymmetric,
@@ -1518,7 +1518,7 @@ namespace llaminar2
         case 4:
             payload_bytes_per_block = 16;
             return true;
-        case kNativeVnniIQ4XSSourceScaleCodebook:
+        case kNativeQuantisedIQ4XSSourceScaleCodebook:
             // Physical secondary presence: raw source coefficient, not a minimum.
             payload_bytes_per_block = 16;
             is_asymmetric = 1;
@@ -1577,12 +1577,12 @@ namespace llaminar2
     }
 
     inline bool deviceMoEProjectionFormat(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         uint8_t &payload_bytes_per_block,
         uint8_t &is_asymmetric,
         uint8_t &has_emins) noexcept
     {
-        return deviceMoENativeVnniFormatForCodebook(
+        return deviceMoENativeQuantisedFormatForCodebook(
             desc.codebook_id,
             payload_bytes_per_block,
             is_asymmetric,
@@ -1590,7 +1590,7 @@ namespace llaminar2
     }
 
     /**
-     * @brief Resolve immutable allocation capacity for a NativeVNNI descriptor.
+     * @brief Resolve immutable allocation capacity for a NativeQuantised descriptor.
      *
      * Model weights have an exact-format allocation and therefore leave the
      * explicit capacity fields at zero. Transfer slots carry non-zero capacity
@@ -1598,7 +1598,7 @@ namespace llaminar2
      * changing any graph-captured pointer.
      */
     inline bool deviceMoEProjectionAllocationCapacity(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         uint8_t &payload_bytes_per_block,
         uint8_t &has_mins,
         uint8_t &has_emins) noexcept
@@ -1628,8 +1628,8 @@ namespace llaminar2
      * @brief Test whether one formatted matrix fits a stable transfer allocation.
      */
     inline bool deviceMoEMatrixFitsTransferCapacity(
-        const DeviceNativeVNNIMatrixDesc &src,
-        const DeviceNativeVNNIMatrixDesc &dst) noexcept
+        const DeviceNativeQuantisedMatrixDesc &src,
+        const DeviceNativeQuantisedMatrixDesc &dst) noexcept
     {
         if (src.n != dst.n ||
             src.k != dst.k ||
@@ -1667,8 +1667,8 @@ namespace llaminar2
      * kernels are updated.
      */
     inline void deviceMoERetargetTransferMatrixFormat(
-        DeviceNativeVNNIMatrixDesc &dst,
-        const DeviceNativeVNNIMatrixDesc &src) noexcept
+        DeviceNativeQuantisedMatrixDesc &dst,
+        const DeviceNativeQuantisedMatrixDesc &src) noexcept
     {
         dst.n = src.n;
         dst.k = src.k;
@@ -1679,13 +1679,13 @@ namespace llaminar2
         dst.source_identity_present = src.source_identity_present;
     }
 
-    inline uint64_t deviceMoEMatrixBlockCount(const DeviceNativeVNNIMatrixDesc &desc) noexcept
+    inline uint64_t deviceMoEMatrixBlockCount(const DeviceNativeQuantisedMatrixDesc &desc) noexcept
     {
         return static_cast<uint64_t>(desc.blocks_per_row) * static_cast<uint64_t>(desc.n);
     }
 
     inline uint64_t deviceMoEMatrixPayloadBytes(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
         (void)entry;
@@ -1703,13 +1703,13 @@ namespace llaminar2
         return deviceMoEMatrixBlockCount(desc) * static_cast<uint64_t>(payload_bytes_per_block);
     }
 
-    inline uint64_t deviceMoEMatrixScalesBytes(const DeviceNativeVNNIMatrixDesc &desc) noexcept
+    inline uint64_t deviceMoEMatrixScalesBytes(const DeviceNativeQuantisedMatrixDesc &desc) noexcept
     {
         return deviceMoEMatrixBlockCount(desc) * sizeof(uint16_t);
     }
 
     inline uint64_t deviceMoEMatrixMinsBytes(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
         (void)entry;
@@ -1728,7 +1728,7 @@ namespace llaminar2
     }
 
     inline uint64_t deviceMoEMatrixEminsBytes(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
         (void)entry;
@@ -1749,7 +1749,7 @@ namespace llaminar2
     }
 
     inline bool deviceMoEMatrixCopyReady(
-        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
         (void)entry;
@@ -1777,7 +1777,7 @@ namespace llaminar2
             return false;
         if (deviceMoEWeightFormatIsFloating(entry.descriptor.weight_format))
             return deviceMoEFloatingExpertCopyReady(entry.descriptor);
-        return entry.descriptor.weight_format == DeviceMoEWeightFormat::NativeVNNI &&
+        return entry.descriptor.weight_format == DeviceMoEWeightFormat::NativeQuantised &&
                deviceMoEMatrixCopyReady(entry.descriptor.gate, entry) &&
                deviceMoEMatrixCopyReady(entry.descriptor.up, entry) &&
                (entry.descriptor.projection_set == DeviceMoEProjectionSet::GateUp ||
@@ -1842,7 +1842,7 @@ namespace llaminar2
             return false;
         if (deviceMoEWeightFormatIsFloating(src.descriptor.weight_format))
             return deviceMoEFloatingExpertFitsTransferCapacity(src.descriptor, dst.descriptor);
-        if (src.descriptor.weight_format != DeviceMoEWeightFormat::NativeVNNI)
+        if (src.descriptor.weight_format != DeviceMoEWeightFormat::NativeQuantised)
             return false;
         return deviceMoEMatrixFitsTransferCapacity(
                    src.descriptor.gate,

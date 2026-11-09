@@ -1,6 +1,6 @@
 /**
  * @file PreparedCPUWeightTensor.h
- * @brief Store-committed CPU matrix metadata retaining its actual NativeVNNI engine.
+ * @brief Store-committed CPU matrix metadata retaining its actual NativeQuantised engine.
  *
  * Raw source windows retire after preparation. This object preserves their
  * logical matrix/source identity and the independently owned final engine,

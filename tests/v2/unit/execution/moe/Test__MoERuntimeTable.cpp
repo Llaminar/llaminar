@@ -240,9 +240,9 @@ namespace llaminar2::test
 
     namespace
     {
-        DeviceNativeVNNIMatrixDesc matrixDesc(uintptr_t base, int n, int k)
+        DeviceNativeQuantisedMatrixDesc matrixDesc(uintptr_t base, int n, int k)
         {
-            DeviceNativeVNNIMatrixDesc desc;
+            DeviceNativeQuantisedMatrixDesc desc;
             desc.payload = reinterpret_cast<const uint8_t *>(base);
             desc.scales = reinterpret_cast<const void *>(base + 0x1000u);
             desc.mins = reinterpret_cast<const void *>(base + 0x2000u);

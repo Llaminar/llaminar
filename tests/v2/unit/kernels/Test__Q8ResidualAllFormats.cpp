@@ -29,11 +29,11 @@ TEST(Q8ResidualAllFormats, NativeDescriptorRejectsForeignAndMalformedPlanes) {
   alignas(256) std::array<uint8_t, 4096> storage{};
   for (const auto &format : test::quantizedVerifierFormats()) {
     SCOPED_TRACE(format.label);
-    const auto *source = native_vnni_formats::forSourceIdentity(
+    const auto *source = native_quantised_formats::forSourceIdentity(
         format.source_codebook_id, format.source_is_superblock);
     ASSERT_NE(source, nullptr);
     const auto physical = canonicalDeviceVnniFormat(*source);
-    DeviceNativeVNNIMatrixDesc d{};
+    DeviceNativeQuantisedMatrixDesc d{};
     d.payload = storage.data();
     d.scales = storage.data() + 256;
     d.mins = physical.is_asymmetric ? storage.data() + 512 : nullptr;
@@ -122,7 +122,7 @@ TEST(Q8ResidualAllFormats, NativeDescriptorRejectsForeignAndMalformedPlanes) {
  * without allocating. */
 TEST(Q8ResidualAllFormats, NativeDeclaredCapacitySpanCannotOverflow) {
   alignas(256) std::array<uint8_t, 4096> storage{};
-  DeviceNativeVNNIMatrixDesc d{};
+  DeviceNativeQuantisedMatrixDesc d{};
   d.payload = storage.data();
   d.scales = storage.data() + 256;
   d.n = 5;

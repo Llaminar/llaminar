@@ -3,7 +3,7 @@
 @brief Real CPU expert source-fragment execution and pre-weighting partial-fold replay.
 
 The ordinary Unit registration stays small. The explicit CPU integration case
-executes prepared NativeVNNI and floating engines over original source slices;
+executes prepared NativeQuantised and floating engines over original source slices;
 it does not certify MPI/NUMA serving placement, source loading or performance.
 ]]
 add_executable(v2_test_cpu_expert_shard_execution

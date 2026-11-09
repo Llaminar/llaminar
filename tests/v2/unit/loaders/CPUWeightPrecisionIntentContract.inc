@@ -2,7 +2,7 @@
  * @file CPUWeightPrecisionIntentContract.inc
  * @brief Registered model operand intent survives unrelated global CPU conversion policies.
  */
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/TensorType.h"
 
 /** @test Shared source/metadata policy preserves the original immutable FP32 operator contract. */
@@ -13,7 +13,7 @@ TEST(CPUWeightPrecisionIntentContract, ImmutableOperatorRolesRetainFP32AcrossGlo
     constexpr WeightRole roles[] = {WeightRole::HyperConnectionNorm, WeightRole::SparseIndexerNorm,
         WeightRole::PerLayerEmbeddingNorm, WeightRole::PerLayerEmbeddingConvolution, WeightRole::SharedExpertInputGate};
     std::vector<TensorType> sources{TensorType::FP32, TensorType::FP16, TensorType::BF16};
-    for (const auto& format : native_vnni_formats::kAllSourceFormats) {
+    for (const auto& format : native_quantised_formats::kAllSourceFormats) {
         const auto type = tensorTypeFromName(format.quant_type);
         ASSERT_TRUE(type);
         sources.push_back(*type);
@@ -65,7 +65,7 @@ TEST(CPUWeightPrecisionIntentContract, NativeCodebooksAndUnscopedFloatingConvers
 {
     using Contract=PreparedWeightRepresentationContract;
     using Operand=FloatingActivationOperandPrecision;
-    for(const auto& format:native_vnni_formats::kAllSourceFormats) {
+    for(const auto& format:native_quantised_formats::kAllSourceFormats) {
         const auto original=tensorTypeFromName(format.quant_type);ASSERT_TRUE(original);
         for(const auto requested:{WeightPrecision::NATIVE,WeightPrecision::CONVERT_TO_INT8,
             WeightPrecision::CONVERT_TO_FP32,WeightPrecision::CONVERT_TO_FP16,WeightPrecision::CONVERT_TO_BF16})

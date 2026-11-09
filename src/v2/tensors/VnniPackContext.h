@@ -3,7 +3,7 @@
 
 /**
  * @file VnniPackContext.h
- * @brief Shared packing context for native-VNNI block interleaving
+ * @brief Shared packing context for native-quantised block interleaving
  *
  * Contains the output buffers and layout parameters needed by
  * IINT8Unpackable::packVnniBlock() to write one 32-element block
@@ -28,7 +28,7 @@ namespace llaminar2
      *
      * Holds all output buffers and layout parameters needed by the
      * per-format packVnniBlock() implementations.  Constructed once
-     * by packNativeVNNI() and passed to every block packing call.
+     * by packNativeQuantised() and passed to every block packing call.
      */
     struct VnniPackContext
     {
@@ -38,7 +38,7 @@ namespace llaminar2
         int blocks_per_row;       ///< K / 32
         int payload_bytes;        ///< Bytes per 32-element block payload
 
-        // Output arrays (pre-allocated by packNativeVNNI)
+        // Output arrays (pre-allocated by packNativeQuantised)
         uint8_t *payload_array; ///< [blocks_per_row × N × payload_bytes]
         uint16_t *scales_array; ///< [blocks_per_row × N] FP16 factor/base.
         uint16_t *mins_array;   ///< Same extent: FP16 minimum/scale or Q6_K/IQ2_S raw coefficients.
@@ -74,7 +74,7 @@ namespace llaminar2
             (ctx.destination_block_count != 0 &&
              b - ctx.destination_block_origin >= ctx.destination_block_count) ||
             n < 0 || n >= ctx.N)
-            throw std::out_of_range("NativeVNNI packing coordinates outside destination window");
+            throw std::out_of_range("NativeQuantised packing coordinates outside destination window");
         return static_cast<size_t>(b - ctx.destination_block_origin) * ctx.N +
                static_cast<size_t>(n);
     }

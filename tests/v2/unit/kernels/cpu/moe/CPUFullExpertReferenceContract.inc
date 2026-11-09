@@ -9,7 +9,7 @@
  */
 #include "utils/CPUProjectionTestWorkspace.h"
 #include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
 #include <iostream>
 #include <iomanip>
@@ -97,10 +97,10 @@ void observeFullExpertReference(const std::string& label,
     // Actual immediate preparations are synchronous and serialized. Contribute
     // the maximum canonical append workspace, separately from retained engines.
     const auto observe_staging=[&](size_t rows,size_t columns,const ExpertWeightFormat& format) {
-        if(!format.isNativeVnni())return;
-        const auto* native=native_vnni_formats::forSourceIdentity(format.native_vnni.codebook_id,format.native_vnni.is_superblock);
+        if(!format.isNativeQuantised())return;
+        const auto* native=native_quantised_formats::forSourceIdentity(format.native_quantised.codebook_id,format.native_quantised.is_superblock);
         if(!native)throw std::invalid_argument("Full expert fixture has no canonical native source format");
-        for(const auto& entry:native_vnni_formats::kAllSourceFormats)if(entry.metadata==native) {
+        for(const auto& entry:native_quantised_formats::kAllSourceFormats)if(entry.metadata==native) {
             staging=std::max(staging,CPUWeightPreparationMemory::sourceNative(entry.quant_type,rows,columns).temporary_bytes);return;
         }
         throw std::logic_error("Full expert fixture canonical native format is unnamed");
@@ -180,7 +180,7 @@ void observeFullExpertReference(const std::string& label,
         ASSERT_TRUE(w.up->multiply_tensor(&input,&up,1,F,H,true,1,0,nullptr,nullptr,-1,workspace.get()));
         ASSERT_TRUE(w.down->multiply_tensor_with_fused_swiglu(&gate,&up,&down,1,H,F,1,0,workspace.get()));
         std::vector<float> fragmentGate(F),fragmentUp(F);std::array<std::vector<float>,P> matchedDown;
-        AlignedVector<Q8_1Block> wholeQ8(F/32);cpu::native_vnni::swiglu_quantize_activations_to_q8_1(
+        AlignedVector<Q8_1Block> wholeQ8(F/32);cpu::native_quantised::swiglu_quantize_activations_to_q8_1(
             gate.data(),up.data(),wholeQ8.data(),1,F,F/32,CPUProjectionNumericalPolicy::GPUAlignedExpert);
         for(int p=0;p<P;++p) {
             const auto& engines=fragments[p][expert];FP32Tensor g({1,F/P}),u({1,F/P}),matchedG({1,F/P}),matchedU({1,F/P}),d({1,H});
@@ -188,7 +188,7 @@ void observeFullExpertReference(const std::string& label,
             ASSERT_TRUE(engines.up->multiply_tensor(&input,&u,1,F/P,H,true,1,0,nullptr,nullptr,-1,workspace.get()));
             std::copy_n(g.data(),F/P,fragmentGate.data()+p*(F/P));std::copy_n(u.data(),F/P,fragmentUp.data()+p*(F/P));
             std::copy_n(gate.data()+p*(F/P),F/P,matchedG.mutable_data());std::copy_n(up.data()+p*(F/P),F/P,matchedU.mutable_data());
-            AlignedVector<Q8_1Block> localQ8(F/P/32);cpu::native_vnni::swiglu_quantize_activations_to_q8_1(
+            AlignedVector<Q8_1Block> localQ8(F/P/32);cpu::native_quantised::swiglu_quantize_activations_to_q8_1(
                 matchedG.data(),matchedU.data(),localQ8.data(),1,F/P,F/P/32,CPUProjectionNumericalPolicy::GPUAlignedExpert);
             EXPECT_EQ(std::memcmp(localQ8.data(),wholeQ8.data()+p*(F/P/32),localQ8.size()*sizeof(Q8_1Block)),0)<<label;
             ASSERT_TRUE(engines.down->multiply_tensor_with_fused_swiglu(&matchedG,&matchedU,&d,1,H,F/P,1,0,workspace.get()));
@@ -227,8 +227,8 @@ TEST(CPUExpertShardExecution, IndependentFullExpertVersusNative320FragmentContra
     };
     for(const auto types:{std::pair{TensorType::Q4_K,TensorType::Q5_1},std::pair{TensorType::Q4_K,TensorType::Q8_0},std::pair{TensorType::Q5_K,TensorType::Q8_0}}) {
         const auto& gate=find(types.first);const auto& down=find(types.second);
-        const auto g=ExpertWeightFormat::nativeVnni({gate.source_codebook_id,gate.source_is_superblock,true});
-        const auto d=ExpertWeightFormat::nativeVnni({down.source_codebook_id,down.source_is_superblock,true});
+        const auto g=ExpertWeightFormat::nativeQuantised({gate.source_codebook_id,gate.source_is_superblock,true});
+        const auto d=ExpertWeightFormat::nativeQuantised({down.source_codebook_id,down.source_is_superblock,true});
         observeFullExpertReference(std::string(tensorTypeName(types.first))+"_"+tensorTypeName(types.second),{gate.create,gate.create,down.create},{g,g,d});
     }
 }

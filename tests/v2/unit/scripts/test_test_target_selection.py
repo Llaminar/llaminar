@@ -40,7 +40,7 @@ class TestTargetSelection(unittest.TestCase):
     ninja = "ninja"
 
     def configure(self, performance_only: bool, feature: str = "cxx_std_20", *,
-                  scope: str = "FullInventory", extra: str = ""):
+                  scope: str = "FullInventory", extra: str = "", native_targets: tuple[str, ...] = ()):
         """Configure an isolated fixture with the selected production module."""
         with tempfile.TemporaryDirectory(prefix="llaminar-test-targets-") as tmp:
             root = Path(tmp)
@@ -51,8 +51,10 @@ class TestTargetSelection(unittest.TestCase):
             # Reuse the module, not copied wrappers or source-string assertions.
             # Include twice to exercise its guard against nested macro wrapping.
             (root / "CMakeLists.txt").write_text(f'''
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.27)
 project(TestTargetSelection LANGUAGES CXX)
+enable_testing()
+set(LLAMINAR_RELEASE_NATIVE_TEST_TARGETS "{";".join(native_targets)}" CACHE STRING "" FORCE)
 set(V2_PERF_TESTS_ONLY {"ON" if performance_only else "OFF"})
 # The production guardian exists before the Release test-target selector.
 add_executable(llaminar_mpi_session IMPORTED)
@@ -68,7 +70,8 @@ foreach(target v2_test_contract v2_integration_contract v2_perf_contract)
     target_compile_options(${{target}} PRIVATE -Wall)
     target_compile_features(${{target}} PRIVATE {feature})
     v2_test_device_scope(${{target}} {scope})
-    if(V2_PERF_TESTS_ONLY AND NOT target MATCHES "^v2_perf_")
+    if(V2_PERF_TESTS_ONLY AND NOT target MATCHES "^v2_perf_" AND
+       NOT target IN_LIST LLAMINAR_RELEASE_NATIVE_TEST_TARGETS)
         if(TARGET ${{target}})
             message(FATAL_ERROR "Excluded target was materialized: ${{target}}")
         endif()
@@ -95,11 +98,94 @@ foreach(target v2_test_contract v2_integration_contract v2_perf_contract)
 endforeach()
 {extra}
 ''', encoding="utf-8")
-            return subprocess.run(
+            configured = subprocess.run(
                 [self.cmake, "-S", str(root), "-B", str(root / "build"),
                  "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={self.ninja}"],
                 capture_output=True, text=True, timeout=15, check=False,
             )
+            ninja_file = root / "build/build.ninja"
+            configured.ninja_text = ninja_file.read_text() if ninja_file.exists() else ""
+            return configured
+
+    def test_explicit_release_native_owner_and_aliases(self):
+        """Original owners and script aliases opt in without entering default all."""
+        declaration = CMAKE_LISTS.read_text(encoding="utf-8")
+        first = declaration.index("function(add_v2_test TEST_NAME)")
+        stop = declaration.index("endfunction()", first) + len("endfunction()")
+        helper = declaration[first:stop]
+        for performance_only, native_targets in ((True, ()),
+                (True, ("v2_integration_contract",)), (False, ())):
+            with self.subTest(release=performance_only, selected=native_targets):
+                extra = helper + f"""
+set(V2_TEST_SOCKETS 1)
+set(V2_TEST_CORES_PER_SOCKET 1)
+set(CMAKE_BUILD_TYPE Release)
+add_v2_test(V2_Perf_Contract COMMAND $<TARGET_FILE:v2_perf_contract>
+    LABELS V2 Performance MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_Contract COMMAND $<TARGET_FILE:v2_integration_contract>
+    LABELS V2 Integration MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_ScriptContract COMMAND "${{CMAKE_COMMAND}}" -E echo
+    $<TARGET_FILE:v2_integration_contract>
+    LABELS V2 Integration MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_Unselected COMMAND $<TARGET_FILE:v2_test_contract>
+    LABELS V2 Integration MPI_PROCS 1 NO_MPI NO_MODELS)
+if(NOT TEST V2_Perf_Contract)
+    message(FATAL_ERROR "Lost original performance alias")
+endif()
+foreach(alias V2_Integration_Contract V2_Integration_ScriptContract)
+    if({"TRUE" if not performance_only or native_targets else "FALSE"})
+        if(NOT TEST ${{alias}})
+            message(FATAL_ERROR "Selected native alias missing: ${{alias}}")
+        endif()
+        get_property(owners GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_${{alias}})
+        if(NOT "v2_integration_contract" IN_LIST owners OR
+           NOT "llaminar_mpi_session" IN_LIST owners)
+            message(FATAL_ERROR "Alias lost original owner/dependency: ${{alias}}")
+        endif()
+    elseif(TEST ${{alias}})
+        message(FATAL_ERROR "Unselected native alias admitted: ${{alias}}")
+    endif()
+endforeach()
+if(V2_PERF_TESTS_ONLY)
+    if(TEST V2_Integration_Unselected)
+        message(FATAL_ERROR "Foreign native alias admitted")
+    endif()
+    if(TARGET v2_integration_contract)
+        get_target_property(excluded v2_integration_contract EXCLUDE_FROM_ALL)
+        if(NOT excluded)
+            message(FATAL_ERROR "Explicit native owner entered default all")
+        endif()
+        # A dependency-only qualification target must not widen default all.
+        add_custom_target(qualify_native DEPENDS v2_integration_contract)
+    endif()
+endif()
+"""
+                result = self.configure(performance_only, scope="DeclaredBackends",
+                                        native_targets=native_targets, extra=extra)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                if performance_only:
+                    default_all = re.search(r"^build all:.*$", result.ninja_text, re.MULTILINE)
+                    self.assertIsNotNone(default_all)
+                    self.assertNotIn("v2_integration_contract", default_all.group())
+                    self.assertNotIn("qualify_native", default_all.group())
+
+    def test_explicit_release_native_owner_rejects_unknown_or_foreign_targets(self):
+        """Unknown, imported, alias and non-test owners cannot masquerade as opt-ins."""
+        cases = (
+            ("v2_unknown", "", "was not declared"),
+            ("requirements", "", "not an original declared test executable"),
+            ("v2_imported", 'add_executable(v2_imported IMPORTED)',
+             "not an original declared test executable"),
+            ("v2_alias", 'add_executable(v2_alias ALIAS v2_perf_contract)',
+             "not an original declared test executable"),
+            ("llaminar2", '_add_executable(llaminar2 main.cpp)',
+             "not an original declared test executable"),
+        )
+        for target, extra, diagnostic in cases:
+            with self.subTest(target=target):
+                result = self.configure(True, native_targets=(target,), extra=extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, " ".join((result.stdout + result.stderr).split()))
 
     def test_finite_storage_cases_keep_original_aggregate_and_owned_processes(self):
         """Actual declarations preserve every old suite and isolate all new source admissions."""
@@ -350,6 +436,10 @@ add_library(GTest::gtest INTERFACE IMPORTED)
 add_library(GTest::gtest_main INTERFACE IMPORTED)
 add_library(hip::host INTERFACE IMPORTED)
 add_library(CUDA::cudart INTERFACE IMPORTED)
+# Actual pooled declarations attach include requirements and registrations to
+# these pre-existing functional owners; only their bodies are fixture doubles.
+add_executable(v2_test_memory_planner main.cpp)
+add_executable(v2_test_physical_memory_authority main.cpp)
 {performance_declarations}
 include("{QFN_PERFORMANCE.as_posix()}")
 if(TARGET v2_perf_immutable_adaptive_lookup)
@@ -516,7 +606,11 @@ set(expected_tests)
 if(NOT V2_PERF_TESTS_ONLY)
     list(APPEND expected_tests V2_Integration_ImmutableHostLookupFixtureOwnership
         V2_Integration_AuthoredRemoteDuplicateShapeReplay
-        V2_Unit_PooledNgramReplayTrace V2_Integration_PooledNgramReplayTrace)
+        V2_Unit_PooledNgramReplayTrace V2_Integration_PooledNgramReplayTrace
+        V2_Unit_PooledNgramRealTraceContract V2_Integration_PooledNgramRealTraceContract
+        V2_Integration_PooledNgramCampaignSeedContract V2_Integration_PooledNgramNativeSourceExtent
+        V2_Integration_PooledNgramFinalPMACostEvidence V2_Integration_PooledNgramMatchedPhysicalBudget
+        V2_Integration_PooledNgramSourceTerminalCostWitness)
     if(HAVE_CUDA OR HAVE_ROCM)
         list(APPEND expected_tests V2_Unit_PooledConsumerLocalEconomyDeclarations
             V2_Integration_PooledConsumerLocalEconomyDeclarations)
@@ -535,8 +629,17 @@ if(NOT V2_PERF_TESTS_ONLY)
        NOT "cxx_std_20" IN_LIST trace_features)
         message(FATAL_ERROR "Replay trace lost its source or language contract")
     endif()
-elseif(TARGET v2_test_pooled_ngram_replay_trace)
-    message(FATAL_ERROR "Release retained functional trace owner")
+    get_target_property(planner_includes v2_test_memory_planner INCLUDE_DIRECTORIES)
+    if(NOT "${{CMAKE_CURRENT_SOURCE_DIR}}/../../external/cnpy" IN_LIST planner_includes)
+        message(FATAL_ERROR "Pooled physical-budget fixture lost its reference include requirement")
+    endif()
+else()
+    foreach(functional_owner v2_test_pooled_ngram_replay_trace
+                             v2_test_memory_planner v2_test_physical_memory_authority)
+        if(TARGET ${{functional_owner}})
+            message(FATAL_ERROR "Release retained functional owner: ${{functional_owner}}")
+        endif()
+    endforeach()
 endif()
 set(placements)
 if(HAVE_CUDA)
@@ -702,6 +805,7 @@ add_library(llaminar2_core INTERFACE)
 add_library(llaminar_mpi_session_owner INTERFACE)
 add_library(GTest::gtest INTERFACE IMPORTED)
 add_library(GTest::gtest_main INTERFACE IMPORTED)
+add_library(OpenMP::OpenMP_CXX INTERFACE IMPORTED)
 add_executable(llaminar_mpi_session IMPORTED)
 set_target_properties(llaminar_mpi_session PROPERTIES IMPORTED_LOCATION "${{CMAKE_COMMAND}}")
 include("{MODULE.as_posix()}")

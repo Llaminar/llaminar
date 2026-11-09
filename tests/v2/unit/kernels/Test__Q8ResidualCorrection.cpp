@@ -12,7 +12,7 @@
  * authored cancellation-sensitive projection feeds the actual nonzero read stage.
  */
 #include <gtest/gtest.h>
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "loaders/PreparedWeightStore.h"
 #include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"
@@ -56,7 +56,7 @@ struct Fixture {
   using Factory=llaminar::v2::kernels::KernelFactory;
   auto handle=std::make_shared<Factory::PreparedGemmHandle>();handle->tensor=&weight;handle->device_id=DeviceId::cpu();handle->kind=Factory::GemmPreparationKind::CPU_PACKED;handle->variant=static_cast<int>(TensorType::Q8_0);
   handle->prepared_weights=std::make_shared<Factory::PreparedGemmWeights>();handle->prepared_weights->kind=handle->kind;
-  handle->prepared_weights->owned_kernel=std::make_shared<cpu::native_vnni::CPUNativeVNNIGemmKernel>(&weight);handle->prepared_weights->kernel=handle->prepared_weights->owned_kernel.get();
+  handle->prepared_weights->owned_kernel=std::make_shared<cpu::native_quantised::CPUNativeQuantisedGemmKernel>(&weight);handle->prepared_weights->kernel=handle->prepared_weights->owned_kernel.get();
   binding.prepared=store.registerPreparedGemmHandle(binding,PreparedWeightKind::CpuPackedGemm,DeviceId::cpu(),std::move(handle));kernel=store.gemmKernel(*binding.prepared);if(!kernel)throw std::runtime_error("Prepared Q8 source missing");
   auto requirements=kernel->q8ResidualCorrectionWorkspaceRequirements(m,n,k);
   if(requirements.buffers.size()!=2)throw std::runtime_error("Two-term CPU Q8 scratch is not two exact activation banks");
@@ -68,7 +68,7 @@ struct Fixture {
 /** @test Every live retained row matches independent serial bytes and holes survive large/small/empty reuse. */
 TEST(Q8ResidualCorrection, PreparedSourceSerialRowsAndExactScratch){
  omp_set_num_threads(3);
- for(auto geometry:std::array{std::array{1,65},std::array{15,127},std::array{512,64},std::array{1024,64},std::array{1,10240},std::array{15,10240},std::array{16,10240},std::array{17,10240}}){Fixture f(geometry[0],geometry[1]);SCOPED_TRACE(::testing::Message()<<"M="<<f.m<<" N="<<f.n);const auto*source=f.kernel->exportCPUNativeVNNIPackedWeights();
+ for(auto geometry:std::array{std::array{1,65},std::array{15,127},std::array{512,64},std::array{1024,64},std::array{1,10240},std::array{15,10240},std::array{16,10240},std::array{17,10240}}){Fixture f(geometry[0],geometry[1]);SCOPED_TRACE(::testing::Message()<<"M="<<f.m<<" N="<<f.n);const auto*source=f.kernel->exportCPUNativeQuantisedPackedWeights();
  ASSERT_NE(source,nullptr);const auto*identity=source->native_interleaved.data();std::vector<std::uint8_t>original(source->native_interleaved.begin(),source->native_interleaved.end());
  ASSERT_TRUE(f.kernel->multiply_tensor(&f.input,&f.baseline,f.m,f.n,f.k,true,1,0,nullptr,nullptr,-1,f.work->get()));
  const auto*primary=static_cast<const Q8_1Block*>(f.work->get()->getBuffer(kCPUProjectionQ8));
@@ -147,11 +147,11 @@ TEST(Q8ResidualCorrection, RejectsUndersizedAndInteriorAliasedOperandsBeforeMuta
  EXPECT_THROW(f.kernel->multiply_q8_residual_corrected(sharedInput.get(),alias.get(),DeviceRowRange::fullyActive(3),64,320,f.work->get()),std::invalid_argument);
  EXPECT_EQ(std::memcmp(before.data(),sharedInput->data(),before.size()*sizeof(float)),0);
  for(std::size_t i=0;i<f.output.numel();++i)ASSERT_EQ(f.output.data()[i],-12345.f);
- const auto*packed=f.kernel->exportCPUNativeVNNIPackedWeights();ASSERT_NE(packed,nullptr);
+ const auto*packed=f.kernel->exportCPUNativeQuantisedPackedWeights();ASSERT_NE(packed,nullptr);
  auto*primary=static_cast<Q8_1Block*>(f.work->get()->getBuffer(kCPUProjectionQ8));
  const auto blocks=cpuProjectionQ8Blocks(3,320);
  // Different starting addresses still alias one physical activation bank.
- EXPECT_THROW(cpu::native_vnni::cpuQ8ResidualCorrectedProjection(*packed,f.input.data(),f.output.mutable_data(),DeviceRowRange::fullyActive(3),
+ EXPECT_THROW(cpu::native_quantised::cpuQ8ResidualCorrectedProjection(*packed,f.input.data(),f.output.mutable_data(),DeviceRowRange::fullyActive(3),
   std::span<Q8_1Block>(primary,blocks),std::span<Q8_1Block>(primary+1,blocks)),std::invalid_argument);
 }
 /** @test Device-free metadata checks cover exact GPU/CPU byte intervals without dereferencing native pointers. */

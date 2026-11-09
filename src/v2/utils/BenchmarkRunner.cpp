@@ -2455,7 +2455,7 @@ namespace llaminar2
                  * retaining unrelated warmup kernel counters.
                  */
                 {"kernel", "cuda_fused_projection_stream_pool_calls"},
-                {"kernel", "cuda_native_vnni_small_m_fused_projection_calls"},
+                {"kernel", "cuda_native_quantised_small_m_fused_projection_calls"},
             });
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();

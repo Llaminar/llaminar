@@ -62,8 +62,8 @@ namespace
     {
         ROCmPackedWeights packed;
         packed.native_source_identity = {
-            .codebook_id = native_vnni_formats::Q4_0.codebook_id,
-            .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+            .codebook_id = native_quantised_formats::Q4_0.codebook_id,
+            .is_superblock = native_quantised_formats::Q4_0.is_superblock,
             .present = true,
         };
         ROCmQuantisedGemmKernel kernel(&packed, 0);
@@ -136,9 +136,9 @@ namespace
         EXPECT_EQ(packed.N, static_cast<int>(N));
         EXPECT_EQ(packed.K, static_cast<int>(K));
 
-        // Native-VNNI path must be empty
-        EXPECT_TRUE(packed.native_vnni_payload.empty());
-        EXPECT_TRUE(packed.native_vnni_scales.empty());
+        // NativeQuantised path must be empty
+        EXPECT_TRUE(packed.native_quantised_payload.empty());
+        EXPECT_TRUE(packed.native_quantised_scales.empty());
     }
 
     /**
@@ -163,8 +163,8 @@ namespace
     /**
      * @test Verify packWeightsToROCm produces valid output for IQ4_NL
      *
-     * IQ4_NL is a native-VNNI format (≤6-bit). After the format-conditional
-     * repack change, it receives ONLY native-VNNI packing — no INT8 requantization.
+     * IQ4_NL is a native-quantised format (≤6-bit). After the format-conditional
+     * repack change, it receives ONLY native-quantised packing — no INT8 requantization.
      */
     TEST_F(ROCmQuantisedGemmKernelUnitTest, PackWeightsToROCm_IQ4_NL_CreatesValidOutput)
     {
@@ -176,9 +176,9 @@ namespace
         ROCmPackedWeights packed;
         ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
 
-        // IQ4_NL is native-VNNI: native payload populated, INT8 path empty
-        EXPECT_FALSE(packed.native_vnni_payload.empty());
-        EXPECT_FALSE(packed.native_vnni_scales.empty());
+        // IQ4_NL is native-quantised: native payload populated, INT8 path empty
+        EXPECT_FALSE(packed.native_quantised_payload.empty());
+        EXPECT_FALSE(packed.native_quantised_scales.empty());
         EXPECT_TRUE(packed.int8_data.empty());
         EXPECT_TRUE(packed.int8_data_vnni.empty());
         EXPECT_EQ(packed.N, static_cast<int>(N));
@@ -631,15 +631,15 @@ namespace
     // =============================================================================
     //
     // These tests verify the format-conditional repack logic:
-    //   - Native-VNNI formats (≤6-bit) → native-VNNI packing ONLY
+    //   - NativeQuantised formats (≤6-bit) → native-quantised packing ONLY
     //   - INT8-VNNI formats (Q8_0, Q8_1, Q8_K) → INT8 requant + VNNI interleave ONLY
     //
-    // The two paths are mutually exclusive: native-VNNI formats must NOT have
+    // The two paths are mutually exclusive: native-quantised formats must NOT have
     // int8_data/scales populated, and INT8-VNNI formats must NOT have
-    // native_vnni_payload/native_vnni_scales populated.
+    // native_quantised_payload/native_quantised_scales populated.
 
     /**
-     * @test INT8-VNNI format (Q8_0) produces ONLY INT8 packing, no native-VNNI
+     * @test INT8-VNNI format (Q8_0) produces ONLY INT8 packing, no native-quantised
      */
     TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q8_0_OnlyInt8Path)
     {
@@ -658,15 +658,15 @@ namespace
         EXPECT_FALSE(packed.int8_data_vnni.empty())
             << "Q8_0 must populate VNNI layout";
 
-        // Native-VNNI path empty
-        EXPECT_TRUE(packed.native_vnni_payload.empty())
-            << "Q8_0 must NOT populate native-VNNI payload";
-        EXPECT_TRUE(packed.native_vnni_scales.empty())
-            << "Q8_0 must NOT populate native-VNNI scales";
+        // NativeQuantised path empty
+        EXPECT_TRUE(packed.native_quantised_payload.empty())
+            << "Q8_0 must NOT populate native-quantised payload";
+        EXPECT_TRUE(packed.native_quantised_scales.empty())
+            << "Q8_0 must NOT populate native-quantised scales";
     }
 
     /**
-     * @test INT8-VNNI format (Q8_1) produces ONLY INT8 packing, no native-VNNI
+     * @test INT8-VNNI format (Q8_1) produces ONLY INT8 packing, no native-quantised
      */
     TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q8_1_OnlyInt8Path)
     {
@@ -682,17 +682,17 @@ namespace
         EXPECT_FALSE(packed.scales.empty()) << "Q8_1 must populate scales";
         EXPECT_FALSE(packed.int8_data_vnni.empty()) << "Q8_1 must populate VNNI layout";
 
-        // Native-VNNI path empty
-        EXPECT_TRUE(packed.native_vnni_payload.empty())
-            << "Q8_1 must NOT populate native-VNNI payload";
-        EXPECT_TRUE(packed.native_vnni_scales.empty())
-            << "Q8_1 must NOT populate native-VNNI scales";
+        // NativeQuantised path empty
+        EXPECT_TRUE(packed.native_quantised_payload.empty())
+            << "Q8_1 must NOT populate native-quantised payload";
+        EXPECT_TRUE(packed.native_quantised_scales.empty())
+            << "Q8_1 must NOT populate native-quantised scales";
     }
 
     /**
-     * @test Native-VNNI format (Q4_0) produces ONLY native packing, no INT8
+     * @test NativeQuantised format (Q4_0) produces ONLY native packing, no INT8
      */
-    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q4_0_OnlyNativeVnniPath)
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q4_0_OnlyNativeQuantisedPath)
     {
         const size_t N = 32;
         const size_t K = 128;
@@ -701,12 +701,12 @@ namespace
         ROCmPackedWeights packed;
         ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
 
-        // Native-VNNI path populated
-        EXPECT_FALSE(packed.native_vnni_payload.empty())
-            << "Q4_0 must populate native-VNNI payload";
-        EXPECT_FALSE(packed.native_vnni_scales.empty())
-            << "Q4_0 must populate native-VNNI scales";
-        EXPECT_GT(packed.native_vnni_blocks_per_row, 0u)
+        // NativeQuantised path populated
+        EXPECT_FALSE(packed.native_quantised_payload.empty())
+            << "Q4_0 must populate native-quantised payload";
+        EXPECT_FALSE(packed.native_quantised_scales.empty())
+            << "Q4_0 must populate native-quantised scales";
+        EXPECT_GT(packed.native_quantised_blocks_per_row, 0u)
             << "Q4_0 must set blocks_per_row";
 
         // INT8 quantized data must NOT be populated
@@ -714,13 +714,13 @@ namespace
             << "Q4_0 must NOT populate int8_data";
         EXPECT_TRUE(packed.int8_data_vnni.empty())
             << "Q4_0 must NOT populate int8_data_vnni";
-        // Note: scales IS populated by packNativeVNNI for force_ck debug compatibility
+        // Note: scales IS populated by packNativeQuantised for force_ck debug compatibility
     }
 
     /**
-     * @test Native-VNNI format (IQ4_NL) produces ONLY native packing, no INT8
+     * @test NativeQuantised format (IQ4_NL) produces ONLY native packing, no INT8
      */
-    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_IQ4_NL_OnlyNativeVnniPath)
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_IQ4_NL_OnlyNativeQuantisedPath)
     {
         const size_t N = 32;
         const size_t K = 64;
@@ -729,9 +729,9 @@ namespace
         ROCmPackedWeights packed;
         ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
 
-        // Native-VNNI path populated
-        EXPECT_FALSE(packed.native_vnni_payload.empty());
-        EXPECT_FALSE(packed.native_vnni_scales.empty());
+        // NativeQuantised path populated
+        EXPECT_FALSE(packed.native_quantised_payload.empty());
+        EXPECT_FALSE(packed.native_quantised_scales.empty());
 
         // INT8 quantized data must NOT be populated
         EXPECT_TRUE(packed.int8_data.empty());
@@ -739,9 +739,9 @@ namespace
     }
 
     /**
-     * @test Super-block native-VNNI format (Q6_K) produces ONLY native packing
+     * @test Super-block native-quantised format (Q6_K) produces ONLY native packing
      */
-    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q6_K_OnlyNativeVnniPath)
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q6_K_OnlyNativeQuantisedPath)
     {
         const size_t N = 32;
         const size_t K = 256; // Super-block K must be multiple of 256
@@ -750,12 +750,12 @@ namespace
         ROCmPackedWeights packed;
         ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
 
-        // Native-VNNI path populated
-        EXPECT_FALSE(packed.native_vnni_payload.empty());
-        EXPECT_FALSE(packed.native_vnni_scales.empty());
-        EXPECT_FALSE(packed.native_vnni_mins.empty())
+        // NativeQuantised path populated
+        EXPECT_FALSE(packed.native_quantised_payload.empty());
+        EXPECT_FALSE(packed.native_quantised_scales.empty());
+        EXPECT_FALSE(packed.native_quantised_mins.empty())
             << "Q6_K is dual-scale, must have mins";
-        EXPECT_EQ(packed.native_vnni_codebook_id, 8);
+        EXPECT_EQ(packed.native_quantised_codebook_id, 8);
 
         // INT8 quantized data must NOT be populated
         EXPECT_TRUE(packed.int8_data.empty());
@@ -765,7 +765,7 @@ namespace
     /**
      * @test Verify repack mutual exclusion exhaustively for all format families
      *
-     * Tests a representative from each native-VNNI format family:
+     * Tests a representative from each native-quantised format family:
      *   - Simple 4-bit (Q4_0)
      *   - Asymmetric 4-bit (Q4_1)
      *   - 5-bit (Q5_0)
@@ -780,12 +780,12 @@ namespace
         struct FormatCase
         {
             const char *name;
-            bool expect_native_vnni; // true = native-VNNI, false = INT8-VNNI
+            bool expect_native_quantised; // true = native-quantised, false = INT8-VNNI
             std::function<std::unique_ptr<TensorBase>()> create;
         };
 
         std::vector<FormatCase> cases = {
-            // Native-VNNI formats (≤6-bit) → only native packing
+            // NativeQuantised formats (≤6-bit) → only native packing
             {"Q4_0", true, []
              { return TestTensorFactory::createQ4_0Random({32, 128}); }},
             {"Q4_1", true, []
@@ -837,20 +837,20 @@ namespace
             ASSERT_TRUE(packWeightsToROCm(tensor.get(), packed))
                 << "packWeightsToROCm failed for " << tc.name;
 
-            if (tc.expect_native_vnni)
+            if (tc.expect_native_quantised)
             {
-                // Native-VNNI path populated
-                EXPECT_FALSE(packed.native_vnni_payload.empty())
-                    << tc.name << " (native-VNNI format) must have native_vnni_payload";
-                EXPECT_FALSE(packed.native_vnni_scales.empty())
-                    << tc.name << " (native-VNNI format) must have native_vnni_scales";
+                // NativeQuantised path populated
+                EXPECT_FALSE(packed.native_quantised_payload.empty())
+                    << tc.name << " (native-quantised format) must have native_quantised_payload";
+                EXPECT_FALSE(packed.native_quantised_scales.empty())
+                    << tc.name << " (native-quantised format) must have native_quantised_scales";
 
                 // INT8 quantized data must NOT be populated
                 EXPECT_TRUE(packed.int8_data.empty())
-                    << tc.name << " (native-VNNI format) must NOT have int8_data";
+                    << tc.name << " (native-quantised format) must NOT have int8_data";
                 EXPECT_TRUE(packed.int8_data_vnni.empty())
-                    << tc.name << " (native-VNNI format) must NOT have int8_data_vnni";
-                // Note: scales IS populated by packNativeVNNI for force_ck compatibility
+                    << tc.name << " (native-quantised format) must NOT have int8_data_vnni";
+                // Note: scales IS populated by packNativeQuantised for force_ck compatibility
             }
             else
             {
@@ -862,11 +862,11 @@ namespace
                 EXPECT_FALSE(packed.int8_data_vnni.empty())
                     << tc.name << " (INT8-VNNI format) must have int8_data_vnni";
 
-                // Native-VNNI path must be empty
-                EXPECT_TRUE(packed.native_vnni_payload.empty())
-                    << tc.name << " (INT8-VNNI format) must NOT have native_vnni_payload";
-                EXPECT_TRUE(packed.native_vnni_scales.empty())
-                    << tc.name << " (INT8-VNNI format) must NOT have native_vnni_scales";
+                // NativeQuantised path must be empty
+                EXPECT_TRUE(packed.native_quantised_payload.empty())
+                    << tc.name << " (INT8-VNNI format) must NOT have native_quantised_payload";
+                EXPECT_TRUE(packed.native_quantised_scales.empty())
+                    << tc.name << " (INT8-VNNI format) must NOT have native_quantised_scales";
             }
         }
     }
@@ -898,18 +898,18 @@ namespace
         EXPECT_EQ(gemm_source.find("GEMV will use INT8-VNNI fallback"), std::string::npos)
             << "Packed GPU upload failures must hard fail instead of silently selecting INT8-VNNI.";
         EXPECT_EQ(gemm_source.find("falling back to INT8 GEMM"), std::string::npos)
-            << "A selected native-VNNI GEMM launch failure must be terminal.";
+            << "A selected native-quantised GEMM launch failure must be terminal.";
         EXPECT_EQ(gemm_source.find("ROCm GEMV prefill paths may not work"), std::string::npos)
             << "Missing packed layouts must hard fail instead of publishing ambiguous state.";
         EXPECT_NE(gemm_source.find("Wide-tile INT8 prefill kernel failed; refusing fallback"), std::string::npos);
         EXPECT_NE(gemm_source.find("INT8 prefill grid-kpar launch failed; refusing baseline fallback"), std::string::npos);
         EXPECT_NE(gemm_source.find("Refusing pageable-host fallback"), std::string::npos);
         EXPECT_NE(gemm_source.find("explicit H2D stream is required for startup upload"), std::string::npos);
-        EXPECT_NE(gemm_source.find("Failed to alloc native-VNNI payload; refusing alternate GEMM path"), std::string::npos);
-        EXPECT_NE(gemm_source.find("Native-VNNI GEMM failed; refusing INT8 GEMM fallback"), std::string::npos);
+        EXPECT_NE(gemm_source.find("Failed to alloc native-quantised payload; refusing alternate GEMM path"), std::string::npos);
+        EXPECT_NE(gemm_source.find("NativeQuantised GEMM failed; refusing INT8 GEMM fallback"), std::string::npos);
         EXPECT_NE(gemm_source.find("No VNNI layout available; refusing implicit CPU or alternate packing path"), std::string::npos);
-        EXPECT_NE(gemm_source.find("if (upload.d_native_vnni_emins)"), std::string::npos)
-            << "Cached native-VNNI emins uploads must be released with the rest of the device upload.";
+        EXPECT_NE(gemm_source.find("if (upload.d_native_quantised_emins)"), std::string::npos)
+            << "Cached native-quantised emins uploads must be released with the rest of the device upload.";
         EXPECT_EQ(int8_source.find("keep using the CK fallback path"), std::string::npos)
             << "The Q8/INT8 prefill launcher must document false as terminal now that CK fallback is retired.";
     }

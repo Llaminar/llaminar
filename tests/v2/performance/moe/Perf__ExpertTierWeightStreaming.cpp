@@ -4,7 +4,7 @@
  *
  * One source is compiled into separate CUDA and ROCm executables.  Each
  * executable prepares real quantized tensors through the production
- * NativeVNNI packer, proves both conversion directions byte-for-byte, and then
+ * NativeQuantised packer, proves both conversion directions byte-for-byte, and then
  * measures the exact explicit-stream kernels with and without pinned-host DMA.
  * CUDA additionally measures service-finite/service-captured public background
  * transactions. Those report complete wall time, not native kernel duration,
@@ -75,7 +75,7 @@
 extern "C"
 {
     /** Publish production IQ decode tables before an IQ tier conversion. */
-    bool cudaNativeVNNIInitIQGridTables_tuned();
+    bool cudaNativeQuantisedInitIQGridTables_tuned();
 }
 #endif
 
@@ -597,9 +597,9 @@ namespace llaminar2
                 dynamic_cast<const IINT8Unpackable *>(&tensor);
             if (unpackable == nullptr || unpackable->vnniFormatInfo() == nullptr)
                 throw std::invalid_argument(
-                    "benchmark format is not NativeVNNI-packable");
+                    "benchmark format is not NativeQuantised-packable");
 
-            const NativeVnniFormatInfo &format =
+            const NativeQuantisedFormatInfo &format =
                 *unpackable->vnniFormatInfo();
             // Physical secondary planes also carry original source coefficients.
             // IQ3_S/IQ4_XS are not mathematically asymmetric, but omitting this
@@ -609,7 +609,7 @@ namespace llaminar2
             const int K = static_cast<int>(tensor.cols());
             if (N <= 0 || K <= 0 || (K % 32) != 0)
                 throw std::invalid_argument(
-                    "benchmark projection is not a complete NativeVNNI geometry");
+                    "benchmark projection is not a complete NativeQuantised geometry");
 
             HostGpuExpertPackedProjection projection;
             projection.N = N;
@@ -1233,10 +1233,10 @@ namespace llaminar2
                 return test::expertTierWireOracle(original,cpu_host_.native_interleaved,0,original.unit_count);
             }
             /** @return Genuine final CPU rectangle root; identity controls retain their existing root. */
-            [[nodiscard]] std::optional<cpu::native_vnni::CPUNativeVNNIPackedWeights> makeCPUDestination() const
+            [[nodiscard]] std::optional<cpu::native_quantised::CPUNativeQuantisedPackedWeights> makeCPUDestination() const
             {
                 if(!shape_.rectangle)return std::nullopt;
-                cpu::native_vnni::CPUNativeVNNIPackedWeights result;
+                cpu::native_quantised::CPUNativeQuantisedPackedWeights result;
                 result.N=95;result.K=256;result.N_padded=128;result.blocks_per_row=8;
                 result.payload_bytes=cpu_host_.payload_bytes;result.codebook_id=cpu_host_.codebook_id;
                 result.is_asymmetric=cpu_host_.is_asymmetric;result.is_superblock=cpu_host_.is_superblock;
@@ -1267,10 +1267,10 @@ namespace llaminar2
             }
 
             /** Resolve exact source provenance; aliases require superblock identity. */
-            [[nodiscard]] const NativeVnniFormatInfo &requireSourceFormat() const
+            [[nodiscard]] const NativeQuantisedFormatInfo &requireSourceFormat() const
             {
-                const NativeVnniFormatInfo *format =
-                    native_vnni_formats::forSourceIdentity(
+                const NativeQuantisedFormatInfo *format =
+                    native_quantised_formats::forSourceIdentity(
                         source_host_.source_codebook_id,
                         source_host_.is_superblock);
                 if (format == nullptr)
@@ -1295,11 +1295,11 @@ namespace llaminar2
             }
 
             /** Build the byte-exact final CPU representation used on the wire. */
-            [[nodiscard]] cpu::native_vnni::CPUNativeVNNIPackedWeights
+            [[nodiscard]] cpu::native_quantised::CPUNativeQuantisedPackedWeights
             packCpuWeights() const
             {
-                cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
-                if (!cpu::native_vnni::packWeightsCPUNativeVNNI(
+                cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
+                if (!cpu::native_quantised::packWeightsCPUNativeQuantised(
                         tensor_.get(), packed))
                     throw std::runtime_error("production CPU weight pack failed");
                 if (!shape_.rectangle && packed.native_interleaved.size() !=
@@ -1476,12 +1476,12 @@ namespace llaminar2
             int numa_node_ = -1;
             std::unique_ptr<TensorBase> tensor_;
             HostGpuExpertPackedProjection source_host_;
-            const NativeVnniFormatInfo &source_format_;
+            const NativeQuantisedFormatInfo &source_format_;
             ExpertTierWeightStreamManifest demotion_manifest_;
             ExpertTierWeightDeviceLayout demotion_layout_;
-            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu_host_;
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_host_;
             std::vector<uint8_t> wire_oracle_;
-            std::optional<cpu::native_vnni::CPUNativeVNNIPackedWeights> cpu_destination_;
+            std::optional<cpu::native_quantised::CPUNativeQuantisedPackedWeights> cpu_destination_;
             ExpertTierWeightStreamManifest promotion_manifest_;
             ExpertTierWeightDeviceLayout promotion_layout_;
             HostGpuExpertPackedProjection destination_host_;
@@ -1825,7 +1825,7 @@ namespace llaminar2
         void initializeDecodeTables(int device)
         {
 #if defined(LLAMINAR_EXPERT_TIER_PERF_CUDA)
-            if (!cudaNativeVNNIInitIQGridTables_tuned())
+            if (!cudaNativeQuantisedInitIQGridTables_tuned())
                 throw std::runtime_error(
                     "CUDA production IQ table initialization failed");
 #else

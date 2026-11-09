@@ -4,7 +4,7 @@
  *
  * Qwen3.6-35B routes each hidden row through a 256-by-2048 FP32 gate and
  * selects eight experts. Production CPU routing also publishes a canonical
- * Q8_1 copy of every hidden row for the immediately following NativeVNNI
+ * Q8_1 copy of every hidden row for the immediately following NativeQuantised
  * expert projections. This harness times that complete contract rather than
  * an isolated dot product.
  *

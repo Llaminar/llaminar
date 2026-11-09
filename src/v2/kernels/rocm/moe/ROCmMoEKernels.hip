@@ -61,9 +61,9 @@
 #include "kernels/common/DeviceIntegerBlockScan.h"
 #include "kernels/common/MoEGroupingInitialization.h"
 #include "kernels/rocm/moe/ROCmMoEKernelResources.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
-#include "../gemm/ROCmNativeVNNIDecodeEquivalentMath.h"
+#include "../gemm/ROCmNativeQuantisedDecodeEquivalentMath.h"
 #include "../ops/ROCmSwiGLUDecodeEquivalentMath.h"
 
 namespace
@@ -198,7 +198,7 @@ namespace
         return static_cast<float>(value);
     }
 
-    struct DeviceNativeVNNIMatrixDescView
+    struct DeviceNativeQuantisedMatrixDescView
     {
         const uint8_t *payload;
         const void *scales;
@@ -219,14 +219,14 @@ namespace
     };
 
     static_assert(
-        sizeof(DeviceNativeVNNIMatrixDescView) == 56,
+        sizeof(DeviceNativeQuantisedMatrixDescView) == 56,
         "ROCm MoE descriptor view must match the shared device ABI");
 
     struct DeviceMoEExpertDescriptorView
     {
-        DeviceNativeVNNIMatrixDescView gate;
-        DeviceNativeVNNIMatrixDescView up;
-        DeviceNativeVNNIMatrixDescView down;
+        DeviceNativeQuantisedMatrixDescView gate;
+        DeviceNativeQuantisedMatrixDescView up;
+        DeviceNativeQuantisedMatrixDescView down;
         llaminar2::DeviceMoEFloatingMatrixDesc floating_gate;
         llaminar2::DeviceMoEFloatingMatrixDesc floating_up;
         llaminar2::DeviceMoEFloatingMatrixDesc floating_down;
@@ -7542,7 +7542,7 @@ namespace
     }
 
     __device__ __forceinline__ bool rebalance_matrix_desc_ready(
-        const DeviceNativeVNNIMatrixDescView &desc)
+        const DeviceNativeQuantisedMatrixDescView &desc)
     {
         return desc.payload != nullptr &&
                desc.scales != nullptr &&
@@ -7558,7 +7558,7 @@ namespace
         if (desc.projection_set != llaminar2::DeviceMoEProjectionSet::CompleteExpert)
             return false;
         const bool native_ready =
-            desc.weight_format == llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+            desc.weight_format == llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
             rebalance_matrix_desc_ready(desc.gate) &&
             rebalance_matrix_desc_ready(desc.up) &&
             rebalance_matrix_desc_ready(desc.down);
@@ -7579,7 +7579,7 @@ namespace
         if (llaminar2::deviceMoEWeightFormatIsFloating(desc.weight_format))
             return llaminar2::deviceMoEFloatingExpertCopyReady(desc);
         return desc.weight_format ==
-                   llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+                   llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
                rebalance_matrix_desc_ready(desc.gate) &&
                rebalance_matrix_desc_ready(desc.up) &&
                (desc.projection_set == llaminar2::DeviceMoEProjectionSet::GateUp ||
@@ -7601,7 +7601,7 @@ namespace
         case 4:
             payload_bytes = 16u;
             return true;
-        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+        case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
             payload_bytes = 16u;
             is_asymmetric = 1u; // Physical raw source coefficient; no additive minimum.
             return true;
@@ -7653,7 +7653,7 @@ namespace
         case 20:
             payload_bytes = 32u;
             return true;
-        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
+        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             payload_bytes = 32u;
             is_asymmetric = 1u;
             return true;
@@ -7663,14 +7663,14 @@ namespace
     }
 
     __device__ __forceinline__ unsigned long long rebalance_block_count(
-        const DeviceNativeVNNIMatrixDescView &desc)
+        const DeviceNativeQuantisedMatrixDescView &desc)
     {
         return static_cast<unsigned long long>(desc.blocks_per_row) *
                static_cast<unsigned long long>(desc.n);
     }
 
     __device__ __forceinline__ bool rebalance_projection_format(
-        const DeviceNativeVNNIMatrixDescView &desc,
+        const DeviceNativeQuantisedMatrixDescView &desc,
         uint8_t &payload_bytes,
         uint8_t &is_asymmetric,
         uint8_t &has_emins)
@@ -7683,7 +7683,7 @@ namespace
     }
 
     __device__ __forceinline__ bool rebalance_projection_allocation_capacity(
-        const DeviceNativeVNNIMatrixDescView &desc,
+        const DeviceNativeQuantisedMatrixDescView &desc,
         uint8_t &payload_bytes,
         uint8_t &has_mins,
         uint8_t &has_emins)
@@ -7710,8 +7710,8 @@ namespace
     }
 
     __device__ __forceinline__ bool rebalance_matrix_fits_transfer_capacity(
-        const DeviceNativeVNNIMatrixDescView &src,
-        const DeviceNativeVNNIMatrixDescView &dst)
+        const DeviceNativeQuantisedMatrixDescView &src,
+        const DeviceNativeQuantisedMatrixDescView &dst)
     {
         if (src.n != dst.n ||
             src.k != dst.k ||
@@ -7742,8 +7742,8 @@ namespace
     }
 
     __device__ __forceinline__ void rebalance_retarget_transfer_matrix(
-        DeviceNativeVNNIMatrixDescView &dst,
-        const DeviceNativeVNNIMatrixDescView &src)
+        DeviceNativeQuantisedMatrixDescView &dst,
+        const DeviceNativeQuantisedMatrixDescView &src)
     {
         dst.n = src.n;
         dst.k = src.k;
@@ -7755,7 +7755,7 @@ namespace
     }
 
     __device__ __forceinline__ bool rebalance_matrix_copy_ready(
-        const DeviceNativeVNNIMatrixDescView &desc,
+        const DeviceNativeQuantisedMatrixDescView &desc,
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
         (void)entry;
@@ -7780,7 +7780,7 @@ namespace
             return false;
         if (llaminar2::deviceMoEWeightFormatIsFloating(entry.descriptor.weight_format))
             return llaminar2::deviceMoEFloatingExpertCopyReady(entry.descriptor);
-        return entry.descriptor.weight_format == llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+        return entry.descriptor.weight_format == llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
                rebalance_matrix_copy_ready(entry.descriptor.gate, entry) &&
                rebalance_matrix_copy_ready(entry.descriptor.up, entry) &&
                (entry.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::GateUp ||
@@ -7873,7 +7873,7 @@ namespace
             return false;
         if (llaminar2::deviceMoEWeightFormatIsFloating(src.descriptor.weight_format))
             return llaminar2::deviceMoEFloatingExpertFitsTransferCapacity(src.descriptor, dst.descriptor);
-        if (src.descriptor.weight_format != llaminar2::DeviceMoEWeightFormat::NativeVNNI)
+        if (src.descriptor.weight_format != llaminar2::DeviceMoEWeightFormat::NativeQuantised)
             return false;
         return rebalance_matrix_fits_transfer_capacity(
                    src.descriptor.gate,
@@ -10607,7 +10607,7 @@ namespace
     }
 
     __device__ __forceinline__ unsigned long long rebalance_projection_payload_bytes(
-        const DeviceNativeVNNIMatrixDescView &desc,
+        const DeviceNativeQuantisedMatrixDescView &desc,
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
         (void)entry;
@@ -10641,7 +10641,7 @@ namespace
     }
 
     __device__ __forceinline__ unsigned long long rebalance_pack_projection_to_payload(
-        const DeviceNativeVNNIMatrixDescView &src,
+        const DeviceNativeQuantisedMatrixDescView &src,
         const DeviceMoEExpertDirectoryEntryView &entry,
         uint8_t *payload)
     {
@@ -10680,7 +10680,7 @@ namespace
 
     __device__ __forceinline__ unsigned long long rebalance_unpack_projection_from_payload(
         const uint8_t *payload,
-        const DeviceNativeVNNIMatrixDescView &dst,
+        const DeviceNativeQuantisedMatrixDescView &dst,
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
         (void)entry;
@@ -13672,7 +13672,7 @@ __global__ void rocm_moe_gate_logits_kpart_reduce_kernel(
 /**
  * @brief Quantize one FP32 value with the canonical serial-decode Q8 arithmetic.
  *
- * The ordinary NativeVNNI M=1 decoder computes a reciprocal once per 32-value
+ * The ordinary NativeQuantised M=1 decoder computes a reciprocal once per 32-value
  * block and multiplies each value by that reciprocal.  Writing the equivalent
  * expression as `value / scale` changes FP32 rounding for values near an integer
  * half-way point; `rintf` can then select a different int8 byte.  Router-owned Q8
@@ -16046,13 +16046,13 @@ void rocm_moe_finalize_canonical_publication_kernel(
                 const float4 contribution =
                     reinterpret_cast<const float4 *>(
                         canonical_publication + route_row)[index];
-                routed.x = rocm_native_vnni_accumulate_rn(
+                routed.x = rocm_native_quantised_accumulate_rn(
                     routed.x, contribution.x);
-                routed.y = rocm_native_vnni_accumulate_rn(
+                routed.y = rocm_native_quantised_accumulate_rn(
                     routed.y, contribution.y);
-                routed.z = rocm_native_vnni_accumulate_rn(
+                routed.z = rocm_native_quantised_accumulate_rn(
                     routed.z, contribution.z);
-                routed.w = rocm_native_vnni_accumulate_rn(
+                routed.w = rocm_native_quantised_accumulate_rn(
                     routed.w, contribution.w);
             }
 
@@ -16068,13 +16068,13 @@ void rocm_moe_finalize_canonical_publication_kernel(
                 const float4 contribution =
                     reinterpret_cast<const float4 *>(
                         rank_banks + bank_row)[index];
-                shared.x = rocm_native_vnni_accumulate_rn(
+                shared.x = rocm_native_quantised_accumulate_rn(
                     shared.x, contribution.x);
-                shared.y = rocm_native_vnni_accumulate_rn(
+                shared.y = rocm_native_quantised_accumulate_rn(
                     shared.y, contribution.y);
-                shared.z = rocm_native_vnni_accumulate_rn(
+                shared.z = rocm_native_quantised_accumulate_rn(
                     shared.z, contribution.z);
-                shared.w = rocm_native_vnni_accumulate_rn(
+                shared.w = rocm_native_quantised_accumulate_rn(
                     shared.w, contribution.w);
             }
 
@@ -16108,7 +16108,7 @@ void rocm_moe_finalize_canonical_publication_kernel(
                  static_cast<size_t>(route)) *
                     static_cast<size_t>(d_model) +
                 static_cast<size_t>(column);
-            routed = rocm_native_vnni_accumulate_rn(
+            routed = rocm_native_quantised_accumulate_rn(
                 routed, canonical_publication[route_index]);
         }
         float shared = 0.0f;
@@ -16120,7 +16120,7 @@ void rocm_moe_finalize_canonical_publication_kernel(
             const size_t shared_index =
                 static_cast<size_t>(participant) * row_elements +
                 row_offset + static_cast<size_t>(column);
-            shared = rocm_native_vnni_accumulate_rn(
+            shared = rocm_native_quantised_accumulate_rn(
                 shared, rank_banks[shared_index]);
         }
         const size_t output_index =
@@ -16169,9 +16169,9 @@ __global__ void rocm_moe_weighted_add_kernel(
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
 
-    const float weighted_route = rocm_native_vnni_weight_route_rn(
+    const float weighted_route = rocm_native_quantised_weight_route_rn(
         weight, input[idx]);
-    output[idx] = rocm_native_vnni_accumulate_rn(
+    output[idx] = rocm_native_quantised_accumulate_rn(
         output[idx], weighted_route);
 }
 
@@ -19039,9 +19039,9 @@ __device__ __forceinline__ bool rocm_publish_runtime_expert_descriptors_lane(
     uint32_t local_bit,
     int expert,
     int num_experts,
-    DeviceNativeVNNIMatrixDescView *__restrict__ gate_descs,
-    DeviceNativeVNNIMatrixDescView *__restrict__ up_descs,
-    DeviceNativeVNNIMatrixDescView *__restrict__ down_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ gate_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ up_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ down_descs,
     llaminar2::DeviceMoEWeightFormat expected_format,
     llaminar2::DeviceMoEProjectionSet expected_projections)
 {
@@ -19058,17 +19058,17 @@ __device__ __forceinline__ bool rocm_publish_runtime_expert_descriptors_lane(
         (bank.resident_participant_mask[expert] & local_bit) != 0u &&
         desc.local_slot >= 0 &&
         desc.weight_format == expected_format && descriptor_ready;
-    if (expected_format == llaminar2::DeviceMoEWeightFormat::NativeVNNI)
+    if (expected_format == llaminar2::DeviceMoEWeightFormat::NativeQuantised)
     {
         gate_descs[expert] = local_ready
                                  ? desc.gate
-                                 : DeviceNativeVNNIMatrixDescView{};
+                                 : DeviceNativeQuantisedMatrixDescView{};
         up_descs[expert] = local_ready
                                ? desc.up
-                               : DeviceNativeVNNIMatrixDescView{};
+                               : DeviceNativeQuantisedMatrixDescView{};
         down_descs[expert] = local_ready
                                  ? desc.down
-                                 : DeviceNativeVNNIMatrixDescView{};
+                                 : DeviceNativeQuantisedMatrixDescView{};
     }
     else
     {
@@ -19115,9 +19115,9 @@ __device__ __forceinline__ bool rocm_publish_runtime_expert_descriptors_lane(
  */
 __device__ __forceinline__ void rocm_publish_runtime_prefill_plan_block(
     const DeviceMoELayerRuntimeView *__restrict__ runtime,
-    DeviceNativeVNNIMatrixDescView *__restrict__ gate_descs,
-    DeviceNativeVNNIMatrixDescView *__restrict__ up_descs,
-    DeviceNativeVNNIMatrixDescView *__restrict__ down_descs, int num_experts,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ gate_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ up_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ down_descs, int num_experts,
     int *__restrict__ active_expert_ids, int max_active_experts,
     llaminar2::DeviceMoEWeightFormat expected_format,
     llaminar2::DeviceMoEProjectionSet expected_projections,
@@ -19128,7 +19128,7 @@ __device__ __forceinline__ void rocm_publish_runtime_prefill_plan_block(
     if (!runtime || !gate_descs || !up_descs || !down_descs || num_experts <= 0 ||
         num_experts > kDeviceMoEMaxExperts || execution_bank > 1u ||
         !llaminar2::deviceMoEProjectionSetValid(expected_projections) ||
-        (expected_format != llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+        (expected_format != llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
          !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)) ||
         (publish_active_experts &&
          (!runtime->expert_counts || max_active_experts <= 0 || max_active_experts > num_experts)))
@@ -19846,9 +19846,9 @@ void rocm_moe_prefill_group_small_runtime_kernel(
     int top_k,
     int filter_to_local_runtime_experts,
     int grouped_demand,
-    DeviceNativeVNNIMatrixDescView *__restrict__ gate_descs,
-    DeviceNativeVNNIMatrixDescView *__restrict__ up_descs,
-    DeviceNativeVNNIMatrixDescView *__restrict__ down_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ gate_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ up_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ down_descs,
     int *__restrict__ active_expert_ids,
     int max_active_experts,
     llaminar2::DeviceMoEWeightFormat expected_format,
@@ -19886,7 +19886,7 @@ void rocm_moe_prefill_group_small_runtime_kernel(
           !active_expert_ids || max_active_experts <= 0 ||
           max_active_experts > num_experts ||
           (expected_format !=
-               llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+               llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
            !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)))) ||
         (retain_routes_for_deferred_commit != 0 &&
          (!runtime->deferred_verifier_route_expert_ids ||
@@ -21412,9 +21412,9 @@ __global__ __launch_bounds__(256) void rocm_moe_prefill_llep_assign_routes_from_
  */
 __global__ __launch_bounds__(kActiveExpertThreads) void rocm_moe_materialize_runtime_prefill_descriptor_tables_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
-    DeviceNativeVNNIMatrixDescView *__restrict__ gate_descs,
-    DeviceNativeVNNIMatrixDescView *__restrict__ up_descs,
-    DeviceNativeVNNIMatrixDescView *__restrict__ down_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ gate_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ up_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ down_descs,
     int num_experts,
     int *__restrict__ active_expert_ids,
     int max_active_experts,
@@ -21612,9 +21612,9 @@ void rocm_grouped_floating_gate_up_decode_kernel(
     {
         if (static_cast<int>(threadIdx.x) < stride)
         {
-            gate_sums[threadIdx.x] = rocm_native_vnni_accumulate_rn(
+            gate_sums[threadIdx.x] = rocm_native_quantised_accumulate_rn(
                 gate_sums[threadIdx.x], gate_sums[threadIdx.x + stride]);
-            up_sums[threadIdx.x] = rocm_native_vnni_accumulate_rn(
+            up_sums[threadIdx.x] = rocm_native_quantised_accumulate_rn(
                 up_sums[threadIdx.x], up_sums[threadIdx.x + stride]);
         }
         __syncthreads();
@@ -21697,17 +21697,17 @@ void rocm_grouped_floating_swiglu_down_decode_kernel(
         {
             if (static_cast<int>(threadIdx.x) < stride)
             {
-                sums[threadIdx.x] = rocm_native_vnni_accumulate_rn(
+                sums[threadIdx.x] = rocm_native_quantised_accumulate_rn(
                     sums[threadIdx.x], sums[threadIdx.x + stride]);
             }
             __syncthreads();
         }
         if (threadIdx.x == 0)
         {
-            output_sum = rocm_native_vnni_accumulate_rn(
+            output_sum = rocm_native_quantised_accumulate_rn(
                 output_sum,
                 ready
-                    ? rocm_native_vnni_weight_route_rn(
+                    ? rocm_native_quantised_weight_route_rn(
                           route_weights[route], sums[0])
                     : 0.0f);
         }
@@ -21849,7 +21849,7 @@ void rocm_grouped_floating_down_prefill_kernel(
         if (!ready)
         {
             if (lane == 0)
-                output_sum = rocm_native_vnni_accumulate_rn(output_sum, 0.0f);
+                output_sum = rocm_native_quantised_accumulate_rn(output_sum, 0.0f);
             continue;
         }
         float sums[warp::partitions_per_lane]{};
@@ -21868,8 +21868,8 @@ void rocm_grouped_floating_down_prefill_kernel(
         }
         const float sum = warp::reduce(sums);
         if (lane == 0)
-            output_sum = rocm_native_vnni_accumulate_rn(output_sum,
-                rocm_native_vnni_weight_route_rn(grouped_weights[grouped_slot], sum));
+            output_sum = rocm_native_quantised_accumulate_rn(output_sum,
+                rocm_native_quantised_weight_route_rn(grouped_weights[grouped_slot], sum));
     }
     if (lane == 0)
     {
@@ -22314,7 +22314,7 @@ bool hipMoE_group_prefill_routes_runtime(
             /*down_descs=*/nullptr,
             /*active_expert_ids=*/nullptr,
             /*max_active_experts=*/0,
-            llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+            llaminar2::DeviceMoEWeightFormat::NativeQuantised,
             expected_projections);
         const hipError_t small_err = hipGetLastError();
         if (small_err != hipSuccess)
@@ -22415,7 +22415,7 @@ bool hipMoE_regroup_prefill_routes_runtime_assignments(
             /*down_descs=*/nullptr,
             /*active_expert_ids=*/nullptr,
             /*max_active_experts=*/0,
-            llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+            llaminar2::DeviceMoEWeightFormat::NativeQuantised,
             llaminar2::DeviceMoEProjectionSet::CompleteExpert);
         const hipError_t small_err = hipGetLastError();
         if (small_err != hipSuccess)
@@ -22488,9 +22488,9 @@ hipMoE_group_prefill_routes_and_materialize_plan_runtime(
     const float *routing_weights,
     void *runtime,
     int *original_to_grouped,
-    DeviceNativeVNNIMatrixDescView *gate_descs,
-    DeviceNativeVNNIMatrixDescView *up_descs,
-    DeviceNativeVNNIMatrixDescView *down_descs,
+    DeviceNativeQuantisedMatrixDescView *gate_descs,
+    DeviceNativeQuantisedMatrixDescView *up_descs,
+    DeviceNativeQuantisedMatrixDescView *down_descs,
     int *active_expert_ids,
     int current_slots,
     int max_slots,
@@ -22515,7 +22515,7 @@ hipMoE_group_prefill_routes_and_materialize_plan_runtime(
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
         top_k <= 0 || top_k > kDeviceMoEMaxTopK ||
         max_active_experts <= 0 || max_active_experts > num_experts ||
-        (expected_format != llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+        (expected_format != llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
          !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)))
     {
         fprintf(stderr, "HIP MoE complete router-plan publication invalid arguments\n");
@@ -22653,9 +22653,9 @@ __attribute__((visibility("default"))) bool
 hipMoE_regroup_prefill_routes_and_materialize_plan_runtime(
     void *runtime,
     int *original_to_grouped,
-    DeviceNativeVNNIMatrixDescView *gate_descs,
-    DeviceNativeVNNIMatrixDescView *up_descs,
-    DeviceNativeVNNIMatrixDescView *down_descs,
+    DeviceNativeQuantisedMatrixDescView *gate_descs,
+    DeviceNativeQuantisedMatrixDescView *up_descs,
+    DeviceNativeQuantisedMatrixDescView *down_descs,
     int *active_expert_ids,
     int current_slots,
     int max_slots,
@@ -22679,7 +22679,7 @@ hipMoE_regroup_prefill_routes_and_materialize_plan_runtime(
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
         top_k <= 0 || top_k > kDeviceMoEMaxTopK ||
         max_active_experts <= 0 || max_active_experts > num_experts ||
-        (expected_format != llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+        (expected_format != llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
          !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)))
     {
         fprintf(stderr, "HIP MoE complete assigned-plan publication invalid arguments\n");
@@ -23079,9 +23079,9 @@ bool hipMoE_assign_prefill_routes_from_llep_current_batch_plan_after_transfers(
 
 __attribute__((visibility("default"))) bool hipMoE_materialize_runtime_prefill_descriptor_tables(
     const void *runtime,
-    DeviceNativeVNNIMatrixDescView *gate_descs,
-    DeviceNativeVNNIMatrixDescView *up_descs,
-    DeviceNativeVNNIMatrixDescView *down_descs,
+    DeviceNativeQuantisedMatrixDescView *gate_descs,
+    DeviceNativeQuantisedMatrixDescView *up_descs,
+    DeviceNativeQuantisedMatrixDescView *down_descs,
     int num_experts,
     int device_idx,
     void *stream)
@@ -23108,7 +23108,7 @@ __attribute__((visibility("default"))) bool hipMoE_materialize_runtime_prefill_d
         /*max_active_experts=*/0,
         /*current_slots=*/0,
         /*publish_prefill_histogram=*/0,
-        llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+        llaminar2::DeviceMoEWeightFormat::NativeQuantised,
         llaminar2::DeviceMoEProjectionSet::CompleteExpert);
 
     hipError_t err = hipGetLastError();
@@ -23398,9 +23398,9 @@ __attribute__((visibility("default"))) bool rocmMoE_grouped_floating_prefill_pip
  */
 __attribute__((visibility("default"))) bool hipMoE_materialize_runtime_prefill_plan(
     const void *runtime,
-    DeviceNativeVNNIMatrixDescView *gate_descs,
-    DeviceNativeVNNIMatrixDescView *up_descs,
-    DeviceNativeVNNIMatrixDescView *down_descs,
+    DeviceNativeQuantisedMatrixDescView *gate_descs,
+    DeviceNativeQuantisedMatrixDescView *up_descs,
+    DeviceNativeQuantisedMatrixDescView *down_descs,
     int *active_expert_ids,
     int num_experts,
     int max_active_experts,
@@ -23431,7 +23431,7 @@ __attribute__((visibility("default"))) bool hipMoE_materialize_runtime_prefill_p
         max_active_experts,
         /*current_slots=*/0,
         /*publish_prefill_histogram=*/0,
-        llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+        llaminar2::DeviceMoEWeightFormat::NativeQuantised,
         llaminar2::DeviceMoEProjectionSet::CompleteExpert);
 
     const hipError_t err = hipGetLastError();

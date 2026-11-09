@@ -1627,7 +1627,7 @@ Artifacts: `/tmp/e2e-1788644336293374856/1`.
 #### CUDA originating access and shared workspace fix (22:01 UTC)
 
 Compute Sanitizer reproduces an **invalid global FP32 write** in
-`nativeVnniGemv_kpar<128,1,5>` on `main_condition` captured replay. The partial
+`nativeQuantisedGemv_kpar<128,1,5>` on `main_condition` captured replay. The partial
 address ends in `...5555`: the CUDA fused-projection binder divides a merged
 workspace byte envelope by three side streams. Another graph-family stage had
 enlarged that same buffer name; the merged capacity is not divisible by twelve,
@@ -1659,7 +1659,7 @@ binders share this calculation. No kernel arithmetic, launch geometry, stream,
 event, workspace allocation, graph reset or collective policy changes. ROCm's
 analogous decode binder already uses explicit column-based prefix offsets in
 FP32 units rather than dividing a merged byte envelope; the floating adapters
-do not use these NativeVNNI partial-slot binders.
+do not use these NativeQuantised partial-slot binders.
 
 Focused red: `/tmp/e2e-merged-workspace-red.log` reproduces CUDA error 716 on
 Q4_0 before the fix, without loading a model. Green:
@@ -3771,14 +3771,14 @@ page mappings and affinity-controlled, certified first-touch machinery.
 Do not call its discard/first-touch API on already-packed live bytes.
 Propagate placement through `KernelFactory::prepareExpertGemmLocal` to the
 quantized packer and FP16/BF16/FP32 expert-owned copy paths. The misleadingly
-named `ensurePackedWeightsInTensorCache` is currently a no-op; NativeVNNI kernels
-actually pack in their constructor via `packWeightsCPUNativeVNNI`, so there is
+named `ensurePackedWeightsInTensorCache` is currently a no-op; NativeQuantised kernels
+actually pack in their constructor via `packWeightsCPUNativeQuantised`, so there is
 no tensor-cache packing authority to extend. Avoid a separate migration-only
 representation or a second physical-memory ledger. Add model-free cross-NUMA
 all-format preparation/byte-equivalence coverage and include it in preflight.
 
 The implementation under validation now passes `CPUWeightStoragePlacement`
-through the CPU expert factory, every NativeVNNI encoding, floating-point native
+through the CPU expert factory, every NativeQuantised encoding, floating-point native
 copies, and portable archive deserialization. Exact-node storage is a dedicated
 page mapping certified before writing. Direct arrivals retain their already
 placed final owner. The old post-pack migration and replacement-copy helpers

@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <exception>
 
 namespace llaminar2
 {
@@ -377,8 +378,19 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Reset committed metadata and auxiliary state on one exact stream.
+     * @param context Named owner boundary and original producer stream.
+     * @return Whether every metadata reset was accepted by the native backend.
+     * @throws Propagates the original cache-owned exception after logging it.
+     *
+     * The function-try-block observes the original exception before the
+     * orchestrator's unpublished-reset guard terminates during unwinding.
+     * Rethrowing preserves its type and all existing fatal semantics.
+     */
     bool ROCmRingKVCacheBase::resetRequestState(
         const StateResetContext &context)
+    try
     {
         requireGPUExecutionStream(
             context.execution_stream,
@@ -459,6 +471,35 @@ namespace llaminar2
         }
         if(auto *aux=auxiliaryState())aux->reset({0,2147483647,0,batch_size_},context.execution_stream);
         return true;
+    }
+
+    catch (const std::exception &error)
+    {
+        std::fprintf(
+            stderr,
+            "[FATAL] ROCm KV request reset threw: "
+            "device=%d reason=%s boundary=%d stream=%p exception=%s\n",
+            device_id_,
+            context.reason ? context.reason : "<unnamed>",
+            static_cast<int>(context.boundary),
+            context.execution_stream,
+            error.what());
+        std::fflush(stderr);
+        throw;
+    }
+    catch (...)
+    {
+        std::fprintf(
+            stderr,
+            "[FATAL] ROCm KV request reset threw: "
+            "device=%d reason=%s boundary=%d stream=%p "
+            "exception=<non-standard exception>\n",
+            device_id_,
+            context.reason ? context.reason : "<unnamed>",
+            static_cast<int>(context.boundary),
+            context.execution_stream);
+        std::fflush(stderr);
+        throw;
     }
 
     bool ROCmRingKVCacheBase::resetSequenceState(

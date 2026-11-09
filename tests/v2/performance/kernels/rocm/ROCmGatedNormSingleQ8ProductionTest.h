@@ -135,8 +135,8 @@ public:
             for(const auto* name:{GemmWorkspaceBuffers::QUANT_A,GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,
                 GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL,GemmWorkspaceBuffers::SCALES_A})
                 banks.emplace_back(workspace->value->getBuffer(name),workspace->value->getBufferSize(name));
-            DeviceNativeVNNIMatrixDesc descriptor;
-            require(prepared.kernel->inspectPreparedNativeVNNIMatrixDesc(descriptor),"Missing original native planes");
+            DeviceNativeQuantisedMatrixDesc descriptor;
+            require(prepared.kernel->inspectPreparedNativeQuantisedMatrixDesc(descriptor),"Missing original native planes");
             const auto physical=requireQ8ResidualNativeMatrix(descriptor,1,n,k);
             const auto blocks=static_cast<size_t>(n)*descriptor.blocks_per_row;
             immutable={{const_cast<uint8_t*>(descriptor.payload),blocks*(descriptor.allocation_payload_bytes_per_block?
@@ -216,7 +216,7 @@ public:
         for(const auto& node:before) {
             const auto* raw=hipKernelNameRefByPtr(node.func,stream.value);require(raw,"Missing original raw function symbol");
             const std::string name(raw);
-            if(name.find("gemv_native_vnni_kernel_t")!=std::string::npos||name.find("gemv_native_vnni_reduce_kernel_t")!=std::string::npos) {
+            if(name.find("gemv_native_quantised_kernel_t")!=std::string::npos||name.find("gemv_native_quantised_reduce_kernel_t")!=std::string::npos) {
                 original.push_back(node);
                 if(name.find("reduce_kernel_t")==std::string::npos)parts=argument<int>(node,11);
             }
@@ -414,12 +414,12 @@ inline void events()
     require(cell.observe(false,31,0x5a)==cell.observe(true,31,0x5a),"Additional restored dirty bytes failed");
 }
 } // namespace gated_norm_single_q8_production
-TEST_F(NativeVNNIPerfTest,GatedNormSingleQ8ProductionOwnerAndAllFormatBytes)
+TEST_F(NativeQuantisedPerfTest,GatedNormSingleQ8ProductionOwnerAndAllFormatBytes)
 {
     if(!has_device_)GTEST_SKIP()<<"ROCm device required";
     gated_norm_single_q8_production::matrix();
 }
-TEST_F(NativeVNNIPerfTest,DISABLED_GatedNormSingleQ8ProductionCompleteEvents)
+TEST_F(NativeQuantisedPerfTest,DISABLED_GatedNormSingleQ8ProductionCompleteEvents)
 {
     if(!has_device_)GTEST_SKIP()<<"ROCm device required";
     gated_norm_single_q8_production::events();

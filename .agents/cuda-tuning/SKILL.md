@@ -328,7 +328,7 @@ profile. The critical details are: attach to `llaminar2` directly with
 so the launch budget reaches captured inference:
 
 ```bash
-RUNTIME_KERNELS='regex:(buildGrouped|build_active|count_per|cuda_attention|cuda_derive_attention|cuda_gated|cuda_gdn|cuda_q_gate|cuda_short_conv1d|exclusive_scan|float_to_int|fp32_|grouped_|groupedImma|quantize_activations|router_gate|scatter_tokens|shared_expert|softmax_topk|embedding_lookup|fused_|mtpConcat|requestTerminal|cuda_kv|residual_add|rmsnorm|rope_|flash_attention|nativeVnniTC|route_logits|shiftedMTP|ring_append|ring_gather)'
+RUNTIME_KERNELS='regex:(buildGrouped|build_active|count_per|cuda_attention|cuda_derive_attention|cuda_gated|cuda_gdn|cuda_q_gate|cuda_short_conv1d|exclusive_scan|float_to_int|fp32_|grouped_|groupedImma|quantize_activations|router_gate|scatter_tokens|shared_expert|softmax_topk|embedding_lookup|fused_|mtpConcat|requestTerminal|cuda_kv|residual_add|rmsnorm|rope_|flash_attention|nativeQuantisedTC|route_logits|shiftedMTP|ring_append|ring_gather)'
 
 sudo -E /usr/local/cuda/bin/ncu \
   --target-processes all \
@@ -490,7 +490,7 @@ directly. Keep `--target-processes all` when the harness can fork, preserve its
 shape/format/M filters, and recalculate launch skip whenever the warmup or
 candidate order changes.
 
-### Prove NativeVNNI IMMA and vectorized memory execution
+### Prove NativeQuantised IMMA and vectorized memory execution
 
 Do not infer tensor-core use from a source-level `mma.sync` spelling or a
 candidate-family name. Profile the actual production-selected candidate and
@@ -498,15 +498,15 @@ record the GA102 IMMA and memory-width counters on one isolated extra launch:
 
 ```bash
 sudo -E /usr/local/cuda/bin/ncu \
-  --kernel-name "nativeVnniTC" --launch-skip 1 --launch-count 1 \
+  --kernel-name "nativeQuantisedTC" --launch-skip 1 --launch-count 1 \
   --metrics \
 sm__inst_executed_pipe_tensor_op_imma.sum,\
 smsp__average_inst_executed_pipe_tensor_op_imma_per_warp,\
 smsp__sass_inst_executed_op_memory_128b.sum,\
 smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.ratio \
-  --target-processes all -o /tmp/native_vnni_instruction_proof -f \
-  ./build_v2_release/tests/v2/v2_perf_cuda_native_vnni_gemm \
-  --gtest_filter="CUDANativeVNNIGemmPerf.Performance_AllFormats_AllShapes"
+  --target-processes all -o /tmp/native_quantised_instruction_proof -f \
+  ./build_v2_release/tests/v2/v2_perf_cuda_native_quantised_gemm \
+  --gtest_filter="CUDANativeQuantisedGemmPerf.Performance_AllFormats_AllShapes"
 ```
 
 The command MUST use the harness's normal shape/format/M filters so Nsight sees
@@ -525,12 +525,12 @@ so it is a valid proxy for those kernels.
 
 ```bash
 # Build the perf test (Release)
-cmake --build build_v2_release --target v2_perf_cuda_native_vnni_gemm --parallel
+cmake --build build_v2_release --target v2_perf_cuda_native_quantised_gemm --parallel
 
 # Correctness gate is cosine >= 0.9990 vs cuBLAS. The full-shape sweep is SLOW
 # (single-threaded CPU reference, several minutes) — ALWAYS scope to the shapes you care about.
 LLAMINAR_CUDA_NATIVE_GEMM_SHAPES="35BMoE_Expert_GateUp,35BMoE_Expert_Down" \
-  ./build_v2_release/tests/v2/v2_perf_cuda_native_vnni_gemm --gtest_filter="*"
+  ./build_v2_release/tests/v2/v2_perf_cuda_native_quantised_gemm --gtest_filter="*"
 ```
 
 Useful env filters (comma-separated, case-insensitive): `LLAMINAR_CUDA_NATIVE_GEMM_FORMATS`,
@@ -538,135 +538,33 @@ Useful env filters (comma-separated, case-insensitive): `LLAMINAR_CUDA_NATIVE_GE
 `LLAMINAR_CUDA_NATIVE_GEMM_BENCH`, `LLAMINAR_CUDA_NATIVE_GEMM_WORKERS`.
 
 Add new production shapes to `kQwenShapes` in
-`tests/v2/performance/kernels/cuda/gemm/CUDANativeVNNIGemmPerfCommon.h` so the harness
+`tests/v2/performance/kernels/cuda/gemm/CUDANativeQuantisedGemmPerfCommon.h` so the harness
 covers the exact GEMMs a model actually runs.
 
-### Generated GEMM/GEMV dispatch training pipeline
+### Generated GEMM/GEMV exact overlays
 
-Read `.agents/nativevnni-gemm-tuning/SKILL.md` for the shared corpus, learner,
-certification, Git LFS, and installation workflow. This section owns only
-CUDA-specific kernel/profiler constraints.
+Use [NativeQuantised exact-overlay tuning](../nativequantised-gemm-tuning/SKILL.md) for
+shared geometry, source aliases, exact selection, retention and installation.
+Generic fitting is retired. Add model and physical TP shapes to the shared
+manifest, not CUDA-private lists; preserve runtime generic decisions for unseen
+shapes. Every forced candidate must report its actual launch family.
 
-Do not land source-level "one shape gets this tile" overrides for CUDA NativeVNNI
-unless the user explicitly asks for a temporary experiment. The durable path is:
+M1 WIDE, DIRECT, global KPAR and CTA-local fused KPAR remain distinct physical
+families. Grouped verifier execution inherits the staged serial arithmetic;
+no independently selected reduction tree may enter an exact overlay. Keep
+source-to-execution codebook aliases explicit in runtime-key composition.
 
-1. Add or confirm the production shapes in
-   `tests/v2/performance/kernels/cuda/gemm/CUDANativeVNNIGemmPerfCommon.h`.
-2. For decode/GEMV dispatch tables, use the Git-LFS-aware turnkey transaction:
-   `scripts/train_native_vnni_dispatch.sh --backend cuda --install`.
-   The lower-level `refresh_native_vnni_dispatch_tables.sh` remains the phase
-   executor used by the driver and for focused diagnostic collection.
-   It first sweeps and freezes `Fast M=1`, then certifies grouped verifier
-   `M=2..16,31` against that exact staged serial policy. Fifteen drafts require
-   verifier M16 because the target pass includes one bonus row; M31 is a deeper
-   sentinel, not a runtime maximum. Installation requires this complete matrix.
-   The M1 broad sweep runs complete sample-interleaved candidate rounds. Failed
-   development-CV cells are converted by
-   `tests/v2/performance/kernels/native_vnni_dispatch/paired_requests.py` into
-   typed, concrete candidate-pair
-   manifests; the CUDA trainer batches those requests, the compiler absorbs the
-   dimensionless tournament ratios, and CV repeats before sealed evaluation.
-   The CUDA decode sweep trainer uses deterministic structurally-valid packed
-   payloads, not per-element random quantization, so giant LM-head refreshes do
-   not stall in host fixture generation. It still constructs the real tensor
-   classes and production VRAM-pool preparation path.
-   Policy fitting itself may use every CUDA and ROCm device through the exact
-   leaf-primary scorer DSOs. The wrapper auto-discovers them; use
-   `--policy-accelerators` and `--policy-lanes` to make ownership explicit.
-   These launches score authenticated regret matrices, not candidate kernels,
-   and cannot enter canonical timing or Nsight evidence. CUDA/HIP workers are
-   process-isolated, and an explicitly requested accelerator failure is fatal.
-   A production refresh also emits a provenance-bound profiler request for
-   every physical candidate observation. Nsight Compute starts with collection
-   disabled; packing, graph capture, route proof, correctness, and warmup remain
-   outside profiling, and `cuProfilerStart` brackets one extra production
-   launch per pass. Never run `ncu` around canonical timing or import
-   replay-inflated profiler duration as the dispatch latency. Multi-kernel
-   candidates retain one ordered evidence record per physical dispatch.
-   Missing `ncu`, a required metric, or one supported candidate record blocks
-   a production install. The final `cuda_profiler_features.csv` is generated
-   only by authenticating the original canonical observation corpus against
-   the request and evidence manifests; it contains untouched pipeline timing
-   plus separate per-dispatch Nsight metrics.
-   The CUDA M1 decode family set is `wide,kpar,direct,fused_kpar`. The latter
-   retains the exact KPAR tree but publishes through CTA-local storage; its
-   resource admission and grouped inheritance belong to the common tuning
-   contract. The perf harness
-   uses the production VRAM-pool preparation path, which does not own ROWPAR's
-   optional row-major auxiliary weight view; do not add `rowpar` back to the
-   standard refresh unless the trainer has an explicit row-major-owner mode and
-   model-level parity proves the generated table.
-   If the full qwen36 inventory is too large for one pass, use the same staged
-   profiles as ROCm: `--profile qwen36-core` for FFN/GDN projections and
-   `--profile qwen-mtp-head` for the complete MTP-specific matrix inventory.
-   The latter is not merely an LM-head alias: it resolves every release hidden
-   width into both the hidden/embedding projection `H x 2H` and terminal
-   `248320 x H` family, then covers M=1, grouped M=2..16, and the M31 sentinel
-   across every supported source format. Do not install either staged artifact
-   until the combined model-level parity and benchmark gates have passed.
-3. Use `--profile family-smoke` for a bounded representative training pass before
-   a full acceptance refresh. This profile is stratified by format: it runs one
-   small sweep per codebook/family, writes per-format partial CSVs, combines them,
-   then runs the normal train/generate/validate flow. This avoids a capped sweep
-   accidentally covering only the first format in the list.
+The native trainer must bind a non-null stream and record events on that exact
+stream. Prepare/upload/repack source weights once per compatible measurement
+batch and size workspace from its declared requirements. Giant LM-head shapes
+must not inherit a guessed fixed workspace budget.
 
-   ```bash
-   scripts/refresh_native_vnni_dispatch_tables.sh --backend cuda \
-     --profile family-smoke \
-     --cuda-formats Q4_0,IQ4_XS \
-     --m-values 1,2
-   ```
-
-   `family-smoke` is a workflow/proxy gate, not production acceptance. Do not
-   replace broad checked-in tables from this profile alone; run `qwen36` or
-   `all`, then model-level parity and benchmark gates, before `--install`.
-   The wrapper intentionally uses proxy hit-rate thresholds for `family-smoke`;
-   production fallback-family/exact thresholds apply only to `qwen36` and `all`.
-
-4. Collect and install dense prefill exact overlays through the resumable
-   `native_vnni_dispatch.production_dense_prefill_sweep` transaction. It owns
-   the all-format Qwen geometry/M inventory, one process per physical GPU,
-   per-candidate native-event timing sidecars, byte certificates, atomic cell
-   publication, resume validation, and deterministic combination. CUDA
-   candidates are only AUTO, direct BK64 output tiles, BK256, and the exact
-   public-M=1 K-partition tree; an independently chosen reduction tree is not a
-   launchable or benchmarkable candidate. Generate the include only after
-   `combine` authenticates every planned cell, using
-   `native_vnni_dispatch.dense_production_overlay`.
-5. When debugging the decode trainer itself, the lower-level flow is
-   `Perf__CUDANativeVNNIDecodeTrainer.cpp` ->
-   `analyze_cuda_native_vnni_decode_trainer.py` -> the common compiler under
-   `native_vnni_dispatch/`. The retired `infer_gemv_dispatch_heuristic.py` and
-   `analyze_cuda_tc_gemv_dispatch.py` pipeline is not an authority and must not
-   be resurrected. Public M1 may legitimately prefer WIDE, DIRECT, or an exact
-   ordered KPAR schedule for the same `(N,K)` in eager versus captured mode.
-   Grouped M2+ never chooses an independent schedule; it inherits the complete
-   frozen M1 arithmetic identity and proves byte equality at every required M.
-   The trained fallback is the real policy: it must generalize by aspect ratio
-   and work-size/log-shape features. Exact `(M,N,K)` rows are overlays only.
-   Do not replace the broad fallback with a table that only recognizes today’s
-   model dimensions.
-   The overlay must score the runtime dispatch surface, not raw source-format
-   rows. CUDA NativeVNNI GEMV dispatch is keyed by `(codebook,M,N,K)`, and
-   aliases such as `Q4_1/Q4_K`, `Q5_1/Q5_K`, and `IQ4_NL/IQ4_XS` cannot receive
-   separate runtime tunings for the same key. Collapse alias rows to one
-   aggregate codebook-level winner before enforcing exact-hit thresholds.
-   The trainer must bind an explicit non-blocking CUDA stream to the GEMM kernel
-   and record CUDA events on that stream. A `stream=0` trainer log or
-   `cudaEventRecord(start)` without a stream argument is a bug, not a benign perf
-   detail.
-   The trainer must prepare/upload/repack each weight once per format+shape
-   before candidate timing and size its `DeviceWorkspaceManager` from
-   `IWorkspaceConsumer::getWorkspaceRequirements()`; fixed 512 MiB budgets fail
-   on giant LM-head small-M partial buffers.
-6. Validate generated artifacts with the transaction unit suite,
-   `V2_Unit_CUDAGemvDispatchGeneratorAliases`, and
-   `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`. For decode trainer changes,
-   include `V2_Unit_GpuWorkspaceAllocationPolicy` so the explicit-stream
-   trainer contract is checked. CUDA prefill installation additionally requires
-   `V2_Integration_CUDA_NativeVNNI_PrefillBucketMInvariantAllFormats` and the
-   backend GEMM source-policy gate; a timing winner without byte equality is an
-   invalid corpus row, not an installable exception.
+Run compiler-resource admission before timing. Profile one exact candidate
+launch after correctness and warmup, separately from canonical event samples.
+Retain register/local/shared-memory use, occupancy and memory/compute counters
+for each physical dispatch. A spilled or byte-inexact candidate is ineligible.
+Keep the generated-codebook, explicit-stream, all-format prefill and grouped
+byte-regression gates green, followed by a matched Release model benchmark.
 
 Example resumable CUDA prefill transaction:
 
@@ -674,27 +572,27 @@ Example resumable CUDA prefill transaction:
 # Preflight the complete compiler-resource surface before any long timing run.
 CUDA_VISIBLE_DEVICES=0 \
 LLAMINAR_TILE_RESOURCE_CSV=/tmp/cuda-dense-prefill-resources.csv \
-build_v2_release/tests/v2/v2_perf_cuda_native_vnni_gemm \
-  --gtest_filter='CUDANativeVNNIGemmPerf.CompilerResources_AllCodebooksAndCandidates'
+build_v2_release/tests/v2/v2_perf_cuda_native_quantised_gemm \
+  --gtest_filter='CUDANativeQuantisedGemmPerf.CompilerResources_AllCodebooksAndCandidates'
 
 PYTHONPATH=tests/v2/performance/kernels python3 -m \
-  native_vnni_dispatch.production_dense_prefill_sweep run \
+  native_quantised_dispatch.production_dense_prefill_sweep run \
   --backend cuda \
-  --output-dir benchmark_results/native_vnni_dispatch/work/cuda-dense-prefill \
-  --binary build_v2_release/tests/v2/v2_perf_cuda_native_vnni_gemm \
+  --output-dir benchmark_results/native_quantised_dispatch/work/cuda-dense-prefill \
+  --binary build_v2_release/tests/v2/v2_perf_cuda_native_quantised_gemm \
   --devices 0,1
 
 PYTHONPATH=tests/v2/performance/kernels python3 -m \
-  native_vnni_dispatch.production_dense_prefill_sweep combine \
+  native_quantised_dispatch.production_dense_prefill_sweep combine \
   --backend cuda \
-  --output-dir benchmark_results/native_vnni_dispatch/work/cuda-dense-prefill
+  --output-dir benchmark_results/native_quantised_dispatch/work/cuda-dense-prefill
 
 PYTHONPATH=tests/v2/performance/kernels python3 -m \
-  native_vnni_dispatch.dense_production_overlay \
+  native_quantised_dispatch.dense_production_overlay \
   --backend cuda \
-  --work-dir benchmark_results/native_vnni_dispatch/work/cuda-dense-prefill \
+  --work-dir benchmark_results/native_quantised_dispatch/work/cuda-dense-prefill \
   --output src/v2/kernels/cuda/gemm/CUDADenseProductionPrefillOverlayGenerated.inc \
-  --summary-csv benchmark_results/native_vnni_dispatch/work/cuda-dense-prefill/overlay.csv
+  --summary-csv benchmark_results/native_quantised_dispatch/work/cuda-dense-prefill/overlay.csv
 ```
 
 The resource preflight enumerates every runtime codebook, all six BK64 tiles,
@@ -716,7 +614,7 @@ Grouped MTP verifier rows are stricter than ordinary fast decode: rows may be
 published to live state, so every native FP32 output byte must equal rowwise
 serial M1 decode. L2/cos/KLD/max-abs are diagnostics only. CUDA exposes this through
 `ITensorGemm::beginVerifierDecodeEquivalentScope()`, which selects the canonical
-small-M NativeVNNI dispatch/reduction policy and disables prefill/concurrent
+small-M NativeQuantised dispatch/reduction policy and disables prefill/concurrent
 decode reordering without enabling global `LLAMINAR_DETERMINISTIC`. Stage code
 must use that shared RAII interface, never call CUDA `extern "C"` mode toggles
 or set environment variables directly.
@@ -797,7 +695,7 @@ nvidia-smi
 
 # Scoped, correctness-gated GEMM A/B
 LLAMINAR_CUDA_NATIVE_GEMM_SHAPES="ShapeA,ShapeB" \
-  ./build_v2_release/tests/v2/v2_perf_cuda_native_vnni_gemm
+  ./build_v2_release/tests/v2/v2_perf_cuda_native_quantised_gemm
 
 # Clean-shell benchmark for the real number
 env | grep -i LLAMINAR_PROFIL   # expect empty

@@ -74,10 +74,10 @@ namespace llaminar2::test::moe_transfer_state_machine
      * synthetic payloads in this state-machine suite. Distinct stable addresses
      * let validation prove that retirement clears all three projections.
      */
-    inline DeviceNativeVNNIMatrixDesc fakeMatrix(
+    inline DeviceNativeQuantisedMatrixDesc fakeMatrix(
         uintptr_t address) noexcept
     {
-        DeviceNativeVNNIMatrixDesc descriptor;
+        DeviceNativeQuantisedMatrixDesc descriptor;
         descriptor.payload =
             reinterpret_cast<const uint8_t *>(address);
         descriptor.scales =

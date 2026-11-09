@@ -598,7 +598,7 @@ predate these changes and must not be reused.
 The new real CPU sparse endpoint / captured GPU ticket test fails immediately
 on Q4_0: first weighted output 0.0965338647 versus serial 0.0970996097, before
 any width change. This exposes a separate serial numerical-policy defect:
-`gemv_native_vnni` quantizes FP32 input with the backend-native helpers even
+`gemv_native_quantised` quantizes FP32 input with the backend-native helpers even
 when the prepared matrix declares `GPUAlignedExpert`. Grouped and fused
 gate/up callers already honor that policy. The serial helper now uses the
 same existing block-publication helpers, moved before it in the header;

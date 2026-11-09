@@ -2,20 +2,27 @@
  * @file Test__GPUExpertTransfer_CUDA.cpp
  * @brief CUDA D2D coverage for packed and floating expert transfers.
  *
- * In addition to the separated NativeVNNI layout, this suite moves raw FP16,
+ * In addition to the separated NativeQuantised layout, this suite moves raw FP16,
  * BF16, and FP32 projection payloads through the persistent production peer
  * lane. Every case joins an exact producer event, observes completion only by
  * polling the destination event, and compares every bit at the destination.
+ * TransferEngine prepares the destination-owned execution stream; each lane
+ * retains its typed pool lease until all event-polled work and cleanup finish.
  */
 
 #include <gtest/gtest.h>
 
 #include "backends/DeviceId.h"
+#include "transfer/TransferEngine.h"
 #include "execution/moe/ExpertTierGpuPeerTransferLane.h"
 #include "execution/moe/GPUExpertTransfer.h"
+#include "execution/moe/GPUExpertTransferBackend.h"
+#include "kernels/qwen4exp/Qwen4ExpStateIO.h"
 
 #include <cuda_runtime.h>
 
+#include <array>
+#include <exception>
 #include <cstdint>
 #include <cstring>
 #include <chrono>
@@ -470,6 +477,11 @@ namespace
             ExpertTierGpuPeerTransferLane lane({
                 .source_device = DeviceId::cuda(src_dev),
                 .destination_device = DeviceId::cuda(dst_dev),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u, DeviceId::cuda(dst_dev),
+                                     "cuda_peer_event_polled")
+                                 .front(),
                 .lane_name = "cuda_peer_event_polled",
                 .perf_device = "cuda-peer",
                 .collect_timing_measurements = true,
@@ -636,6 +648,11 @@ namespace
             ExpertTierGpuPeerTransferLane lane({
                 .source_device = DeviceId::cuda(src_dev),
                 .destination_device = DeviceId::cuda(dst_dev),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u, DeviceId::cuda(dst_dev),
+                                     std::string("cuda_peer_contiguous_") + precision_name)
+                                 .front(),
                 .lane_name = std::string("cuda_peer_contiguous_") +
                              precision_name,
                 .perf_device = "cuda-peer-floating",
@@ -748,4 +765,106 @@ TEST(Test__ExpertTierGpuPeerTransferCUDA, FP32ContiguousTransferIsByteExact)
     if (!cudaPeerLaneEdgeAvailable())
         GTEST_SKIP() << "CUDA 1 cannot directly access CUDA 0";
     runCudaContiguousPeerLaneTransfer("fp32", 4, 0xF032u);
+}
+
+
+namespace
+{
+    /** @brief Own one tiny retained reset graph, including failed-test cleanup. */
+    struct CUDAPeerResetResources
+    {
+        int ordinal;
+        cudaStream_t stream=nullptr;
+        cudaGraph_t graph=nullptr;
+        cudaGraphExec_t executable=nullptr;
+        std::uint32_t *words=nullptr;
+        /** @brief Retire the exact test stream before releasing its captured bytes. */
+        ~CUDAPeerResetResources()
+        {
+            if(cudaSetDevice(ordinal)!=cudaSuccess)std::terminate();
+            if(stream && cudaStreamSynchronize(stream)!=cudaSuccess)std::terminate();
+            if(executable && cudaGraphExecDestroy(executable)!=cudaSuccess)std::terminate();
+            if(graph && cudaGraphDestroy(graph)!=cudaSuccess)std::terminate();
+            if(words && cudaFree(words)!=cudaSuccess)std::terminate();
+            if(stream && cudaStreamDestroy(stream)!=cudaSuccess)std::terminate();
+        }
+    };
+
+    /**
+     * @brief Replay an actual partial QFN reset after repeated direct-peer setup.
+     * @param source Actual native source ordinal.
+     * @param destination Actual native consumer ordinal.
+     * @param direct_peer Whether the queried directed edge is physically supported.
+     *
+     * Peer setup and ordinary auxiliary reset stay on this SAME host thread.
+     * A fresh thread isolates the defect from unrelated earlier test cases;
+     * no last-error clear is used to make either setup or reset pass.
+     */
+    void runCUDAPeerPreparationReset(int source,int destination,bool direct_peer)
+    {
+        ASSERT_EQ(cudaPeekAtLastError(),cudaSuccess);
+        ASSERT_EQ(cudaSetDevice(destination),cudaSuccess);
+        CUDAPeerResetResources owner{destination};
+        constexpr std::size_t capacity=37,live=17;
+        constexpr std::uint32_t captured_bits=0x13579BDFu;
+        ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&owner.words),capacity*sizeof(std::uint32_t)),cudaSuccess);
+        ASSERT_EQ(cudaStreamCreateWithFlags(&owner.stream,cudaStreamNonBlocking),cudaSuccess);
+        ASSERT_EQ(cudaStreamBeginCapture(owner.stream,cudaStreamCaptureModeThreadLocal),cudaSuccess);
+        ASSERT_NO_THROW(qwen4exp::cudaQwenStateFill({owner.words,live,captured_bits},owner.stream));
+        ASSERT_EQ(cudaStreamEndCapture(owner.stream,&owner.graph),cudaSuccess);
+        ASSERT_EQ(cudaGraphInstantiate(&owner.executable,owner.graph,nullptr,nullptr,0),cudaSuccess);
+        for(unsigned replay=0;replay<20;++replay)
+        {
+            SCOPED_TRACE(replay);
+            ASSERT_EQ(cudaSetDevice(source),cudaSuccess);
+            ASSERT_EQ(detail::prepareDirectPeerAccessCUDABackend(DeviceId::cuda(source),DeviceId::cuda(destination)),direct_peer);
+            ASSERT_EQ(detail::prepareDirectPeerAccessCUDABackend(DeviceId::cuda(source),DeviceId::cuda(destination)),direct_peer);
+            int ambient=-1;ASSERT_EQ(cudaGetDevice(&ambient),cudaSuccess);ASSERT_EQ(ambient,source);
+            ASSERT_EQ(cudaSetDevice(destination),cudaSuccess);
+            const std::uint32_t poison=0xAA550000u+replay;
+            // This is the ordinary cache-owned reset wrapper, before replay.
+            // Repeated setup must retire only its own AlreadyEnabled status.
+            ASSERT_NO_THROW(qwen4exp::cudaQwenStateFill({owner.words,capacity,poison},owner.stream));
+            ASSERT_EQ(cudaPeekAtLastError(),cudaSuccess);
+            ASSERT_EQ(cudaGraphLaunch(owner.executable,owner.stream),cudaSuccess);
+            std::array<std::uint32_t,capacity> observed{};
+            ASSERT_EQ(cudaMemcpyAsync(observed.data(),owner.words,sizeof(observed),cudaMemcpyDeviceToHost,owner.stream),cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(owner.stream),cudaSuccess);
+            for(std::size_t index=0;index<capacity;++index)
+                ASSERT_EQ(observed[index],index<live ? captured_bits : poison)<<index;
+        }
+    }
+}
+
+TEST(Test__ExpertTierGpuPeerTransferCUDA, RepeatedPreparationPreservesCapturedAuxiliaryReset)
+{
+    if(cudaDeviceCount()<2)GTEST_SKIP()<<"Requires two actual CUDA devices";
+    const int source=0,destination=1;
+    const bool direct_peer=cudaPeerLaneEdgeAvailable();
+    RecordProperty("direct_peer_available",direct_peer ? 1 : 0);
+    RecordProperty("source_ordinal",source);RecordProperty("destination_ordinal",destination);
+    // Unsupported edges are an explicit negative capability: setup must return
+    // false with clean error state while the device-local reset still works.
+    std::thread worker([&]{runCUDAPeerPreparationReset(source,destination,direct_peer);});
+    worker.join();
+}
+
+TEST(Test__ExpertTierGpuPeerTransferCUDA, PreparationPreservesUnrelatedPreexistingError)
+{
+    const int count=cudaDeviceCount();
+    if(count<2)GTEST_SKIP()<<"Requires two actual CUDA devices";
+    std::thread worker([&]{
+        ASSERT_EQ(cudaSetDevice(0),cudaSuccess);
+        ASSERT_EQ(cudaPeekAtLastError(),cudaSuccess);
+        // The deliberately invalid ordinal is defined cuda behavior, not an
+        // invalid native pointer. Only this test retires its injected error.
+        const auto injected=cudaSetDevice(count);
+        ASSERT_NE(injected,cudaSuccess);
+        ASSERT_EQ(cudaPeekAtLastError(),injected);
+        const bool prepared=detail::prepareDirectPeerAccessCUDABackend(DeviceId::cuda(0),DeviceId::cuda(1));
+        EXPECT_FALSE(prepared);
+        EXPECT_EQ(cudaPeekAtLastError(),injected);
+        EXPECT_EQ(cudaGetLastError(),injected);
+    });
+    worker.join();
 }

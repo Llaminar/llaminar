@@ -685,11 +685,11 @@ existing counted execution defect, not a demonstrated ordinary A1 model
 accuracy failure. Source review additionally found that counted M>1 consumers
 mask outputs while several quantizers still process inactive input and scratch.
 
-The scalar failure was a test admission mistake: NativeVNNI's original
+The scalar failure was a test admission mistake: NativeQuantised's original
 participant geometry supports AVX2/AVX512 and deliberately rejects Scalar.
 The corrected scalar registration proves actual scalar activation/read
-arithmetic and the precise NativeVNNI rejection. It does not fabricate an
-AVX2 workspace or claim a scalar NativeVNNI chain. All five corrected CPU
+arithmetic and the precise NativeQuantised rejection. It does not fabricate an
+AVX2 workspace or claim a scalar NativeQuantised chain. All five corrected CPU
 registrations pass in `hc103-original-cpu-calibration-r2` (12.43 s), retaining
 all frozen arithmetic. The initial build's namespace ambiguity and its fixed
 build receipt are retained separately.

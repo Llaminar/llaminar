@@ -57,9 +57,9 @@ Add a model-owned, per-device, per-MoE-layer runtime state object. Graph stages 
 
 ```cpp
 struct DeviceMoEExpertDescriptor {
-    DeviceNativeVNNIMatrixDesc gate;
-    DeviceNativeVNNIMatrixDesc up;
-    DeviceNativeVNNIMatrixDesc down;
+    DeviceNativeQuantisedMatrixDesc gate;
+    DeviceNativeQuantisedMatrixDesc up;
+    DeviceNativeQuantisedMatrixDesc down;
     int logical_expert_id;
     int owner_participant;
     int local_slot;
@@ -136,7 +136,7 @@ Performance direction:
 
 - Stop treating router weights as a generic FP32 raw pointer path.
 - Export router weights through the same descriptor/prepared-weight mechanism where possible.
-- Add a ROCm native-VNNI or FP16 router GEMV path tuned for `num_experts x d_model` with one-token input.
+- Add a ROCm native-quantised or FP16 router GEMV path tuned for `num_experts x d_model` with one-token input.
 - Fuse top-k and weight renormalization so there is no separate int-to-float conversion or D2D routing-copy kernel in Release.
 
 Debug/snapshot mode may still materialize router logits and routing tensors through an explicit slow path.
@@ -328,7 +328,7 @@ Expected stage changes:
 
 - Add prepared/quantized router weights for ROCm.
 - Implement fused logits/top-k/renorm/histogram kernel that does not materialize full logits in Release.
-- Compare FP32, FP16, and native-VNNI router paths with low-level tests and model parity.
+- Compare FP32, FP16, and native-quantised router paths with low-level tests and model parity.
 
 ### Phase D: Graph-Compatible Prefill
 

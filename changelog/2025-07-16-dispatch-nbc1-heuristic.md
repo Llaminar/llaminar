@@ -4,7 +4,7 @@
 
 ## Summary
 
-Changed the NativeVNNI tile dispatch heuristic to use `n_block_chunks=1` for both
+Changed the NativeQuantised tile dispatch heuristic to use `n_block_chunks=1` for both
 GEMV (decode, M=1) FFN shapes and GEMM (prefill, M>1) non-tiled paths. This was
 validated by a comprehensive dispatch parameter sweep.
 
@@ -21,7 +21,7 @@ better thread load balance without any cache penalty.
 
 ## Changes
 
-- **`CPUNativeVNNITileConfig.h`**:
+- **`CPUNativeQuantisedTileConfig.h`**:
   - GEMV FFN case: `nbc = min(chunks_per_task, max_chunks_l2)` → `nbc = 1`
   - GEMM non-tiled else-branch: removed `target_tasks/m_tasks/calc_chunks` formula → `nbc = 1`
   - Added `LLAMINAR_CPU_VNNI_*` env-var overrides for future sweep testing (GEMV + GEMM paths)
@@ -32,7 +32,7 @@ better thread load balance without any cache penalty.
 
 - **`KernelProfiler.h`**: Added `recordParallel()` for correct OMP thread-time accounting
 
-- **Sweep test**: `Perf__CPUNativeVNNI_DispatchSweep.cpp` — 5 test cases covering
+- **Sweep test**: `Perf__CPUNativeQuantised_DispatchSweep.cpp` — 5 test cases covering
   Q8_0/Q4_0 decode + prefill across all Qwen 7B shapes
 
 ## Micro-benchmark Results (Q8_0 decode, M=1, 28 threads)

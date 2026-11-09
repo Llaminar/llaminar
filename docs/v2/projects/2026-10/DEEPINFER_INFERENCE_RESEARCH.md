@@ -132,7 +132,7 @@ collective with participant-local work. It cannot conceal remote progress
 inside an ordinary compute stage. Symmetric buffers need an admitted
 `PhysicalMemoryAuthority` BOM, and grouped computation must consume device
 counts without host readbacks. New precision families cannot replace existing
-NativeVNNI/codebook behavior implicitly.
+NativeQuantised/codebook behavior implicitly.
 
 ## KV cache and attention ownership
 

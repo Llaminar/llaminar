@@ -2,7 +2,7 @@
  * @file ExpertTierGpuPeerTransferLane.h
  * @brief Persistent event-polled packed transfer within one GPU backend.
  *
- * CUDA-to-CUDA and ROCm-to-ROCm tiers share the separated NativeVNNI layout,
+ * CUDA-to-CUDA and ROCm-to-ROCm tiers share the separated NativeQuantised layout,
  * so migration is a direct asynchronous blob copy.  This lane owns a named
  * destination auxiliary stream and one reusable completion event.  It joins an
  * exact source producer event when necessary, submits all separated regions,

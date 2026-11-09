@@ -8,7 +8,7 @@
  */
 #pragma once
 
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <stdexcept>
 
 namespace llaminar2
@@ -27,8 +27,8 @@ namespace llaminar2
      * @return Exact payload stride and presence of the minima metadata planes.
      * @throws std::invalid_argument If the caller supplies an unknown layout.
      */
-    [[nodiscard]] inline NativeVnniReusableDeviceAllocationFormat
-    gpuPreparedWeightPoolAllocation(const NativeVnniFormatInfo &source,
+    [[nodiscard]] inline NativeQuantisedReusableDeviceAllocationFormat
+    gpuPreparedWeightPoolAllocation(const NativeQuantisedFormatInfo &source,
         GPUPreparedWeightPoolLayout layout)
     {
         switch (layout)

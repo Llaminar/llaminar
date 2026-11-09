@@ -9,7 +9,7 @@
  * - MPI serialization for inter-rank weight transfer (phase 2)
  *
  * Each concrete implementation wraps a device-specific packed format:
- * - CPU: CPUNativeVNNIPackedWeights (VNNI-interleaved layout)
+ * - CPU: CPUNativeQuantisedPackedWeights (VNNI-interleaved layout)
  * - CUDA: CUDAPackedWeights (INT8 column-major, phase 2)
  * - ROCm: ROCmPackedWeights (INT8 column-major, phase 2)
  * Explicit CPU clone destinations bind new physical bytes to a destination
@@ -31,12 +31,12 @@ namespace llaminar2
     /**
      * @brief Identifies the packed weight format for compatibility checking.
      *
-     * Same-format transfers are a straight memcpy (e.g., CPU_NATIVE_VNNI → CPU_NATIVE_VNNI
+     * Same-format transfers are a straight memcpy (e.g., CPU_NATIVE_QUANTISED → CPU_NATIVE_QUANTISED
      * across NUMA nodes). Cross-format transfers require conversion (phase 2).
      */
     enum class PackedWeightsFormat : uint8_t
     {
-        CPU_NATIVE_VNNI,  ///< CPUNativeVNNIPackedWeights (VNNI-interleaved + native payload)
+        CPU_NATIVE_QUANTISED,  ///< CPUNativeQuantisedPackedWeights (VNNI-interleaved + native payload)
         CUDA_INT8,        ///< CUDAPackedWeights (INT8 column-major on device)
         ROCM_INT8,        ///< ROCmPackedWeights (INT8 on device)
         UNKNOWN

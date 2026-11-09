@@ -40,7 +40,7 @@ std::vector<MoEOverlayBoundPhysicalMemoryBudget> cpuShardBudgets(std::size_t fir
 /** @test All source formats retain exact original N/K axes and native block groups. */
 TEST(CPUExpertShardAccounting, OriginalFormatsSlicesAndSocketIdentity){
  std::vector<ExpertWeightFormat> formats;
- for(const auto& f:native_vnni_formats::kAllSourceFormats)formats.push_back(ExpertWeightFormat::nativeVnni({f.metadata->codebook_id,f.metadata->is_superblock,true}));
+ for(const auto& f:native_quantised_formats::kAllSourceFormats)formats.push_back(ExpertWeightFormat::nativeQuantised({f.metadata->codebook_id,f.metadata->is_superblock,true}));
  for(const auto f:{TensorType::FP16,TensorType::BF16,TensorType::FP32})formats.push_back(ExpertWeightFormat::floating(f));
  for(const auto& f:formats){
   const auto source=cpuShardSource(f);const auto cohort=MoEExpertShardCohort::checked(source,6,cpuShardMembers(),{{0,256},{256,256}});
@@ -59,13 +59,13 @@ TEST(CPUExpertShardAccounting, OriginalFormatsSlicesAndSocketIdentity){
   }
  }
  for(const auto& registered:test::quantizedVerifierFormats()){
-  const auto source_format=ExpertWeightFormat::nativeVnni({registered.source_codebook_id,registered.source_is_superblock,true});
+  const auto source_format=ExpertWeightFormat::nativeQuantised({registered.source_codebook_id,registered.source_is_superblock,true});
   const auto native_layout=NativeEmbeddingLayout::forSource(registered.tensor_type,1,768);
   const auto block=static_cast<int>(native_layout.block_elements);
   const auto cuts=MoEExpertShardCohort::balancedIntervals(cpuShardSource(source_format,3,3*block),2);
   EXPECT_EQ(cuts,(std::vector<MoEExpertShardCohort::Interval>{{0,2*block},{2*block,block}}));
  }
- const auto native=cpuShardSource(ExpertWeightFormat::nativeVnni({native_vnni_formats::Q4_K.codebook_id,true,true}));
+ const auto native=cpuShardSource(ExpertWeightFormat::nativeQuantised({native_quantised_formats::Q4_K.codebook_id,true,true}));
  EXPECT_THROW(MoEExpertShardCohort::checked(native,6,cpuShardMembers(),{{0,128},{128,384}}),std::invalid_argument);
  auto bad=cpuShardMembers();bad[1].address=GlobalDeviceAddress::cpu(0);
  EXPECT_THROW(MoEExpertShardCohort::checked(native,6,bad,{{0,256},{256,256}}),std::invalid_argument);
@@ -148,7 +148,7 @@ TEST(CPUExpertShardAccounting, SingleSocketKeepsOriginalWholeExpertAuthority){
 }
 /** @test Original native superblock cuts may be unequal, and every actual fragment limits admission. */
 TEST(CPUExpertShardAccounting, UnequalFragmentsCannotBorrowPeerCapacity){
- const auto format=ExpertWeightFormat::nativeVnni({native_vnni_formats::Q4_K.codebook_id,true,true});
+ const auto format=ExpertWeightFormat::nativeQuantised({native_quantised_formats::Q4_K.codebook_id,true,true});
  const auto source=cpuShardSource(format,3,768);const auto cuts=MoEExpertShardCohort::balancedIntervals(source,2);
  ASSERT_EQ(cuts,(std::vector<MoEExpertShardCohort::Interval>{{0,512},{512,256}}));
  const auto cohort=MoEExpertShardCohort::checked(source,4,cpuShardMembers(),cuts);
@@ -164,9 +164,9 @@ TEST(CPUExpertShardAccounting, UnequalFragmentsCannotBorrowPeerCapacity){
 namespace llaminar2 {
 /** @test Actual QFN source geometry retains E512 while GPU64/CPU448 logical quotas charge two CPU fragments. */
 TEST(CPUExpertShardAccounting, QFNOriginal512AxisAnd448JointTierStayDistinct){
- auto source=cpuShardSource(ExpertWeightFormat::nativeVnni({native_vnni_formats::Q4_K.codebook_id,true,true}),3,640);
+ auto source=cpuShardSource(ExpertWeightFormat::nativeQuantised({native_quantised_formats::Q4_K.codebook_id,true,true}),3,640);
  source.projections[0].K=source.projections[1].K=source.projections[2].N=2560;
- source.projections[2].format=ExpertWeightFormat::nativeVnni({native_vnni_formats::Q5_1.codebook_id,false,true});
+ source.projections[2].format=ExpertWeightFormat::nativeQuantised({native_quantised_formats::Q5_1.codebook_id,false,true});
  const auto geometry=MoEExpertShardCohort::checked(source,512,cpuShardMembers(),{{0,320},{320,320}});
  const auto fragment=MoEOverlayCapacityResolver::preparedFootprints({geometry.localManifest(0)}).front().cpu_live_bytes;
  for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}){

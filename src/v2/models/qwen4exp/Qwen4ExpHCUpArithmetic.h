@@ -10,7 +10,7 @@
  */
 #pragma once
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <stdexcept>
 #include <string_view>
 
@@ -40,7 +40,7 @@ inline Qwen4ExpHCUpArithmetic resolveQwen4ExpHCUpArithmetic(
     if(source_format=="F32" || source_format=="FP32" ||
        source_format=="F16" || source_format=="FP16" || source_format=="BF16")
         return Qwen4ExpHCUpArithmetic::FloatingNative;
-    if(!native_vnni_formats::forQuantType(source_format))
+    if(!native_quantised_formats::forQuantType(source_format))
         throw std::invalid_argument("QFN HC-up requires native floating or cataloged native quantized source weights");
     return quantized_policy==QuantizedActivationOperandPrecision::TwoTermQ8
         ? Qwen4ExpHCUpArithmetic::QuantizedTwoTermQ8

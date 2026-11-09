@@ -37,7 +37,7 @@
 #include "utils/MPIContext.h"
 #include "utils/CPUWeightPlanTestAdmission.h"
 #include "loaders/PreparedWeightStore.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 
 namespace llaminar2::test
 {
@@ -908,7 +908,7 @@ namespace llaminar2::test
                 PreparedWeightKind::CpuPackedGemm,DeviceId::cpu()};
             const auto binding=manager->preparedWeightStore()->binding(ref);
             const auto engine=manager->preparedWeightStore()->gemmKernelLifetime(ref);
-            if(!binding || !binding->native_source || !engine || !engine->exportCPUNativeVNNIPackedWeights())
+            if(!binding || !binding->native_source || !engine || !engine->exportCPUNativeQuantisedPackedWeights())
                 throw std::logic_error("Native linked source lost actual committed engine/source projection");
             const auto& projection=*binding->native_source;
             const size_t bytes_per_row=tensor->shape()[1]/32*34;
@@ -923,10 +923,10 @@ namespace llaminar2::test
                     }
                 });
             auto expected=std::make_shared<Q8_0Tensor>(tensor->shape(),bytes);
-            cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
-            if(!cpu::native_vnni::packWeightsCPUNativeVNNI(expected.get(),packed))
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
+            if(!cpu::native_quantised::packWeightsCPUNativeQuantised(expected.get(),packed))
                 throw std::logic_error("Native independent original-byte oracle failed packing");
-            const auto* actual=engine->exportCPUNativeVNNIPackedWeights();
+            const auto* actual=engine->exportCPUNativeQuantisedPackedWeights();
             EXPECT_EQ(actual->native_interleaved.size(),packed.native_interleaved.size());
             EXPECT_EQ(std::memcmp(actual->native_interleaved.data(),packed.native_interleaved.data(),packed.native_interleaved.size()),0);
             return bytes;

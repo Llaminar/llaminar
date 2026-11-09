@@ -9,7 +9,7 @@
  * No model, GPU context, prepared weight or cache payload is materialized.
  */
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <gtest/gtest.h>
 
@@ -116,8 +116,8 @@ namespace llaminar2
         std::vector<ExpertWeightFormat> sourceFormats()
         {
             std::vector<ExpertWeightFormat> formats;
-            for (const auto &source : native_vnni_formats::kAllSourceFormats)
-                formats.push_back(ExpertWeightFormat::nativeVnni({
+            for (const auto &source : native_quantised_formats::kAllSourceFormats)
+                formats.push_back(ExpertWeightFormat::nativeQuantised({
                     .codebook_id = source.metadata->codebook_id,
                     .is_superblock = source.metadata->is_superblock, .present = true}));
             for (auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})

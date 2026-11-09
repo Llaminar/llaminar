@@ -45,8 +45,8 @@ namespace llaminar2
      */
     struct MoEProjectionNumericalContract final
     {
-        /** Number of source values represented by one NativeVNNI K block. */
-        static constexpr int native_vnni_values_per_block = 32;
+        /** Number of source values represented by one NativeQuantised K block. */
+        static constexpr int native_quantised_values_per_block = 32;
 
         static constexpr float q8_scale_multiplier = 0x1.020408p-7f;
 
@@ -91,7 +91,7 @@ namespace llaminar2
         /**
          * @brief Resolve the physical Q8 partition count for a reduction width.
          *
-         * Small synthetic shapes can contain fewer than sixteen NativeVNNI
+         * Small synthetic shapes can contain fewer than sixteen NativeQuantised
          * blocks.  Bounding the certified tree by the number of real blocks
          * preserves its ordering without launching semantically empty planes.
          * Invalid widths return zero and are rejected by the caller.
@@ -103,12 +103,12 @@ namespace llaminar2
             int reduction_width) noexcept
         {
             if (reduction_width <= 0 ||
-                (reduction_width % native_vnni_values_per_block) != 0)
+                (reduction_width % native_quantised_values_per_block) != 0)
             {
                 return 0;
             }
             const int blocks =
-                reduction_width / native_vnni_values_per_block;
+                reduction_width / native_quantised_values_per_block;
             return blocks < ordered_k_partitions
                        ? blocks
                        : ordered_k_partitions;
@@ -125,16 +125,16 @@ namespace llaminar2
          *
          * @param reduction_width Number of source values reduced by the row.
          * @return True only for a valid width whose partition count equals its
-         *         NativeVNNI block count.
+         *         NativeQuantised block count.
          */
-        static constexpr bool oneNativeVNNIBlockPerOrderedPartition(
+        static constexpr bool oneNativeQuantisedBlockPerOrderedPartition(
             int reduction_width) noexcept
         {
             const int partitions =
                 orderedKPartitionsForWidth(reduction_width);
             return partitions > 0 &&
                    partitions ==
-                       reduction_width / native_vnni_values_per_block;
+                       reduction_width / native_quantised_values_per_block;
         }
     };
 }

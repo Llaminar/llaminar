@@ -691,7 +691,7 @@ TEST_F(Test__Q8_0Tensor, RoundTrip_Q8_0_FP32_BF16_FP32)
 /**
  * @brief Quantized GEMM vs FP32 GEMM Parity Test for Q8_0
  *
- * Compares CPUNativeVNNIGemmKernel (INT8) against FloatingPointGemmKernel (FP32 OneDNN)
+ * Compares CPUNativeQuantisedGemmKernel (INT8) against FloatingPointGemmKernel (FP32 OneDNN)
  * using randomly initialized Q8_0 weights. Validates that quantization introduces
  * acceptable error (< 1% relative L2).
  */

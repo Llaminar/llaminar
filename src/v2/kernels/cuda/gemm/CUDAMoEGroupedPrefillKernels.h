@@ -18,9 +18,9 @@
 
 #include "../../common/MoEGroupedDirectory.h"
 
-#include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
-#include "../../common/DeviceNativeVNNIMatrixDesc.h"
+#include "../../common/DeviceNativeQuantisedMatrixDesc.h"
 #include "../../common/MoEGroupedSourceRows.h"
 #include "../../common/MoEPrefillProjectionExecution.h"
 
@@ -81,17 +81,17 @@ namespace llaminar2::cuda::moe
         bool exact_overlay = false;
     };
 
-    /** NativeVNNI execution codebook used by IQ4_XS routed projections. */
+    /** NativeQuantised execution codebook used by IQ4_XS routed projections. */
     inline constexpr int kQwenIQ4ExecutionCodebook =
-        kNativeVnniIQ4XSSourceScaleCodebook;
+        kNativeQuantisedIQ4XSSourceScaleCodebook;
 
-    /** NativeVNNI execution codebook used by Q6_K routed projections. */
+    /** NativeQuantised execution codebook used by Q6_K routed projections. */
     inline constexpr int kQwenQ6KExecutionCodebook = 8;
 
-    /** NativeVNNI execution codebook used by IQ3_S routed projections. */
+    /** NativeQuantised execution codebook used by IQ3_S routed projections. */
     inline constexpr int kQwenIQ3SExecutionCodebook = 11;
 
-    /** NativeVNNI execution codebook used by IQ2_S routed projections. */
+    /** NativeQuantised execution codebook used by IQ2_S routed projections. */
     inline constexpr int kQwenIQ2SExecutionCodebook = 13;
 
     /**
@@ -325,7 +325,7 @@ extern "C"
     bool cudaMoEGroupedImma_project(
         const int8_t *d_A_int8,
         const float *d_scales_A,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_desc_table,
         const int *d_group_counts,
         const int *d_group_offsets,
         const uint32_t *d_directory,
@@ -381,8 +381,8 @@ extern "C"
         const int8_t *d_A_int8,
         const float *d_scales_A,
         llaminar2::MoEGroupedSourceRows source_rows,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_gate_desc_table,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc *d_up_desc_table,
         const int *d_group_counts,
         const int *d_group_offsets,
         const uint32_t *d_directory,
@@ -406,7 +406,7 @@ extern "C"
      * This setup-only API supplies the all-format spill and occupancy gate.
      * It performs no allocation, transfer, launch, or synchronization.
      *
-     * @param codebook_id NativeVNNI execution codebook specialization.
+     * @param codebook_id NativeQuantised execution codebook specialization.
      * @param columns Exact compiled down-projection geometry to inspect.
      * @param registers_per_thread Receives compiler-assigned registers/thread.
      * @param local_memory_bytes_per_thread Receives compiler local-memory use.
@@ -430,7 +430,7 @@ extern "C"
      * The setup-only resource query lets the all-format performance suite reject
      * spills or an uneconomical occupancy change before model-level timing.
      *
-     * @param codebook_id NativeVNNI execution codebook specialization.
+     * @param codebook_id NativeQuantised execution codebook specialization.
      * @param columns Exact compiled gate/up geometry to inspect.
      * @param schedule Exact compiled projection-to-warp schedule to inspect.
      * @param registers_per_thread Receives compiler-assigned registers/thread.

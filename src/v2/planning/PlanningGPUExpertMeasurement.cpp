@@ -88,7 +88,7 @@ namespace llaminar2
             for (size_t i = 0; i < inputs.size(); ++i)
             {
                 const auto &matrix = description.matrices[i];
-                const auto *format = native_vnni_formats::forQuantType(description.formats[i]);
+                const auto *format = native_quantised_formats::forQuantType(description.formats[i]);
                 if (format)
                     pool.planWeightForOwner(device.gpu_ordinal(), inputs[i]->tensor_name,
                         matrix.n, matrix.k, format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric,
@@ -123,7 +123,7 @@ namespace llaminar2
                 {
                     const auto &matrix = description.matrices[index];
                     const auto &format = description.formats[index];
-                    if (const auto *native = native_vnni_formats::forQuantType(format))
+                    if (const auto *native = native_quantised_formats::forQuantType(format))
                     {
                         const uint8_t codebook = canonicalDeviceVnniCodebookId(*native);
                         return cuda::quantized_gemm_workspace::projectionRequirements(
@@ -139,7 +139,7 @@ namespace llaminar2
                     const int rows = rowsFor(phase);
                     auto current = MoEWorkspaceBuffers::cudaMoE(rows, k, n, 1, 1);
                     current.merge(projection(0, rows));
-                    if (native_vnni_formats::forQuantType(description.formats[0]))
+                    if (native_quantised_formats::forQuantType(description.formats[0]))
                     {
                         const std::array columns{n, n};
                         cuda::quantized_gemm_workspace::appendFusedProjectionRequirements(current, rows, columns, k);
@@ -394,7 +394,7 @@ namespace llaminar2
                     std::string error;
                     if (!resolveMoEOverlayPreparedWeightSource(engine, device, source, &error))
                         throw std::invalid_argument("Prepared GPU service original source: " + error);
-                    const bool packed = source.kind == MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeVnni;
+                    const bool packed = source.kind == MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeQuantised;
                     if ((packed ? source.gpu_packed.n : source.floating.n) != n ||
                         (packed ? source.gpu_packed.k : source.floating.k) != k)
                         throw std::invalid_argument("Prepared GPU service source projection geometry changed");
@@ -465,9 +465,9 @@ namespace llaminar2
             GpuExpertSlotPool::ProjectionSpec projection{
                 .label = labels[index], .N = static_cast<int>(matrix.n), .K = static_cast<int>(matrix.k)};
             const auto &format = description.formats[index];
-            if (const auto *native = native_vnni_formats::forQuantType(format))
+            if (const auto *native = native_quantised_formats::forQuantType(format))
             {
-                projection.format = ExpertWeightFormat::nativeVnni({native->codebook_id, native->is_superblock, true});
+                projection.format = ExpertWeightFormat::nativeQuantised({native->codebook_id, native->is_superblock, true});
                 projection.payload_bytes_per_block = native->payload_bytes;
                 projection.codebook_id = canonicalDeviceVnniCodebookId(*native);
                 projection.is_asymmetric = canonicalDeviceVnniFormat(*native).is_asymmetric;
@@ -549,7 +549,7 @@ namespace llaminar2
         pool->allocate(description.largest_source_bytes, 3);
         for (size_t i = 0; i < inputs.size(); ++i)
         {
-            const auto *format = native_vnni_formats::forQuantType(description.formats[i]);
+            const auto *format = native_quantised_formats::forQuantType(description.formats[i]);
             const auto repack = format ? codebookIdToRepackFormat(format->codebook_id, format->is_superblock) :
                 std::optional<RepackFormat>(RepackFormat::RAW_FP);
             require(repack.has_value(), "source format has no native GPU repacker");

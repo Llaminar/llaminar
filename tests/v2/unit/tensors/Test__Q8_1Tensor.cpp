@@ -84,7 +84,7 @@ TEST(Test__Q8_1Tensor, FromInt32WithScalesQuantizesAndStoresSum)
 /**
  * @brief Quantized GEMM vs FP32 GEMM Parity Test for Q8_1
  *
- * Compares CPUNativeVNNIGemmKernel (INT8) against FloatingPointGemmKernel (FP32 OneDNN)
+ * Compares CPUNativeQuantisedGemmKernel (INT8) against FloatingPointGemmKernel (FP32 OneDNN)
  * using randomly initialized Q8_1 weights. Validates that quantization introduces
  * acceptable error (< 1% relative L2).
  */

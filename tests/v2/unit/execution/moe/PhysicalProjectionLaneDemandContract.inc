@@ -5,7 +5,7 @@
 #include "execution/moe/MoEOverlayPhysicalLaneDemand.h"
 namespace llaminar2 { namespace {
 /** @return Declared native source, not a loaded tensor or fabricated prepared engine. */
-MoEOverlayLayerWeightManifest pieceDemandSource(const NativeVnniFormatInfo& format=native_vnni_formats::Q4_0) {
+MoEOverlayLayerWeightManifest pieceDemandSource(const NativeQuantisedFormatInfo& format=native_quantised_formats::Q4_0) {
     return {.layer_idx=0,.projections={{projection(ExpertTierWeightProjection::Gate,8192,256,format),
         projection(ExpertTierWeightProjection::Up,8192,256,format),projection(ExpertTierWeightProjection::Down,256,8192,format)}}};
 }
@@ -35,7 +35,7 @@ size_t pieceDemandCount(const MoEOverlayPhysicalLaneCounts& counts,MoEOverlayPhy
 }
 /** @test Whole-to-cohort fanout prices actual P pieces, not one scalar owner or P-squared padding. */
 TEST(MoEOverlayPhysicalPieceDemand, WholeCohortFanoutUsesOriginalCutsAndOneMaterializedPlan) {
-    for(const auto& format:native_vnni_formats::kAllSourceFormats) {
+    for(const auto& format:native_quantised_formats::kAllSourceFormats) {
     SCOPED_TRACE(format.quant_type);
     const std::vector<MoEOverlayLayerWeightManifest> source{pieceDemandSource(*format.metadata)};
     for(int members=2;members<=8;++members) {
@@ -130,7 +130,7 @@ TEST(MoEOverlayPhysicalPieceDemand, RetainedPortsPreserveWholeOwnerBOMWithoutTra
 }
 /** @test Different cohort cuts count only nonempty pieces; local CPU workers add no staging family. */
 TEST(MoEOverlayPhysicalPieceDemand, UnequalCohortsKeepDirectCPUWorkersScratchFree) {
-    for(const auto& format:native_vnni_formats::kAllSourceFormats) {
+    for(const auto& format:native_quantised_formats::kAllSourceFormats) {
         SCOPED_TRACE(format.quant_type);
         auto plan=pieceDemandPlan(2);auto third=plan.domains.back();third.name="third";
         third.participants.push_back(GlobalDeviceAddress::cpu(2));third.world_ranks.push_back(3);
@@ -165,8 +165,8 @@ TEST(MoEOverlayPhysicalPieceDemand, LayerCapsProduceCheckedNonfactorableWaveBoun
     fourth.world_ranks={3,1,2,4};
     plan.domains.push_back(fourth);plan.routed_tiers.back().fallback=false;
     plan.routed_tiers.push_back({.name="fourth",.domain="fourth",.priority=2,.fallback=true});
-    const auto source=[](int layer,int f){const auto format=ExpertWeightFormat::nativeVnni({.codebook_id=native_vnni_formats::Q4_0.codebook_id,
-        .is_superblock=native_vnni_formats::Q4_0.is_superblock,.present=true});
+    const auto source=[](int layer,int f){const auto format=ExpertWeightFormat::nativeQuantised({.codebook_id=native_quantised_formats::Q4_0.codebook_id,
+        .is_superblock=native_quantised_formats::Q4_0.is_superblock,.present=true});
         return MoEOverlayLayerWeightManifest{.layer_idx=layer,.projections={{{ExpertTierWeightProjection::Gate,f,256,format},
             {ExpertTierWeightProjection::Up,f,256,format},{ExpertTierWeightProjection::Down,256,f,format}}}};};
     // Six32-column blocks cut2↔4 at unequal origins: five intersections.

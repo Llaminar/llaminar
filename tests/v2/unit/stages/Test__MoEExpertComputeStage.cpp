@@ -112,7 +112,7 @@ namespace
      * measure repeated team construction rather than the stage contract and
      * can turn a device-free unit test into a multi-minute workload on a
      * many-core host.  Thread-count scaling remains the responsibility of the
-     * NativeVNNI performance suites; this guard keeps the correctness sweep
+     * NativeQuantised performance suites; this guard keeps the correctness sweep
      * fast while executing the same kernels and arithmetic implementation.
      */
     class ScopedOpenMPThreadCount
@@ -1322,7 +1322,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q4K)
 }
 
 /**
- * @brief A sparse CPU ExpertOverlay row must publish the same NativeVNNI input.
+ * @brief A sparse CPU ExpertOverlay row must publish the same NativeQuantised input.
  *
  * The continuation router is intentionally absent from the second invocation:
  * its compact row models an authoritative CPU-cold packet received through the
@@ -1332,7 +1332,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q4K)
  * separate grouped-row transport implementation.
  */
 TEST_F(MoEExpertComputeStageTest,
-       CpuTransportedSerialRowPublishesNativeVNNIRouterQ8BeforeExpertCompute)
+       CpuTransportedSerialRowPublishesNativeQuantisedRouterQ8BeforeExpertCompute)
 {
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedOpenMPThreadCount omp_threads(/*threads=*/1);
@@ -1404,7 +1404,7 @@ TEST_F(MoEExpertComputeStageTest,
         router_output->data(),
         /*rows=*/1,
         d,
-        "CPU transported serial NativeVNNI expert row");
+        "CPU transported serial NativeQuantised expert row");
 
     const auto records = PerfStatsCollector::snapshot({"moe_overlay"});
     EXPECT_TRUE(std::any_of(
@@ -1659,7 +1659,7 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_RuntimeMVerifierAllNativeFormatsM
             [](const PerfStatRecord &record)
             {
                 return record.domain == "kernel" &&
-                       record.name == "cpu_native_vnni_grouped_verifier_swiglu_down_calls";
+                       record.name == "cpu_native_quantised_grouped_verifier_swiglu_down_calls";
             }))
             << "CPU shared expert verifier must exercise the grouped SwiGLU/down kernel for "
             << format.label << ".\n"
@@ -2257,11 +2257,11 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                 {
                     return record.domain == "kernel" &&
                            record.name ==
-                               "cpu_native_vnni_router_q8_grouped_decode_equivalent_projection_calls" &&
+                               "cpu_native_quantised_router_q8_grouped_decode_equivalent_projection_calls" &&
                            record.count > 0;
                 }))
                 << "CPU " << format.label
-                << " verifier must execute the prequantized NativeVNNI grouped gate/up kernel.\n"
+                << " verifier must execute the prequantized NativeQuantised grouped gate/up kernel.\n"
                 << PerfStatsCollector::summaryString({"mtp", "kernel"});
             EXPECT_TRUE(std::any_of(
                 records.begin(),
@@ -2271,7 +2271,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                     const auto rows_it = record.tags.find("local_route_rows");
                     return record.domain == "kernel" &&
                            record.name ==
-                               "cpu_moe_native_vnni_layer_batched_expert_calls" &&
+                               "cpu_moe_native_quantised_layer_batched_expert_calls" &&
                            record.phase == "prefill" &&
                            rows_it != record.tags.end() &&
                            rows_it->second == expected_route_rows &&
@@ -2279,7 +2279,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                 }))
                 << "CPU " << format.label << " M=" << seq
                 << " ordinary prefill must execute the layer-batched "
-                   "NativeVNNI production path.\n"
+                   "NativeQuantised production path.\n"
                 << PerfStatsCollector::summaryString({"prefill", "kernel"});
             EXPECT_TRUE(std::any_of(
                 records.begin(),
@@ -2289,14 +2289,14 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                     const auto rows_it = record.tags.find("local_route_rows");
                     return record.domain == "kernel" &&
                            record.name ==
-                               "cpu_moe_native_vnni_layer_batched_expert_calls" &&
+                               "cpu_moe_native_quantised_layer_batched_expert_calls" &&
                            record.phase == "verifier" &&
                            rows_it != record.tags.end() &&
                            rows_it->second == expected_route_rows &&
                            record.count > 0;
                 }))
                 << "CPU " << format.label << " M=" << seq
-                << " verifier must execute the layer-batched NativeVNNI "
+                << " verifier must execute the layer-batched NativeQuantised "
                    "production path.\n"
                 << PerfStatsCollector::summaryString({"mtp", "kernel"});
             observed_grouped_multirow_launch =
@@ -2310,7 +2310,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                         const auto route_it = record.tags.find("route");
                         return record.domain == "kernel" &&
                                record.name ==
-                                   "cpu_native_vnni_fused_verifier_rows_projection_launch" &&
+                                   "cpu_native_quantised_fused_verifier_rows_projection_launch" &&
                                m_it != record.tags.end() &&
                                std::stoi(m_it->second) > 1 &&
                                route_it != record.tags.end() &&
@@ -2462,7 +2462,7 @@ TEST_F(
  * @brief Prove the CPU canonical fold is M-total and never requests a small team.
  *
  * The original root-only reduction used `num_threads(M)`. At grouped M=4 this
- * made libgomp retire 24 workers on a 28-core socket, and the next NativeVNNI
+ * made libgomp retire 24 workers on a 28-core socket, and the next NativeQuantised
  * projection recreated them for every model layer. The typed planner permits
  * only caller-thread execution or the complete configured/existing team.
  */

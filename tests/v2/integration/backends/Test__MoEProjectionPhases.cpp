@@ -22,7 +22,7 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/IMoEKernel.h"
-#include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
+#include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "kernels/KernelFactory.h"
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/QuantizedVerifierFormats.h"
@@ -62,7 +62,7 @@ namespace
     {
         std::vector<Format> result;
         for (const auto &format : quantizedMoEVerifierFormats())
-            result.push_back({format.label, DeviceMoEWeightFormat::NativeVNNI, format.create});
+            result.push_back({format.label, DeviceMoEWeightFormat::NativeQuantised, format.create});
         result.push_back({"FP16", DeviceMoEWeightFormat::FP16,
             [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
             { return TestTensorFactory::createFP16Random(shape, -0.125f, 0.125f, seed); }});
@@ -184,10 +184,10 @@ namespace
                 return values;
             };
 
-            std::vector<DeviceNativeVNNIMatrixDesc> gates(experts), ups(experts), downs(experts);
+            std::vector<DeviceNativeQuantisedMatrixDesc> gates(experts), ups(experts), downs(experts);
             std::vector<DeviceMoEFloatingMatrixDesc> fp_gates(experts), fp_ups(experts), fp_downs(experts);
             auto prepare = [&](std::shared_ptr<TensorBase> source,
-                               DeviceNativeVNNIMatrixDesc &native, DeviceMoEFloatingMatrixDesc &fp)
+                               DeviceNativeQuantisedMatrixDesc &native, DeviceMoEFloatingMatrixDesc &fp)
             {
                 const std::string name = "test.projection_phases." + format.name + "." + std::to_string(prepared.size());
                 sources.push_back(std::move(source));
@@ -204,7 +204,7 @@ namespace
                 }
                 else
                 {
-                    require(prepared.back().kernel->exportNativeVNNIMatrixDesc(native), "projection descriptor export");
+                    require(prepared.back().kernel->exportNativeQuantisedMatrixDesc(native), "projection descriptor export");
                     if (geometry)
                     {
                         const auto &registry = quantizedMoEVerifierFormats();
@@ -461,7 +461,7 @@ namespace
                                 node.name.find(expected_symbol) != std::string::npos &&
                                 node.block_x == (workers ? 256u : 64u) && node.block_y == 1 && node.block_z == 1 &&
                                 node.static_shared_memory_bytes == (workers ?
-                                    size_t(NativeVNNIGroupedDecodePolicy::maximum_k_partitions) * 64 * sizeof(float) : 0u) &&
+                                    size_t(NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) * 64 * sizeof(float) : 0u) &&
                                 node.dynamic_shared_memory_bytes == 0 && node.local_memory_bytes_per_thread == 0 &&
                                 node.grid_x == static_cast<unsigned>((slice.width + 63) / 64) &&
                                 node.grid_y == static_cast<unsigned>(std::min(rows * top_k, 32)) && node.grid_z == 1;
@@ -599,7 +599,7 @@ namespace
         for (const auto &format : selected)
         {
             ASSERT_TRUE(format.name == "Q5_1" || format.name == "Q5_K");
-            ASSERT_EQ(format.family, DeviceMoEWeightFormat::NativeVNNI);
+            ASSERT_EQ(format.family, DeviceMoEWeightFormat::NativeQuantised);
             SCOPED_TRACE(format.name);
             const ProjectionGeometry geometry{2560, format.name == "Q5_1" ? 640 : 768, 17,
                 format.name == "Q5_1" ? std::vector<int>{1, 3, 17} : std::vector<int>{1},

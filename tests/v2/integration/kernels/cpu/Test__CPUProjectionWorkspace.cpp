@@ -7,11 +7,11 @@
  * fails before any transform write. This is a model-free preflight regression,
  * not a replacement for captured model parity or a performance certificate.
  */
-#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "execution/compute_stages/stages/LMHeadStage.h"
 #include "utils/CPUProjectionTestWorkspace.h"
-#include "utils/NativeVNNITestPartialStorage.h"
+#include "utils/NativeQuantisedTestPartialStorage.h"
 #include "utils/PreparedWeightTestHarness.h"
 #include "utils/QuantizedVerifierFormats.h"
 #include <gtest/gtest.h>
@@ -36,7 +36,7 @@ struct WorkerScope final
 /** @test Remote metadata declares every real prepared engine's exact named buffers. */
 TEST(CPUProjectionWorkspace, MetadataMatchesPreparedRequirementsAllFormatsAndTPWidths)
 {
-    using namespace cpu::native_vnni;
+    using namespace cpu::native_quantised;
     WorkerScope restore;
     ASSERT_TRUE(CPUExecutionGeometry::local().isValid());
     for (const auto &format : quantizedMoEVerifierFormats())
@@ -48,7 +48,7 @@ TEST(CPUProjectionWorkspace, MetadataMatchesPreparedRequirementsAllFormatsAndTPW
                                  CPUProjectionNumericalPolicy::GPUAlignedExpert})
         {
             const int n = (513 + shards - 1) / shards;
-            CPUNativeVNNIGemmKernel kernel(weight.get(), 0, n, policy);
+            CPUNativeQuantisedGemmKernel kernel(weight.get(), 0, n, policy);
             ASSERT_TRUE(kernel.isValid());
             for (const int workers : {1, 2, 3, 8, 28})
             for (const int rows : {1, 2, 3, 15, 31})
@@ -74,7 +74,7 @@ TEST(CPUProjectionWorkspace, MetadataMatchesPreparedRequirementsAllFormatsAndTPW
 }
 
 /** @brief Ordinary and fused projections must borrow the declared Q8 bank without changing output bytes. */
-void proveQ8Workspace(cpu::native_vnni::CPUNativeVNNIGemmKernel &kernel, int n, int k)
+void proveQ8Workspace(cpu::native_quantised::CPUNativeQuantisedGemmKernel &kernel, int n, int k)
 {
     constexpr int max_rows = 31;
     const size_t blocks = (size_t(k) + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
@@ -207,7 +207,7 @@ void proveWorkspace(ITensorGemm &kernel, int n, int k)
 }
 
 /** @brief Alpha/beta and optional rotation preserve bytes under a retained workshare. */
-void proveOutputAccumulation(cpu::native_vnni::CPUNativeVNNIGemmKernel &kernel, int n, int k)
+void proveOutputAccumulation(cpu::native_quantised::CPUNativeQuantisedGemmKernel &kernel, int n, int k)
 {
     constexpr int max_rows = 31;
     auto requirements = kernel.getWorkspaceRequirements(max_rows, n, k);
@@ -262,7 +262,7 @@ void proveOutputAccumulation(cpu::native_vnni::CPUNativeVNNIGemmKernel &kernel, 
         EXPECT_EQ(std::memcmp(team->data(), direct->data(), team->size_bytes()), 0);
         const size_t touched = beta == 0.f ? 0u : size_t(rows) * n;
         EXPECT_TRUE(std::all_of(product.begin() + touched, product.end(), [](float x) { return x == 12345.f; }));
-        const size_t used_partials = cpu::native_vnni::nativeVNNIProjectionPartialFloats(kernel.packedWeights(), rows);
+        const size_t used_partials = cpu::native_quantised::nativeQuantisedProjectionPartialFloats(kernel.packedWeights(), rows);
         EXPECT_TRUE(std::all_of(partials.begin() + used_partials, partials.end(), [](float x) { return x == 12345.f; }));
     }
 }
@@ -270,14 +270,14 @@ void proveOutputAccumulation(cpu::native_vnni::CPUNativeVNNIGemmKernel &kernel, 
 /** @test Mixed-format bundle admission preserves full-K, private and shared ownership. */
 TEST(CPUProjectionWorkspace, FusedPlanPricesEveryMemberAndPreservesPrivateTrees)
 {
-    using namespace cpu::native_vnni;
+    using namespace cpu::native_quantised;
     for (const auto &format : quantizedMoEVerifierFormats())
     {
         SCOPED_TRACE(format.label);
         auto first_weight = format.create({65u, 256u}, 719);
         auto second_weight = TestTensorFactory::createQ4_0Random({193u, 256u}, 727);
-        CPUNativeVNNIGemmKernel first(first_weight.get());
-        CPUNativeVNNIGemmKernel second(second_weight.get(), 0, -1,
+        CPUNativeQuantisedGemmKernel first(first_weight.get());
+        CPUNativeQuantisedGemmKernel second(second_weight.get(), 0, -1,
             CPUProjectionNumericalPolicy::GPUAlignedExpert);
         ASSERT_TRUE(first.isValid());
         ASSERT_TRUE(second.isValid());
@@ -289,8 +289,8 @@ TEST(CPUProjectionWorkspace, FusedPlanPricesEveryMemberAndPreservesPrivateTrees)
         for (int rows : {1, 2, 3, 15, 31})
         for (int workers : {1, 2, 3, 7, 16, 128})
         {
-            const auto plan = planNativeVNNIFusedRows(descriptors, rows, workers);
-            EXPECT_EQ(plan.partial_route, NativeVNNIFusedPartialRoute::SharedBank);
+            const auto plan = planNativeQuantisedFusedRows(descriptors, rows, workers);
+            EXPECT_EQ(plan.partial_route, NativeQuantisedFusedPartialRoute::SharedBank);
             EXPECT_EQ(plan.projections[0].rows, rows);
             EXPECT_EQ(plan.projections[0].partial_sums_size, 0u);
             EXPECT_EQ(plan.projections[1].rows, 3);
@@ -300,34 +300,34 @@ TEST(CPUProjectionWorkspace, FusedPlanPricesEveryMemberAndPreservesPrivateTrees)
         }
         descriptors[0].packed = &second.packedWeights();
         descriptors[0].N = descriptors[0].ldc = 193;
-        const auto private_plan = planNativeVNNIFusedRows(descriptors, 1, 1);
-        EXPECT_EQ(private_plan.partial_route, NativeVNNIFusedPartialRoute::OutputTileLocal);
+        const auto private_plan = planNativeQuantisedFusedRows(descriptors, 1, 1);
+        EXPECT_EQ(private_plan.partial_route, NativeQuantisedFusedPartialRoute::OutputTileLocal);
         EXPECT_EQ(private_plan.sharedPartialFloats(), 0u);
-        const auto shared_plan = planNativeVNNIFusedRows(descriptors, 1, 128);
-        EXPECT_EQ(shared_plan.partial_route, NativeVNNIFusedPartialRoute::SharedBank);
+        const auto shared_plan = planNativeQuantisedFusedRows(descriptors, 1, 128);
+        EXPECT_EQ(shared_plan.partial_route, NativeQuantisedFusedPartialRoute::SharedBank);
         EXPECT_EQ(shared_plan.projections[1].partial_sums_offset,
             shared_plan.projections[0].partial_sums_size);
         EXPECT_EQ(shared_plan.sharedPartialFloats(), cpuProjectionPartialFloats(4, 193,
             MoEProjectionNumericalContract::orderedKPartitionsForWidth(256)));
         descriptors[0].packed = descriptors[1].packed = &first.packedWeights();
-        const auto full_k_plan = planNativeVNNIFusedRows(descriptors, 1, 128);
-        EXPECT_EQ(full_k_plan.partial_route, NativeVNNIFusedPartialRoute::FullK);
+        const auto full_k_plan = planNativeQuantisedFusedRows(descriptors, 1, 128);
+        EXPECT_EQ(full_k_plan.partial_route, NativeQuantisedFusedPartialRoute::FullK);
         EXPECT_EQ(full_k_plan.sharedPartialFloats(), 0u);
-        EXPECT_THROW(planNativeVNNIFusedRows({}, 1, 1), std::invalid_argument);
-        EXPECT_THROW(planNativeVNNIFusedRows(descriptors, 0, 1), std::invalid_argument);
-        EXPECT_THROW(planNativeVNNIFusedRows(descriptors, 1, 0), std::invalid_argument);
+        EXPECT_THROW(planNativeQuantisedFusedRows({}, 1, 1), std::invalid_argument);
+        EXPECT_THROW(planNativeQuantisedFusedRows(descriptors, 0, 1), std::invalid_argument);
+        EXPECT_THROW(planNativeQuantisedFusedRows(descriptors, 1, 0), std::invalid_argument);
         descriptors[1].rows = -1;
-        EXPECT_THROW(planNativeVNNIFusedRows(descriptors, 1, 1), std::invalid_argument);
+        EXPECT_THROW(planNativeQuantisedFusedRows(descriptors, 1, 1), std::invalid_argument);
         descriptors[1].rows = 1;
         descriptors[1].verifier_schedule = VerifierRowsPolicy::WideRows;
-        EXPECT_THROW(planNativeVNNIFusedRows(descriptors, 1, 1), std::invalid_argument);
+        EXPECT_THROW(planNativeQuantisedFusedRows(descriptors, 1, 1), std::invalid_argument);
     }
 }
 
 /** @test Two mixed-mode partial readers reuse one admitted bank without new ordering edges. */
 TEST(CPUProjectionWorkspace, FusedMixedMembersReuseTheLargestBank)
 {
-    using namespace cpu::native_vnni;
+    using namespace cpu::native_quantised;
     WorkerScope restore;
     omp_set_num_threads(4);
     constexpr int k = 256, rows = 5;
@@ -338,8 +338,8 @@ TEST(CPUProjectionWorkspace, FusedMixedMembersReuseTheLargestBank)
     {
         SCOPED_TRACE(format.label);
         auto weight = format.create({193u, k}, 751);
-        CPUNativeVNNIGemmKernel native(weight.get());
-        CPUNativeVNNIGemmKernel partitioned(weight.get(), 0, -1,
+        CPUNativeQuantisedGemmKernel native(weight.get());
+        CPUNativeQuantisedGemmKernel partitioned(weight.get(), 0, -1,
             CPUProjectionNumericalPolicy::GPUAlignedExpert);
         std::array<std::vector<float>, 3> output, expected;
         std::array<FusedVerifierRowsDesc, 3> descriptors;
@@ -349,25 +349,25 @@ TEST(CPUProjectionWorkspace, FusedMixedMembersReuseTheLargestBank)
             expected[member].resize(rows * 193);
             const auto &packed = member == 1 ? native.packedWeights() : partitioned.packedWeights();
             descriptors[member] = {.packed = &packed, .output = output[member].data(), .N = 193, .ldc = 193};
-            NativeVNNITestPartialStorage scratch(packed, 1);
+            NativeQuantisedTestPartialStorage scratch(packed, 1);
             for (int row = 0; row < rows; ++row)
-                gemv_native_vnni_preq(packed, q8.data() + row * (k / 32),
+                gemv_native_quantised_preq(packed, q8.data() + row * (k / 32),
                     expected[member].data() + row * 193, scratch.span());
         }
-        const auto plan = planNativeVNNIFusedRows(descriptors, rows, 4);
-        ASSERT_EQ(plan.partial_route, NativeVNNIFusedPartialRoute::SharedBank);
+        const auto plan = planNativeQuantisedFusedRows(descriptors, rows, 4);
+        ASSERT_EQ(plan.partial_route, NativeQuantisedFusedPartialRoute::SharedBank);
         ASSERT_EQ(plan.projections[1].partial_sums_size, 0u);
         ASSERT_EQ(plan.projections[0].partial_sums_offset, 0u);
         ASSERT_EQ(plan.projections[2].partial_sums_offset, 0u);
         ASSERT_EQ(plan.sharedPartialFloats(), plan.projections[0].partial_sums_size);
-        NativeVNNITestPartialStorage storage(plan.sharedPartialFloats() + 64);
+        NativeQuantisedTestPartialStorage storage(plan.sharedPartialFloats() + 64);
         std::fill(storage.span().begin(), storage.span().end(), 12345.f);
         const auto exact = storage.span().first(plan.sharedPartialFloats());
-        EXPECT_THROW(gemm_native_vnni_fused_verifier_rows_preq(q8.data(), descriptors.data(),
+        EXPECT_THROW(gemm_native_quantised_fused_verifier_rows_preq(q8.data(), descriptors.data(),
             exact.first(exact.size() - 1), 3, rows, k / 32), std::runtime_error);
         for (const auto &member : output)
             EXPECT_TRUE(std::all_of(member.begin(), member.end(), [](float x) { return x == 12345.f; }));
-        ASSERT_TRUE(gemm_native_vnni_fused_verifier_rows_preq(q8.data(), descriptors.data(),
+        ASSERT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(q8.data(), descriptors.data(),
             exact, 3, rows, k / 32));
         for (int member = 0; member < 3; ++member)
             EXPECT_EQ(std::memcmp(output[member].data(), expected[member].data(), output[member].size() * sizeof(float)), 0);
@@ -379,7 +379,7 @@ TEST(CPUProjectionWorkspace, FusedMixedMembersReuseTheLargestBank)
 /** @test Large native trees use admitted worker tiles, preserving tails and independent serial rows. */
 TEST(CPUProjectionWorkspace, FusedLargeTreesUseExclusiveWorkerTiles)
 {
-    using namespace cpu::native_vnni;
+    using namespace cpu::native_quantised;
     WorkerScope restore;
     constexpr int n = 513, k = 16384, max_rows = 5, workers = 32;
     omp_set_num_threads(workers);
@@ -390,13 +390,13 @@ TEST(CPUProjectionWorkspace, FusedLargeTreesUseExclusiveWorkerTiles)
     {
         SCOPED_TRACE(format.label);
         auto weight = format.create({n, k}, 761);
-        CPUNativeVNNIGemmKernel kernel(weight.get());
+        CPUNativeQuantisedGemmKernel kernel(weight.get());
         ASSERT_TRUE(kernel.isValid());
         const auto &packed = kernel.packedWeights();
         std::vector<float> expected(max_rows * n);
-        NativeVNNITestPartialStorage serial_storage(packed, 1);
+        NativeQuantisedTestPartialStorage serial_storage(packed, 1);
         for (int row = 0; row < max_rows; ++row)
-            gemv_native_vnni_preq(packed, q8.data() + row * (k / 32),
+            gemv_native_quantised_preq(packed, q8.data() + row * (k / 32),
                 expected.data() + row * n, serial_storage.span());
         for (int rows : {1, max_rows})
         {
@@ -407,17 +407,17 @@ TEST(CPUProjectionWorkspace, FusedLargeTreesUseExclusiveWorkerTiles)
             std::array<FusedVerifierRowsDesc, 2> descriptors{{
                 {.packed = &packed, .output = output[0].data(), .N = n, .ldc = n},
                 {.packed = &packed, .output = output[1].data(), .N = n, .ldc = n}}};
-            const auto plan = planNativeVNNIFusedRows(descriptors, rows, workers);
+            const auto plan = planNativeQuantisedFusedRows(descriptors, rows, workers);
             ASSERT_GT(plan.projections[0].k_tiles, MoEProjectionNumericalContract::ordered_k_partitions);
-            ASSERT_EQ(plan.partial_route, rows == 1 ? NativeVNNIFusedPartialRoute::SharedBank
-                : NativeVNNIFusedPartialRoute::OutputTileWorkspace);
+            ASSERT_EQ(plan.partial_route, rows == 1 ? NativeQuantisedFusedPartialRoute::SharedBank
+                : NativeQuantisedFusedPartialRoute::OutputTileWorkspace);
             const auto requirements = kernel.getWorkspaceRequirements(rows);
             CPUProjectionTestWorkspace workspace(rows, k, requirements);
             auto bank = CPUInvocationWorkspace::available<float>(workspace.get(), kCPUProjectionPartials);
             ASSERT_GE(bank.size(), plan.sharedPartialFloats());
             std::fill(bank.begin(), bank.end(), 12345.f);
             const auto exact = bank.first(plan.sharedPartialFloats());
-            EXPECT_THROW(gemm_native_vnni_fused_verifier_rows_preq(q8.data(), descriptors.data(),
+            EXPECT_THROW(gemm_native_quantised_fused_verifier_rows_preq(q8.data(), descriptors.data(),
                 exact.first(exact.size() - 1), 2, rows, k / 32), std::runtime_error);
             for (const auto &member : output)
                 EXPECT_TRUE(std::all_of(member.begin(), member.end(), [](float x) { return x == 12345.f; }));
@@ -426,7 +426,7 @@ TEST(CPUProjectionWorkspace, FusedLargeTreesUseExclusiveWorkerTiles)
             std::atomic<bool> complete{true};
 #pragma omp parallel num_threads(workers)
             {
-                if (!gemm_native_vnni_fused_verifier_rows_preq(q8.data(), descriptors.data(),
+                if (!gemm_native_quantised_fused_verifier_rows_preq(q8.data(), descriptors.data(),
                         exact, 2, rows, k / 32)) complete.store(false);
             }
             EXPECT_TRUE(complete.load());
@@ -440,7 +440,7 @@ TEST(CPUProjectionWorkspace, FusedLargeTreesUseExclusiveWorkerTiles)
 /** @test A retained team's actual worker count, not a future nested team, owns arithmetic. */
 TEST(CPUProjectionWorkspace, FusedRetainedTeamUsesItsActualWorkerGeometry)
 {
-    using namespace cpu::native_vnni;
+    using namespace cpu::native_quantised;
     WorkerScope restore;
     constexpr int n = 512, k = 16384, rows = 3;
     auto input = TestTensorFactory::createFP32Random({rows, k}, -.7f, .7f, 733);
@@ -454,19 +454,19 @@ TEST(CPUProjectionWorkspace, FusedRetainedTeamUsesItsActualWorkerGeometry)
         SCOPED_TRACE("workers=" + std::to_string(workers));
         omp_set_num_threads(workers);
         auto weight = format.create({n, k}, 739);
-        CPUNativeVNNIGemmKernel kernel(weight.get());
+        CPUNativeQuantisedGemmKernel kernel(weight.get());
         const auto &packed = kernel.packedWeights();
         ASSERT_TRUE(kernel.isValid());
         quantize_activations_to_q8_1(input->data(), q8.data(), rows, k, k / 32);
-        NativeVNNITestPartialStorage partials(packed, rows);
+        NativeQuantisedTestPartialStorage partials(packed, rows);
         for (int row = 0; row < rows; ++row)
-            gemv_native_vnni_preq(packed, q8.data() + size_t(row) * (k / 32),
+            gemv_native_quantised_preq(packed, q8.data() + size_t(row) * (k / 32),
                 expected->mutable_data() + size_t(row) * n, partials.span());
         FusedVerifierRowsDesc descriptor{.packed = &packed,
             .output = actual->mutable_data(), .N = n, .ldc = n};
-        const auto current = planNativeVNNIFusedRows({&descriptor, 1}, rows, workers);
+        const auto current = planNativeQuantisedFusedRows({&descriptor, 1}, rows, workers);
         const int future_workers = workers == 2 ? 8 : 2;
-        const auto nested = planNativeVNNIFusedRows({&descriptor, 1}, rows, future_workers);
+        const auto nested = planNativeQuantisedFusedRows({&descriptor, 1}, rows, future_workers);
         ASSERT_NE(current.projections[0].k_tiles, nested.projections[0].k_tiles);
         // The explicit team can be smaller OR larger than nthreads-var. Its
         // actual participants own both the arithmetic and shared bank extent.
@@ -482,13 +482,13 @@ TEST(CPUProjectionWorkspace, FusedRetainedTeamUsesItsActualWorkerGeometry)
                     if (lane == 0)
                     {
                         for (int row = 0; row < rows; ++row)
-                            gemv_native_vnni_preq(packed, q8.data() + size_t(row) * (k / 32),
+                            gemv_native_quantised_preq(packed, q8.data() + size_t(row) * (k / 32),
                                 actual->mutable_data() + size_t(row) * n, partials.span());
                     }
                     else if (lane == 1)
-                        gemm_native_vnni_preq_decode_equivalent_rows(packed, q8.data(),
+                        gemm_native_quantised_preq_decode_equivalent_rows(packed, q8.data(),
                             actual->mutable_data(), partials.span(), rows, n);
-                    else if (!gemm_native_vnni_fused_verifier_rows_preq(q8.data(), &descriptor,
+                    else if (!gemm_native_quantised_fused_verifier_rows_preq(q8.data(), &descriptor,
                                  partials.span(), 1, rows, k / 32))
                         completed.store(false, std::memory_order_relaxed);
                 }
@@ -509,15 +509,15 @@ TEST(CPUProjectionWorkspace, FusedRetainedTeamUsesItsActualWorkerGeometry)
 /** @test Mirrored terminal admission uses serial policy N but allocates physical N. */
 TEST(CPUProjectionWorkspace, MirroredHeadDeclaresSerialTreeForPhysicalOutput)
 {
-    using namespace cpu::native_vnni;
+    using namespace cpu::native_quantised;
     WorkerScope restore;
     omp_set_num_threads(16);
     constexpr int n = 2048, serial_n = 512, k = 16384, rows = 3;
     auto weight = TestTensorFactory::createQ4_0Random({n, k}, 701);
     auto prepared = makePreparedGemmFixture(weight.get(), DeviceId::cpu(), "output.weight");
-    auto *kernel = dynamic_cast<CPUNativeVNNIGemmKernel *>(prepared.store->gemmKernel(prepared.ref));
+    auto *kernel = dynamic_cast<CPUNativeQuantisedGemmKernel *>(prepared.store->gemmKernel(prepared.ref));
     ASSERT_NE(kernel, nullptr);
-    ASSERT_EQ(nativeVNNIProjectionPartialFloats(kernel->packedWeights(), rows), 0u);
+    ASSERT_EQ(nativeQuantisedProjectionPartialFloats(kernel->packedWeights(), rows), 0u);
     auto input = TestTensorFactory::createFP32Random({rows, k}, -.5f, .5f, 709);
     auto output = TestTensorFactory::createFP32({rows, n});
     LMHeadStage::Params params;
@@ -534,12 +534,12 @@ TEST(CPUProjectionWorkspace, MirroredHeadDeclaresSerialTreeForPhysicalOutput)
     params.prepared_ref = prepared.ref;
     LMHeadStage stage(params);
     const auto requirements = stage.getWorkspaceRequirements(rows, n, k);
-    ASSERT_EQ(cpuNativeVNNISerialOutputPartitionN(), 0);
+    ASSERT_EQ(cpuNativeQuantisedSerialOutputPartitionN(), 0);
     const auto partials = std::find_if(requirements.buffers.begin(), requirements.buffers.end(),
         [](const auto &buffer) { return buffer.name == kCPUProjectionPartials; });
     ASSERT_NE(partials, requirements.buffers.end());
     const auto scope = kernel->beginOutputPartitionEquivalenceScope(n, serial_n);
-    const auto expected = nativeVNNIProjectionPartialFloats(kernel->packedWeights(), rows);
+    const auto expected = nativeQuantisedProjectionPartialFloats(kernel->packedWeights(), rows);
     ASSERT_GT(expected, 0u);
     EXPECT_EQ(partials->size_bytes, expected * sizeof(float));
     CPUProjectionTestWorkspace workspace(rows, k, requirements);
@@ -547,16 +547,16 @@ TEST(CPUProjectionWorkspace, MirroredHeadDeclaresSerialTreeForPhysicalOutput)
         true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
 }
 
-/** @test Every NativeVNNI source codebook uses the same admitted transform contract. */
+/** @test Every NativeQuantised source codebook uses the same admitted transform contract. */
 TEST(CPUProjectionWorkspace, AllQuantizedFormats)
 {
-    using namespace cpu::native_vnni;
+    using namespace cpu::native_quantised;
     for (const auto &format : quantizedMoEVerifierFormats())
     for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
     {
         SCOPED_TRACE(std::string(format.label) + " policy=" + std::to_string(static_cast<int>(policy)));
         auto weight = format.create({128u, 256u}, 313);
-        CPUNativeVNNIGemmKernel kernel(weight.get(), 0, -1, policy);
+        CPUNativeQuantisedGemmKernel kernel(weight.get(), 0, -1, policy);
         ASSERT_TRUE(kernel.isValid());
         proveQ8Workspace(kernel, 128, 256);
         proveWorkspace(kernel, 128, 256);
@@ -567,14 +567,14 @@ TEST(CPUProjectionWorkspace, AllQuantizedFormats)
 /** @test Every source format's optional rotated representation retains participant isolation. */
 TEST(CPUProjectionWorkspace, RotatedQuantizedFormats)
 {
-    using namespace cpu::native_vnni;
+    using namespace cpu::native_quantised;
     ActivationRotation rotation(256, 128);
     for (const auto &format : quantizedMoEVerifierFormats())
     {
         SCOPED_TRACE(format.label);
         auto weight = format.create({128u, 256u}, 683);
         weight->setActivationRotation(&rotation);
-        CPUNativeVNNIGemmKernel kernel(weight.get());
+        CPUNativeQuantisedGemmKernel kernel(weight.get());
         ASSERT_TRUE(kernel.isValid());
         const auto requirements = kernel.getWorkspaceRequirements(31);
         const auto found = std::find_if(requirements.buffers.begin(), requirements.buffers.end(),

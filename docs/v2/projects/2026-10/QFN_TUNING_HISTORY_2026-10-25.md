@@ -605,13 +605,13 @@ Updated: 2026-10-23; **L104 is the current A1 checkpoint** at **815.121 / 37.460
 
 Goal: beat **all applicable measured reference engines in both prefill and decode**, while keeping each row's accuracy gate green. For each phase, the target is the fastest applicable measured result across **Castagna Veloce, upstream llama.cpp and Strata**. Keep their pinned revisions, topology differences and arithmetic qualifications explicit, including Strata's approved default-tail7 approximation. Supported but unmeasured comparisons remain pending; an unsupported topology is not an automatic win. Collect the applicable baselines before tuning a row. Runtime configurations remain owned by the typed parity inventory; a planned row does not advertise implemented support.
 
-**Priority:** the next focused win is **four-MI50 decode against Castagna Veloce's 42.959 tok/s**, while preserving the prefill lead and numerical acceptance. The four policy pairs below have been exercised: retain `TensorParallel + GateUpOwnedDownColumns` as the fastest numerically green pair. The requested [CPU ngram investigation](QFN_NGRAM_CPU_PATH_INVESTIGATION.md#measured-follow-up-host-worker-placement-2026-10-21) found all four lookup-service workers sharing one physical core. Candidate69 fixes that placement with green regressions and unchanged logits; paired throughput is effectively unchanged. The [compact-import follow-up](QFN_COMPACT_INTERMEDIATE_IMPORT_TUNING.md) is accurate and faster in isolation, but its complete A/B/B/A gives only −0.060% prefill / +0.194% decode with overlapping ranges. It is not promoted. The [fresh accepted-runtime trace and exact collective fixture](QFN_TP4_COLLECTIVE_ATTRIBUTION.md) now identify a native RCCL selector defect: `AllGather:LL` targeted broadcast because the name table disagrees with the enum. The repair now passes 756/756 Unit registrations, 9/9 focused native/packaging tests and the frozen A1 Release accuracy slice, with all 185 retained logit rows byte-identical to L69. Captured traces prove that the selector now dispatches LL; automatic transport defaults remain unchanged. The [ordered short-K TwoTerm candidate](QFN_ORDERED_SHORT_K_PROJECTION_TUNING.md) now passes all 180 backend/tile/shape checks. Its K320 component is about 1.25× faster on MI50 and 1.08× on RTX 3090 with identical bytes. The shared 32-column production dispatch passes 756/756 Unit, 3/3 focused native/geometry and 19/19 surrounding all-format checks. Frozen A1 accuracy retains all 185 logit rows byte-identically. Four clean matched arms measure **785.397 prefill / 33.882 decode tok/s**, a **+1.797% decode** gain with effectively unchanged prefill. The next probe passed exactness and attributes most isolated transaction cost to gathering: about 41 µs versus 2.29 µs for the fold. A broad LL protocol pilot gives **702.850 / 34.853 tok/s**: better decode but a 10.51% prefill loss, so it is not promoted. The fixed-message channel component 76 is exact but slower at 97 transactions: **+25.8% CUDA P2 / +8.89% ROCm P4 latency**, so it is not attached to production. It exposed a HIP kernel-argument sizing defect: the focused original runtime consumes 24 MiB against the unchanged 8 MiB family budget; the isolated repaired runtime fits 8 MiB and passes four variants with three exact replays each. The dependency repair passes the surrounding **24/24** model-free graph/lifetime/packaging gates, and the complete Unit suite passes **757/757**. Its frozen A1 Release accuracy slice is green, with **all 185 logit rows byte-identical to L74**, exact reset replay and clean native/driver retirement; complete qualification remains pending. The batch-only 16 KiB candidate77 passes **757/757 Unit**, **24/24 focused checks** and frozen A1 accuracy with **all 185 logit rows byte-identical to L74**. It improves the paired ROCm transfer component by **3.53–4.09%** at 97 transactions; CUDA remains **24.93% slower than native**. This is a component result with no production TP attachment or whole-model gain. The direct-consumer/fold prototype78 passes 32 focused checks but is **7.84% slower than native on ROCm and 52.70% slower on CUDA** at 97 transactions, winning 0/31 pairs on each backend. Its source is retired and evidence retained; CUDA sanitizer qualification also remains failed/open. The private size-aware LL candidate79 now passes native boundary/loader/byte checks and a complete model A/B/B/A: **785.609 prefill / 34.697 decode tok/s**, versus matched automatic **785.103 / 33.947**, or **+0.064% / +2.209%**. All twelve measured output sequences match. That plugin remains experimental. The native integration80 now passes **759/759 Unit**, **17/17 focused checks**, frozen accuracy with **185 byte-identical logit rows**, and all four matched model arms. Accepted A1 advances to **L80 785.303 / 34.700 tok/s**, versus matched original **785.911 / 33.939** (**−0.077% prefill / +2.240% decode**); all twelve output sequences match. QFN NativeVNNI coverage is the next tuning pass. Complete production preflight remains pending. TP4 names the participant count, not either policy pair. Other topology tuning is parked until this focused pass is settled; then resume A before novel compositions and remaining families in B–D.
+**Priority:** the next focused win is **four-MI50 decode against Castagna Veloce's 42.959 tok/s**, while preserving the prefill lead and numerical acceptance. The four policy pairs below have been exercised: retain `TensorParallel + GateUpOwnedDownColumns` as the fastest numerically green pair. The requested [CPU ngram investigation](QFN_NGRAM_CPU_PATH_INVESTIGATION.md#measured-follow-up-host-worker-placement-2026-10-21) found all four lookup-service workers sharing one physical core. Candidate69 fixes that placement with green regressions and unchanged logits; paired throughput is effectively unchanged. The [compact-import follow-up](QFN_COMPACT_INTERMEDIATE_IMPORT_TUNING.md) is accurate and faster in isolation, but its complete A/B/B/A gives only −0.060% prefill / +0.194% decode with overlapping ranges. It is not promoted. The [fresh accepted-runtime trace and exact collective fixture](QFN_TP4_COLLECTIVE_ATTRIBUTION.md) now identify a native RCCL selector defect: `AllGather:LL` targeted broadcast because the name table disagrees with the enum. The repair now passes 756/756 Unit registrations, 9/9 focused native/packaging tests and the frozen A1 Release accuracy slice, with all 185 retained logit rows byte-identical to L69. Captured traces prove that the selector now dispatches LL; automatic transport defaults remain unchanged. The [ordered short-K TwoTerm candidate](QFN_ORDERED_SHORT_K_PROJECTION_TUNING.md) now passes all 180 backend/tile/shape checks. Its K320 component is about 1.25× faster on MI50 and 1.08× on RTX 3090 with identical bytes. The shared 32-column production dispatch passes 756/756 Unit, 3/3 focused native/geometry and 19/19 surrounding all-format checks. Frozen A1 accuracy retains all 185 logit rows byte-identically. Four clean matched arms measure **785.397 prefill / 33.882 decode tok/s**, a **+1.797% decode** gain with effectively unchanged prefill. The next probe passed exactness and attributes most isolated transaction cost to gathering: about 41 µs versus 2.29 µs for the fold. A broad LL protocol pilot gives **702.850 / 34.853 tok/s**: better decode but a 10.51% prefill loss, so it is not promoted. The fixed-message channel component 76 is exact but slower at 97 transactions: **+25.8% CUDA P2 / +8.89% ROCm P4 latency**, so it is not attached to production. It exposed a HIP kernel-argument sizing defect: the focused original runtime consumes 24 MiB against the unchanged 8 MiB family budget; the isolated repaired runtime fits 8 MiB and passes four variants with three exact replays each. The dependency repair passes the surrounding **24/24** model-free graph/lifetime/packaging gates, and the complete Unit suite passes **757/757**. Its frozen A1 Release accuracy slice is green, with **all 185 logit rows byte-identical to L74**, exact reset replay and clean native/driver retirement; complete qualification remains pending. The batch-only 16 KiB candidate77 passes **757/757 Unit**, **24/24 focused checks** and frozen A1 accuracy with **all 185 logit rows byte-identical to L74**. It improves the paired ROCm transfer component by **3.53–4.09%** at 97 transactions; CUDA remains **24.93% slower than native**. This is a component result with no production TP attachment or whole-model gain. The direct-consumer/fold prototype78 passes 32 focused checks but is **7.84% slower than native on ROCm and 52.70% slower on CUDA** at 97 transactions, winning 0/31 pairs on each backend. Its source is retired and evidence retained; CUDA sanitizer qualification also remains failed/open. The private size-aware LL candidate79 now passes native boundary/loader/byte checks and a complete model A/B/B/A: **785.609 prefill / 34.697 decode tok/s**, versus matched automatic **785.103 / 33.947**, or **+0.064% / +2.209%**. All twelve measured output sequences match. That plugin remains experimental. The native integration80 now passes **759/759 Unit**, **17/17 focused checks**, frozen accuracy with **185 byte-identical logit rows**, and all four matched model arms. Accepted A1 advances to **L80 785.303 / 34.700 tok/s**, versus matched original **785.911 / 33.939** (**−0.077% prefill / +2.240% decode**); all twelve output sequences match. QFN NativeQuantised coverage is the next tuning pass. Complete production preflight remains pending. TP4 names the participant count, not either policy pair. Other topology tuning is parked until this focused pass is settled; then resume A before novel compositions and remaining families in B–D.
 
 Current evidence: all five admitted rows passed checkpoint60 accuracy. **A1–A4 now have uninstrumented Llaminar observations; A4 is ahead of Castagna in both phases, while A1 decode and A2 prefill remain behind their selected references.** A3 is ahead of the recorded upstream samples, whose decode variance remains unresolved, but A2 and A3 both remain below Strata's approved approximate-policy decode reference. Strata's full-routing and default-tail7 controls are complete for A2/A3. Complete checkpoint60 Unit/production preflight and all five model accuracy cells passed, with clean drivers, unchanged runtime metadata, exact reset replay and normal native retirement. The qualified source is committed and pushed to `feat/qwen-flash-next` as `6c06e8efe`; its commit hook authenticated all 2,454 prerequisite registrations without rerunning them.
 
 Accuracy legend: **🟢 GREEN** = all required numerical groups and execution/retirement/reset checks passed; **🔴 RED** = an observed gate failure; **⚪ PENDING** = not tested or prerequisites missing. Hardware, capacity and implementation blocks are recorded separately from numerical failure. `—` means unmeasured. All throughput cells are **tokens/second**.
 
-## Active tuning pass: QFN NativeVNNI dispatch coverage
+## Active tuning pass: QFN NativeQuantised dispatch coverage
 
 With native small-AllGather L80 qualified as a focused checkpoint, audit QFN GEMM/GEMV
 dispatch on CPU, CUDA and ROCm. Inventory the actual native weight formats,
@@ -619,7 +619,7 @@ activation policies and live M/N/K shapes for prefill and decode, including the
 TP slices and expert partitions used by every admitted dashboard topology.
 Compare those keys with the installed exact overlays and observe the kernels
 selected by real inference; an overlay entry alone does not prove selection.
-Measure missing or suboptimal entries with the canonical NativeVNNI tuning
+Measure missing or suboptimal entries with the canonical NativeQuantised tuning
 workflow, preserve numerical acceptance and arithmetic order, then qualify
 end-to-end performance before installing winners. Extend dispatch coverage and
 focused regression registrations for any defects found.
@@ -635,7 +635,7 @@ Before collecting new winners, fix two identity gaps. The ROCm dense exact key
 omits the prepared-weight family: legitimate native-Q8 and packed-INT8 programs
 can share CB19/M/N/K, while using different operand layouts. A source-derived
 witness at M64/N512/K5120 collides with an installed packed-INT8 row. The
-[original-production regression](../../../../parity-results/qwen-flash-next/nativevnni81-red-regression/result.json)
+[original-production regression](../../../../parity-results/qwen-flash-next/nativequantised81-red-regression/result.json)
 reproduces that exact exception after the expanded-INT8 control and 64 native
 serial-row oracles pass. The expert pair key also omits the
 physical down-output width. A1 computes gate/up640×2560 and down640×640;
@@ -650,27 +650,27 @@ original resolved records remain unchanged; the inventory now has 628 records,
 admission or a set of measured winners. CPU ordinary-prefill collection uses
 the explicit large-model evidence budget without asserting a model parameter
 total. The real C++ loader and Python loader agree on every resolved field in
-the [five focused checks](../../../../parity-results/qwen-flash-next/nativevnni81-inventory-focused/result.json).
+the [five focused checks](../../../../parity-results/qwen-flash-next/nativequantised81-inventory-focused/result.json).
 The surrounding run passed 62/63 registrations; its stale CPU process-count
-assertion is [fixed and green](../../../../parity-results/qwen-flash-next/nativevnni81-inventory-training-plan/result.json),
+assertion is [fixed and green](../../../../parity-results/qwen-flash-next/nativequantised81-inventory-training-plan/result.json),
 now deriving equal-M groups from the authoritative shape/format/ISA inventory.
 
-The prepared-family repair passes its focused native and Unit gates. NativeVNNI and expanded
+The prepared-family repair passes its focused native and Unit gates. NativeQuantised and expanded
 Int8Blockwise now have distinct complete keys, including for CB19. All 576
 installed measured configurations retain their original numeric keys and launch
-tuples ([540 native, 36 expanded INT8](../../../../parity-results/qwen-flash-next/nativevnni81-installed-policy-preservation.json)); no native-Q8 winner is invented. Runtime,
+tuples ([540 native, 36 expanded INT8](../../../../parity-results/qwen-flash-next/nativequantised81-installed-policy-preservation.json)); no native-Q8 winner is invented. Runtime,
 generator, additive retention and explicit preflight regressions share that
-identity. The [five focused checks](../../../../parity-results/qwen-flash-next/nativevnni81-family-focused/result.json)
+identity. The [five focused checks](../../../../parity-results/qwen-flash-next/nativequantised81-family-focused/result.json)
 pass, including three captured replays with every native-Q8 output byte equal
 to all 64 serial rows and the unchanged expanded-INT8 selection.
-All [16 surrounding registrations](../../../../parity-results/qwen-flash-next/nativevnni81-family-surrounding/result.json)
+All [16 surrounding registrations](../../../../parity-results/qwen-flash-next/nativequantised81-family-surrounding/result.json)
 pass: installed all-format exact entries, actual producer identity, prefill
 bucket invariance and grouped prepared-source byte equivalence.
-The rebuilt [complete Unit suite](../../../../parity-results/qwen-flash-next/nativevnni81-unit/result.json)
+The rebuilt [complete Unit suite](../../../../parity-results/qwen-flash-next/nativequantised81-unit/result.json)
 passes **760/760**, with no skips, in **115.61 seconds**. Driver windows and
-native retirement are clean. The [archived Release accuracy run](../../../../parity-results/qwen-flash-next/nativevnni81-release-accuracy/runtime-observation.json)
+native retirement are clean. The [archived Release accuracy run](../../../../parity-results/qwen-flash-next/nativequantised81-release-accuracy/runtime-observation.json)
 passes the unchanged canonical panel in **101.68 seconds**. All **26 retained
-files / 185 final-logit rows** are [byte-identical to L74](../../../../parity-results/qwen-flash-next/nativevnni81-release-accuracy/shortk74-logit-byte-comparison.json),
+files / 185 final-logit rows** are [byte-identical to L74](../../../../parity-results/qwen-flash-next/nativequantised81-release-accuracy/shortk74-logit-byte-comparison.json),
 including reset and diagnostic rows; the ordered short-K path is observed.
 This is a correctness and measurement-coverage checkpoint. Throughput remains
 the measured L80 result; these focused passes do not replace complete
@@ -686,13 +686,13 @@ installed until repeated captured timing, compiler resources, byte equivalence
 and the model comparison establish a winner. CUDA and CPU have different
 effective dispatch surfaces and need their own measured evidence.
 
-The first [qualified Release sweep](../../../../parity-results/qwen-flash-next/nativevnni82-release-tournament-loader-fixed/result.json)
+The first [qualified Release sweep](../../../../parity-results/qwen-flash-next/nativequantised82-release-tournament-loader-fixed/result.json)
 passes **50/50 candidate cells and all 5,050 timing samples**, with no output or
 retained-replay byte mismatches. It uses the real prepared native-Q8 public
 projection, including activation quantization, captured at M1 on gfx906; each
 candidate has 31 warmups and 101 samples. These synthetic component weights
 are not the model accuracy panel. The ordinary unscoped TN128/CPT1 launch is
-the single timed control. The [common analyzer summary](../../../../parity-results/qwen-flash-next/nativevnni82-release-tournament-loader-fixed/summary.csv)
+the single timed control. The [common analyzer summary](../../../../parity-results/qwen-flash-next/nativequantised82-release-tournament-loader-fixed/summary.csv)
 is explicitly diagnostic and cannot emit or install a policy.
 
 | Physical N × K | Default median µs | Lowest median µs | Geometry at lowest median | Latency reduction |
@@ -713,8 +713,8 @@ Retain every result, including slower candidates. The balanced follow-up below
 supersedes these screening values for candidate selection. No component
 percentage is a whole-model throughput claim.
 
-The [paired single-projection run](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-one/result.json)
-and [captured batch32 run](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-batch32/result.json)
+The [paired single-projection run](../../../../parity-results/qwen-flash-next/nativequantised82-paired-release-one/result.json)
+and [captured batch32 run](../../../../parity-results/qwen-flash-next/nativequantised82-paired-release-batch32/result.json)
 both pass all **50 candidate/shape cases and 5,050 raw samples**. The trainer
 retains all five actual graphs, rotates and reverses their order through a
 shared ten-round schedule, and preserves every original round and position.
@@ -727,8 +727,8 @@ the byte oracle. Both runs retain zero output/replay mismatches, the intended
 native loader closure, clean driver windows and normal retirement.
 
 The common analyzer retains all five candidates in each
-[single-projection summary](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-one/summary.csv)
-and [batch32 summary](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-batch32/summary.csv).
+[single-projection summary](../../../../parity-results/qwen-flash-next/nativequantised82-paired-release-one/summary.csv)
+and [batch32 summary](../../../../parity-results/qwen-flash-next/nativequantised82-paired-release-batch32/summary.csv).
 The table shows the best paired geometric-mean speedup in each separate regime;
 it is a diagnostic comparison, not an installed selection or model result.
 
@@ -764,55 +764,55 @@ mode. Consumer-minimal KV ownership and unused short-context indexer query work
 are separate next candidates; their typed ownership and replay tests remain
 required before any speed claim.
 
-The [Release build](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-build-r1/result.json)
-passes, as do the [seven focused checks](../../../../parity-results/qwen-flash-next/nativevnni82-paired-focused/result.json)
-and [complete Unit suite](../../../../parity-results/qwen-flash-next/nativevnni82-paired-unit/result.json):
+The [Release build](../../../../parity-results/qwen-flash-next/nativequantised82-paired-release-build-r1/result.json)
+passes, as do the [seven focused checks](../../../../parity-results/qwen-flash-next/nativequantised82-paired-focused/result.json)
+and [complete Unit suite](../../../../parity-results/qwen-flash-next/nativequantised82-paired-unit/result.json):
 **761/761, zero failures or skips, 116.45 seconds**. Focused preflight entries
 cover the actual shared order and malformed pairing/capture evidence, alongside
 the existing native geometry and benchmark loader checks. This change touches
 the test/analysis harness only; it does not replace the retained model accuracy
 receipt or claim a new complete production-preflight run. The first Release
 build attempt also requested a Unit-only target and was rejected before
-compilation; its [failed receipt](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-build/result.json)
+compilation; its [failed receipt](../../../../parity-results/qwen-flash-next/nativequantised82-paired-release-build/result.json)
 is preserved, and the corrected build targets the Release trainer alone.
 
-The [exact compiled gfx906 functions](../../../../parity-results/qwen-flash-next/nativevnni82-isa/resources.json)
+The [exact compiled gfx906 functions](../../../../parity-results/qwen-flash-next/nativequantised82-isa/resources.json)
 have zero spills, private storage and LDS. Producers use 18 VGPRs; reducers use
 23 for CPT1 and 27 for CPT2. Actual loaded-function queries agree and prove
 resident blocks at each launch width; these are resource limits, not measured
 occupancy. Captured kernel-node functions and grids match the recorded launches.
-The [initial 13 focused checks](../../../../parity-results/qwen-flash-next/nativevnni82-focused/result.json)
+The [initial 13 focused checks](../../../../parity-results/qwen-flash-next/nativequantised82-focused/result.json)
 pass, including tail widths, empty partition planes, poisoned replays and
 invalid scoped bindings.
 
-The [first timing attempt](../../../../parity-results/qwen-flash-next/nativevnni82-release-tournament/result.json)
+The [first timing attempt](../../../../parity-results/qwen-flash-next/nativequantised82-release-tournament/result.json)
 was rejected: the benchmark's HIP host link embedded an overriding SDK RPATH
 and loaded LLVM OpenMP alongside the compiler-selected GNU runtime. Its 40
-partial rows remain rejected evidence. A [device-free original-code control](../../../../parity-results/qwen-flash-next/nativevnni82-loader-negative/result.json)
+partial rows remain rejected evidence. A [device-free original-code control](../../../../parity-results/qwen-flash-next/nativequantised82-loader-negative/result.json)
 reproduces the wrong OpenMP binding. The target now uses the C++ host linker
 and `OpenMP::OpenMP_CXX`; HIP source compilation and the spill guard remain
 enabled. The actual benchmark and application loader controls, mixed-runtime
 negative cases, geometry bytes and evidence validation all pass in the
-[five-check follow-up](../../../../parity-results/qwen-flash-next/nativevnni82-openmp-focused/result.json).
+[five-check follow-up](../../../../parity-results/qwen-flash-next/nativequantised82-openmp-focused/result.json).
 The successful sweep authenticates its complete loader closure before device
 launch, observes the intended core/HIP/GNU runtime, and retires normally with
 an unchanged source/runtime snapshot and clean driver window. Its exact build
-receipt is [nativevnni82-openmp-release-build](../../../../parity-results/qwen-flash-next/nativevnni82-openmp-release-build/result.json).
+receipt is [nativequantised82-openmp-release-build](../../../../parity-results/qwen-flash-next/nativequantised82-openmp-release-build/result.json).
 
-The [complete Unit suite](../../../../parity-results/qwen-flash-next/nativevnni82-unit/result.json)
+The [complete Unit suite](../../../../parity-results/qwen-flash-next/nativequantised82-unit/result.json)
 passes **760/760**, zero skips, in **116.28 seconds**. The
-[surrounding native run](../../../../parity-results/qwen-flash-next/nativevnni82-surrounding/result.json)
+[surrounding native run](../../../../parity-results/qwen-flash-next/nativequantised82-surrounding/result.json)
 passes all four selected registrations plus their fixture in **19.19 seconds**:
 complete GEMV format coverage, grouped prepared-source byte equivalence, the
 Qwen GDN output shard, and actual serial-route telemetry. Driver windows and
 native retirement are clean.
 
-The [unchanged-default Release accuracy panel](../../../../parity-results/qwen-flash-next/nativevnni82-release-accuracy/runtime-observation.json)
+The [unchanged-default Release accuracy panel](../../../../parity-results/qwen-flash-next/nativequantised82-release-accuracy/runtime-observation.json)
 passes in **100.87 seconds**. All **26 files / 185 final-logit rows** remain
-[byte-identical to L74](../../../../parity-results/qwen-flash-next/nativevnni82-release-accuracy/shortk74-logit-byte-comparison.json),
+[byte-identical to L74](../../../../parity-results/qwen-flash-next/nativequantised82-release-accuracy/shortk74-logit-byte-comparison.json),
 including reset and diagnostic rows. This qualifies the infrastructure with the
 existing production geometry; it does not qualify an installed faster policy.
-The new [actual construction-route observations](../../../../parity-results/qwen-flash-next/nativevnni82-release-accuracy/native-q8-physical-route-observation.json)
+The new [actual construction-route observations](../../../../parity-results/qwen-flash-next/nativequantised82-release-accuracy/native-q8-physical-route-observation.json)
 show seven ordinary serial shapes and the vocabulary head on TN128/CPT1/KB16.
 The head has physical N248320 but arithmetic-policy N62080, which the component
 head's equal-N key does not represent. Neither 160×2560 nor 2560×160 appears in
@@ -820,7 +820,7 @@ this serial producer's model observations, so their isolated timings cannot yet
 be attributed to A1. Physical shape, arithmetic-policy shape and fused/batched
 operation identity must remain distinct in any measured dispatch update.
 
-The [actual GGUF descriptor inventory](../../../../parity-results/qwen-flash-next/nativevnni81-source-descriptors.json)
+The [actual GGUF descriptor inventory](../../../../parity-results/qwen-flash-next/nativequantised81-source-descriptors.json)
 was collected through the canonical bounded header parser, without scanning or
 hashing tensor payloads. Main ordinary dense/HC/PLE/head weights are Q8_0;
 routed gate/up use Q4_K in47 layers and Q5_K in1, while down uses Q5_1 in43 and

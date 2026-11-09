@@ -35,7 +35,7 @@ class MoEOverlayEconomyEvidenceCodec final {
         const auto &x=*identity.intersection;
         return {migration,piece,static_cast<std::uint64_t>(identity.projection),static_cast<std::uint64_t>(identity.source_participant),
             static_cast<std::uint64_t>(identity.destination_participant),static_cast<std::uint64_t>(identity.format.kind),
-            identity.format.native_vnni.codebook_id,identity.format.native_vnni.is_superblock?1u:0u,{static_cast<std::uint64_t>(x.source().source_rows),static_cast<std::uint64_t>(x.source().source_columns),
+            identity.format.native_quantised.codebook_id,identity.format.native_quantised.is_superblock?1u:0u,{static_cast<std::uint64_t>(x.source().source_rows),static_cast<std::uint64_t>(x.source().source_columns),
             static_cast<std::uint64_t>(x.firstRow()),static_cast<std::uint64_t>(x.firstColumn()),static_cast<std::uint64_t>(x.rows()),static_cast<std::uint64_t>(x.columns()),static_cast<std::uint64_t>(x.source().rows),static_cast<std::uint64_t>(x.source().columns),
             static_cast<std::uint64_t>(x.sourceRowOrigin()),static_cast<std::uint64_t>(x.sourceColumnOrigin()),static_cast<std::uint64_t>(x.destinationRowOrigin()),static_cast<std::uint64_t>(x.destinationColumnOrigin()),
             static_cast<std::uint64_t>(x.destination().rows),static_cast<std::uint64_t>(x.destination().columns)}};

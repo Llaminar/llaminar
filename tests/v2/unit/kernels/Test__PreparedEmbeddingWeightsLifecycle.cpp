@@ -154,7 +154,7 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, NestedSlicesPreserveEveryFormatC
     {
         SCOPED_TRACE(format.label);
         // K=256 covers every superblock codebook, including Q8_K, which has
-        // no NativeVNNI metadata but does have complete native unpack support.
+        // no NativeQuantised metadata but does have complete native unpack support.
         std::unique_ptr<TensorBase> tensor = format.create({3, 256}, 481);
         for (int nesting = 0; nesting != 3; ++nesting)
         {

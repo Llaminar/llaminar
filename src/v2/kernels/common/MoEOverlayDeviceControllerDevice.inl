@@ -15,7 +15,7 @@
 #include "execution/moe/MoEOverlayDeviceControllerKernels.h"
 #include "execution/moe/MoEOverlayCycleSearch.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
-#include "kernels/common/DeviceNativeVNNIMatrixDesc.h"
+#include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -139,9 +139,9 @@ namespace llaminar2::moe_overlay_controller_device
     /** Device-safe view of the host runtime's fixed expert descriptor ABI. */
     struct RuntimeExpertDescriptorView
     {
-        DeviceNativeVNNIMatrixDesc gate;
-        DeviceNativeVNNIMatrixDesc up;
-        DeviceNativeVNNIMatrixDesc down;
+        DeviceNativeQuantisedMatrixDesc gate;
+        DeviceNativeQuantisedMatrixDesc up;
+        DeviceNativeQuantisedMatrixDesc down;
         DeviceMoEFloatingMatrixDesc floating_gate;
         DeviceMoEFloatingMatrixDesc floating_up;
         DeviceMoEFloatingMatrixDesc floating_down;
@@ -376,9 +376,9 @@ namespace llaminar2::moe_overlay_controller_device
                nullptr;
     }
 
-    /** @return Device-safe completeness check for one NativeVNNI matrix. */
+    /** @return Device-safe completeness check for one NativeQuantised matrix. */
     __device__ __forceinline__ bool nativeMatrixReady(
-        const DeviceNativeVNNIMatrixDesc &matrix) noexcept
+        const DeviceNativeQuantisedMatrixDesc &matrix) noexcept
     {
         return matrix.payload != nullptr && matrix.scales != nullptr &&
                matrix.n > 0 && matrix.k > 0 && matrix.blocks_per_row > 0u;
@@ -402,7 +402,7 @@ namespace llaminar2::moe_overlay_controller_device
         {
             return false;
         }
-        if (descriptor.weight_format == DeviceMoEWeightFormat::NativeVNNI)
+        if (descriptor.weight_format == DeviceMoEWeightFormat::NativeQuantised)
         {
             return nativeMatrixReady(descriptor.gate) &&
                    nativeMatrixReady(descriptor.up) &&

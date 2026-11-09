@@ -39,7 +39,7 @@ inline void admitCPUWeightPlansForTest(WeightManager& manager,IModelLoader& load
     std::map<Key,size_t> persistent;
     std::map<DeviceId,size_t> staging;
     // A tied floating resident/engine aliases the same final root. Native raw
-    // residency and NativeVNNI packing are distinct physical representations.
+    // residency and NativeQuantised packing are distinct physical representations.
     // Original participant scopes also distinguish actual replicated roots;
     // equal source bytes on different TP/overlay participants are not one owner.
     std::set<std::tuple<uint64_t,DeviceId,PhysicalMemoryOwner,std::string,size_t,size_t,size_t,size_t,size_t,int,bool,
@@ -97,7 +97,7 @@ inline void admitCPUWeightPlansForTest(WeightManager& manager,IModelLoader& load
                 if(quote)staging[requirement.target_device]=std::max(staging[requirement.target_device],
                     resolveNativeWeightLoadStaging(*quote,placement,configuredNativeWeightLoadStagingBudgetBytes()).physical_bytes);
                 const bool packed=gemm && precision==WeightPrecision::NATIVE &&
-                    native_vnni_formats::forQuantType(tensorTypeName(original.original_type));
+                    native_quantised_formats::forQuantType(tensorTypeName(original.original_type));
                 auto final_type=original.original_type;
                 if(precision==WeightPrecision::CONVERT_TO_FP32)final_type=TensorType::FP32;
                 if(precision==WeightPrecision::CONVERT_TO_FP16)final_type=TensorType::FP16;

@@ -49,7 +49,7 @@
 #include "execution/mtp/MTPForwardConstruction.h"
 #include "models/qwen35moe/Qwen35MoESchema.h"
 #include "kernels/KernelFactory.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "loaders/PreparedWeightStore.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "utils/CPUProjectionTestWorkspace.h"
@@ -283,8 +283,8 @@ namespace
             return false;
         }
 
-        bool exportNativeVNNIMatrixDesc(
-            DeviceNativeVNNIMatrixDesc &out) override
+        bool exportNativeQuantisedMatrixDesc(
+            DeviceNativeQuantisedMatrixDesc &out) override
         {
             out = {};
             out.payload = payload_;
@@ -6218,7 +6218,7 @@ TEST(Test__Qwen35MoEGraph,
 
 /**
  * @test CPU graph families borrow exact admitted engines and their final packed allocations.
- * @details Actual CPU NativeVNNI engines are prepared once, then the production
+ * @details Actual CPU NativeQuantised engines are prepared once, then the production
  * graph builder records prefill/decode for both logical NUMA owners. Replicated
  * ownership deliberately shadows domain aliases with a different sibling engine.
  */
@@ -6251,10 +6251,10 @@ TEST(Test__Qwen35MoEGraph, CPUOverlayGraphFamiliesReuseExactParticipantPackedEng
         std::array<std::array<std::array<Observation, 3>, 2>, 2> original{};
         std::vector<std::shared_ptr<TensorBase>> sources;
         size_t prepared_physical_bytes = 0;
-        const auto *format = native_vnni_formats::forQuantType("Q4_0");
+        const auto *format = native_quantised_formats::forQuantType("Q4_0");
         ASSERT_NE(format, nullptr);
         const auto admitted_projection = resolveExpertPreparedProjectionMemoryGeometry(32, 32,
-            ExpertWeightFormat::nativeVnni({format->codebook_id, format->is_superblock, true}));
+            ExpertWeightFormat::nativeQuantised({format->codebook_id, format->is_superblock, true}));
         for (int participant = 0; participant < 2; ++participant)
         for (int expert = 0; expert < 2; ++expert)
         {
@@ -6275,7 +6275,7 @@ TEST(Test__Qwen35MoEGraph, CPUOverlayGraphFamiliesReuseExactParticipantPackedEng
                 auto engine = llaminar::v2::kernels::KernelFactory::prepareExpertGemmLocal(
                     std::shared_ptr<const TensorBase>(source), DeviceId::cpu());
                 ASSERT_TRUE(engine);
-                const auto *packed = engine->exportCPUNativeVNNIPackedWeights();
+                const auto *packed = engine->exportCPUNativeQuantisedPackedWeights();
                 ASSERT_TRUE(packed);ASSERT_NE(packed->interleavedBase(), nullptr);
                 ASSERT_GT(packed->native_interleaved.size(), 0u);
                 original[participant][expert][role] = {
@@ -6376,7 +6376,7 @@ TEST(Test__Qwen35MoEGraph, CPUOverlayGraphFamiliesReuseExactParticipantPackedEng
                     EXPECT_EQ(engines[role], expected.engine);
                     if (!expected.engine)
                         continue;
-                    const auto *packed = engines[role]->exportCPUNativeVNNIPackedWeights();
+                    const auto *packed = engines[role]->exportCPUNativeQuantisedPackedWeights();
                     ASSERT_TRUE(packed);
                     EXPECT_EQ(packed->interleavedBase(), expected.storage);
                     EXPECT_EQ(packed->native_interleaved.size(), expected.bytes);
@@ -6438,7 +6438,7 @@ TEST(Test__Qwen35MoEGraph, CPUOverlayGraphFamiliesReuseExactParticipantPackedEng
             {
                 auto *engine = const_cast<ITensorGemm *>(engines[role]);
                 ASSERT_EQ(engine, original[participant][moved_expert][role].engine);
-                const auto *packed = engine->exportCPUNativeVNNIPackedWeights();
+                const auto *packed = engine->exportCPUNativeQuantisedPackedWeights();
                 ASSERT_NE(packed, nullptr);
                 EXPECT_EQ(packed->interleavedBase(), original[participant][moved_expert][role].storage);
                 FP32Tensor input({1, 32});

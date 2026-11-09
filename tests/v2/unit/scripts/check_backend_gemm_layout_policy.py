@@ -8,7 +8,7 @@ representations, and weight packers belong below:
 
 Keeping CPU, CUDA, and ROCm symmetric makes the complete implementation surface
 discoverable without knowing historical backend-specific directory names.  In
-particular, this policy forbids restoring the old CPU ``native_vnni`` sibling
+particular, this policy forbids restoring the old CPU ``native_quantised`` sibling
 tree or placing a backend weight packer at the backend root.
 
 The check is intentionally filename based.  Adjacent facilities such as
@@ -46,23 +46,23 @@ GEMM_OWNED_NAME = re.compile(
     re.IGNORECASE,
 )
 RETIRED_ENTRYPOINTS = (
-    "setNativeVNNIEnabled",
-    "isNativeVNNIEnabled",
+    "setNativeQuantisedEnabled",
+    "isNativeQuantisedEnabled",
     "setForceCutlassFallback",
     "isForceCutlassFallback",
-    "cudaNativeVNNIPrefill_freeStreamKFixup",
-    "cudaNativeVNNIPrefill_setStreamKMode",
-    "cudaNativeVNNIPrefill_getStreamKMode",
-    "cudaNativeVNNIPrefill_setDeterministicMode",
-    "cudaNativeVNNIPrefill_getDeterministicMode",
-    "CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS",
-    "CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP",
+    "cudaNativeQuantisedPrefill_freeStreamKFixup",
+    "cudaNativeQuantisedPrefill_setStreamKMode",
+    "cudaNativeQuantisedPrefill_getStreamKMode",
+    "cudaNativeQuantisedPrefill_setDeterministicMode",
+    "cudaNativeQuantisedPrefill_getDeterministicMode",
+    "CUDA_NATIVE_QUANTISED_PREFILL_SPLITK_PARTIALS",
+    "CUDA_NATIVE_QUANTISED_PREFILL_STREAMK_FIXUP",
     "LLAMINAR_FORCE_PREFILL_SPLIT_K",
     "LLAMINAR_STREAM_K",
-    "LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE",
-    "nvnni_atomic_reduce",
+    "LLAMINAR_ROCM_NATIVE_QUANTISED_ATOMIC_REDUCE",
+    "native_quantised_atomic_reduce",
 )
-NATIVE_VNNI_PREFILL_FORBIDDEN_REDUCTIONS = (
+NATIVE_QUANTISED_PREFILL_FORBIDDEN_REDUCTIONS = (
     "atomicAdd(",
     "split_k",
     "split-K",
@@ -71,20 +71,20 @@ NATIVE_VNNI_PREFILL_FORBIDDEN_REDUCTIONS = (
     "stream-K",
     "STREAM_K",
 )
-ROCM_NATIVE_VNNI_M1_FORBIDDEN_REDUCTIONS = (
+ROCM_NATIVE_QUANTISED_M1_FORBIDDEN_REDUCTIONS = (
     "use_atomic_reduce",
     "atomicAdd(&d_C_fp32[n], result)",
 )
-CUDA_NATIVE_VNNI_GEMV_FORBIDDEN_REDUCTIONS = (
+CUDA_NATIVE_QUANTISED_GEMV_FORBIDDEN_REDUCTIONS = (
     "atomicAdd(",
-    "nativeVnniGemv_epilogue",
+    "nativeQuantisedGemv_epilogue",
     "kTwoPhaseMaxBytes",
     "debugEnv().gemm.deterministic",
 )
-CPU_NATIVE_VNNI_GROUPED_FALLBACK = re.compile(
+CPU_NATIVE_QUANTISED_GROUPED_FALLBACK = re.compile(
     r"\bverifier_policy\s*=\s*VerifierRowsPolicy::Pairwise\s*;"
 )
-CPU_NATIVE_VNNI_FORBIDDEN_LAUNCHER_TOKENS = (
+CPU_NATIVE_QUANTISED_FORBIDDEN_LAUNCHER_TOKENS = (
     "deferred_packing_",
     "native_blocks_",
     "thread_local std::vector",
@@ -107,10 +107,10 @@ def find_violations(repo_root: pathlib.Path) -> list[str]:
         if not backend_root.is_dir():
             continue
 
-        legacy_root = backend_root / "native_vnni"
+        legacy_root = backend_root / "native_quantised"
         if legacy_root.exists():
             violations.append(
-                f"{legacy_root.relative_to(repo_root)}: legacy NativeVNNI "
+                f"{legacy_root.relative_to(repo_root)}: legacy NativeQuantised "
                 "directory is forbidden; move its production files to gemm/"
             )
 
@@ -126,47 +126,47 @@ def find_violations(repo_root: pathlib.Path) -> list[str]:
                         f"entrypoint {entrypoint} is forbidden"
                     )
             if path.name in {
-                "CUDANativeVNNIPrefillKernels.cu",
-                "CUDANativeVNNIPrefillDevice.cuh",
+                "CUDANativeQuantisedPrefillKernels.cu",
+                "CUDANativeQuantisedPrefillDevice.cuh",
             }:
-                for token in NATIVE_VNNI_PREFILL_FORBIDDEN_REDUCTIONS:
+                for token in NATIVE_QUANTISED_PREFILL_FORBIDDEN_REDUCTIONS:
                     if token in source:
                         violations.append(
-                            f"{path.relative_to(repo_root)}: CUDA NativeVNNI "
+                            f"{path.relative_to(repo_root)}: CUDA NativeQuantised "
                             f"prefill reduction token {token!r} is forbidden; "
                             "retain the public M=1 arithmetic tree"
                         )
-            if path.name == "ROCmGemvKernel_native_VNNI.hip":
-                for token in ROCM_NATIVE_VNNI_M1_FORBIDDEN_REDUCTIONS:
+            if path.name == "ROCmGemvKernel_native_quantised.hip":
+                for token in ROCM_NATIVE_QUANTISED_M1_FORBIDDEN_REDUCTIONS:
                     if token in source:
                         violations.append(
-                            f"{path.relative_to(repo_root)}: ROCm NativeVNNI "
+                            f"{path.relative_to(repo_root)}: ROCm NativeQuantised "
                             f"serial-decode reduction token {token!r} is "
                             "forbidden; retain the ordered K-partition fold"
                         )
-            if path.name == "CUDANativeVNNIGemvShardImpl.cu.inc":
-                for token in CUDA_NATIVE_VNNI_GEMV_FORBIDDEN_REDUCTIONS:
+            if path.name == "CUDANativeQuantisedGemvShardImpl.cu.inc":
+                for token in CUDA_NATIVE_QUANTISED_GEMV_FORBIDDEN_REDUCTIONS:
                     if token in source:
                         violations.append(
-                            f"{path.relative_to(repo_root)}: CUDA NativeVNNI "
+                            f"{path.relative_to(repo_root)}: CUDA NativeQuantised "
                             f"GEMV reduction token {token!r} is forbidden; "
                             "serial and grouped decode must retain one ordered "
                             "K-partition publication contract"
                         )
             if (
-                path.name == "CPUNativeVNNIGemv.h"
-                and CPU_NATIVE_VNNI_GROUPED_FALLBACK.search(source)
+                path.name == "CPUNativeQuantisedGemv.h"
+                and CPU_NATIVE_QUANTISED_GROUPED_FALLBACK.search(source)
             ):
                 violations.append(
                     f"{path.relative_to(repo_root)}: CPU grouped verifier "
                     "policy substitution is forbidden; reject an invalid "
                     "physical policy before launch"
                 )
-            if path.name == "CPUNativeVNNIGemmKernel.h":
-                for token in CPU_NATIVE_VNNI_FORBIDDEN_LAUNCHER_TOKENS:
+            if path.name == "CPUNativeQuantisedGemmKernel.h":
+                for token in CPU_NATIVE_QUANTISED_FORBIDDEN_LAUNCHER_TOKENS:
                     if token in source:
                         violations.append(
-                            f"{path.relative_to(repo_root)}: CPU NativeVNNI "
+                            f"{path.relative_to(repo_root)}: CPU NativeQuantised "
                             f"production launcher token {token!r} is forbidden; "
                             "prepare weights eagerly and use persistent aligned "
                             "scratch rather than deferred or vector-backed work"
@@ -229,7 +229,7 @@ def run_self_test() -> int:
 
         legacy_file = (
             root
-            / "src/v2/kernels/cpu/native_vnni/CPUNativeVNNIDecode.h"
+            / "src/v2/kernels/cpu/native_quantised/CPUNativeQuantisedDecode.h"
         )
         legacy_file.parent.mkdir(parents=True)
         legacy_file.write_text("// legacy fixture\n", encoding="utf-8")
@@ -244,7 +244,7 @@ def run_self_test() -> int:
 
         unsafe_prefill = (
             root
-            / "src/v2/kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu"
+            / "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu"
         )
         unsafe_prefill.write_text(
             "void bad(float *p) { atomicAdd(p, 1.0f); }\n",
@@ -253,7 +253,7 @@ def run_self_test() -> int:
 
         # Moving the canonical tile into a reusable device header must not
         # move its reduction arithmetic outside the architecture gate.
-        unsafe_prefill_header = unsafe_prefill.with_name("CUDANativeVNNIPrefillDevice.cuh")
+        unsafe_prefill_header = unsafe_prefill.with_name("CUDANativeQuantisedPrefillDevice.cuh")
         unsafe_prefill_header.write_text(
             "void bad(float *p) { atomicAdd(p, 1.0f); }\n",
             encoding="utf-8",
@@ -261,7 +261,7 @@ def run_self_test() -> int:
 
         unsafe_rocm_decode = (
             root
-            / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip"
+            / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip"
         )
         unsafe_rocm_decode.parent.mkdir(parents=True, exist_ok=True)
         unsafe_rocm_decode.write_text(
@@ -272,7 +272,7 @@ def run_self_test() -> int:
         unsafe_cuda_decode = (
             root
             / "src/v2/kernels/cuda/gemm/"
-            "CUDANativeVNNIGemvShardImpl.cu.inc"
+            "CUDANativeQuantisedGemvShardImpl.cu.inc"
         )
         unsafe_cuda_decode.parent.mkdir(parents=True, exist_ok=True)
         unsafe_cuda_decode.write_text(
@@ -281,7 +281,7 @@ def run_self_test() -> int:
         )
 
         unsafe_cpu_grouped = (
-            root / "src/v2/kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+            root / "src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
         )
         unsafe_cpu_grouped.parent.mkdir(parents=True, exist_ok=True)
         unsafe_cpu_grouped.write_text(
@@ -290,7 +290,7 @@ def run_self_test() -> int:
         )
 
         unsafe_cpu_launcher = (
-            root / "src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+            root / "src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
         )
         unsafe_cpu_launcher.write_text(
             "bool deferred_packing_;\n"

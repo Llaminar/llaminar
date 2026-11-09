@@ -266,7 +266,7 @@ all 256 IDs. Both upstream modes first differ from Llaminar at index 77.
 four-row IQ4_NL execution-codebook projection from the IQ4_XS GGUF during the
 benchmark warmup. NCU application replay runs six independent passes; none of
 their timing receipts are canonical performance samples. The exact symbol is
-`nativeVnniGemv_kpar_small_m<4,128,1,4,false>`, grid `(136,6,1)`, block 128.
+`nativeQuantisedGemv_kpar_small_m<4,128,1,4,false>`, grid `(136,6,1)`, block 128.
 It reports 37 registers/thread, zero local-memory spill requests, 81.34%
 achieved occupancy, 74.49% DRAM throughput (678.40 GB/s), and 48.03% compute
 throughput. This measured node is not suffering from low occupancy or spills;

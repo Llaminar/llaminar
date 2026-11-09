@@ -46,15 +46,15 @@ TEST_F(ROCmDensePrefillOverlay, ExactRowsDoNotConsumeUnmeasuredGeometry)
     for (int m = 1; m <= 2048; ++m)
     {
         const auto selected = selectDensePrefillExactConfig(0, m, 512, 5120,
-            DensePrefillWeightFamily::NativeVNNI);
+            DensePrefillWeightFamily::NativeQuantised);
         EXPECT_EQ(selected.has_value(), measured_rows.contains(m)) << m;
     }
     EXPECT_FALSE(selectDensePrefillExactConfig(0, 64, 513, 5120,
-        DensePrefillWeightFamily::NativeVNNI));
+        DensePrefillWeightFamily::NativeQuantised));
     EXPECT_FALSE(selectDensePrefillExactConfig(0, 64, 512, 5152,
-        DensePrefillWeightFamily::NativeVNNI));
+        DensePrefillWeightFamily::NativeQuantised));
     EXPECT_FALSE(selectDensePrefillExactConfig(23, 64, 512, 5120,
-        DensePrefillWeightFamily::NativeVNNI));
+        DensePrefillWeightFamily::NativeQuantised));
 }
 /** @brief A prepared physical ABI cannot reinterpret a measured foreign producer. */
 TEST_F(ROCmDensePrefillOverlay, RejectsInvalidGeometryAndWeightAuthority)
@@ -65,8 +65,8 @@ TEST_F(ROCmDensePrefillOverlay, RejectsInvalidGeometryAndWeightAuthority)
         ASSERT_TRUE(selectDensePrefillExactConfig(entry.codebook, entry.m, entry.n,
             entry.k, entry.family));
         EXPECT_TRUE(densePrefillProducerMatchesFamily(entry.family, entry.config.producer));
-        const auto foreign = entry.family == DensePrefillWeightFamily::NativeVNNI
-            ? DensePrefillWeightFamily::Int8Blockwise : DensePrefillWeightFamily::NativeVNNI;
+        const auto foreign = entry.family == DensePrefillWeightFamily::NativeQuantised
+            ? DensePrefillWeightFamily::Int8Blockwise : DensePrefillWeightFamily::NativeQuantised;
         // A valid other-family request is a distinct key. Query its complete
         // immutable identity so future measured coexistence remains covered.
         const auto expected = std::find_if(std::begin(entries), std::end(entries),
@@ -90,11 +90,11 @@ TEST_F(ROCmDensePrefillOverlay, RejectsInvalidGeometryAndWeightAuthority)
     for (int invalid : {0, -1})
     {
         EXPECT_THROW((void)selectDensePrefillExactConfig(0, invalid, 512, 5120,
-            DensePrefillWeightFamily::NativeVNNI), std::invalid_argument);
+            DensePrefillWeightFamily::NativeQuantised), std::invalid_argument);
         EXPECT_THROW((void)selectDensePrefillExactConfig(0, 64, invalid, 5120,
-            DensePrefillWeightFamily::NativeVNNI), std::invalid_argument);
+            DensePrefillWeightFamily::NativeQuantised), std::invalid_argument);
         EXPECT_THROW((void)selectDensePrefillExactConfig(0, 64, 512, invalid,
-            DensePrefillWeightFamily::NativeVNNI), std::invalid_argument);
+            DensePrefillWeightFamily::NativeQuantised), std::invalid_argument);
     }
     EXPECT_THROW((void)selectDensePrefillExactConfig(0, 64, 512, 5120,
         static_cast<DensePrefillWeightFamily>(255)), std::invalid_argument);
@@ -103,7 +103,7 @@ TEST_F(ROCmDensePrefillOverlay, RejectsInvalidGeometryAndWeightAuthority)
 TEST_F(ROCmDensePrefillOverlay, NativeQ8AndExpandedInt8HaveDistinctKeys)
 {
     EXPECT_FALSE(selectDensePrefillExactConfig(19, 64, 512, 5120,
-        DensePrefillWeightFamily::NativeVNNI));
+        DensePrefillWeightFamily::NativeQuantised));
     const auto expanded = selectDensePrefillExactConfig(19, 64, 512, 5120,
         DensePrefillWeightFamily::Int8Blockwise);
     ASSERT_TRUE(expanded);
@@ -115,16 +115,16 @@ TEST_F(ROCmDensePrefillOverlay, NativeQ8AndExpandedInt8HaveDistinctKeys)
     // Exercise the actual generated ordering with two possible physical
     // contracts at identical decoder and geometry; neither is an alias.
     const generated::ROCmDensePrefillOverlayEntry native{
-        19, 64, 512, 5120, DensePrefillWeightFamily::NativeVNNI,
+        19, 64, 512, 5120, DensePrefillWeightFamily::NativeQuantised,
         {64, 16, 1, 4, false, VNNIPrefillProducer::NativeCooperative}};
     const generated::ROCmDensePrefillOverlayEntry int8{
         19, 64, 512, 5120, DensePrefillWeightFamily::Int8Blockwise, *expanded};
     EXPECT_EQ(generated::compareROCmDensePrefillOverlayKey(native, 19, 64, 512, 5120,
-        DensePrefillWeightFamily::NativeVNNI), 0);
+        DensePrefillWeightFamily::NativeQuantised), 0);
     EXPECT_LT(generated::compareROCmDensePrefillOverlayKey(native, 19, 64, 512, 5120,
         DensePrefillWeightFamily::Int8Blockwise), 0);
     EXPECT_GT(generated::compareROCmDensePrefillOverlayKey(int8, 19, 64, 512, 5120,
-        DensePrefillWeightFamily::NativeVNNI), 0);
+        DensePrefillWeightFamily::NativeQuantised), 0);
     EXPECT_EQ(generated::compareROCmDensePrefillOverlayKey(int8, 19, 64, 512, 5120,
         DensePrefillWeightFamily::Int8Blockwise), 0);
 }
@@ -134,18 +134,18 @@ TEST_F(ROCmDensePrefillOverlay, ProducerAdmissionRequiresTypedPhysicalFamily)
     for (const auto producer : {VNNIPrefillProducer::NativeCooperative,
                                VNNIPrefillProducer::NativeStreaming})
     {
-        EXPECT_TRUE(densePrefillProducerMatchesFamily(DensePrefillWeightFamily::NativeVNNI, producer));
+        EXPECT_TRUE(densePrefillProducerMatchesFamily(DensePrefillWeightFamily::NativeQuantised, producer));
         EXPECT_FALSE(densePrefillProducerMatchesFamily(DensePrefillWeightFamily::Int8Blockwise, producer));
     }
     for (const auto producer : {VNNIPrefillProducer::Int8BlockwiseV3,
                                VNNIPrefillProducer::Int8BlockwiseV7})
     {
         EXPECT_TRUE(densePrefillProducerMatchesFamily(DensePrefillWeightFamily::Int8Blockwise, producer));
-        EXPECT_FALSE(densePrefillProducerMatchesFamily(DensePrefillWeightFamily::NativeVNNI, producer));
+        EXPECT_FALSE(densePrefillProducerMatchesFamily(DensePrefillWeightFamily::NativeQuantised, producer));
     }
     EXPECT_FALSE(densePrefillProducerMatchesFamily(static_cast<DensePrefillWeightFamily>(255),
         VNNIPrefillProducer::NativeCooperative));
-    EXPECT_FALSE(densePrefillProducerMatchesFamily(DensePrefillWeightFamily::NativeVNNI,
+    EXPECT_FALSE(densePrefillProducerMatchesFamily(DensePrefillWeightFamily::NativeQuantised,
         static_cast<VNNIPrefillProducer>(255)));
 }
 /** @brief A diagnostic tournament cannot disable another graph-construction thread. */
@@ -153,17 +153,17 @@ TEST_F(ROCmDensePrefillOverlay, TournamentBypassIsThreadLocal)
 {
     setDensePrefillExactOverlayEnabled(false);
     EXPECT_FALSE(selectDensePrefillExactConfig(0, 64, 512, 5120,
-        DensePrefillWeightFamily::NativeVNNI));
+        DensePrefillWeightFamily::NativeQuantised));
     auto other = std::async(std::launch::async, []
     {
         return densePrefillExactOverlayEnabled() &&
             selectDensePrefillExactConfig(0, 64, 512, 5120,
-                DensePrefillWeightFamily::NativeVNNI).has_value();
+                DensePrefillWeightFamily::NativeQuantised).has_value();
     });
     EXPECT_TRUE(other.get());
     EXPECT_FALSE(densePrefillExactOverlayEnabled());
     setDensePrefillExactOverlayEnabled(true);
     EXPECT_TRUE(selectDensePrefillExactConfig(0, 64, 512, 5120,
-        DensePrefillWeightFamily::NativeVNNI));
+        DensePrefillWeightFamily::NativeQuantised));
 }
 }

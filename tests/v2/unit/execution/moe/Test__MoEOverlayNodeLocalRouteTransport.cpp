@@ -6,6 +6,8 @@
  * physical accelerator.  They lock down the production rule that native
  * NCCL/RCCL remains authoritative whenever any peer edge exists, while a
  * proven no-P2P homogeneous cell uses mapped sparse routing for both phases.
+ * Explicit diagnostics preserve that topology and decode/MTP default while
+ * independently validating the ordinary-prefill transport support contract.
  */
 
 #include "backends/ComputeBackend.h"
@@ -181,6 +183,115 @@ namespace llaminar2::test
                 std::vector<DeviceId>{DeviceId::cuda(0), DeviceId::cuda(0)},
                 PeerAccessCoverage::Complete),
             std::invalid_argument);
+    }
+
+    TEST(Test__MoEOverlayNodeLocalRouteTransport,
+         DiagnosticParsesOnlyExplicitCanonicalPrefillSelections)
+    {
+        EXPECT_FALSE(parseMoEOverlayDiagnosticPrefillTransport(nullptr));
+        EXPECT_EQ(parseMoEOverlayDiagnosticPrefillTransport("native_collective"),
+            MoEOverlayNodeLocalRouteTransport::NativeCollective);
+        EXPECT_EQ(parseMoEOverlayDiagnosticPrefillTransport("mapped_sparse"),
+            MoEOverlayNodeLocalRouteTransport::MappedSparse);
+        for (const auto *invalid : {"", "auto", "mapped", "MAPPED_SPARSE", " mapped_sparse"})
+            EXPECT_THROW((void)parseMoEOverlayDiagnosticPrefillTransport(invalid),
+                std::invalid_argument);
+    }
+
+    TEST(Test__MoEOverlayNodeLocalRouteTransport,
+         DiagnosticParsedStartupValueDoesNotBorrowEnvironmentStorage)
+    {
+        char original[] = "mapped_sparse";
+        const auto frozen = parseMoEOverlayDiagnosticPrefillTransport(original);
+        original[0] = 'x';
+        EXPECT_EQ(frozen, MoEOverlayNodeLocalRouteTransport::MappedSparse);
+        const std::vector<DeviceId> devices{DeviceId::rocm(2), DeviceId::rocm(5)};
+        const auto policy = selectMoEOverlayDiagnosticPrefillTransportPolicy(
+            devices, PeerAccessCoverage::Complete, frozen);
+        EXPECT_EQ(policy.ordinary_prefill, MoEOverlayNodeLocalRouteTransport::MappedSparse);
+        EXPECT_EQ(policy.decode, MoEOverlayNodeLocalRouteTransport::NativeCollective);
+    }
+
+    TEST(Test__MoEOverlayNodeLocalRouteTransport,
+         DiagnosticMappedPrefillPreservesNativeDecodeAndActualPeerCoverage)
+    {
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            const std::vector<DeviceId> devices = backend == DeviceType::CUDA
+                ? std::vector<DeviceId>{DeviceId::cuda(4), DeviceId::cuda(9)}
+                : std::vector<DeviceId>{DeviceId::rocm(2), DeviceId::rocm(5)};
+            for (const auto coverage : {PeerAccessCoverage::Partial, PeerAccessCoverage::Complete})
+            {
+                const auto default_policy = selectMoEOverlayNodeLocalRouteTransportPolicy(devices, coverage);
+                EXPECT_EQ(selectMoEOverlayDiagnosticPrefillTransportPolicy(devices, coverage, std::nullopt),
+                    default_policy);
+                const auto selected = selectMoEOverlayDiagnosticPrefillTransportPolicy(devices, coverage,
+                    parseMoEOverlayDiagnosticPrefillTransport("mapped_sparse"));
+                EXPECT_EQ(selected.ordinary_prefill, MoEOverlayNodeLocalRouteTransport::MappedSparse);
+                EXPECT_EQ(selected.decode, default_policy.decode);
+                EXPECT_EQ(selected.forPhase(MoEOverlayNodeLocalRoutePhase::Decode),
+                    MoEOverlayNodeLocalRouteTransport::NativeCollective);
+                EXPECT_TRUE(selected.requiresMappedExchange());
+            }
+        }
+    }
+
+    TEST(Test__MoEOverlayNodeLocalRouteTransport,
+         DiagnosticNativeSupportDoesNotPretendNoPeerCoverageIsUnsupported)
+    {
+        const std::vector<DeviceId> devices{DeviceId::rocm(2), DeviceId::rocm(5)};
+        const auto selected = selectMoEOverlayDiagnosticPrefillTransportPolicy(devices,
+            PeerAccessCoverage::None, parseMoEOverlayDiagnosticPrefillTransport("native_collective"));
+        EXPECT_EQ(selected.ordinary_prefill, MoEOverlayNodeLocalRouteTransport::NativeCollective);
+        EXPECT_EQ(selected.decode, MoEOverlayNodeLocalRouteTransport::MappedSparse);
+        EXPECT_TRUE(selected.requiresMappedExchange());
+    }
+
+    TEST(Test__MoEOverlayNodeLocalRouteTransport,
+         DiagnosticAuxiliaryCPUAndWholeExpertRanksDoNotRequireLocalTP)
+    {
+        const std::vector<DeviceId> continuation{DeviceId::rocm(1), DeviceId::rocm(2)};
+        // The CPU2 capacity rank and another whole-expert rank carry the same
+        // original plan; neither owns the continuation's execution layout.
+        const std::vector<DeviceId> cpu_auxiliary{DeviceId::cpu()};
+        EXPECT_FALSE(validateMoEOverlayDiagnosticPrefillTransportOwner(
+            cpu_auxiliary, continuation, /*rank_local_tp=*/false));
+        const std::vector<DeviceId> gpu_auxiliary{DeviceId::rocm(3)};
+        EXPECT_FALSE(validateMoEOverlayDiagnosticPrefillTransportOwner(
+            gpu_auxiliary, continuation, /*rank_local_tp=*/false));
+        const std::vector<DeviceId> reordered{DeviceId::rocm(2), DeviceId::rocm(1)};
+        EXPECT_TRUE(validateMoEOverlayDiagnosticPrefillTransportOwner(
+            reordered, continuation, /*rank_local_tp=*/true));
+    }
+
+    TEST(Test__MoEOverlayNodeLocalRouteTransport,
+         DiagnosticActualContinuationOwnerRejectsPartialOrUnsupportedLayout)
+    {
+        const std::vector<DeviceId> continuation{DeviceId::rocm(1), DeviceId::rocm(2)};
+        const std::vector<DeviceId> partial{DeviceId::rocm(1)};
+        EXPECT_THROW((void)validateMoEOverlayDiagnosticPrefillTransportOwner(
+            partial, continuation, /*rank_local_tp=*/true), std::invalid_argument);
+        EXPECT_THROW((void)validateMoEOverlayDiagnosticPrefillTransportOwner(
+            continuation, continuation, /*rank_local_tp=*/false), std::invalid_argument);
+        const std::vector<DeviceId> mixed_owner{DeviceId::rocm(1), DeviceId::cpu()};
+        EXPECT_THROW((void)validateMoEOverlayDiagnosticPrefillTransportOwner(
+            mixed_owner, continuation, /*rank_local_tp=*/true), std::invalid_argument);
+    }
+
+    TEST(Test__MoEOverlayNodeLocalRouteTransport,
+         DiagnosticRejectsNativeMixedVendorAndIncompleteTopology)
+    {
+        const std::vector<DeviceId> mixed{DeviceId::cuda(3), DeviceId::rocm(1)};
+        EXPECT_THROW((void)selectMoEOverlayDiagnosticPrefillTransportPolicy(mixed, std::nullopt,
+            parseMoEOverlayDiagnosticPrefillTransport("native_collective")), std::invalid_argument);
+        EXPECT_NO_THROW((void)selectMoEOverlayDiagnosticPrefillTransportPolicy(mixed, std::nullopt,
+            parseMoEOverlayDiagnosticPrefillTransport("mapped_sparse")));
+        const std::vector<DeviceId> single{DeviceId::rocm(1)};
+        EXPECT_THROW((void)selectMoEOverlayDiagnosticPrefillTransportPolicy(single, PeerAccessCoverage::Complete,
+            parseMoEOverlayDiagnosticPrefillTransport("mapped_sparse")), std::invalid_argument);
+        const std::vector<DeviceId> homogeneous{DeviceId::rocm(1), DeviceId::rocm(2)};
+        EXPECT_THROW((void)selectMoEOverlayDiagnosticPrefillTransportPolicy(homogeneous, std::nullopt,
+            parseMoEOverlayDiagnosticPrefillTransport("mapped_sparse")), std::invalid_argument);
     }
 
     TEST(Test__MoEOverlayNodeLocalRouteTransport,

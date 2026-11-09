@@ -7,7 +7,7 @@
  *
  * Prepared weight handles and arena-owned activation/scratch surfaces survive
  * graph recording and replay. Explicit producer policies select lossless
- * NativeVNNI low-bit or blockwise INT8 kernels; execution quantizes resident
+ * NativeQuantised low-bit or blockwise INT8 kernels; execution quantizes resident
  * activations on the exact caller stream and publishes resident FP32 output.
  * The immutable dense-prefill overlay owns only its measured physical keys.
  * Unmeasured geometry remains owned by the complete generic launch policy,
@@ -47,11 +47,11 @@
 #include "ROCmDenseProductionPrefillOverlay.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 #include "ROCmQuantisedGemmWorkspaceContract.h"
-#include "ROCmNativeVNNISerialGeometry.h"
+#include "ROCmNativeQuantisedSerialGeometry.h"
 #include "ROCmNativeM1Reduction.h"
 #include "transfer/TransferEngine.h"
 #include "../ROCmKernelBase.h"
-#include "ROCmWeightPacker.h"     // packWeightsToROCm, packNativeVNNI
+#include "ROCmWeightPacker.h"     // packWeightsToROCm, packNativeQuantised
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/DeviceId.h"       // DeviceId
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
@@ -103,7 +103,7 @@ namespace llaminar2
                     quantized_gemm_workspace::kFusedProjectionStreamCapacity);
             constexpr int ROCM_NATIVE_SMALL_M_GRAPH_SAFE_KB_CAP =
                 quantized_gemm_workspace::kScatterKBlockCapacity;
-            thread_local bool g_rocm_native_vnni_decode_equivalent_scope = false;
+            thread_local bool g_rocm_native_quantised_decode_equivalent_scope = false;
 
             /**
              * @brief Apply the original epilogue using the enclosing row authority.
@@ -187,7 +187,7 @@ namespace llaminar2
             return rows && rows->countOwner();
         }
 
-            int computeNativeVNNISmallMBatchedKBForValidation(
+            int computeNativeQuantisedSmallMBatchedKBForValidation(
                 const std::array<int, 8> &Ns,
                 int num_projections,
                 int M,
@@ -333,12 +333,12 @@ namespace llaminar2
             // Get current activation block size for blockwise quantization (32, 64, or 128)
             int rocmGemv_int8_vnni_get_act_block_k();
 
-            // Native-VNNI GEMM: lossless decode with FP16 per-block scales (M>1 prefill).
-            // Supports all native-VNNI formats via codebook_id.
+            // NativeQuantised GEMM: lossless decode with FP16 per-block scales (M>1 prefill).
+            // Supports all native-quantised formats via codebook_id.
             // Output is FP32 with scale_A applied inline — no separate epilogue needed.
             // Halved HBM bandwidth vs INT8 GEMM (4.5 bpw vs 8 bpw for Q4_0/IQ4_NL).
-            // Public dispatcher for the physically sharded NativeVNNI GEMM TUs.
-            bool rocmGemm_native_vnni_fp32(
+            // Public dispatcher for the physically sharded NativeQuantised GEMM TUs.
+            bool rocmGemm_native_quantised_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const void *d_block_scales, // __half* (FP16 d)
@@ -351,8 +351,8 @@ namespace llaminar2
                 uint8_t codebook_id,
                 int device_id, void *stream);
 
-            /** Execute physical NativeVNNI bytes with source math policy. */
-            bool rocmGemm_native_vnni_fp32_with_policy(
+            /** Execute physical NativeQuantised bytes with source math policy. */
+            bool rocmGemm_native_quantised_fp32_with_policy(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const void *d_block_scales,
@@ -366,7 +366,7 @@ namespace llaminar2
                 uint8_t arithmetic_policy_codebook_id,
                 int device_id, void *stream);
 
-            // Native-VNNI GEMV: lossless decode with FP16 per-block scales.
+            // NativeQuantised GEMV: lossless decode with FP16 per-block scales.
             // Supports all ≤6-bit quantized formats via codebook_id:
             //   Q-quants: Q4_0, Q4_1, Q5_0, Q5_1
             //   K-quants: Q2_K, Q3_K, Q4_K (via Q4_1 codebook), Q5_K (via Q5_1 codebook), Q6_K
@@ -375,7 +375,7 @@ namespace llaminar2
             // Q8_0/Q8_1/Q8_K use the INT8-VNNI path instead (already 1 byte/element).
             // Output is FP32 with scale_A applied inline — no epilogue kernel needed.
             // Uses scatter+reduce pattern: KB=1 → direct, KB>1 → scatter+reduce.
-            bool rocmGemv_native_vnni_fp32(
+            bool rocmGemv_native_quantised_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const void *d_block_scales, // __half* (FP16 d)
@@ -390,7 +390,7 @@ namespace llaminar2
                 const float *d_scale_A_blockwise = nullptr);
 
             /** Execute serial GEMV with distinct decoder and math policy. */
-            bool rocmGemv_native_vnni_fp32_with_policy(
+            bool rocmGemv_native_quantised_fp32_with_policy(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const void *d_block_scales,
@@ -405,7 +405,7 @@ namespace llaminar2
                 int device_id, void *stream,
                 const float *d_scale_A_blockwise = nullptr);
 
-            bool rocmGemv_native_vnni_small_m_fp32(
+            bool rocmGemv_native_quantised_small_m_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const void *d_block_scales, // __half* (FP16 d)
@@ -418,7 +418,7 @@ namespace llaminar2
                 uint8_t codebook_id,
                 int device_id, void *stream);
 
-            bool rocmGemv_native_vnni_small_m_fp32_with_sums(
+            bool rocmGemv_native_quantised_small_m_fp32_with_sums(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const void *d_block_scales, // __half* (FP16 d)
@@ -433,7 +433,7 @@ namespace llaminar2
                 int device_id, void *stream);
 
 
-            bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
+            bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums(
                 const int8_t *d_A_int8,
                 const uint8_t *const *d_payloads,
                 const uint16_t *const *d_block_scales,
@@ -452,7 +452,7 @@ namespace llaminar2
 
 
 
-            bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums(
+            bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums(
                 const int8_t *d_A_int8,
                 const uint8_t *const *d_payloads,
                 const uint16_t *const *d_block_scales,
@@ -470,20 +470,20 @@ namespace llaminar2
                 int device_id, void *stream);
 
 
-            void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
-            void rocmGemv_native_vnni_set_decode_equivalent_m1_config(int enabled);
-            void rocmGemv_native_vnni_set_serial_partition_n(int n);
-            int rocmGemv_native_vnni_get_serial_partition_n();
-            bool rocmGemv_native_vnni_query_serial_m1_config(
+            void rocmGemv_native_quantised_set_tuning_overrides(int kb, int target_waves_per_cu);
+            void rocmGemv_native_quantised_set_decode_equivalent_m1_config(int enabled);
+            void rocmGemv_native_quantised_set_serial_partition_n(int n);
+            int rocmGemv_native_quantised_get_serial_partition_n();
+            bool rocmGemv_native_quantised_query_serial_m1_config(
                 uint8_t codebook_id,
                 int N,
                 int K,
                 int *kb,
                 int *target_waves_per_cu);
             /** @brief Query exact original source arithmetic without physical-codebook inference. */
-            bool rocmGemv_native_vnni_query_serial_m1_config_with_policy(
+            bool rocmGemv_native_quantised_query_serial_m1_config_with_policy(
                 uint8_t policy_codebook_id, int N, int K, int *kb, int *target_waves_per_cu);
-            bool rocmGemv_native_vnni_query_generated_config(
+            bool rocmGemv_native_quantised_query_generated_config(
                 uint8_t codebook_id,
                 int M,
                 int N,
@@ -743,26 +743,26 @@ namespace llaminar2
         struct ROCmQuantisedGemmKernel::Impl
         {
             // Device memory for converted weights (only used when owns_weight_memory_ = true)
-            // VNNI-only on device: native-VNNI (≤6-bit) or INT8-VNNI (8-bit).
+            // VNNI-only on device: native-quantised (≤6-bit) or INT8-VNNI (8-bit).
             int8_t *d_weights_int8_vnni = nullptr;    // [K/4 x N x 4] VNNI layout (sole INT8 device copy)
             float *d_scales_B = nullptr;              // [N] per-column scales
-            uint8_t *d_weights_native_vnni = nullptr; // [blocks_per_row × N × payload_bytes]
+            uint8_t *d_weights_native_quantised = nullptr; // [blocks_per_row × N × payload_bytes]
             void *d_weights_native_scales = nullptr;  // [blocks_per_row × N] __half*
             void *d_weights_native_mins = nullptr;    // [blocks_per_row × N] __half* (asymmetric only, else NULL)
             void *d_weights_native_emins = nullptr;   // [blocks_per_row × N] uint32_t* (Q2_K only, packed {lo,hi} FP16 emins)
-            uint8_t native_vnni_codebook_id = 0;
-            uint32_t native_vnni_blocks_per_row = 0;
-            NativeVnniSourceIdentity native_source_identity;
+            uint8_t native_quantised_codebook_id = 0;
+            uint32_t native_quantised_blocks_per_row = 0;
+            NativeQuantisedSourceIdentity native_source_identity;
             // Borrowed immutable IQ view is bound cold once and never replaced.
             // A backend reset invalidates it together with the prepared weights.
             NativeEmbeddingIQTables residual_iq_tables;
             std::atomic<std::uint64_t> residual_iq_generation{0};
             std::once_flag residual_iq_once;
-            NativeVnniReusableDeviceAllocationFormat native_allocation_format;
-            bool has_native_vnni = false;
+            NativeQuantisedReusableDeviceAllocationFormat native_allocation_format;
+            bool has_native_quantised = false;
             void *startup_h2d_pinned_scales = nullptr;
             void *startup_h2d_pinned_vnni = nullptr;
-            void *startup_h2d_pinned_native_vnni = nullptr;
+            void *startup_h2d_pinned_native_quantised = nullptr;
             void *startup_h2d_pinned_native_scales = nullptr;
             void *startup_h2d_pinned_native_mins = nullptr;
             void *startup_h2d_pinned_native_emins = nullptr;
@@ -807,8 +807,8 @@ namespace llaminar2
                         rocmQuantGemm_freeDevice(d_weights_int8_vnni, rocm_device_id);
                     if (d_scales_B)
                         rocmQuantGemm_freeDevice(d_scales_B, rocm_device_id);
-                    if (d_weights_native_vnni)
-                        rocmQuantGemm_freeDevice(d_weights_native_vnni, rocm_device_id);
+                    if (d_weights_native_quantised)
+                        rocmQuantGemm_freeDevice(d_weights_native_quantised, rocm_device_id);
                     if (d_weights_native_scales)
                         rocmQuantGemm_freeDevice(d_weights_native_scales, rocm_device_id);
                     if (d_weights_native_mins)
@@ -826,7 +826,7 @@ namespace llaminar2
                     };
                     free_pinned(startup_h2d_pinned_scales);
                     free_pinned(startup_h2d_pinned_vnni);
-                    free_pinned(startup_h2d_pinned_native_vnni);
+                    free_pinned(startup_h2d_pinned_native_quantised);
                     free_pinned(startup_h2d_pinned_native_scales);
                     free_pinned(startup_h2d_pinned_native_mins);
                     free_pinned(startup_h2d_pinned_native_emins);
@@ -847,14 +847,14 @@ namespace llaminar2
              * provenance once; reaching inference without it is a fatal
              * lifecycle violation rather than permission to guess.
              */
-            inline uint8_t requireNativeVNNIArithmeticPolicyCodebook(
+            inline uint8_t requireNativeQuantisedArithmeticPolicyCodebook(
                 uint8_t execution_codebook_id,
-                const NativeVnniSourceIdentity &source_identity)
+                const NativeQuantisedSourceIdentity &source_identity)
             {
                 if (!source_identity.present)
                 {
                     throw std::logic_error(
-                        "[ROCmQuantisedGemmKernel] NativeVNNI execution lost "
+                        "[ROCmQuantisedGemmKernel] NativeQuantised execution lost "
                         "source arithmetic identity for codebook " +
                         std::to_string(
                             static_cast<int>(execution_codebook_id)));
@@ -926,7 +926,7 @@ namespace llaminar2
 
                 free_if_set(upload.startup_h2d_pinned_scales);
                 free_if_set(upload.startup_h2d_pinned_vnni);
-                free_if_set(upload.startup_h2d_pinned_native_vnni);
+                free_if_set(upload.startup_h2d_pinned_native_quantised);
                 free_if_set(upload.startup_h2d_pinned_native_scales);
                 free_if_set(upload.startup_h2d_pinned_native_mins);
 #else
@@ -1009,15 +1009,15 @@ namespace llaminar2
                         rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, device_id);
                     if (upload.d_scales)
                         rocmQuantGemm_freeDevice(upload.d_scales, device_id);
-                    if (upload.d_native_vnni_payload)
-                        rocmQuantGemm_freeDevice(upload.d_native_vnni_payload, device_id);
+                    if (upload.d_native_quantised_payload)
+                        rocmQuantGemm_freeDevice(upload.d_native_quantised_payload, device_id);
 #ifdef HAVE_ROCM
-                    if (upload.d_native_vnni_scales)
-                        rocmQuantGemm_freeDevice(upload.d_native_vnni_scales, device_id);
-                    if (upload.d_native_vnni_mins)
-                        rocmQuantGemm_freeDevice(upload.d_native_vnni_mins, device_id);
-                    if (upload.d_native_vnni_emins)
-                        rocmQuantGemm_freeDevice(upload.d_native_vnni_emins, device_id);
+                    if (upload.d_native_quantised_scales)
+                        rocmQuantGemm_freeDevice(upload.d_native_quantised_scales, device_id);
+                    if (upload.d_native_quantised_mins)
+                        rocmQuantGemm_freeDevice(upload.d_native_quantised_mins, device_id);
+                    if (upload.d_native_quantised_emins)
+                        rocmQuantGemm_freeDevice(upload.d_native_quantised_emins, device_id);
                     freeStartupPinnedStaging(upload);
                     if (upload.startup_h2d_stream)
                         (void)hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_h2d_stream));
@@ -1035,7 +1035,7 @@ namespace llaminar2
 
         // =====================================================================
         // Weight packing: see ROCmWeightPacker.cpp
-        // (packNativeVNNI, packWeightsToROCm_Q8_0_fast, packWeightsToROCm)
+        // (packNativeQuantised, packWeightsToROCm_Q8_0_fast, packWeightsToROCm)
         // =====================================================================
 
         /** @brief Borrow typed HIP handles without adding another native resource owner. */
@@ -1123,7 +1123,7 @@ namespace llaminar2
 
             // Validate it's a quantized type supported by this kernel
             TensorType wt = weights->native_type();
-            bool is_quantized = isNativeVnniFormat(wt) || isInt8VnniFormat(wt);
+            bool is_quantized = isNativeQuantisedFormat(wt) || isInt8VnniFormat(wt);
 
             if (!is_quantized)
             {
@@ -1136,12 +1136,12 @@ namespace llaminar2
             impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
 
             const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
-            const NativeVnniFormatInfo *format =
+            const NativeQuantisedFormatInfo *format =
                 unpackable ? unpackable->vnniFormatInfo() : nullptr;
             if (!format)
             {
                 throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Quantized tensor has no NativeVNNI source identity");
+                    "[ROCmQuantisedGemmKernel] Quantized tensor has no NativeQuantised source identity");
             }
             impl_->native_source_identity = {
                 .codebook_id = format->codebook_id,
@@ -1179,7 +1179,7 @@ namespace llaminar2
             if (!impl_->native_source_identity.present)
             {
                 throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Pre-packed weights lost NativeVNNI source identity");
+                    "[ROCmQuantisedGemmKernel] Pre-packed weights lost NativeQuantised source identity");
             }
 
             LOG_TRACE("[ROCmQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
@@ -1188,12 +1188,12 @@ namespace llaminar2
 
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(
             int N, int K, int rocm_device_id,
-            uint8_t *d_native_vnni, void *d_native_scales,
+            uint8_t *d_native_quantised, void *d_native_scales,
             void *d_native_mins, void *d_native_emins,
             uint8_t codebook_id, uint32_t blocks_per_row,
             std::shared_ptr<void> lifetime_owner,
-            NativeVnniSourceIdentity source_identity,
-            NativeVnniReusableDeviceAllocationFormat allocation_format)
+            NativeQuantisedSourceIdentity source_identity,
+            NativeQuantisedReusableDeviceAllocationFormat allocation_format)
             : weights_(nullptr),
               packed_(nullptr),
               lifetime_owner_(std::move(lifetime_owner)),
@@ -1205,26 +1205,26 @@ namespace llaminar2
               slice_id_(g_rocm_gemm_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed)),
               impl_(std::make_unique<Impl>())
         {
-            impl_->d_weights_native_vnni = d_native_vnni;
+            impl_->d_weights_native_quantised = d_native_quantised;
             impl_->d_weights_native_scales = d_native_scales;
             impl_->d_weights_native_mins = d_native_mins;
             impl_->d_weights_native_emins = d_native_emins;
-            impl_->native_vnni_codebook_id = codebook_id;
-            impl_->native_vnni_blocks_per_row = blocks_per_row;
-            const NativeVnniFormatInfo *source_format =
+            impl_->native_quantised_codebook_id = codebook_id;
+            impl_->native_quantised_blocks_per_row = blocks_per_row;
+            const NativeQuantisedFormatInfo *source_format =
                 source_identity.present
-                    ? native_vnni_formats::forSourceIdentity(
+                    ? native_quantised_formats::forSourceIdentity(
                           source_identity.codebook_id,
                           source_identity.is_superblock)
                     : nullptr;
             if (!source_format ||
                 !deviceVnniExecutionCompatibleWithSource(*source_format, codebook_id) ||
-                ((codebook_id == 11 || codebook_id == kNativeVnniExpandedInt8MinCodebook ||
-                  codebook_id == kNativeVnniIQ4XSSourceScaleCodebook) && !d_native_mins))
+                ((codebook_id == 11 || codebook_id == kNativeQuantisedExpandedInt8MinCodebook ||
+                  codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook) && !d_native_mins))
             {
                 throw std::invalid_argument(
                     "[ROCmQuantisedGemmKernel] Direct device weights require an exact, "
-                    "execution-compatible NativeVNNI source identity");
+                    "execution-compatible NativeQuantised source identity");
             }
             impl_->native_source_identity = source_identity;
             if (allocation_format.payload_bytes_per_block != 0)
@@ -1259,7 +1259,7 @@ namespace llaminar2
                     "destination IQ tables before capture");
             }
             impl_->native_allocation_format = allocation_format;
-            impl_->has_native_vnni = true;
+            impl_->has_native_quantised = true;
             impl_->owns_weight_memory = false;
             impl_->rocm_device_id = rocm_device_id;
 
@@ -1273,62 +1273,62 @@ namespace llaminar2
         ROCmQuantisedGemmKernel &ROCmQuantisedGemmKernel::operator=(ROCmQuantisedGemmKernel &&) noexcept = default;
 
         /**
-         * @brief Scoped ROCm NativeVNNI verifier dispatch contract.
+         * @brief Scoped ROCm NativeQuantised verifier dispatch contract.
          *
          * The grouped verifier has to match the normal M=1 serial decode path,
-         * not merely an idealized direct GEMV. ROCm NativeVNNI dispatch is
+         * not merely an idealized direct GEMV. ROCm NativeQuantised dispatch is
          * generated per shape and M; choosing a grouped-M split policy can alter
          * FP32 partial-reduction order relative to the serial baseline. While
          * this scope is active, every grouped verifier depth reuses the generated M=1
          * policy for the same projection shape. That keeps the path economical
          * and graph-capturable while preserving serial-decode equivalence.
          */
-        class ScopedNativeVNNIDecodeEquivalentDispatch final : public ITensorGemm::VerifierKernelModeScope
+        class ScopedNativeQuantisedDecodeEquivalentDispatch final : public ITensorGemm::VerifierKernelModeScope
         {
         public:
-            explicit ScopedNativeVNNIDecodeEquivalentDispatch(std::optional<DeviceRowRange> rows)
+            explicit ScopedNativeQuantisedDecodeEquivalentDispatch(std::optional<DeviceRowRange> rows)
                 : VerifierKernelModeScope(rows)
             {
-                previous_ = g_rocm_native_vnni_decode_equivalent_scope;
-                g_rocm_native_vnni_decode_equivalent_scope = true;
-                rocmGemv_native_vnni_set_decode_equivalent_m1_config(1);
+                previous_ = g_rocm_native_quantised_decode_equivalent_scope;
+                g_rocm_native_quantised_decode_equivalent_scope = true;
+                rocmGemv_native_quantised_set_decode_equivalent_m1_config(1);
             }
 
-            ~ScopedNativeVNNIDecodeEquivalentDispatch()
+            ~ScopedNativeQuantisedDecodeEquivalentDispatch()
             {
-                g_rocm_native_vnni_decode_equivalent_scope = previous_;
-                rocmGemv_native_vnni_set_decode_equivalent_m1_config(previous_ ? 1 : 0);
+                g_rocm_native_quantised_decode_equivalent_scope = previous_;
+                rocmGemv_native_quantised_set_decode_equivalent_m1_config(previous_ ? 1 : 0);
             }
 
-            ScopedNativeVNNIDecodeEquivalentDispatch(const ScopedNativeVNNIDecodeEquivalentDispatch &) = delete;
-            ScopedNativeVNNIDecodeEquivalentDispatch &operator=(const ScopedNativeVNNIDecodeEquivalentDispatch &) = delete;
+            ScopedNativeQuantisedDecodeEquivalentDispatch(const ScopedNativeQuantisedDecodeEquivalentDispatch &) = delete;
+            ScopedNativeQuantisedDecodeEquivalentDispatch &operator=(const ScopedNativeQuantisedDecodeEquivalentDispatch &) = delete;
 
         private:
             bool previous_ = false;
         };
 
         /**
-         * @brief Bind generated NativeVNNI geometry to the serial TP shard width.
+         * @brief Bind generated NativeQuantised geometry to the serial TP shard width.
          */
-        class ScopedNativeVNNISerialPartition final
+        class ScopedNativeQuantisedSerialPartition final
             : public ITensorGemm::OutputPartitionEquivalenceScope
         {
         public:
-            explicit ScopedNativeVNNISerialPartition(int serial_partition_n)
-                : previous_(rocmGemv_native_vnni_get_serial_partition_n())
+            explicit ScopedNativeQuantisedSerialPartition(int serial_partition_n)
+                : previous_(rocmGemv_native_quantised_get_serial_partition_n())
             {
-                rocmGemv_native_vnni_set_serial_partition_n(serial_partition_n);
+                rocmGemv_native_quantised_set_serial_partition_n(serial_partition_n);
             }
 
-            ~ScopedNativeVNNISerialPartition() override
+            ~ScopedNativeQuantisedSerialPartition() override
             {
-                rocmGemv_native_vnni_set_serial_partition_n(previous_);
+                rocmGemv_native_quantised_set_serial_partition_n(previous_);
             }
 
-            ScopedNativeVNNISerialPartition(
-                const ScopedNativeVNNISerialPartition &) = delete;
-            ScopedNativeVNNISerialPartition &operator=(
-                const ScopedNativeVNNISerialPartition &) = delete;
+            ScopedNativeQuantisedSerialPartition(
+                const ScopedNativeQuantisedSerialPartition &) = delete;
+            ScopedNativeQuantisedSerialPartition &operator=(
+                const ScopedNativeQuantisedSerialPartition &) = delete;
 
         private:
             int previous_ = 0;
@@ -1338,7 +1338,7 @@ namespace llaminar2
         ROCmQuantisedGemmKernel::beginVerifierDecodeEquivalentScope(
             std::optional<DeviceRowRange> rows)
         {
-            return std::make_unique<ScopedNativeVNNIDecodeEquivalentDispatch>(rows);
+            return std::make_unique<ScopedNativeQuantisedDecodeEquivalentDispatch>(rows);
         }
 
         std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
@@ -1354,7 +1354,7 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "[ROCmQuantisedGemmKernel] Invalid replicated-output serial partition contract");
             }
-            return std::make_unique<ScopedNativeVNNISerialPartition>(
+            return std::make_unique<ScopedNativeQuantisedSerialPartition>(
                 serial_partition_columns);
         }
 
@@ -1364,49 +1364,49 @@ namespace llaminar2
             slice.require(this, static_cast<int>(N_), static_cast<int>(K_));
             if (slice.device() != DeviceId::rocm(rocm_device_id_))
                 throw std::invalid_argument("Original output slice belongs to a foreign ROCm endpoint");
-            if (!impl_ || !(impl_->has_native_vnni && impl_->d_weights_native_vnni && impl_->d_weights_native_scales) ||
+            if (!impl_ || !(impl_->has_native_quantised && impl_->d_weights_native_quantised && impl_->d_weights_native_scales) ||
                 !impl_->native_source_identity.present)
                 throw std::invalid_argument("Original output slice requires ready source-authenticated native quantized weights");
-            return std::make_unique<ScopedNativeVNNISerialPartition>(slice.policyColumns());
+            return std::make_unique<ScopedNativeQuantisedSerialPartition>(slice.policyColumns());
         }
 
         bool ROCmQuantisedGemmKernel::weights_converted() const
         {
             /*
              * Prepared-weight ROCm kernels can be constructed directly from
-             * model-lifetime WeightVRAMPool native-VNNI descriptors.  The
+             * model-lifetime WeightVRAMPool native-quantised descriptors.  The
              * resident descriptor pointers are the execution contract for
              * grouped MoE verifier kernels; weights_converted_ remains the
              * legacy lazy-upload flag for host-weight constructors.
              */
             return weights_converted_ ||
                    (impl_ &&
-                    impl_->d_weights_native_vnni &&
+                    impl_->d_weights_native_quantised &&
                     impl_->d_weights_native_scales &&
-                    impl_->has_native_vnni &&
+                    impl_->has_native_quantised &&
                     N_ > 0 &&
                     K_ > 0 &&
-                    impl_->native_vnni_blocks_per_row > 0);
+                    impl_->native_quantised_blocks_per_row > 0);
         }
 
         WorkspaceRequirements ROCmQuantisedGemmKernel::q8ResidualCorrectionWorkspaceRequirements(int m, int n,
                                                                                                  int k) const
         {
             validateQ8ResidualCorrectionGeometry(m, n, k);
-            NativeVnniSourceIdentity source;
-            if (!weights_converted() || !impl_ || !exportNativeVNNISourceIdentity(source) ||
+            NativeQuantisedSourceIdentity source;
+            if (!weights_converted() || !impl_ || !exportNativeQuantisedSourceIdentity(source) ||
                 n != static_cast<int>(N_) || k != static_cast<int>(K_))
                 throw std::invalid_argument(
                     "TwoTerm ROCm requires already prepared original source and exact geometry");
-            const DeviceNativeVNNIMatrixDesc descriptor{
-                .payload = impl_->d_weights_native_vnni,
+            const DeviceNativeQuantisedMatrixDesc descriptor{
+                .payload = impl_->d_weights_native_quantised,
                 .scales = impl_->d_weights_native_scales,
                 .mins = impl_->d_weights_native_mins,
                 .emins = impl_->d_weights_native_emins,
                 .n = n,
                 .k = k,
-                .blocks_per_row = impl_->native_vnni_blocks_per_row,
-                .codebook_id = impl_->native_vnni_codebook_id,
+                .blocks_per_row = impl_->native_quantised_blocks_per_row,
+                .codebook_id = impl_->native_quantised_codebook_id,
                 .allocation_payload_bytes_per_block = impl_->native_allocation_format.payload_bytes_per_block,
                 .allocation_has_mins = static_cast<std::uint8_t>(impl_->native_allocation_format.has_mins),
                 .allocation_has_emins = static_cast<std::uint8_t>(impl_->native_allocation_format.has_emins),
@@ -1459,15 +1459,15 @@ namespace llaminar2
             void *stream = gpu_stream_;
             if (!stream)
                 throw std::invalid_argument("Two-term ROCm Q8 requires its exact producer stream");
-            if (q8ResidualNeedsIQTables(impl_->native_vnni_codebook_id))
+            if (q8ResidualNeedsIQTables(impl_->native_quantised_codebook_id))
             {
                 auto *backend = getROCmBackend();
                 const auto generation = impl_->residual_iq_generation.load(std::memory_order_acquire);
                 if (!backend || !generation || backend->deviceRuntimeGeneration(rocm_device_id_) != generation)
                     throw std::logic_error("TwoTerm ROCm IQ execution requires its original cold prepared generation");
             }
-            DeviceNativeVNNIMatrixDesc weights;
-            if (!exportNativeVNNIMatrixDesc(weights))
+            DeviceNativeQuantisedMatrixDesc weights;
+            if (!exportNativeQuantisedMatrixDesc(weights))
                 throw std::logic_error("Prepared two-term ROCm Q8 source export failed");
             (void)requireQ8ResidualNativeMatrix(weights, rows.physicalRows(), n, k);
             TransferEngine::requireDeviceInput(const_cast<TensorBase *>(input), target, stream);
@@ -1513,15 +1513,15 @@ namespace llaminar2
             void *stream = gpu_stream_;
             if (!stream)
                 throw std::invalid_argument("Two-term ROCm Q8 requires its exact producer stream");
-            if (q8ResidualNeedsIQTables(impl_->native_vnni_codebook_id))
+            if (q8ResidualNeedsIQTables(impl_->native_quantised_codebook_id))
             {
                 auto *backend = getROCmBackend();
                 const auto generation = impl_->residual_iq_generation.load(std::memory_order_acquire);
                 if (!backend || !generation || backend->deviceRuntimeGeneration(rocm_device_id_) != generation)
                     throw std::logic_error("TwoTerm ROCm IQ execution requires its original cold prepared generation");
             }
-            DeviceNativeVNNIMatrixDesc weights;
-            if (!exportNativeVNNIMatrixDesc(weights))
+            DeviceNativeQuantisedMatrixDesc weights;
+            if (!exportNativeQuantisedMatrixDesc(weights))
                 throw std::logic_error("Prepared two-term ROCm Q8 source export failed");
             (void)requireQ8ResidualNativeMatrix(weights, rows.physicalRows(), n, k);
             TransferEngine::requireDeviceInput(const_cast<TensorBase *>(input), target, stream);
@@ -1577,8 +1577,8 @@ namespace llaminar2
                !workspace||workspace!=workspace_||workspace->device()!=target||!workspace->isAllocated()||
                !weights_converted()||currentProjectionRowWork(1)||countedVerifierRows(1))
                 throw std::invalid_argument("Gated-norm SingleQ8 requires its ordinary scalar FP32 tensors, exact prepared source and original bound workspace");
-            DeviceNativeVNNIMatrixDesc weights;
-            if(!inspectPreparedNativeVNNIMatrixDesc(weights))
+            DeviceNativeQuantisedMatrixDesc weights;
+            if(!inspectPreparedNativeQuantisedMatrixDesc(weights))
                 throw std::logic_error("Gated-norm SingleQ8 requires already-prepared native source planes");
             const auto physical=requireQ8ResidualNativeMatrix(weights,1,n,k);
             const auto requirements=getWorkspaceRequirements(1,n,k);
@@ -1646,10 +1646,10 @@ namespace llaminar2
             TransferEngine::requireDeviceOutput(output,target,gpu_stream_);
             if(!rocm::launchGatedNormSingleQ8(native.input,rocm_device_id_,gpu_stream_))return false;
             const auto& weights=native.weights;
-            if(!rocmGemv_native_vnni_fp32_with_policy(native.input.quant,weights.payload,weights.scales,weights.mins,
+            if(!rocmGemv_native_quantised_fp32_with_policy(native.input.quant,weights.payload,weights.scales,weights.mins,
                 weights.emins,static_cast<float*>(output->gpu_data_ptr()),native.row_scales,native.partials,n,k,
-                weights.codebook_id,requireNativeVNNIArithmeticPolicyCodebook(
-                    impl_->native_vnni_codebook_id,impl_->native_source_identity),
+                weights.codebook_id,requireNativeQuantisedArithmeticPolicyCodebook(
+                    impl_->native_quantised_codebook_id,impl_->native_source_identity),
                 rocm_device_id_,gpu_stream_,native.input.scales))return false;
             publishROCmTensorWrite(input.values,rocm_device_id_,gpu_stream_);
             publishROCmTensorWrite(*output,rocm_device_id_,gpu_stream_);
@@ -1664,32 +1664,32 @@ namespace llaminar2
             return true;
         }
 
-        bool ROCmQuantisedGemmKernel::exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)
+        bool ROCmQuantisedGemmKernel::exportNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out)
         {
             out = {};
             ensureWeightsConverted();
 
-            return inspectPreparedNativeVNNIMatrixDesc(out);
+            return inspectPreparedNativeQuantisedMatrixDesc(out);
         }
 
-        /** @copydoc ITensorGemm::inspectPreparedNativeVNNIMatrixDesc */
-        bool ROCmQuantisedGemmKernel::inspectPreparedNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) const
+        /** @copydoc ITensorGemm::inspectPreparedNativeQuantisedMatrixDesc */
+        bool ROCmQuantisedGemmKernel::inspectPreparedNativeQuantisedMatrixDesc(DeviceNativeQuantisedMatrixDesc &out) const
         {
             out = {};
-            if (!impl_ || !impl_->has_native_vnni ||
-                !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales)
+            if (!impl_ || !impl_->has_native_quantised ||
+                !impl_->d_weights_native_quantised || !impl_->d_weights_native_scales)
             {
                 return false;
             }
 
-            out.payload = impl_->d_weights_native_vnni;
+            out.payload = impl_->d_weights_native_quantised;
             out.scales = impl_->d_weights_native_scales;
             out.mins = impl_->d_weights_native_mins;
             out.emins = impl_->d_weights_native_emins;
             out.n = static_cast<int>(N_);
             out.k = static_cast<int>(K_);
-            out.blocks_per_row = impl_->native_vnni_blocks_per_row;
-            out.codebook_id = impl_->native_vnni_codebook_id;
+            out.blocks_per_row = impl_->native_quantised_blocks_per_row;
+            out.codebook_id = impl_->native_quantised_codebook_id;
             out.allocation_payload_bytes_per_block =
                 impl_->native_allocation_format.payload_bytes_per_block;
             out.allocation_has_mins = static_cast<uint8_t>(
@@ -1704,8 +1704,8 @@ namespace llaminar2
             return out.valid();
         }
 
-        bool ROCmQuantisedGemmKernel::exportNativeVNNISourceIdentity(
-            NativeVnniSourceIdentity &out) const
+        bool ROCmQuantisedGemmKernel::exportNativeQuantisedSourceIdentity(
+            NativeQuantisedSourceIdentity &out) const
         {
             if (!impl_ || !impl_->native_source_identity.present)
             {
@@ -1713,7 +1713,7 @@ namespace llaminar2
                 return false;
             }
             out = impl_->native_source_identity;
-            return native_vnni_formats::forSourceIdentity(
+            return native_quantised_formats::forSourceIdentity(
                        out.codebook_id, out.is_superblock) != nullptr;
         }
 
@@ -1722,7 +1722,7 @@ namespace llaminar2
          *
          * This is the single source of truth for dispatch routing decisions.
          * The dispatch policy is:
-         *   - ≤6-bit weights (has_native_vnni) → NATIVE_VNNI
+         *   - ≤6-bit weights (has_native_quantised) → NATIVE_QUANTISED
          *   - 8-bit weights (d_weights_int8_vnni) → INT8_VNNI_NATIVE
          *   - Otherwise → UNSUPPORTED (no viable path)
          *
@@ -1745,10 +1745,10 @@ namespace llaminar2
 
             // CK path retired. No fallback path available.
 
-            // ≤6-bit formats use native-VNNI (lossless decode, FP16 block scales)
-            if (impl_->has_native_vnni)
+            // ≤6-bit formats use native-quantised (lossless decode, FP16 block scales)
+            if (impl_->has_native_quantised)
             {
-                return PrefillDispatchPath::NATIVE_VNNI;
+                return PrefillDispatchPath::NATIVE_QUANTISED;
             }
 
             // 8-bit formats use INT8-VNNI (requantized symmetric INT8)
@@ -1758,8 +1758,8 @@ namespace llaminar2
             }
 
             LOG_WARN("[ROCmQuantisedGemmKernel] No viable prefill dispatch path:"
-                     " has_native_vnni="
-                     << impl_->has_native_vnni
+                     " has_native_quantised="
+                     << impl_->has_native_quantised
                      << " d_weights_int8_vnni=" << (const void *)impl_->d_weights_int8_vnni
                      << " M=" << m << " N=" << n << " K=" << k);
             return PrefillDispatchPath::UNSUPPORTED;
@@ -1768,7 +1768,7 @@ namespace llaminar2
         /**
          * @brief Try native M>1 prefill execution for INT8 VNNI or ratio-VNNI formats.
          *
-         * A false return means the selected INT8-VNNI or native-VNNI prefill
+         * A false return means the selected INT8-VNNI or native-quantised prefill
          * path could not execute. There is no retired CK fallback path; callers
          * must fail the operation instead of silently switching implementations.
          */
@@ -1792,8 +1792,8 @@ namespace llaminar2
             {
                 switch (p)
                 {
-                case PrefillDispatchPath::NATIVE_VNNI:
-                    return "native_vnni";
+                case PrefillDispatchPath::NATIVE_QUANTISED:
+                    return "native_quantised";
                 case PrefillDispatchPath::INT8_VNNI_NATIVE:
                     return "int8_vnni_native";
                 case PrefillDispatchPath::UNSUPPORTED:
@@ -1869,12 +1869,12 @@ namespace llaminar2
                                               << reason << ")"); });
             };
 
-            // Native-VNNI path uses impl_->d_weights_native_scales (not d_scales_B),
-            // so d_scales_B may be null when only native-VNNI weights are present
+            // NativeQuantised path uses impl_->d_weights_native_scales (not d_scales_B),
+            // so d_scales_B may be null when only native-quantised weights are present
             // (e.g. weights loaded via GPU pipeline / MoE batch constructor).
-            const bool native_vnni_available = impl_ && impl_->has_native_vnni;
+            const bool native_quantised_available = impl_ && impl_->has_native_quantised;
             if (!impl_ || !d_A_int8 || !d_output || !d_scales_A ||
-                (!d_scales_B && !native_vnni_available))
+                (!d_scales_B && !native_quantised_available))
             {
                 LOG_WARN("[" << callsite << "] Prefill GEMM null pointer diagnostic:"
                                             " impl="
@@ -1910,16 +1910,16 @@ namespace llaminar2
             if (profiling_enabled)
                 kernel_start = std::chrono::high_resolution_clock::now();
 
-            if (path == PrefillDispatchPath::NATIVE_VNNI)
+            if (path == PrefillDispatchPath::NATIVE_QUANTISED)
             {
-                LOG_TRACE("[" << callsite << "] Trying native-VNNI prefill (M=" << m
+                LOG_TRACE("[" << callsite << "] Trying native-quantised prefill (M=" << m
                               << " N=" << n << " K=" << k << ")");
 
-                if (!impl_->d_weights_native_vnni || !impl_->d_weights_native_scales)
+                if (!impl_->d_weights_native_quantised || !impl_->d_weights_native_scales)
                 {
-                    LOG_WARN("[" << callsite << "] Native-VNNI prefill missing weight buffers:"
-                                                " d_weights_native_vnni="
-                                 << (const void *)impl_->d_weights_native_vnni
+                    LOG_WARN("[" << callsite << "] NativeQuantised prefill missing weight buffers:"
+                                                " d_weights_native_quantised="
+                                 << (const void *)impl_->d_weights_native_quantised
                                  << " d_weights_native_scales=" << (const void *)impl_->d_weights_native_scales);
                     logFallback("buffers");
                     return false;
@@ -1927,15 +1927,15 @@ namespace llaminar2
 
                 if (beta != 0.0f && d_output == impl_->d_C_fp32)
                 {
-                    LOG_WARN("[" << callsite << "] Native-VNNI prefill beta path needs a distinct existing-output buffer");
+                    LOG_WARN("[" << callsite << "] NativeQuantised prefill beta path needs a distinct existing-output buffer");
                     logFallback("native_beta_alias");
                     return false;
                 }
 
                 float *d_native_output = (beta != 0.0f) ? impl_->d_C_fp32 : d_output;
-                native_ok = rocmGemm_native_vnni_fp32_with_policy(
+                native_ok = rocmGemm_native_quantised_fp32_with_policy(
                     d_A_int8,
-                    impl_->d_weights_native_vnni,
+                    impl_->d_weights_native_quantised,
                     impl_->d_weights_native_scales,
                     impl_->d_weights_native_mins,
                     impl_->d_weights_native_emins,
@@ -1943,9 +1943,9 @@ namespace llaminar2
                     d_scales_A,
                     d_scales_A_blockwise,
                     m, n, k,
-                    impl_->native_vnni_codebook_id,
-                    requireNativeVNNIArithmeticPolicyCodebook(
-                        impl_->native_vnni_codebook_id,
+                    impl_->native_quantised_codebook_id,
+                    requireNativeQuantisedArithmeticPolicyCodebook(
+                        impl_->native_quantised_codebook_id,
                         impl_->native_source_identity),
                     rocm_device_id_, effective_stream);
 
@@ -2665,9 +2665,9 @@ namespace llaminar2
                 llaminar2::rocm::clearNativeQ8SerialLaunch();
                 llaminar2::rocm::validateNativeQ8SerialScopeBinding(rocm_device_id_, gpu_stream_);
                 if (m != 1 || n <= 0 || k <= 0 || alpha != 1.0f ||
-                    beta != 0.0f || bias || !impl_ || !impl_->has_native_vnni ||
-                    impl_->native_vnni_codebook_id != 19 ||
-                    !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales)
+                    beta != 0.0f || bias || !impl_ || !impl_->has_native_quantised ||
+                    impl_->native_quantised_codebook_id != 19 ||
+                    !impl_->d_weights_native_quantised || !impl_->d_weights_native_scales)
                     throw std::logic_error("native-Q8 serial geometry scope requires the prepared native19 M1 alpha1/beta0 projection");
             }
             auto execution_stream =
@@ -2788,7 +2788,7 @@ namespace llaminar2
             // =========================================================================
             // DISPATCH POLICY (unified):
             //
-            //   ≤6-bit weights (has_native_vnni) → native-VNNI GEMV/GEMM
+            //   ≤6-bit weights (has_native_quantised) → native-quantised GEMV/GEMM
             //   8-bit weights (d_weights_int8_vnni) → INT8-VNNI GEMV/GEMM
             //
             // If both VNNI paths fail, that is a hard error.
@@ -2809,12 +2809,12 @@ namespace llaminar2
             //
             // Handles optional bias in a single fused kernel launch.
             // =========================================================================
-            if (g_rocm_native_vnni_decode_equivalent_scope &&
+            if (g_rocm_native_quantised_decode_equivalent_scope &&
                 (m > 1 || countedVerifierRows(m)))
             {
                 ensureWeightsConverted();
-            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
-                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_quantised))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeQuantised route");
 
                 int8_t *d_weights_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
                 float *d_scales_B = nullptr;
@@ -2827,7 +2827,7 @@ namespace llaminar2
                     d_scales_B = impl_->d_scales_B;
                 }
 
-                if (!impl_ || (!impl_->has_native_vnni && !(d_weights_vnni && d_scales_B)))
+                if (!impl_ || (!impl_->has_native_quantised && !(d_weights_vnni && d_scales_B)))
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M verifier path has no supported GEMV weights");
                     return false;
@@ -2877,13 +2877,13 @@ namespace llaminar2
 
 
                 const bool supports_native_small_m =
-                    impl_->has_native_vnni && (m >= 2 || countedVerifierRows(m));
+                    impl_->has_native_quantised && (m >= 2 || countedVerifierRows(m));
                 if (supports_native_small_m &&
                     !gemv_output_needs_copyout && beta == 0.0f)
                 {
                     if ((k % 32) != 0)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI small-M verifier requires K multiple of 32, got M="
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised small-M verifier requires K multiple of 32, got M="
                                   << m << " K=" << k);
                         return false;
                     }
@@ -2898,13 +2898,13 @@ namespace llaminar2
                             rocm_device_id_,
                             gpu_stream_))
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI small-M blockwise activation quantization failed");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised small-M blockwise activation quantization failed");
                         return false;
                     }
 
-                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
+                    if (!rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
                             impl_->d_A_int8,
-                            impl_->d_weights_native_vnni,
+                            impl_->d_weights_native_quantised,
                             impl_->d_weights_native_scales,
                             impl_->d_weights_native_mins,
                             impl_->d_weights_native_emins,
@@ -2913,14 +2913,14 @@ namespace llaminar2
                             impl_->d_sums_A_blockwise,
                             impl_->d_scatter_partial,
                             m, n, k,
-                            impl_->native_vnni_codebook_id,
-                            requireNativeVNNIArithmeticPolicyCodebook(
-                                impl_->native_vnni_codebook_id,
+                            impl_->native_quantised_codebook_id,
+                            requireNativeQuantisedArithmeticPolicyCodebook(
+                                impl_->native_quantised_codebook_id,
                                 impl_->native_source_identity),
                             rocm_device_id_, gpu_stream_,
                             VerifierKernelModeScope::rowsFor(m)))
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI small-M verifier GEMV failed");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised small-M verifier GEMV failed");
                         return false;
                     }
 
@@ -2935,7 +2935,7 @@ namespace llaminar2
                                 rocm_device_id_,
                                 gpu_stream_))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI small-M epilogue failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised small-M epilogue failed");
                             return false;
                         }
                     }
@@ -2944,13 +2944,13 @@ namespace llaminar2
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
-                            "rocm_native_vnni_small_m_calls",
+                            "rocm_native_quantised_small_m_calls",
                             1.0,
                             "gemm",
                             "rocm:" + std::to_string(rocm_device_id_),
                             PerfStatsCollector::Tags{
                                 {"m", std::to_string(m)},
-                                {"codebook", std::to_string(static_cast<int>(impl_->native_vnni_codebook_id))},
+                                {"codebook", std::to_string(static_cast<int>(impl_->native_quantised_codebook_id))},
                                 {"n", std::to_string(n)},
                                 {"k", std::to_string(k)}});
 
@@ -2960,13 +2960,13 @@ namespace llaminar2
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
-                            "rocm_native_vnni_small_m_rows",
+                            "rocm_native_quantised_small_m_rows",
                             static_cast<double>(m),
                             "gemm",
                             "rocm:" + std::to_string(rocm_device_id_),
                             PerfStatsCollector::Tags{
                                 {"m", std::to_string(m)},
-                                {"codebook", std::to_string(static_cast<int>(impl_->native_vnni_codebook_id))},
+                                {"codebook", std::to_string(static_cast<int>(impl_->native_quantised_codebook_id))},
                                 {"n", std::to_string(n)},
                                 {"k", std::to_string(k)}});
                     }
@@ -2995,11 +2995,11 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (impl_->has_native_vnni)
+                    if (impl_->has_native_quantised)
                     {
-                        if (!rocmGemv_native_vnni_fp32_with_policy(
+                        if (!rocmGemv_native_quantised_fp32_with_policy(
                                 impl_->d_A_int8,
-                                impl_->d_weights_native_vnni,
+                                impl_->d_weights_native_quantised,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
                                 impl_->d_weights_native_emins,
@@ -3007,14 +3007,14 @@ namespace llaminar2
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
                                 n, k,
-                                impl_->native_vnni_codebook_id,
-                                requireNativeVNNIArithmeticPolicyCodebook(
-                                    impl_->native_vnni_codebook_id,
+                                impl_->native_quantised_codebook_id,
+                                requireNativeQuantisedArithmeticPolicyCodebook(
+                                    impl_->native_quantised_codebook_id,
                                     impl_->native_source_identity),
                                 rocm_device_id_, gpu_stream_,
                                 impl_->d_scales_A_blockwise))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-VNNI GEMV failed at row "
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-quantised GEMV failed at row "
                                       << row);
                             return false;
                         }
@@ -3033,7 +3033,7 @@ namespace llaminar2
                                     rocm_device_id_,
                                     gpu_stream_))
                             {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-VNNI beta epilogue failed at row "
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-quantised beta epilogue failed at row "
                                           << row);
                                 return false;
                             }
@@ -3049,7 +3049,7 @@ namespace llaminar2
                                     rocm_device_id_,
                                     gpu_stream_))
                             {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-VNNI epilogue failed at row "
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-quantised epilogue failed at row "
                                           << row);
                                 return false;
                             }
@@ -3107,8 +3107,8 @@ namespace llaminar2
             {
                 // Ensure weights are on device
                 ensureWeightsConverted();
-            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
-                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_quantised))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeQuantised route");
 
                 // Option B: weights are stored as VNNI on device
                 int8_t *d_weights_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
@@ -3122,7 +3122,7 @@ namespace llaminar2
                     d_scales_B = impl_->d_scales_B;
                 }
 
-                if ((impl_ && impl_->has_native_vnni) || (d_weights_vnni && d_scales_B))
+                if ((impl_ && impl_->has_native_quantised) || (d_weights_vnni && d_scales_B))
                 {
                     // Resolve bias device pointer if present
                     const float *d_bias = nullptr;
@@ -3176,8 +3176,8 @@ namespace llaminar2
                     {
                         return false;
                     }
-                    // d_scales_B is only used by the INT8-VNNI path, not native-VNNI.
-                    // Native-VNNI weights use impl_->d_weights_native_scales instead.
+                    // d_scales_B is only used by the INT8-VNNI path, not native-quantised.
+                    // NativeQuantised weights use impl_->d_weights_native_scales instead.
                     if (d_scales_B && !validatePointerDeviceOrLog(
                                           d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor"))
                     {
@@ -3194,21 +3194,21 @@ namespace llaminar2
                     }
 
                     // =====================================================================
-                    // Native-VNNI path: lossless Q4/IQ4 decode, typed block metadata, scale_A inline.
+                    // NativeQuantised path: lossless Q4/IQ4 decode, typed block metadata, scale_A inline.
                     // Native GEMV produces FP32, then applies alpha/beta/bias with the shared epilogue when needed.
                     // =====================================================================
-                    if (impl_->has_native_vnni)
+                    if (impl_->has_native_quantised)
                     {
                         if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
                                 d_input, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI blockwise activation quantization failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised blockwise activation quantization failed");
                             return false;
                         }
 
-                        if (!rocmGemv_native_vnni_fp32_with_policy(
+                        if (!rocmGemv_native_quantised_fp32_with_policy(
                                 impl_->d_A_int8,
-                                impl_->d_weights_native_vnni,
+                                impl_->d_weights_native_quantised,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
                                 impl_->d_weights_native_emins,
@@ -3216,14 +3216,14 @@ namespace llaminar2
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
                                 n, k,
-                                impl_->native_vnni_codebook_id,
-                                requireNativeVNNIArithmeticPolicyCodebook(
-                                    impl_->native_vnni_codebook_id,
+                                impl_->native_quantised_codebook_id,
+                                requireNativeQuantisedArithmeticPolicyCodebook(
+                                    impl_->native_quantised_codebook_id,
                                     impl_->native_source_identity),
                                 rocm_device_id_, gpu_stream_,
                                 impl_->d_scales_A_blockwise))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI GEMV failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised GEMV failed");
                             return false;
                         }
 
@@ -3241,7 +3241,7 @@ namespace llaminar2
                                     rocm_device_id_,
                                     gpu_stream_))
                             {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI beta epilogue failed");
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised beta epilogue failed");
                                 return false;
                             }
                         }
@@ -3256,7 +3256,7 @@ namespace llaminar2
                                     rocm_device_id_,
                                     gpu_stream_))
                             {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI epilogue failed");
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised epilogue failed");
                                 return false;
                             }
                         }
@@ -3320,19 +3320,19 @@ namespace llaminar2
 
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] M=1 decode has no supported GEMV path for alpha="
                               << alpha << " beta=" << beta
-                              << " native_vnni=" << (impl_->has_native_vnni ? "true" : "false")
+                              << " native_quantised=" << (impl_->has_native_quantised ? "true" : "false")
                               << " int8_vnni=" << (d_weights_vnni ? "true" : "false"));
                     return false;
                 }
                 // No VNNI weight pointers available for M=1 decode — this should
                 // not happen unless weights failed to upload.
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] M=1 decode: "
-                          "no native-VNNI or INT8-VNNI weights available");
+                          "no native-quantised or INT8-VNNI weights available");
                 return false;
             }
 
             // =========================================================================
-            // NATIVE VNNI PREFILL ROUTE (M>1)
+            // NATIVE QUANTISED PREFILL ROUTE (M>1)
             //
             // We defer actual native dispatch until after activation quantization,
             // because both native prefill formats consume INT8 activations.
@@ -3342,8 +3342,8 @@ namespace llaminar2
             if (phase_timing)
                 phase_start = std::chrono::high_resolution_clock::now();
             ensureWeightsConverted();
-            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
-                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_quantised))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeQuantised route");
             if (phase_timing)
             {
                 phase_end = std::chrono::high_resolution_clock::now();
@@ -3366,11 +3366,11 @@ namespace llaminar2
                 d_scales_B = impl_->d_scales_B;
             }
 
-            // Native-VNNI path uses impl_->d_weights_native_scales (not d_scales_B),
-            // so d_scales_B may be null when only native-VNNI weights are present
+            // NativeQuantised path uses impl_->d_weights_native_scales (not d_scales_B),
+            // so d_scales_B may be null when only native-quantised weights are present
             // (e.g. weights loaded via GPU pipeline / MoE batch constructor).
-            const bool native_vnni_available_mt = impl_ && impl_->has_native_vnni;
-            if (!d_scales_B && !native_vnni_available_mt)
+            const bool native_quantised_available_mt = impl_ && impl_->has_native_quantised;
+            if (!d_scales_B && !native_quantised_available_mt)
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Weight scales not uploaded to device");
                 return false;
@@ -3395,7 +3395,7 @@ namespace llaminar2
             }
 
             // Option B: Repack VNNI→row-major was used only by the CK fallback.
-            // CK is retired; the M>1 path dispatches native-VNNI / INT8-VNNI
+            // CK is retired; the M>1 path dispatches native-quantised / INT8-VNNI
             // directly against `impl_->d_weights_int8_vnni` and never needs a
             // row-major copy.
 
@@ -3480,18 +3480,18 @@ namespace llaminar2
                     d_prefill_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
                 }
 
-                // Try native-VNNI GEMM first (halved HBM bandwidth for Q4_0/IQ4_NL)
-                // This path reads compact native-VNNI payloads (4.5 bpw) directly,
+                // Try native-quantised GEMM first (halved HBM bandwidth for Q4_0/IQ4_NL)
+                // This path reads compact native-quantised payloads (4.5 bpw) directly,
                 // decodes to INT8 in-register, and produces FP32 output with per-block
                 // FP16 scales applied inline — no separate scaling epilogue needed.
                 // Bias is applied via a lightweight biasAdd kernel after the GEMM.
-                if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
+                if (impl_->has_native_quantised && alpha == 1.0f && beta == 0.0f)
                 {
-                    const uint8_t cb_id = impl_->native_vnni_codebook_id;
+                    const uint8_t cb_id = impl_->native_quantised_codebook_id;
                     {
-                        if (rocmGemm_native_vnni_fp32_with_policy(
+                        if (rocmGemm_native_quantised_fp32_with_policy(
                                 d_A_int8,
-                                impl_->d_weights_native_vnni,
+                                impl_->d_weights_native_quantised,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
                                 impl_->d_weights_native_emins,
@@ -3500,13 +3500,13 @@ namespace llaminar2
                                 impl_->d_scales_A_blockwise,
                                 m, n, k,
                                 cb_id,
-                                requireNativeVNNIArithmeticPolicyCodebook(
+                                requireNativeQuantisedArithmeticPolicyCodebook(
                                     cb_id,
                                     impl_->native_source_identity),
                                 rocm_device_id_, gpu_stream_))
                         {
                             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] "
-                                      "Native-VNNI GEMM succeeded (M="
+                                      "NativeQuantised GEMM succeeded (M="
                                       << m << " N=" << n << " K=" << k
                                       << " codebook=" << static_cast<int>(cb_id)
                                       << (d_prefill_bias ? " +bias" : "") << ")");
@@ -3516,7 +3516,7 @@ namespace llaminar2
                             {
                                 if (!rocmQuantGemm_biasAdd(d_prefill_output, d_prefill_bias, m, n, rocm_device_id_, gpu_stream_))
                                 {
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI GEMM bias add failed");
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised GEMM bias add failed");
                                     return false;
                                 }
                             }
@@ -3524,11 +3524,11 @@ namespace llaminar2
                             // Copy from workspace to output if needed.
                             if (output_needs_copyout)
                             {
-                                const size_t nvnni_c_size = static_cast<size_t>(m) * n;
+                                const size_t native_quantised_c_size = static_cast<size_t>(m) * n;
                                 const hipError_t copy_err = hipMemcpyAsync(
                                     d_output,
                                     d_prefill_output,
-                                    nvnni_c_size * sizeof(float),
+                                    native_quantised_c_size * sizeof(float),
                                     hipMemcpyDeviceToDevice,
                                     static_cast<hipStream_t>(gpu_stream_));
                                 if (copy_err != hipSuccess)
@@ -3542,7 +3542,7 @@ namespace llaminar2
                             return true;
                         }
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] "
-                                  "Native-VNNI GEMM failed; refusing INT8 GEMM fallback");
+                                  "NativeQuantised GEMM failed; refusing INT8 GEMM fallback");
                         return false;
                     }
                 }
@@ -3585,7 +3585,7 @@ namespace llaminar2
 
                 // Both VNNI paths failed for M>1 prefill — hard error.
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] M>1 prefill: "
-                          "both native-VNNI and INT8-VNNI paths failed (M="
+                          "both native-quantised and INT8-VNNI paths failed (M="
                           << m << " N=" << n << " K=" << k << ").");
                 return false;
             }
@@ -3602,7 +3602,7 @@ namespace llaminar2
         {
             // CK timed path retired. The timed variant existed solely to measure
             // CK kernel execution time for benchmarking. Use multiply_tensor() for
-            // functional execution via native-VNNI / INT8-VNNI paths.
+            // functional execution via native-quantised / INT8-VNNI paths.
             if (kernel_time_ms)
                 *kernel_time_ms = -1.0f;
             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] CK timed path retired");
@@ -3726,8 +3726,8 @@ namespace llaminar2
             // Step 2: Validate and populate workspace pointers (shared across all projections)
             validateWorkspace();
 
-            // Step 3: Ensure all projection weights are on GPU before the native-VNNI
-            // pre-scan. has_native_vnni is only set by ensureWeightsConverted(), so we
+            // Step 3: Ensure all projection weights are on GPU before the native-quantised
+            // pre-scan. has_native_quantised is only set by ensureWeightsConverted(), so we
             // must call it on every projection kernel before checking the flag.
             for (size_t pi = 0; pi < projections.size(); ++pi)
             {
@@ -3737,7 +3737,7 @@ namespace llaminar2
                     rk->ensureWeightsConverted();
                     // Reject foreign original shapes before even shared activation
                     // quantization can read an invalid K extent.
-                    if(m==1 && projections.size()>=2 && rk->impl_ && rk->impl_->has_native_vnni &&
+                    if(m==1 && projections.size()>=2 && rk->impl_ && rk->impl_->has_native_quantised &&
                         (rk->rocm_device_id_!=rocm_device_id_ || rk->N_!=projections[pi].n || rk->K_!=k))
                         throw std::invalid_argument("Fused M1 original prepared device/N/K differs from its descriptor");
                 }
@@ -3748,22 +3748,22 @@ namespace llaminar2
             // activations. For M>1, CK GEMM also uses pre-quantized activations.
             //
             // Blockwise quantization is supported when ALL projection kernels support it.
-            // - Native-VNNI (Q4_0/IQ4_NL): blockwise at any M.
+            // - NativeQuantised (Q4_0/IQ4_NL): blockwise at any M.
             // - INT8-VNNI (Q8_0/Q8_1): blockwise for both decode and prefill.
-            bool all_projections_native_vnni = true;
+            bool all_projections_native_quantised = true;
             bool all_projections_have_vnni_weights = true;
             for (size_t pi = 0; pi < projections.size(); ++pi)
             {
                 auto *rk = dynamic_cast<ROCmQuantisedGemmKernel *>(projections[pi].kernel);
-                if (!rk || !rk->impl_ || !rk->impl_->has_native_vnni)
+                if (!rk || !rk->impl_ || !rk->impl_->has_native_quantised)
                 {
-                    all_projections_native_vnni = false;
+                    all_projections_native_quantised = false;
                 }
-                if (!rk || !rk->impl_ || (!rk->impl_->has_native_vnni && !rk->impl_->d_weights_int8_vnni))
+                if (!rk || !rk->impl_ || (!rk->impl_->has_native_quantised && !rk->impl_->d_weights_int8_vnni))
                 {
                     all_projections_have_vnni_weights = false;
                 }
-                if (!all_projections_native_vnni && !all_projections_have_vnni_weights)
+                if (!all_projections_native_quantised && !all_projections_have_vnni_weights)
                     break;
             }
             bool fused_uses_blockwise_shared_quant = false;
@@ -3771,8 +3771,8 @@ namespace llaminar2
                 LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
 
                 const bool needs_block_sums =
-                    g_rocm_native_vnni_decode_equivalent_scope &&
-                    all_projections_native_vnni && (m >= 2 || countedVerifierRows(m)) && (k % 32) == 0;
+                    g_rocm_native_quantised_decode_equivalent_scope &&
+                    all_projections_native_quantised && (m >= 2 || countedVerifierRows(m)) && (k % 32) == 0;
                 const bool quant_ok = needs_block_sums
                     ? rocmQuantGemm_quantizeActivationsBlockwiseWithSumsScoped(
                           const_cast<float *>(d_input),
@@ -3824,7 +3824,7 @@ namespace llaminar2
 
             // Step 5: Execute projections using the SHARED quantized activations
             // For M=1, VNNI projections are batched into a single kernel dispatch.
-            // Native-VNNI (Q4/IQ4) and M>1 projections are dispatched individually.
+            // NativeQuantised (Q4/IQ4) and M>1 projections are dispatched individually.
             bool all_success = true;
 
             // Batched INT8 scatter GEMV collection arrays (for M=1 VNNI projections)
@@ -3931,11 +3931,11 @@ namespace llaminar2
             // =========================================================================
 #ifdef HAVE_ROCM
             const bool small_m_native_verifier_fused =
-                g_rocm_native_vnni_decode_equivalent_scope &&
-                all_projections_native_vnni && (m >= 2 || countedVerifierRows(m));
+                g_rocm_native_quantised_decode_equivalent_scope &&
+                all_projections_native_quantised && (m >= 2 || countedVerifierRows(m));
             if (m > 2 && projections.size() >= 2 &&
                 fused_uses_blockwise_shared_quant &&
-                all_projections_native_vnni &&
+                all_projections_native_quantised &&
                 !small_m_native_verifier_fused &&
                 debugEnv().rocm.concurrent_prefill)
             {
@@ -4017,7 +4017,7 @@ namespace llaminar2
                         {
                             d_scales_B = rocm_kernel->impl_->d_scales_B;
                         }
-                        if (!d_scales_B && !(rocm_kernel->impl_ && rocm_kernel->impl_->has_native_vnni))
+                        if (!d_scales_B && !(rocm_kernel->impl_ && rocm_kernel->impl_->has_native_quantised))
                         {
                             LOG_WARN("[ConcurrentPrefill] Projection " << pi
                                                                        << " (" << (proj.name ? proj.name : "?")
@@ -4152,7 +4152,7 @@ namespace llaminar2
             //
             // INT8-VNNI projections use rocmGemv_int8_int8_fp32_vnni_blockwise_scaled
             //   which has no shared scratch dependency (atomicAdd to output).
-            // Native-VNNI projections use rocmGemv_native_vnni_fp32 which needs a
+            // NativeQuantised projections use rocmGemv_native_quantised_fp32 which needs a
             //   per-stream scatter_partial buffer from the pool.
             //
             // DAG: quantization (main stream)
@@ -4328,7 +4328,7 @@ namespace llaminar2
 
                         bool proj_ok = false;
 
-                        if (rocm_kernel->impl_->has_native_vnni)
+                        if (rocm_kernel->impl_->has_native_quantised)
                         {
                             // Each stream receives its exact disjoint prefix
                             // slice; a reused stream retains the widest width
@@ -4354,9 +4354,9 @@ namespace llaminar2
                                     scatter_slot_offsets[
                                         static_cast<size_t>(stream_idx)]);
 
-                            proj_ok = rocmGemv_native_vnni_fp32_with_policy(
+                            proj_ok = rocmGemv_native_quantised_fp32_with_policy(
                                 impl_->d_A_int8,
-                                rocm_kernel->impl_->d_weights_native_vnni,
+                                rocm_kernel->impl_->d_weights_native_quantised,
                                 rocm_kernel->impl_->d_weights_native_scales,
                                 rocm_kernel->impl_->d_weights_native_mins,
                                 rocm_kernel->impl_->d_weights_native_emins,
@@ -4364,9 +4364,9 @@ namespace llaminar2
                                 impl_->d_scales_A,
                                 stream_partial,
                                 n, k,
-                                rocm_kernel->impl_->native_vnni_codebook_id,
-                                requireNativeVNNIArithmeticPolicyCodebook(
-                                    rocm_kernel->impl_->native_vnni_codebook_id,
+                                rocm_kernel->impl_->native_quantised_codebook_id,
+                                requireNativeQuantisedArithmeticPolicyCodebook(
+                                    rocm_kernel->impl_->native_quantised_codebook_id,
                                     rocm_kernel->impl_->native_source_identity),
                                 rocm_device_id_, pool.streams[stream_idx],
                                 fused_uses_blockwise_shared_quant ? impl_->d_scales_A_blockwise : nullptr);
@@ -4399,7 +4399,7 @@ namespace llaminar2
                                 " — cannot continue inference");
                         }
 
-                        if (rocm_kernel->impl_->has_native_vnni && d_bias)
+                        if (rocm_kernel->impl_->has_native_quantised && d_bias)
                         {
                             if (!rocmQuantGemm_biasAdd(d_output, d_bias, m, n,
                                                        rocm_device_id_, pool.streams[stream_idx]))
@@ -4485,7 +4485,7 @@ namespace llaminar2
                     auto original_scope = proj.beginOriginalOutputSliceScope();
                     auto *rocm_kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(proj.kernel);
                     auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
-                    if (!rocm_kernel || !rocm_kernel->impl_ || !rocm_kernel->impl_->has_native_vnni)
+                    if (!rocm_kernel || !rocm_kernel->impl_ || !rocm_kernel->impl_->has_native_quantised)
                     {
                         mark_batched_bypass("non_native_projection");
                         break;
@@ -4513,7 +4513,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (!rocm_kernel->impl_->d_weights_native_vnni ||
+                    if (!rocm_kernel->impl_->d_weights_native_quantised ||
                         !rocm_kernel->impl_->d_weights_native_scales ||
                         !rocm_kernel->impl_->d_scatter_partial)
                     {
@@ -4532,7 +4532,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    const uint8_t codebook = rocm_kernel->impl_->native_vnni_codebook_id;
+                    const uint8_t codebook = rocm_kernel->impl_->native_quantised_codebook_id;
                     if (!have_common_codebook)
                     {
                         common_codebook = codebook;
@@ -4580,7 +4580,7 @@ namespace llaminar2
                         }
                     }
 
-                    payloads[i] = rocm_kernel->impl_->d_weights_native_vnni;
+                    payloads[i] = rocm_kernel->impl_->d_weights_native_quantised;
                     scales[i] = static_cast<const uint16_t *>(rocm_kernel->impl_->d_weights_native_scales);
                     mins[i] = static_cast<const uint16_t *>(rocm_kernel->impl_->d_weights_native_mins);
                     emins[i] = static_cast<const uint32_t *>(rocm_kernel->impl_->d_weights_native_emins);
@@ -4600,14 +4600,14 @@ namespace llaminar2
 
                 if (batched_eligible)
                 {
-                    const int expected_kb = computeNativeVNNISmallMBatchedKBForValidation(
+                    const int expected_kb = computeNativeQuantisedSmallMBatchedKBForValidation(
                         Ns,
                         static_cast<int>(projections.size()),
                         m,
                         k);
                     if (static_cast<int>(projections.size()) > ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M batched route "
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] NativeQuantised fused small-M batched route "
                                   << "requires projection count <= "
                                   << ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS
                                   << " for declared graph workspace, got " << projections.size());
@@ -4629,7 +4629,7 @@ namespace llaminar2
                             // match the declared arena instead of pricing all
                             // logical rows as simultaneously resident partials.
                             static_cast<size_t>(std::min(
-                                m, kDefaultNativeVNNIVerifierRowCapacity)) *
+                                m, kDefaultNativeQuantisedVerifierRowCapacity)) *
                             static_cast<size_t>(Ns[i]);
                         const size_t next_offset = partial_offset_floats + required_projection_floats;
                         if (!batched_partial_base ||
@@ -4714,7 +4714,7 @@ namespace llaminar2
 
                         const int group_count = static_cast<int>(indices.size());
                         return group_mixed
-                            ? rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy(
+                            ? rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy(
                                   impl_->d_A_int8,
                                   group_payloads.data(),
                                   group_scales.data(),
@@ -4734,7 +4734,7 @@ namespace llaminar2
                                   policy_kb,
                                   policy_target_waves,
                             VerifierKernelModeScope::rowsFor(m))
-                            : rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy(
+                            : rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy(
                                   impl_->d_A_int8,
                                   group_payloads.data(),
                                   group_scales.data(),
@@ -4757,7 +4757,7 @@ namespace llaminar2
                     };
 
                     bool gemv_ok = true;
-                    if (g_rocm_native_vnni_decode_equivalent_scope)
+                    if (g_rocm_native_quantised_decode_equivalent_scope)
                     {
                         struct GeneratedGroupPolicy
                         {
@@ -4795,24 +4795,24 @@ namespace llaminar2
                              * serial reduction geometry by construction.
                              */
                             const bool policy_ready = projections[i].original_output_slice
-                                ? rocmGemv_native_vnni_query_serial_m1_config_with_policy(
+                                ? rocmGemv_native_quantised_query_serial_m1_config_with_policy(
                                     canonicalDeviceVnniCodebookId(projections[i].original_output_slice->sourceIdentity().codebook_id),
                                     Ns[i], k, &policy_kb, &policy_target_waves)
-                                : rocmGemv_native_vnni_query_serial_m1_config(
+                                : rocmGemv_native_quantised_query_serial_m1_config(
                                     codebooks[i], Ns[i], k, &policy_kb, &policy_target_waves);
                             if (!policy_ready)
                             {
                                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection "
                                           << i
-                                          << " has no serial-M1 NativeVNNI policy for decode-equivalent grouped verifier"
+                                          << " has no serial-M1 NativeQuantised policy for decode-equivalent grouped verifier"
                                           << " codebook=" << static_cast<int>(codebooks[i])
                                           << " m=" << m
                                           << " n=" << Ns[i]
                                           << " k=" << k
-                                          << "; refusing serial-M1 fallback. Refresh the ROCm NativeVNNI decode dispatch table.");
+                                          << "; refusing serial-M1 fallback. Refresh the ROCm NativeQuantised decode dispatch table.");
                                 PerfStatsCollector::addCounter(
                                     "kernel",
-                                    "rocm_native_vnni_small_m_generated_policy_miss",
+                                    "rocm_native_quantised_small_m_generated_policy_miss",
                                     1.0,
                                     "gemm",
                                     "rocm:" + std::to_string(rocm_device_id_),
@@ -4870,7 +4870,7 @@ namespace llaminar2
                     }
                     if (!gemv_ok)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M batched GEMV failed"
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] NativeQuantised fused small-M batched GEMV failed"
                                   << " m=" << m << " k=" << k
                                   << " projections=" << projections.size()
                                   << " codebook=" << (mixed_codebooks ? std::string("mixed") : std::to_string(static_cast<int>(common_codebook))));
@@ -4881,7 +4881,7 @@ namespace llaminar2
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
-                            "rocm_native_vnni_small_m_batched_calls",
+                            "rocm_native_quantised_small_m_batched_calls",
                             1.0,
                             "gemm",
                             "rocm:" + std::to_string(rocm_device_id_),
@@ -4895,7 +4895,7 @@ namespace llaminar2
                         {
                             PerfStatsCollector::addCounter(
                                 "kernel",
-                                "rocm_native_vnni_small_m_batched_mixed_calls",
+                                "rocm_native_quantised_small_m_batched_mixed_calls",
                                 1.0,
                                 "gemm",
                                 "rocm:" + std::to_string(rocm_device_id_),
@@ -4912,7 +4912,7 @@ namespace llaminar2
                                 continue;
                             PerfStatsCollector::addCounter(
                                 "kernel",
-                                "rocm_native_vnni_small_m_batched_projection_calls",
+                                "rocm_native_quantised_small_m_batched_projection_calls",
                                 1.0,
                                 "gemm",
                                 "rocm:" + std::to_string(rocm_device_id_),
@@ -4936,7 +4936,7 @@ namespace llaminar2
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
-                        "rocm_native_vnni_small_m_batched_bypasses",
+                        "rocm_native_quantised_small_m_batched_bypasses",
                         1.0,
                         "gemm",
                         "rocm:" + std::to_string(rocm_device_id_),
@@ -4952,7 +4952,7 @@ namespace llaminar2
             // Ordinary direct-device M1 owns a static grouped-reduction implementation.
             // Mapped destinations retain their existing serialized copy-out transaction:
             // its one shared d_C_fp32 cannot back simultaneous pending producers.
-            const bool direct_native_m1 = m==1 && !countedVerifierRows(m) && projections.size()>=2 && all_projections_native_vnni &&
+            const bool direct_native_m1 = m==1 && !countedVerifierRows(m) && projections.size()>=2 && all_projections_native_quantised &&
                 std::all_of(projections.begin(),projections.end(),[](const auto &p)
                 {
                     const auto *output=dynamic_cast<const FP32Tensor *>(p.output);
@@ -4999,7 +4999,7 @@ namespace llaminar2
                 {
                     const auto &p=projections[i];
                     auto *kernel=dynamic_cast<ROCmQuantisedGemmKernel *>(p.kernel);
-                    if(!kernel || !kernel->impl_ || !kernel->impl_->has_native_vnni ||
+                    if(!kernel || !kernel->impl_ || !kernel->impl_->has_native_quantised ||
                         kernel->rocm_device_id_!=rocm_device_id_ || kernel->N_!=p.n || kernel->K_!=k ||
                         p.output->size_bytes()<std::size_t(p.n)*sizeof(float))
                         throw std::invalid_argument("Grouped M1 requires complete original prepared/output owners");
@@ -5038,11 +5038,11 @@ namespace llaminar2
                         auto *kernel=static_cast<ROCmQuantisedGemmKernel *>(p.kernel);
                         auto *partial=reinterpret_cast<float *>(reinterpret_cast<unsigned char *>(impl_->d_scatter_partial_batched)+offsets[local]);
                         if(!enqueueNativeM1Producer(tickets[local],impl_->d_A_int8,
-                            kernel->impl_->d_weights_native_vnni,kernel->impl_->d_weights_native_scales,
+                            kernel->impl_->d_weights_native_quantised,kernel->impl_->d_weights_native_scales,
                             kernel->impl_->d_weights_native_mins,kernel->impl_->d_weights_native_emins,
                             static_cast<float *>(p.output->gpu_data_ptr()),impl_->d_scales_A,partial,p.n,k,
-                            kernel->impl_->native_vnni_codebook_id,
-                            requireNativeVNNIArithmeticPolicyCodebook(kernel->impl_->native_vnni_codebook_id,kernel->impl_->native_source_identity),
+                            kernel->impl_->native_quantised_codebook_id,
+                            requireNativeQuantisedArithmeticPolicyCodebook(kernel->impl_->native_quantised_codebook_id,kernel->impl_->native_source_identity),
                             rocm_device_id_,gpu_stream_,fused_uses_blockwise_shared_quant?impl_->d_scales_A_blockwise:nullptr))
                             throw std::runtime_error("Grouped M1 original producer submission failed");
                     }
@@ -5130,10 +5130,10 @@ namespace llaminar2
                     d_scales_B = rocm_kernel->impl_->d_scales_B;
                 }
 
-                // Native-VNNI path uses impl_->d_weights_native_scales (not d_scales_B),
-                // so d_scales_B may be null when only native-VNNI weights are present.
-                const bool native_vnni_fused = rocm_kernel->impl_ && rocm_kernel->impl_->has_native_vnni;
-                if (!d_scales_B && !native_vnni_fused)
+                // NativeQuantised path uses impl_->d_weights_native_scales (not d_scales_B),
+                // so d_scales_B may be null when only native-quantised weights are present.
+                const bool native_quantised_fused = rocm_kernel->impl_ && rocm_kernel->impl_->has_native_quantised;
+                if (!d_scales_B && !native_quantised_fused)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " weight scales not on device");
                     all_success = false;
@@ -5209,15 +5209,15 @@ namespace llaminar2
                 if (m == 1 && !countedVerifierRows(m))
                 {
                     int8_t *d_vnni = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_int8_vnni : nullptr;
-                    if (!rocm_kernel->impl_->has_native_vnni && !d_vnni)
+                    if (!rocm_kernel->impl_->has_native_quantised && !d_vnni)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " VNNI weights not on device");
                         all_success = false;
                         break;
                     }
 
-                    // Native-VNNI path: lossless Q4/IQ4 decode with typed block metadata
-                    if (rocm_kernel->impl_->has_native_vnni)
+                    // NativeQuantised path: lossless Q4/IQ4 decode with typed block metadata
+                    if (rocm_kernel->impl_->has_native_quantised)
                     {
                         const bool output_is_mapped = fp32_output->isMapped();
                         const bool output_needs_copyout = output_is_mapped;
@@ -5225,12 +5225,12 @@ namespace llaminar2
 
                         // Activations are always pre-quantized above (Step 3)
                         LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                                 << " NATIVE-VNNI GEMV M=1 N=" << n << " K=" << k
+                                                                                                 << " NATIVE-QUANTISED GEMV M=1 N=" << n << " K=" << k
                                                                                                  << (d_bias ? " +bias" : ""));
 
-                        if (!rocmGemv_native_vnni_fp32_with_policy(
+                        if (!rocmGemv_native_quantised_fp32_with_policy(
                                 impl_->d_A_int8,
-                                rocm_kernel->impl_->d_weights_native_vnni,
+                                rocm_kernel->impl_->d_weights_native_quantised,
                                 rocm_kernel->impl_->d_weights_native_scales,
                                 rocm_kernel->impl_->d_weights_native_mins,
                                 rocm_kernel->impl_->d_weights_native_emins,
@@ -5238,14 +5238,14 @@ namespace llaminar2
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
                                 n, k,
-                                rocm_kernel->impl_->native_vnni_codebook_id,
-                                requireNativeVNNIArithmeticPolicyCodebook(
-                                    rocm_kernel->impl_->native_vnni_codebook_id,
+                                rocm_kernel->impl_->native_quantised_codebook_id,
+                                requireNativeQuantisedArithmeticPolicyCodebook(
+                                    rocm_kernel->impl_->native_quantised_codebook_id,
                                     rocm_kernel->impl_->native_source_identity),
                                 rocm_device_id_, gpu_stream_,
                                 fused_uses_blockwise_shared_quant ? impl_->d_scales_A_blockwise : nullptr))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI GEMV failed for projection " << i);
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] NativeQuantised GEMV failed for projection " << i);
                             all_success = false;
                             break;
                         }
@@ -5254,7 +5254,7 @@ namespace llaminar2
                         {
                             if (!rocmQuantGemm_biasAdd(d_native_output, d_bias, m, n, rocm_device_id_, gpu_stream_))
                             {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI bias add failed for projection " << i);
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] NativeQuantised bias add failed for projection " << i);
                                 all_success = false;
                                 break;
                             }
@@ -5279,7 +5279,7 @@ namespace llaminar2
                             }
                         }
 
-                        LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " native-VNNI GEMV complete");
+                        LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " native-quantised GEMV complete");
                         continue;
                     }
 
@@ -5334,7 +5334,7 @@ namespace llaminar2
                     else
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                                 << " has no VNNI weights and is not native-VNNI");
+                                                                                                 << " has no VNNI weights and is not native-quantised");
                         all_success = false;
                         break;
                     }
@@ -5352,36 +5352,36 @@ namespace llaminar2
                 float *d_prefill_output = output_needs_copyout ? impl_->d_C_fp32 : d_output;
 
                 const bool supports_native_small_m =
-                    g_rocm_native_vnni_decode_equivalent_scope &&
-                    native_vnni_fused && (m >= 2 || countedVerifierRows(m));
+                    g_rocm_native_quantised_decode_equivalent_scope &&
+                    native_quantised_fused && (m >= 2 || countedVerifierRows(m));
                 if (supports_native_small_m)
                 {
                     if ((k % 32) != 0)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M verifier requires K multiple of 32, got M="
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] NativeQuantised fused small-M verifier requires K multiple of 32, got M="
                                   << m << " K=" << k);
                         all_success = false;
                         break;
                     }
                     if (!impl_->d_A_int8 || !impl_->d_scales_A_blockwise || !impl_->d_sums_A_blockwise ||
-                        !rocm_kernel->impl_->d_weights_native_vnni ||
+                        !rocm_kernel->impl_->d_weights_native_quantised ||
                         !rocm_kernel->impl_->d_weights_native_scales ||
                         !rocm_kernel->impl_->d_scatter_partial)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M verifier missing graph-native buffers"
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] NativeQuantised fused small-M verifier missing graph-native buffers"
                                   << " A=" << static_cast<const void *>(impl_->d_A_int8)
                                   << " scale_A_blockwise=" << static_cast<const void *>(impl_->d_scales_A_blockwise)
                                   << " sum_A_blockwise=" << static_cast<const void *>(impl_->d_sums_A_blockwise)
-                                  << " weights=" << static_cast<const void *>(rocm_kernel->impl_->d_weights_native_vnni)
+                                  << " weights=" << static_cast<const void *>(rocm_kernel->impl_->d_weights_native_quantised)
                                   << " scales=" << static_cast<const void *>(rocm_kernel->impl_->d_weights_native_scales)
                                   << " partial=" << static_cast<const void *>(rocm_kernel->impl_->d_scatter_partial));
                         all_success = false;
                         break;
                     }
 
-                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
+                    if (!rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
                             impl_->d_A_int8,
-                            rocm_kernel->impl_->d_weights_native_vnni,
+                            rocm_kernel->impl_->d_weights_native_quantised,
                             rocm_kernel->impl_->d_weights_native_scales,
                             rocm_kernel->impl_->d_weights_native_mins,
                             rocm_kernel->impl_->d_weights_native_emins,
@@ -5390,14 +5390,14 @@ namespace llaminar2
                             impl_->d_sums_A_blockwise,
                             rocm_kernel->impl_->d_scatter_partial,
                             m, n, k,
-                            rocm_kernel->impl_->native_vnni_codebook_id,
-                            requireNativeVNNIArithmeticPolicyCodebook(
-                                rocm_kernel->impl_->native_vnni_codebook_id,
+                            rocm_kernel->impl_->native_quantised_codebook_id,
+                            requireNativeQuantisedArithmeticPolicyCodebook(
+                                rocm_kernel->impl_->native_quantised_codebook_id,
                                 rocm_kernel->impl_->native_source_identity),
                             rocm_device_id_, gpu_stream_,
                             VerifierKernelModeScope::rowsFor(m)))
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M verifier GEMV failed for projection "
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] NativeQuantised fused small-M verifier GEMV failed for projection "
                                   << i);
                         all_success = false;
                         break;
@@ -5414,7 +5414,7 @@ namespace llaminar2
                                 rocm_device_id_,
                                 gpu_stream_))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M epilogue failed for projection "
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] NativeQuantised fused small-M epilogue failed for projection "
                                       << i);
                             all_success = false;
                             break;
@@ -5443,13 +5443,13 @@ namespace llaminar2
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
-                            "rocm_native_vnni_small_m_calls",
+                            "rocm_native_quantised_small_m_calls",
                             1.0,
                             "gemm",
                             "rocm:" + std::to_string(rocm_device_id_),
                             PerfStatsCollector::Tags{
                                 {"m", std::to_string(m)},
-                                {"codebook", std::to_string(static_cast<int>(rocm_kernel->impl_->native_vnni_codebook_id))},
+                                {"codebook", std::to_string(static_cast<int>(rocm_kernel->impl_->native_quantised_codebook_id))},
                                 {"n", std::to_string(n)},
                                 {"k", std::to_string(k)},
                                 {"shared_quant", "true"}});
@@ -5498,7 +5498,7 @@ namespace llaminar2
 
                 // Native prefill failed and CK is retired — hard error.
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                         << " native-VNNI prefill failed (m=" << m << " n=" << n << " k=" << k
+                                                                                         << " native-quantised prefill failed (m=" << m << " n=" << n << " k=" << k
                                                                                          << "); CK fallback has been removed.");
                 all_success = false;
                 break;
@@ -5818,29 +5818,29 @@ namespace llaminar2
                             rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
                             upload.d_scales = nullptr;
                         }
-                        if (upload.d_native_vnni_payload)
+                        if (upload.d_native_quantised_payload)
                         {
-                            rocmQuantGemm_freeDevice(upload.d_native_vnni_payload, rocm_device_id_);
-                            upload.d_native_vnni_payload = nullptr;
+                            rocmQuantGemm_freeDevice(upload.d_native_quantised_payload, rocm_device_id_);
+                            upload.d_native_quantised_payload = nullptr;
                         }
 #ifdef HAVE_ROCM
-                        if (upload.d_native_vnni_scales)
+                        if (upload.d_native_quantised_scales)
                         {
                             rocmQuantGemm_freeDevice(
-                                upload.d_native_vnni_scales, rocm_device_id_);
-                            upload.d_native_vnni_scales = nullptr;
+                                upload.d_native_quantised_scales, rocm_device_id_);
+                            upload.d_native_quantised_scales = nullptr;
                         }
-                        if (upload.d_native_vnni_mins)
+                        if (upload.d_native_quantised_mins)
                         {
                             rocmQuantGemm_freeDevice(
-                                upload.d_native_vnni_mins, rocm_device_id_);
-                            upload.d_native_vnni_mins = nullptr;
+                                upload.d_native_quantised_mins, rocm_device_id_);
+                            upload.d_native_quantised_mins = nullptr;
                         }
-                        if (upload.d_native_vnni_emins)
+                        if (upload.d_native_quantised_emins)
                         {
                             rocmQuantGemm_freeDevice(
-                                upload.d_native_vnni_emins, rocm_device_id_);
-                            upload.d_native_vnni_emins = nullptr;
+                                upload.d_native_quantised_emins, rocm_device_id_);
+                            upload.d_native_quantised_emins = nullptr;
                         }
 #endif
                     };
@@ -5927,17 +5927,17 @@ namespace llaminar2
                         // a persistent row-major copy per weight would double GPU
                         // memory usage (VNNI + row-major) and OOM on large models.
 
-                        // Upload native-VNNI payload + scales + mins (Q4_0, Q4_1, Q5_0, Q5_1,
+                        // Upload native-quantised payload + scales + mins (Q4_0, Q4_1, Q5_0, Q5_1,
                         // Q6_K, Q3_K, Q2_K, Q4_K, Q5_K, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS,
                         // IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, IQ1_M)
-                        if (!packed_->native_vnni_payload.empty() && !packed_->native_vnni_scales.empty())
+                        if (!packed_->native_quantised_payload.empty() && !packed_->native_quantised_scales.empty())
                         {
                             // Allocate payload buffer
-                            if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&upload.d_native_vnni_payload),
-                                                         packed_->native_vnni_payload.size(),
+                            if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&upload.d_native_quantised_payload),
+                                                         packed_->native_quantised_payload.size(),
                                                          rocm_device_id_))
                             {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI payload; refusing alternate GEMM path");
+                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-quantised payload; refusing alternate GEMM path");
                                 cleanup_startup_device_upload();
                                 cleanup_startup_async_resources();
                                 return;
@@ -5945,17 +5945,17 @@ namespace llaminar2
                             else
                             {
                                 err = startupMemcpyAsyncOrSync(
-                                    upload.d_native_vnni_payload,
-                                    packed_->native_vnni_payload.data(),
-                                    packed_->native_vnni_payload.size() * sizeof(uint8_t),
+                                    upload.d_native_quantised_payload,
+                                    packed_->native_quantised_payload.data(),
+                                    packed_->native_quantised_payload.size() * sizeof(uint8_t),
                                     async_upload_enabled,
                                     upload.startup_h2d_stream,
-                                    &upload.startup_h2d_pinned_native_vnni,
+                                    &upload.startup_h2d_pinned_native_quantised,
                                     "ROCmQuantisedGemmKernel::ensureWeightsConverted",
-                                    "native_vnni_payload");
+                                    "native_quantised_payload");
                                 if (err != hipSuccess)
                                 {
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI payload: "
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-quantised payload: "
                                               << hipGetErrorString(err)
                                               << "; refusing alternate GEMM path");
                                     cleanup_startup_device_upload();
@@ -5965,35 +5965,35 @@ namespace llaminar2
                             }
 
                             // Allocate FP16 scales buffer
-                            if (upload.d_native_vnni_payload)
+                            if (upload.d_native_quantised_payload)
                             {
-                                const size_t scales_bytes = packed_->native_vnni_scales.size() * sizeof(uint16_t);
+                                const size_t scales_bytes = packed_->native_quantised_scales.size() * sizeof(uint16_t);
                                 void *d_scales_tmp = nullptr;
                                 if (!rocmQuantGemm_allocInt8(
                                         reinterpret_cast<int8_t **>(&d_scales_tmp),
                                         scales_bytes,
                                         rocm_device_id_))
                                 {
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI scales");
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-quantised scales");
                                     cleanup_startup_device_upload();
                                     cleanup_startup_async_resources();
                                     return;
                                 }
-                                upload.d_native_vnni_scales = d_scales_tmp;
+                                upload.d_native_quantised_scales = d_scales_tmp;
                                 if (d_scales_tmp)
                                 {
                                     err = startupMemcpyAsyncOrSync(
                                         d_scales_tmp,
-                                        packed_->native_vnni_scales.data(),
+                                        packed_->native_quantised_scales.data(),
                                         scales_bytes,
                                         async_upload_enabled,
                                         upload.startup_h2d_stream,
                                         &upload.startup_h2d_pinned_native_scales,
                                         "ROCmQuantisedGemmKernel::ensureWeightsConverted",
-                                        "native_vnni_scales");
+                                        "native_quantised_scales");
                                     if (err != hipSuccess)
                                     {
-                                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI scales: "
+                                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-quantised scales: "
                                                   << hipGetErrorString(err)
                                                   << "; refusing alternate GEMM path");
                                         cleanup_startup_device_upload();
@@ -6003,43 +6003,43 @@ namespace llaminar2
                                 }
                             }
 
-                            if (upload.d_native_vnni_payload && upload.d_native_vnni_scales)
+                            if (upload.d_native_quantised_payload && upload.d_native_quantised_scales)
                             {
-                                LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded native-VNNI payload="
-                                          << (packed_->native_vnni_payload.size() / 1024) << " KB scales="
-                                          << (packed_->native_vnni_scales.size() * 2 / 1024) << " KB");
+                                LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded native-quantised payload="
+                                          << (packed_->native_quantised_payload.size() / 1024) << " KB scales="
+                                          << (packed_->native_quantised_scales.size() * 2 / 1024) << " KB");
                             }
 
                             // Allocate FP16 mins buffer (asymmetric formats: Q4_1, Q5_1)
-                            if (upload.d_native_vnni_payload && !packed_->native_vnni_mins.empty())
+                            if (upload.d_native_quantised_payload && !packed_->native_quantised_mins.empty())
                             {
-                                const size_t mins_bytes = packed_->native_vnni_mins.size() * sizeof(uint16_t);
+                                const size_t mins_bytes = packed_->native_quantised_mins.size() * sizeof(uint16_t);
                                 void *d_mins_tmp = nullptr;
                                 if (!rocmQuantGemm_allocInt8(
                                         reinterpret_cast<int8_t **>(&d_mins_tmp),
                                         mins_bytes,
                                         rocm_device_id_))
                                 {
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI mins");
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-quantised mins");
                                     cleanup_startup_device_upload();
                                     cleanup_startup_async_resources();
                                     return;
                                 }
-                                upload.d_native_vnni_mins = d_mins_tmp;
+                                upload.d_native_quantised_mins = d_mins_tmp;
                                 if (d_mins_tmp)
                                 {
                                     err = startupMemcpyAsyncOrSync(
                                         d_mins_tmp,
-                                        packed_->native_vnni_mins.data(),
+                                        packed_->native_quantised_mins.data(),
                                         mins_bytes,
                                         async_upload_enabled,
                                         upload.startup_h2d_stream,
                                         &upload.startup_h2d_pinned_native_mins,
                                         "ROCmQuantisedGemmKernel::ensureWeightsConverted",
-                                        "native_vnni_mins");
+                                        "native_quantised_mins");
                                     if (err != hipSuccess)
                                     {
-                                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI mins: "
+                                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-quantised mins: "
                                                   << hipGetErrorString(err)
                                                   << "; refusing alternate GEMM path");
                                         cleanup_startup_device_upload();
@@ -6048,42 +6048,42 @@ namespace llaminar2
                                     }
                                     else
                                     {
-                                        LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded native-VNNI mins="
+                                        LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded native-quantised mins="
                                                   << (mins_bytes / 1024) << " KB");
                                     }
                                 }
                             }
 
                             // Allocate uint32 emins buffer (Q2_K only: packed {emin_lo, emin_hi} FP16)
-                            if (upload.d_native_vnni_payload && !packed_->native_vnni_emins.empty())
+                            if (upload.d_native_quantised_payload && !packed_->native_quantised_emins.empty())
                             {
-                                const size_t emins_bytes = packed_->native_vnni_emins.size() * sizeof(uint32_t);
+                                const size_t emins_bytes = packed_->native_quantised_emins.size() * sizeof(uint32_t);
                                 void *d_emins_tmp = nullptr;
                                 if (!rocmQuantGemm_allocInt8(
                                         reinterpret_cast<int8_t **>(&d_emins_tmp),
                                         emins_bytes,
                                         rocm_device_id_))
                                 {
-                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI emins");
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-quantised emins");
                                     cleanup_startup_device_upload();
                                     cleanup_startup_async_resources();
                                     return;
                                 }
-                                upload.d_native_vnni_emins = d_emins_tmp;
+                                upload.d_native_quantised_emins = d_emins_tmp;
                                 if (d_emins_tmp)
                                 {
                                     err = startupMemcpyAsyncOrSync(
                                         d_emins_tmp,
-                                        packed_->native_vnni_emins.data(),
+                                        packed_->native_quantised_emins.data(),
                                         emins_bytes,
                                         async_upload_enabled,
                                         upload.startup_h2d_stream,
                                         &upload.startup_h2d_pinned_native_emins,
                                         "ROCmQuantisedGemmKernel::ensureWeightsConverted",
-                                        "native_vnni_emins");
+                                        "native_quantised_emins");
                                     if (err != hipSuccess)
                                     {
-                                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI emins: "
+                                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-quantised emins: "
                                                   << hipGetErrorString(err)
                                                   << "; refusing alternate GEMM path");
                                         cleanup_startup_device_upload();
@@ -6092,14 +6092,14 @@ namespace llaminar2
                                     }
                                     else
                                     {
-                                        LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded native-VNNI emins="
+                                        LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded native-quantised emins="
                                                   << (emins_bytes / 1024) << " KB");
                                     }
                                 }
                             }
                         }
 
-                        if (packed_->int8_data_vnni.empty() && packed_->native_vnni_payload.empty())
+                        if (packed_->int8_data_vnni.empty() && packed_->native_quantised_payload.empty())
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel] No VNNI layout available; refusing implicit CPU or alternate packing path.");
                             cleanup_startup_device_upload();
@@ -6140,27 +6140,27 @@ namespace llaminar2
                     auto &upload = upload_it->second;
                     packed_->d_int8_data_vnni = upload.d_int8_data_vnni;
                     packed_->d_scales = upload.d_scales;
-                    packed_->d_native_vnni_payload = upload.d_native_vnni_payload;
-                    packed_->d_native_vnni_scales = upload.d_native_vnni_scales;
-                    packed_->d_native_vnni_mins = upload.d_native_vnni_mins;
-                    packed_->d_native_vnni_emins = upload.d_native_vnni_emins;
+                    packed_->d_native_quantised_payload = upload.d_native_quantised_payload;
+                    packed_->d_native_quantised_scales = upload.d_native_quantised_scales;
+                    packed_->d_native_quantised_mins = upload.d_native_quantised_mins;
+                    packed_->d_native_quantised_emins = upload.d_native_quantised_emins;
                     packed_->uploaded = true;
                     packed_->rocm_device_id = rocm_device_id_;
 
                     // Point impl_ to packed_ device pointers
                     impl_->d_weights_int8_vnni = upload.d_int8_data_vnni;
                     impl_->d_scales_B = upload.d_scales;
-                    impl_->d_weights_native_vnni = upload.d_native_vnni_payload;
-                    impl_->d_weights_native_scales = upload.d_native_vnni_scales;
-                    impl_->d_weights_native_mins = upload.d_native_vnni_mins;
-                    impl_->d_weights_native_emins = upload.d_native_vnni_emins;
-                    impl_->native_vnni_codebook_id = packed_->native_vnni_codebook_id;
-                    impl_->native_vnni_blocks_per_row = packed_->native_vnni_blocks_per_row;
+                    impl_->d_weights_native_quantised = upload.d_native_quantised_payload;
+                    impl_->d_weights_native_scales = upload.d_native_quantised_scales;
+                    impl_->d_weights_native_mins = upload.d_native_quantised_mins;
+                    impl_->d_weights_native_emins = upload.d_native_quantised_emins;
+                    impl_->native_quantised_codebook_id = packed_->native_quantised_codebook_id;
+                    impl_->native_quantised_blocks_per_row = packed_->native_quantised_blocks_per_row;
                     impl_->native_source_identity = packed_->native_source_identity;
-                    impl_->has_native_vnni = (upload.d_native_vnni_payload != nullptr && upload.d_native_vnni_scales != nullptr);
+                    impl_->has_native_quantised = (upload.d_native_quantised_payload != nullptr && upload.d_native_quantised_scales != nullptr);
                     impl_->startup_h2d_pinned_scales = upload.startup_h2d_pinned_scales;
                     impl_->startup_h2d_pinned_vnni = upload.startup_h2d_pinned_vnni;
-                    impl_->startup_h2d_pinned_native_vnni = upload.startup_h2d_pinned_native_vnni;
+                    impl_->startup_h2d_pinned_native_quantised = upload.startup_h2d_pinned_native_quantised;
                     impl_->startup_h2d_pinned_native_scales = upload.startup_h2d_pinned_native_scales;
                     impl_->startup_h2d_pinned_native_mins = upload.startup_h2d_pinned_native_mins;
                     impl_->startup_h2d_pinned_native_emins = upload.startup_h2d_pinned_native_emins;
@@ -6178,21 +6178,21 @@ namespace llaminar2
                         packed_->int8_data.capacity() +
                         packed_->int8_data_vnni.capacity() +
                         packed_->scales.capacity() * sizeof(float) +
-                        packed_->native_vnni_payload.capacity() +
-                        packed_->native_vnni_scales.capacity() * sizeof(uint16_t) +
-                        packed_->native_vnni_mins.capacity() * sizeof(uint16_t);
+                        packed_->native_quantised_payload.capacity() +
+                        packed_->native_quantised_scales.capacity() * sizeof(uint16_t) +
+                        packed_->native_quantised_mins.capacity() * sizeof(uint16_t);
                     packed_->int8_data.clear();
                     packed_->int8_data.shrink_to_fit();
                     packed_->int8_data_vnni.clear();
                     packed_->int8_data_vnni.shrink_to_fit();
                     packed_->scales.clear();
                     packed_->scales.shrink_to_fit();
-                    packed_->native_vnni_payload.clear();
-                    packed_->native_vnni_payload.shrink_to_fit();
-                    packed_->native_vnni_scales.clear();
-                    packed_->native_vnni_scales.shrink_to_fit();
-                    packed_->native_vnni_mins.clear();
-                    packed_->native_vnni_mins.shrink_to_fit();
+                    packed_->native_quantised_payload.clear();
+                    packed_->native_quantised_payload.shrink_to_fit();
+                    packed_->native_quantised_scales.clear();
+                    packed_->native_quantised_scales.shrink_to_fit();
+                    packed_->native_quantised_mins.clear();
+                    packed_->native_quantised_mins.shrink_to_fit();
                     if (freed_bytes > 0)
                     {
                         LOG_DEBUG("[ROCmQuantisedGemmKernel] Released host packing buffers: "
@@ -6218,7 +6218,7 @@ namespace llaminar2
             }
 
             // Legacy path: upload the packed layouts produced by packWeightsToROCm.
-            // INT8 formats provide VNNI + scales; native-VNNI formats provide
+            // INT8 formats provide VNNI + scales; native-quantised formats provide
             // payload + per-block metadata for the dedicated native kernels.
             rocmQuantGemm_setDevice(rocm_device_id_);
 
@@ -6265,103 +6265,103 @@ namespace llaminar2
                 }
             }
 
-            // Upload native-VNNI payload + metadata when present.
-            if (!host_packed.native_vnni_payload.empty() && !host_packed.native_vnni_scales.empty())
+            // Upload native-quantised payload + metadata when present.
+            if (!host_packed.native_quantised_payload.empty() && !host_packed.native_quantised_scales.empty())
             {
-                if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&impl_->d_weights_native_vnni),
-                                             host_packed.native_vnni_payload.size(),
+                if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&impl_->d_weights_native_quantised),
+                                             host_packed.native_quantised_payload.size(),
                                              rocm_device_id_))
                 {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI payload");
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-quantised payload");
                     return;
                 }
 
-                err = hipMemcpy(impl_->d_weights_native_vnni,
-                                host_packed.native_vnni_payload.data(),
-                                host_packed.native_vnni_payload.size() * sizeof(uint8_t),
+                err = hipMemcpy(impl_->d_weights_native_quantised,
+                                host_packed.native_quantised_payload.data(),
+                                host_packed.native_quantised_payload.size() * sizeof(uint8_t),
                                 hipMemcpyHostToDevice);
                 if (err != hipSuccess)
                 {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI payload: "
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-quantised payload: "
                               << hipGetErrorString(err));
                     return;
                 }
 
-                const size_t native_scales_bytes = host_packed.native_vnni_scales.size() * sizeof(uint16_t);
+                const size_t native_scales_bytes = host_packed.native_quantised_scales.size() * sizeof(uint16_t);
                 if (!rocmQuantGemm_allocInt8(
                         reinterpret_cast<int8_t **>(&impl_->d_weights_native_scales),
                         native_scales_bytes,
                         rocm_device_id_))
                 {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI scales");
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-quantised scales");
                     return;
                 }
 
                 err = hipMemcpy(impl_->d_weights_native_scales,
-                                host_packed.native_vnni_scales.data(),
+                                host_packed.native_quantised_scales.data(),
                                 native_scales_bytes,
                                 hipMemcpyHostToDevice);
                 if (err != hipSuccess)
                 {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI scales: "
+                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-quantised scales: "
                               << hipGetErrorString(err));
                     return;
                 }
 
-                if (!host_packed.native_vnni_mins.empty())
+                if (!host_packed.native_quantised_mins.empty())
                 {
-                    const size_t native_mins_bytes = host_packed.native_vnni_mins.size() * sizeof(uint16_t);
+                    const size_t native_mins_bytes = host_packed.native_quantised_mins.size() * sizeof(uint16_t);
                     if (!rocmQuantGemm_allocInt8(
                             reinterpret_cast<int8_t **>(&impl_->d_weights_native_mins),
                             native_mins_bytes,
                             rocm_device_id_))
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI mins");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-quantised mins");
                         return;
                     }
 
                     err = hipMemcpy(impl_->d_weights_native_mins,
-                                    host_packed.native_vnni_mins.data(),
+                                    host_packed.native_quantised_mins.data(),
                                     native_mins_bytes,
                                     hipMemcpyHostToDevice);
                     if (err != hipSuccess)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI mins: "
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-quantised mins: "
                                   << hipGetErrorString(err));
                         return;
                     }
                 }
 
-                if (!host_packed.native_vnni_emins.empty())
+                if (!host_packed.native_quantised_emins.empty())
                 {
-                    const size_t native_emins_bytes = host_packed.native_vnni_emins.size() * sizeof(uint32_t);
+                    const size_t native_emins_bytes = host_packed.native_quantised_emins.size() * sizeof(uint32_t);
                     if (!rocmQuantGemm_allocInt8(
                             reinterpret_cast<int8_t **>(&impl_->d_weights_native_emins),
                             native_emins_bytes,
                             rocm_device_id_))
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI emins");
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-quantised emins");
                         return;
                     }
 
                     err = hipMemcpy(impl_->d_weights_native_emins,
-                                    host_packed.native_vnni_emins.data(),
+                                    host_packed.native_quantised_emins.data(),
                                     native_emins_bytes,
                                     hipMemcpyHostToDevice);
                     if (err != hipSuccess)
                     {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI emins: "
+                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-quantised emins: "
                                   << hipGetErrorString(err));
                         return;
                     }
                 }
 
-                impl_->native_vnni_codebook_id = host_packed.native_vnni_codebook_id;
-                impl_->native_vnni_blocks_per_row = host_packed.native_vnni_blocks_per_row;
+                impl_->native_quantised_codebook_id = host_packed.native_quantised_codebook_id;
+                impl_->native_quantised_blocks_per_row = host_packed.native_quantised_blocks_per_row;
                 impl_->native_source_identity = host_packed.native_source_identity;
             }
 
-            impl_->has_native_vnni = (impl_->d_weights_native_vnni != nullptr &&
+            impl_->has_native_quantised = (impl_->d_weights_native_quantised != nullptr &&
                                       impl_->d_weights_native_scales != nullptr);
 
             impl_->owns_weight_memory = true; // We now own the device memory
@@ -6594,8 +6594,8 @@ namespace llaminar2
             }
 
             ensureWeightsConverted();
-            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
-                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_quantised))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeQuantised route");
             validateWorkspace();
 
             if (!impl_)
@@ -6617,8 +6617,8 @@ namespace llaminar2
 
                 // Step 1: Fused SwiGLU + blockwise quantize → d_A_int8 + d_scales_A_blockwise
                 const bool needs_block_sums =
-                    g_rocm_native_vnni_decode_equivalent_scope &&
-                    impl_->has_native_vnni && (m >= 2 || countedVerifierRows(m)) && (k % 32) == 0;
+                    g_rocm_native_quantised_decode_equivalent_scope &&
+                    impl_->has_native_quantised && (m >= 2 || countedVerifierRows(m)) && (k % 32) == 0;
                 const bool swiglu_quant_ok = needs_block_sums
                     ? hipOps_fused_swiglu_quantize_blockwise_with_sumsScoped(
                           d_gate, d_up,
@@ -6636,38 +6636,38 @@ namespace llaminar2
                     return false;
                 }
 
-                // Step 2: Native-VNNI grouped verifier path. Once the explicit
+                // Step 2: NativeQuantised grouped verifier path. Once the explicit
                 // verifier API selects this route, runtime M must stay on the
                 // grouped decode-equivalent kernel instead of generic prefill.
                 const bool supports_native_small_m =
-                    g_rocm_native_vnni_decode_equivalent_scope &&
-                    impl_->has_native_vnni && (m >= 2 || countedVerifierRows(m)) &&
+                    g_rocm_native_quantised_decode_equivalent_scope &&
+                    impl_->has_native_quantised && (m >= 2 || countedVerifierRows(m)) &&
                     alpha == 1.0f && beta == 0.0f;
                 if (supports_native_small_m)
                 {
                     if ((k % 32) != 0)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
-                                  "Native-VNNI fused SwiGLU small-M verifier requires K multiple of 32, got M="
+                                  "NativeQuantised fused SwiGLU small-M verifier requires K multiple of 32, got M="
                                   << m << " K=" << k);
                         return false;
                     }
 
                     if (!impl_->d_scatter_partial ||
-                        !impl_->d_weights_native_vnni ||
+                        !impl_->d_weights_native_quantised ||
                         !impl_->d_weights_native_scales)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
-                                  "Native-VNNI fused SwiGLU small-M verifier missing graph-native buffers"
-                                  << " weights=" << static_cast<const void *>(impl_->d_weights_native_vnni)
+                                  "NativeQuantised fused SwiGLU small-M verifier missing graph-native buffers"
+                                  << " weights=" << static_cast<const void *>(impl_->d_weights_native_quantised)
                                   << " scales=" << static_cast<const void *>(impl_->d_weights_native_scales)
                                   << " partial=" << static_cast<const void *>(impl_->d_scatter_partial));
                         return false;
                     }
 
-                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
+                    if (!rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
                             impl_->d_A_int8,
-                            impl_->d_weights_native_vnni,
+                            impl_->d_weights_native_quantised,
                             impl_->d_weights_native_scales,
                             impl_->d_weights_native_mins,
                             impl_->d_weights_native_emins,
@@ -6676,15 +6676,15 @@ namespace llaminar2
                             impl_->d_sums_A_blockwise,
                             impl_->d_scatter_partial,
                             m, n, k,
-                            impl_->native_vnni_codebook_id,
-                            requireNativeVNNIArithmeticPolicyCodebook(
-                                impl_->native_vnni_codebook_id,
+                            impl_->native_quantised_codebook_id,
+                            requireNativeQuantisedArithmeticPolicyCodebook(
+                                impl_->native_quantised_codebook_id,
                                 impl_->native_source_identity),
                             rocm_device_id_, gpu_stream_,
                             VerifierKernelModeScope::rowsFor(m)))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
-                                  "Native-VNNI fused SwiGLU small-M verifier GEMV failed");
+                                  "NativeQuantised fused SwiGLU small-M verifier GEMV failed");
                         return false;
                     }
 
@@ -6692,26 +6692,26 @@ namespace llaminar2
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
-                            "rocm_native_vnni_small_m_calls",
+                            "rocm_native_quantised_small_m_calls",
                             1.0,
                             "gemm",
                             "rocm:" + std::to_string(rocm_device_id_),
                             PerfStatsCollector::Tags{
                                 {"m", std::to_string(m)},
-                                {"codebook", std::to_string(static_cast<int>(impl_->native_vnni_codebook_id))},
+                                {"codebook", std::to_string(static_cast<int>(impl_->native_quantised_codebook_id))},
                                 {"n", std::to_string(n)},
                                 {"k", std::to_string(k)},
                                 {"source", "fused_swiglu"}});
 
                         PerfStatsCollector::addCounter(
                             "kernel",
-                            "rocm_native_vnni_small_m_rows",
+                            "rocm_native_quantised_small_m_rows",
                             static_cast<double>(m),
                             "gemm",
                             "rocm:" + std::to_string(rocm_device_id_),
                             PerfStatsCollector::Tags{
                                 {"m", std::to_string(m)},
-                                {"codebook", std::to_string(static_cast<int>(impl_->native_vnni_codebook_id))},
+                                {"codebook", std::to_string(static_cast<int>(impl_->native_quantised_codebook_id))},
                                 {"n", std::to_string(n)},
                                 {"k", std::to_string(k)},
                                 {"source", "fused_swiglu"}});
@@ -6722,12 +6722,12 @@ namespace llaminar2
                 }
 
                 // Step 2 fallback for non-small-M prefill shapes.
-                if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
+                if (impl_->has_native_quantised && alpha == 1.0f && beta == 0.0f)
                 {
-                    const uint8_t cb_id = impl_->native_vnni_codebook_id;
-                    if (rocmGemm_native_vnni_fp32_with_policy(
+                    const uint8_t cb_id = impl_->native_quantised_codebook_id;
+                    if (rocmGemm_native_quantised_fp32_with_policy(
                             impl_->d_A_int8,
-                            impl_->d_weights_native_vnni,
+                            impl_->d_weights_native_quantised,
                             impl_->d_weights_native_scales,
                             impl_->d_weights_native_mins,
                             impl_->d_weights_native_emins,
@@ -6736,7 +6736,7 @@ namespace llaminar2
                             impl_->d_scales_A_blockwise,
                             m, n, k,
                             cb_id,
-                            requireNativeVNNIArithmeticPolicyCodebook(
+                            requireNativeQuantisedArithmeticPolicyCodebook(
                                 cb_id,
                                 impl_->native_source_identity),
                             rocm_device_id_, gpu_stream_))
@@ -6853,12 +6853,12 @@ namespace llaminar2
             if (m == 1 && !countedVerifierRows(m))
             {
                 ensureWeightsConverted();
-            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
-                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_quantised))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeQuantised route");
                 // Option B: weights are VNNI and/or ratio-VNNI on device
                 int8_t *d_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
                 float *d_s = packed_ ? packed_->d_scales : (impl_ ? impl_->d_scales_B : nullptr);
-                if ((impl_ && impl_->has_native_vnni) || (d_vnni && d_s))
+                if ((impl_ && impl_->has_native_quantised) || (d_vnni && d_s))
                 {
                     LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] GEMV fast path M=1 +bias");
 
@@ -6870,20 +6870,20 @@ namespace llaminar2
 
                     validateWorkspace();
 
-                    // Native-VNNI path: lossless Q4/IQ4 decode, typed block metadata, then optional alpha/beta/bias epilogue.
-                    if (impl_->has_native_vnni)
+                    // NativeQuantised path: lossless Q4/IQ4 decode, typed block metadata, then optional alpha/beta/bias epilogue.
+                    if (impl_->has_native_quantised)
                     {
                         if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
                                 d_A, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI blockwise activation quantization failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] NativeQuantised blockwise activation quantization failed");
                             return false;
                         }
 
                         float *d_native_output = (beta != 0.0f) ? impl_->d_C_fp32 : d_C;
-                        if (!rocmGemv_native_vnni_fp32_with_policy(
+                        if (!rocmGemv_native_quantised_fp32_with_policy(
                                 impl_->d_A_int8,
-                                impl_->d_weights_native_vnni,
+                                impl_->d_weights_native_quantised,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
                                 impl_->d_weights_native_emins,
@@ -6891,14 +6891,14 @@ namespace llaminar2
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
                                 n, k,
-                                impl_->native_vnni_codebook_id,
-                                requireNativeVNNIArithmeticPolicyCodebook(
-                                    impl_->native_vnni_codebook_id,
+                                impl_->native_quantised_codebook_id,
+                                requireNativeQuantisedArithmeticPolicyCodebook(
+                                    impl_->native_quantised_codebook_id,
                                     impl_->native_source_identity),
                                 rocm_device_id_, gpu_stream_,
                                 impl_->d_scales_A_blockwise))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI GEMV failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] NativeQuantised GEMV failed");
                             return false;
                         }
 
@@ -6916,7 +6916,7 @@ namespace llaminar2
                                     rocm_device_id_,
                                     gpu_stream_))
                             {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI beta epilogue failed");
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] NativeQuantised beta epilogue failed");
                                 return false;
                             }
                         }
@@ -6931,7 +6931,7 @@ namespace llaminar2
                                     rocm_device_id_,
                                     gpu_stream_))
                             {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI epilogue failed");
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] NativeQuantised epilogue failed");
                                 return false;
                             }
                         }
@@ -7027,8 +7027,8 @@ namespace llaminar2
 
             // Ensure weights converted and validate workspace
             ensureWeightsConverted();
-            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_vnni))
-                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeVNNI route");
+            if (currentProjectionRowWork(m) && (!impl_ || !impl_->has_native_quantised))
+                throw std::invalid_argument("Decode projection work requires the prepared all-codebook NativeQuantised route");
             validateWorkspace();
 
             // Step 1: Quantize FP32 activations to INT8 (blockwise)
@@ -7039,16 +7039,16 @@ namespace llaminar2
                 return false;
             }
 
-            // Step 1b: Try native-VNNI GEMM (halved HBM bandwidth, no epilogue)
-            // Same pattern as multiply_tensor and multiply_fp32_to_fp32: native-VNNI
+            // Step 1b: Try native-quantised GEMM (halved HBM bandwidth, no epilogue)
+            // Same pattern as multiply_tensor and multiply_fp32_to_fp32: native-quantised
             // produces final FP32 output with per-block scales applied inline.
             // Bias is applied via a lightweight biasAdd kernel after the GEMM.
-            if (m > 1 && impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
+            if (m > 1 && impl_->has_native_quantised && alpha == 1.0f && beta == 0.0f)
             {
-                const uint8_t cb_id = impl_->native_vnni_codebook_id;
-                if (rocmGemm_native_vnni_fp32_with_policy(
+                const uint8_t cb_id = impl_->native_quantised_codebook_id;
+                if (rocmGemm_native_quantised_fp32_with_policy(
                         impl_->d_A_int8,
-                        impl_->d_weights_native_vnni,
+                        impl_->d_weights_native_quantised,
                         impl_->d_weights_native_scales,
                         impl_->d_weights_native_mins,
                         impl_->d_weights_native_emins,
@@ -7057,13 +7057,13 @@ namespace llaminar2
                         impl_->d_scales_A_blockwise,
                         m, n, k,
                         cb_id,
-                        requireNativeVNNIArithmeticPolicyCodebook(
+                        requireNativeQuantisedArithmeticPolicyCodebook(
                             cb_id,
                             impl_->native_source_identity),
                         rocm_device_id_, gpu_stream_))
                 {
                     LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
-                              "Native-VNNI GEMM succeeded (M="
+                              "NativeQuantised GEMM succeeded (M="
                               << m << " N=" << n << " K=" << k
                               << " codebook=" << static_cast<int>(cb_id) << " +bias)");
 
@@ -7071,14 +7071,14 @@ namespace llaminar2
                     {
                         if (!rocmQuantGemm_biasAdd(d_C, d_bias, m, n, rocm_device_id_, gpu_stream_))
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI GEMM bias add failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] NativeQuantised GEMM bias add failed");
                             return false;
                         }
                     }
                     return true;
                 }
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
-                          "Native-VNNI GEMM failed; refusing INT8 GEMM fallback");
+                          "NativeQuantised GEMM failed; refusing INT8 GEMM fallback");
                 return false;
             }
 
@@ -7096,9 +7096,9 @@ namespace llaminar2
                 return true;
             }
 
-            // CK fallback retired — native-VNNI / INT8-VNNI are the only supported paths.
+            // CK fallback retired — native-quantised / INT8-VNNI are the only supported paths.
             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
-                      "Native-VNNI and INT8-VNNI prefill both failed (m="
+                      "NativeQuantised and INT8-VNNI prefill both failed (m="
                       << m
                       << " n=" << n << " k=" << k << "); CK fallback has been removed.");
             return false;

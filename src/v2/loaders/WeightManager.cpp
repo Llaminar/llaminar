@@ -6657,7 +6657,7 @@ namespace llaminar2
 
         size_t max_raw_bytes = 0;
         size_t planned_storage_count = 0;
-        std::vector<std::pair<std::string, const NativeVnniFormatInfo *>> weight_formats;
+        std::vector<std::pair<std::string, const NativeQuantisedFormatInfo *>> weight_formats;
         weight_formats.reserve(gemm_weights.size());
 
         for (const auto &job : gemm_weights)
@@ -6668,7 +6668,7 @@ namespace llaminar2
                 continue;
 
             auto *unpackable = dynamic_cast<IINT8Unpackable *>(tensor);
-            const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            const NativeQuantisedFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
             if (!vnni)
             {
                 // Floating-point types (FP32, FP16, BF16) don't use VNNI repack —
@@ -6717,7 +6717,7 @@ namespace llaminar2
             int row_offset = 0;
         };
 
-        std::vector<const NativeVnniFormatInfo *> moe_vnni_infos;
+        std::vector<const NativeQuantisedFormatInfo *> moe_vnni_infos;
         moe_vnni_infos.reserve(moe_jobs.size());
         std::vector<MoEPackedStorageRef> moe_storage_refs(moe_jobs.size());
         std::vector<WeightJob> moe_logical_jobs;
@@ -6732,7 +6732,7 @@ namespace llaminar2
         {
             const auto &mj = moe_jobs[semantic_index];
             auto *unpackable = dynamic_cast<IINT8Unpackable *>(mj.view.get());
-            const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            const NativeQuantisedFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
             WeightJob logical_job;
             logical_job.name = mj.slot_name;
             logical_job.host_raw_data = mj.view ? mj.view->raw_data() : nullptr;
@@ -6793,7 +6793,7 @@ namespace llaminar2
                 const auto allocation = overlay_preparation_plan
                                             ? reusableDeviceVnniAllocationFormat(
                                                   *vnni)
-                                            : NativeVnniReusableDeviceAllocationFormat{
+                                            : NativeQuantisedReusableDeviceAllocationFormat{
                                                   .payload_bytes_per_block =
                                                       static_cast<uint8_t>(
                                                           vnni->payload_bytes),
@@ -6872,7 +6872,7 @@ namespace llaminar2
                     const auto allocation = overlay_preparation_plan
                                                 ? reusableDeviceVnniAllocationFormat(
                                                       *vnni)
-                                                : NativeVnniReusableDeviceAllocationFormat{
+                                                : NativeQuantisedReusableDeviceAllocationFormat{
                                                       .payload_bytes_per_block =
                                                           static_cast<uint8_t>(
                                                               vnni->payload_bytes),

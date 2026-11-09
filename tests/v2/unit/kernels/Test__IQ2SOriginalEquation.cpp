@@ -20,8 +20,8 @@
 #include "tensors/FP16Utils.h"
 #include "tensors/IQQuantTables.h"
 #include "tensors/VnniPackContext.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
-#include "kernels/cpu/gemm/CPUNativeVNNIMultiScaleKernels.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
 
@@ -29,7 +29,7 @@ namespace llaminar2::test
 {
 namespace
 {
-using namespace cpu::native_vnni;
+using namespace cpu::native_quantised;
 constexpr int kFullN = 73, kStart = 3, kN = 67, kK = 288;
 constexpr int kBlocks = kK / 32, kSuperblocks = (kK + 255) / 256;
 constexpr std::array<uint16_t, 20> kBases = {
@@ -122,7 +122,7 @@ private:
  * @param chunk Destination 64-column chunk.
  */
 template<int Lanes, size_t Rows>
-void checkSIMD(const CPUNativeVNNIPackedWeights &packed,
+void checkSIMD(const CPUNativeQuantisedPackedWeights &packed,
     const std::vector<IQ2_SBlock> &source,
     const std::array<std::array<Q8_1Block, kBlocks>, 4> &activations, int chunk)
 {
@@ -174,8 +174,8 @@ TEST_F(IQ2SOriginalEquation, OrdinaryFiniteScaleChangesOriginalEquationWithFixed
     std::vector<uint8_t> raw(sizeof(original));
     std::memcpy(raw.data(), &original, raw.size());
     IQ2_STensor source({1, 32}, raw);
-    CPUNativeVNNIPackedWeights packed;
-    ASSERT_TRUE(packWeightsCPUNativeVNNI(&source, packed));
+    CPUNativeQuantisedPackedWeights packed;
+    ASSERT_TRUE(packWeightsCPUNativeQuantised(&source, packed));
     ASSERT_EQ(packed.codebook_id, 13);
     Q8_1Block activation{};
     activation.d = 0x3c00; activation.qs[0] = 1; activation.qs[31] = 127; activation.sum_qs = 128;
@@ -185,7 +185,7 @@ TEST_F(IQ2SOriginalEquation, OrdinaryFiniteScaleChangesOriginalEquationWithFixed
         ASSERT_EQ(device_q8_activation_contract::quantize(float(activation.qs[lane]), 1.0f), activation.qs[lane]);
     ASSERT_EQ(contribution(original, 0, activation), 384.375f);
     float actual = -123.0f;
-    gemv_native_vnni_scalar(packed, &activation, &actual, 1, 1);
+    gemv_native_quantised_scalar(packed, &activation, &actual, 1, 1);
     EXPECT_EQ(std::bit_cast<uint32_t>(actual), std::bit_cast<uint32_t>(384.375f));
     EXPECT_EQ(std::memcmp(&activation, &before, sizeof(activation)), 0);
     EXPECT_EQ(std::memcmp(source.raw_data(), raw.data(), raw.size()), 0);
@@ -276,8 +276,8 @@ TEST_F(IQ2SOriginalEquation, ScalarAndAllSIMDRowsUseOriginalFactors)
     std::vector<uint8_t> bytes(source.size() * sizeof(IQ2_SBlock));
     std::memcpy(bytes.data(), source.data(), bytes.size());
     IQ2_STensor tensor({kFullN, kK}, bytes);
-    CPUNativeVNNIPackedWeights packed;
-    ASSERT_TRUE(packWeightsCPUNativeVNNI(&tensor, packed, kStart, kStart + kN));
+    CPUNativeQuantisedPackedWeights packed;
+    ASSERT_TRUE(packWeightsCPUNativeQuantised(&tensor, packed, kStart, kStart + kN));
     ASSERT_TRUE(packed.usesCompactMultiScale());
     ASSERT_EQ(packed.codebook_id, 13);
     EXPECT_EQ(packed.interleaved_block_stride, 1536);
@@ -301,7 +301,7 @@ TEST_F(IQ2SOriginalEquation, ScalarAndAllSIMDRowsUseOriginalFactors)
     std::array<float, kN> scalar{};
     for (int row = 0; row < 4; ++row)
     {
-        gemv_native_vnni_scalar(packed, activations[row].data(), scalar.data(), kN, kBlocks);
+        gemv_native_quantised_scalar(packed, activations[row].data(), scalar.data(), kN, kBlocks);
         for (int n = 0; n < kN; ++n)
         {
             float expected = 0.0f;

@@ -9,6 +9,8 @@
  * ROCm, and CPU/NUMA endpoints can share one production model topology.
  * Native-capture ownership follows every declared service boundary: portable
  * inter-host MPI and colocated CPU work share the typed ticket lifecycle.
+ * Ordinary-prefill CPU input publication precedes independent shared GPU FFN
+ * work; result ingress still follows the final canonical-bank writer.
  * Independent rank-batch sends and colocated expert compute share a fork;
  * ordered return publication is the join, not a prerequisite for local compute.
  * CPU ExpertOverlay graphs adopt exact participant registry engines and shared
@@ -74,7 +76,7 @@
 #include "../../memory/BufferId.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
 #include "../../planning/ActivationBufferSizing.h"
-#include "../../tensors/NativeVnniFormatInfo.h"
+#include "../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../tensors/Tensors.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -1110,7 +1112,7 @@ namespace llaminar2
                     LOG_ERROR("[Qwen35MoEGraph] " << context
                                                   << ": prepared GEMM engines for local expert "
                                                   << expert << " layer " << layer_idx
-                                                  << " cannot export one uniform NativeVNNI/FP16/BF16/FP32 descriptor family");
+                                                  << " cannot export one uniform NativeQuantised/FP16/BF16/FP32 descriptor family");
                     return false;
                 }
 
@@ -1300,7 +1302,7 @@ namespace llaminar2
                     LOG_ERROR("[Qwen35MoEGraph] " << context
                                                   << ": prepared GEMM engines for expert "
                                                   << expert << " layer " << layer_idx
-                                                  << " cannot export one uniform NativeVNNI/FP16/BF16/FP32 descriptor family");
+                                                  << " cannot export one uniform NativeQuantised/FP16/BF16/FP32 descriptor family");
                     return false;
                 }
 
@@ -2065,12 +2067,12 @@ namespace llaminar2
                     };
                 }
 
-                DeviceNativeVNNIMatrixDesc descriptor{};
-                NativeVnniSourceIdentity source_identity{};
-                if (!engine->exportNativeVNNIMatrixDesc(descriptor) ||
-                    !engine->exportNativeVNNISourceIdentity(source_identity) ||
+                DeviceNativeQuantisedMatrixDesc descriptor{};
+                NativeQuantisedSourceIdentity source_identity{};
+                if (!engine->exportNativeQuantisedMatrixDesc(descriptor) ||
+                    !engine->exportNativeQuantisedSourceIdentity(source_identity) ||
                     !source_identity.present ||
-                    native_vnni_formats::forSourceIdentity(
+                    native_quantised_formats::forSourceIdentity(
                         source_identity.codebook_id,
                         source_identity.is_superblock) == nullptr ||
                     !descriptor.valid() ||
@@ -2110,7 +2112,7 @@ namespace llaminar2
                 spec.has_emins = has_emins != 0;
                 spec.codebook_id = descriptor.codebook_id;
                 spec.format =
-                    ExpertWeightFormat::nativeVnni(source_identity);
+                    ExpertWeightFormat::nativeQuantised(source_identity);
                 return spec;
             };
 
@@ -5707,7 +5709,7 @@ namespace llaminar2
                         if (!exact_specs.has_value())
                         {
                             throw std::runtime_error(
-                                "Qwen35 MoE graph found an invalid NativeVNNI "
+                                "Qwen35 MoE graph found an invalid NativeQuantised "
                                 "descriptor triple for model layer " +
                                 std::to_string(scan_layer) + " expert " +
                                 std::to_string(expert) + " in " +
@@ -5771,7 +5773,7 @@ namespace llaminar2
                 if (!found_layer_format)
                 {
                     throw std::runtime_error(
-                        "Qwen35 MoE graph could not derive NativeVNNI "
+                        "Qwen35 MoE graph could not derive NativeQuantised "
                         "transfer-slot specs from prepared engines for model layer " +
                         std::to_string(scan_layer) + " on " + device.to_string());
                 }
@@ -7500,6 +7502,15 @@ namespace llaminar2
         TensorBase *shared_output = buffers.get(buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT));
         bool moe_combined_output_ready = false;
         std::string shared_ffn_last; // Track last shared expert stage (empty if no shared expert)
+        // Only an ordinary-prefill CPU authority can publish this existing
+        // routing ticket. Carry its node identity to the independent shared FFN
+        // so topological scheduling cannot delay the CPU fork behind that work.
+        struct SharedPrefillCPUInputFork
+        {
+            std::string publication_node;
+            std::string routed_expert_node;
+        };
+        std::optional<SharedPrefillCPUInputFork> shared_prefill_cpu_input_fork;
         /* Retain the root-only publisher identity so trace-only checkpoints can
          * localize the exact captured sibling immediately before it. */
         /*
@@ -9843,6 +9854,23 @@ namespace llaminar2
                                     captured_local_expert_compute_node);
                             }
                         }
+                    }
+                    if (ordinary_prefill_graph && has_shared_expert_branch &&
+                        planned_shared_device == device &&
+                        requiresHeterogeneousTicketSegmentation(graph.nativeCaptureEnvelope()) &&
+                        !dispatch_ticket_publish_name.empty() &&
+                        !captured_local_expert_compute_node.empty() &&
+                        std::any_of(owner_map_lifetime->participants().begin(),
+                            owner_map_lifetime->participants().end(),
+                            [](const auto &participant) { return participant.device.is_cpu(); }))
+                    {
+                        // The complete ticket owns normalized rows and routes
+                        // before either expert branch runs. CPU service already
+                        // waits on this publication in its persistent worker;
+                        // it need not wait for the unrelated shared GPU FFN.
+                        shared_prefill_cpu_input_fork = SharedPrefillCPUInputFork{
+                            .publication_node = dispatch_ticket_publish_name,
+                            .routed_expert_node = captured_local_expert_compute_node};
                     }
                     host_dispatch_path_materialized = true;
                 };
@@ -12816,6 +12844,22 @@ namespace llaminar2
                         ordered_reduce_dependency = rooted_params.stage_name;
                     }
 
+                    // The native rooted reduction is still part of the GPU
+                    // producer. Retain this frontier before CPU/follower
+                    // ingress extends the ordered fold's dependencies below.
+                    const std::string captured_continuation_terminal =
+                        ordered_reduce_dependency;
+                    for (const auto &pending : pending_canonical_ticket_consumes)
+                    {
+                        // The native reduction also writes the canonical bank.
+                        // CPU rows may replace their slots only after every
+                        // continuation writer, irrespective of launch ordering.
+                        graph.addDependency(
+                            prefix + "moe_overlay_canonical_ticket_consume_" +
+                                pending.participant_suffix,
+                            captured_continuation_terminal);
+                    }
+
                     if (use_mapped_activation_parent)
                     {
                         if (mapped_activation_return_nodes.empty() ||
@@ -12831,6 +12875,19 @@ namespace llaminar2
                         graph.addDependency(
                             mapped_activation_return_nodes.front(),
                             ordered_reduce_dependency);
+                        ordered_reduce_dependency = last_return_reduce;
+                    }
+
+                    const bool has_cpu_ticket_boundary =
+                        requiresHeterogeneousTicketSegmentation(
+                            graph.nativeCaptureEnvelope()) &&
+                        (has_external_contributions || use_mapped_activation_parent);
+                    if (has_cpu_ticket_boundary && !last_return_reduce.empty())
+                    {
+                        // Portable CPU packets and their ticket ingress form
+                        // one service unit. Keep the final GPU fold in its
+                        // captured suffix instead of interleaving a launch
+                        // between host parsing and remote dispatch.
                         ordered_reduce_dependency = last_return_reduce;
                     }
 
@@ -12892,6 +12949,12 @@ namespace llaminar2
                     graph.addDependency(
                         ordered_reduce_name,
                         ordered_reduce_dependency);
+                    if (ordered_reduce_dependency != captured_continuation_terminal)
+                    {
+                        graph.addDependency(
+                            ordered_reduce_name,
+                            captured_continuation_terminal);
+                    }
                     if (!local_canonical_ticket_terminal.empty())
                     {
                         graph.addDependency(
@@ -12920,9 +12983,7 @@ namespace llaminar2
                     graph.setGraphCaptureWaveContract(
                         ordered_reduce_name,
                         std::move(ordered_reduce_capture_wave));
-                    if (requiresHeterogeneousTicketSegmentation(
-                            graph.nativeCaptureEnvelope()) &&
-                        (has_external_contributions || use_mapped_activation_parent))
+                    if (has_cpu_ticket_boundary)
                     {
                         /*
                          * Close the captured producer immediately before the
@@ -12934,33 +12995,32 @@ namespace llaminar2
                          * that suffix a second time and manufacture two native
                          * executables for every one manual boundary.
                          *
-                         * Every continuation participant owns this local
-                         * expert terminal, so authority and LocalTP followers
-                         * retain the same typed cutpoint without moving a
-                         * collective across the CPU transaction.
+                         * Every continuation participant owns the complete
+                         * local producer, including the native rooted route
+                         * collective when selected. Closing before that
+                         * collective would place a GPU launch between host
+                         * ticket parsing and CPU service, splitting one
+                         * authenticated boundary into two manual units.
                          */
                         graph.setHeterogeneousTicketUnitContract(
-                            captured_local_expert_terminal,
+                            captured_continuation_terminal,
                             GraphHeterogeneousTicketUnitContract{
                                 .identity =
                                     prefix +
                                     "moe_overlay_pre_cpu_ticket_unit",
                             });
 
-                        if (!rank_local_ticket_return_terminal.empty())
+                        if (host_dispatch_path_materialized &&
+                            sparse_graph_contract.ownsDispatchAuthority())
                         {
-                            /*
-                             * Declaratively place the root's host ticket unit
-                             * after the same captured terminal used by every
-                             * continuation participant.  This is submission
-                             * order only; the ticket consumer observes its
-                             * earlier exact publication edge and need not wait
-                             * for unrelated work at this terminal.
-                             */
+                            // This is submission order, not a stream fence.
+                            // The host still consumes the earlier exact ticket
+                            // publication while the captured producer retires.
                             graph.addDependency(
                                 dispatch_name,
-                                ordered_reduce_name);
+                                captured_continuation_terminal);
                         }
+
                     }
                     if (sparse_graph_contract.ownsDispatchAuthority())
                     {
@@ -12976,7 +13036,9 @@ namespace llaminar2
                         {
                             graph.addDependency(
                                 rank_batch_dispatch_name,
-                                ordered_reduce_name);
+                                has_cpu_ticket_boundary
+                                    ? captured_continuation_terminal
+                                    : ordered_reduce_name);
                         }
                     }
 
@@ -13929,6 +13991,20 @@ namespace llaminar2
                           ComputeStageFactory::createSharedExpertFFN(shared_params),
                           shared_device);
             graph.addDependency(prefix + "shared_expert_ffn", prefix + "ffn_norm");
+            if (shared_prefill_cpu_input_fork)
+            {
+                // FIFO topological order otherwise makes this ffn_norm sibling
+                // ready before routing's ticket child. Publish the same input
+                // ticket first; retain the existing late CPU-result ingress and
+                // all GPU scratch, arithmetic and collective dependencies.
+                graph.addDependency(prefix + "shared_expert_ffn",
+                    shared_prefill_cpu_input_fork->publication_node);
+                // Preserve the former exact-stream shared-before-routed order;
+                // only the CPU fork moves earlier, not either FFN's math or
+                // the rank-symmetric collective sequence.
+                graph.addDependency(shared_prefill_cpu_input_fork->routed_expert_node,
+                    prefix + "shared_expert_ffn");
+            }
             if (shared_requires_router_q8_publication)
             {
                 /*

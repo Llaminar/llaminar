@@ -6,8 +6,8 @@
  * allocated by the original persistent owner and never charged here again.
  */
 #include "CPUWeightPreparationGeometry.h"
-#include "CPUNativeVNNIWeightPacker.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "CPUNativeQuantisedWeightPacker.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <limits>
 namespace llaminar2 {
 std::optional<NativeWeightLoadStagingRequest> quoteCPUWeightPreparation(
@@ -34,23 +34,23 @@ std::optional<NativeWeightLoadStagingRequest> quoteCPUWeightPreparation(
         if(n>std::numeric_limits<size_t>::max()/k)throw std::overflow_error("CPU source population overflows");
         if(precision==WeightPrecision::CONVERT_TO_INT8) {
             if(k%32)throw std::invalid_argument("Q8_0 conversion requires complete native groups");
-            const auto* q8=native_vnni_formats::forQuantType("Q8_0");
+            const auto* q8=native_quantised_formats::forQuantType("Q8_0");
             const auto pack=consumer==CPUWeightConsumer::PreparedGemm
-                ? sizeof(Q8_0Block)+cpu::native_vnni::NativePackGroupScratch::checked(*q8).bytes : 0;
+                ? sizeof(Q8_0Block)+cpu::native_quantised::NativePackGroupScratch::checked(*q8).bytes : 0;
             return NativeWeightLoadStagingRequest{32*source_bytes,32*sizeof(float)+pack,
                 consumer==CPUWeightConsumer::PreparedGemm?64u:0u,n*(k/32)};
         }
         return NativeWeightLoadStagingRequest{source_bytes,0,0,n*k};
     }
-    const auto* format=native_vnni_formats::forQuantType(tensorTypeName(type));
+    const auto* format=native_quantised_formats::forQuantType(tensorTypeName(type));
     if(!format)throw std::invalid_argument("CPU weight quote has unsupported original native format");
     const auto elements=format->is_superblock?size_t(256):size_t(32);
     if(k%elements)throw std::invalid_argument("CPU native source K must preserve original group boundaries");
     if(n>std::numeric_limits<size_t>::max()/(k/elements))throw std::overflow_error("CPU native group population overflows");
-    const auto bytes=cpu::native_vnni::native_block_bytes_for_format(format->codebook_id,format->is_superblock);
+    const auto bytes=cpu::native_quantised::native_block_bytes_for_format(format->codebook_id,format->is_superblock);
     if(precision==WeightPrecision::NATIVE) {
         if(consumer==CPUWeightConsumer::ResidentTensor)return std::nullopt;
-        return NativeWeightLoadStagingRequest{bytes,cpu::native_vnni::NativePackGroupScratch::checked(*format).bytes,0,n*(k/elements)};
+        return NativeWeightLoadStagingRequest{bytes,cpu::native_quantised::NativePackGroupScratch::checked(*format).bytes,0,n*(k/elements)};
     }
     if(precision==WeightPrecision::CONVERT_TO_INT8)
         throw std::invalid_argument("Original native quantized CPU weights cannot be requantized");

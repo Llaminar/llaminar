@@ -1616,10 +1616,10 @@ TEST(Test__GDNProjectionArithmetic, HalfAlphaBetaMaterializationLeavesWideQuanti
         ASSERT_TRUE(binding.prepared);
         const auto engine=manager.preparedWeightStore()->gemmKernelLifetime(*binding.prepared);
         ASSERT_TRUE(engine);
-        const auto* actual=engine->exportCPUNativeVNNIPackedWeights();
+        const auto* actual=engine->exportCPUNativeQuantisedPackedWeights();
         ASSERT_NE(actual,nullptr);
-        cpu::native_vnni::CPUNativeVNNIPackedWeights expected_bank;
-        ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(wide.get(),expected_bank));
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_bank;
+        ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(wide.get(),expected_bank));
         ASSERT_EQ(actual->native_interleaved.size(),expected_bank.native_interleaved.size());
         EXPECT_EQ(std::memcmp(actual->native_interleaved.data(),expected_bank.native_interleaved.data(),
             actual->native_interleaved.size()),0);

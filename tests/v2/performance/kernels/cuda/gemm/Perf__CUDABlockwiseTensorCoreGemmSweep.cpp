@@ -1,6 +1,6 @@
 /**
  * @file Perf__CUDABlockwiseTensorCoreGemmSweep.cpp
- * @brief Parameterized GEMV dispatch sweep for CUDA native-vnni tuned kernels.
+ * @brief Parameterized GEMV dispatch sweep for CUDA native-quantised tuned kernels.
  */
 
 #include <gtest/gtest.h>
@@ -43,12 +43,12 @@ using llaminar::v2::kernels::KernelFactory;
 
 extern "C"
 {
-    void cudaNativeVNNIGemvSweep_setConfig(
+    void cudaNativeQuantisedGemvSweep_setConfig(
         int kernel_family, int tile_n, int cpt,
         int target_waves, int mkg, int max_kb,
         int exact_kb,
         int force_two_phase);
-    void cudaNativeVNNIGemvSweep_clearConfig();
+    void cudaNativeQuantisedGemvSweep_clearConfig();
 }
 
 namespace
@@ -66,7 +66,7 @@ namespace
      * @brief Build a deterministic, structurally valid quantized weight tensor for dispatch sweeps.
      *
      * Dispatch-table training only needs each candidate to see the production tensor
-     * class, NativeVNNI metadata, upload path, and packed byte count.  It does not
+     * class, NativeQuantised metadata, upload path, and packed byte count.  It does not
      * need statistically realistic random model weights.  The regular
      * TestTensorFactory random quantizers are excellent correctness fixtures, but on
      * LM-head shapes they spend minutes generating per-element host random data
@@ -142,10 +142,10 @@ namespace
          { return createFastSweepTensor<Q8_KTensor, Q8_KBlock>(n, k); }},
     };
 
-    const NativeVnniFormatInfo &requireNativeVnniInfo(const TensorBase *weights, const std::string &format_name)
+    const NativeQuantisedFormatInfo &requireNativeQuantisedInfo(const TensorBase *weights, const std::string &format_name)
     {
         const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
-        const NativeVnniFormatInfo *info = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        const NativeQuantisedFormatInfo *info = unpackable ? unpackable->vnniFormatInfo() : nullptr;
         if (!info)
             throw std::runtime_error("CUDA decode sweep format " + format_name + " did not expose vnniFormatInfo()");
         return *info;
@@ -161,7 +161,7 @@ namespace
     const std::vector<Shape> kQwenShapes = {
         // Qwen3.5-35B-A3B MoE expert FFN shapes (d_model=2048, expert_intermediate=512).
         // These are the production hot-path GEMVs for grouped MoE decode and mirror the
-        // CUDA NativeVNNI prefill sweep inventory.
+        // CUDA NativeQuantised prefill sweep inventory.
         {"35BMoE_Expert_GateUp", 512, 2048},
         {"35BMoE_Expert_Down", 2048, 512},
         {"0.5B_Attn", 896, 896},
@@ -491,7 +491,7 @@ namespace
         {
             if (force_phase != std::vector<int>{1})
                 throw std::invalid_argument(
-                    "CUDA NativeVNNI KPAR supports only ordered publication (phase 1)");
+                    "CUDA NativeQuantised KPAR supports only ordered publication (phase 1)");
             cfg.force_two_phase_values = force_phase;
         }
 
@@ -562,7 +562,7 @@ namespace
     {
         /**
          * The CUDA decode trainer uses makeGpuPreparedGemm(), which mirrors the
-         * production VRAM-pool upload path.  That path owns native-VNNI payloads
+         * production VRAM-pool upload path.  That path owns native-quantised payloads
          * and workspace buffers, but it does not own the optional row-major
          * transpose required by ROWPAR.  Do not emit ROWPAR training rows from
          * this harness until a row-major-owner preparation mode is added.
@@ -619,9 +619,9 @@ namespace
             const SweepConfig &cfg,
             const TuneCandidate &candidate)
         {
-            // NativeVNNI is always enabled (sole CUDA GEMM path)
+            // NativeQuantised is always enabled (sole CUDA GEMM path)
 
-            cudaNativeVNNIGemvSweep_setConfig(
+            cudaNativeQuantisedGemvSweep_setConfig(
                 static_cast<int>(candidate.family),
                 candidate.tile_n,
                 candidate.cpt,
@@ -633,14 +633,14 @@ namespace
 
             if (!kernel)
             {
-                cudaNativeVNNIGemvSweep_clearConfig();
-                throw std::runtime_error("CUDA NativeVNNI sweep has no prepared GEMM kernel");
+                cudaNativeQuantisedGemvSweep_clearConfig();
+                throw std::runtime_error("CUDA NativeQuantised sweep has no prepared GEMM kernel");
             }
 
             cudaStream_t stream = nullptr;
             if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
             {
-                cudaNativeVNNIGemvSweep_clearConfig();
+                cudaNativeQuantisedGemvSweep_clearConfig();
                 throw std::runtime_error("cudaStreamCreateWithFlags failed");
             }
             kernel->setGPUStream(static_cast<void *>(stream));
@@ -653,7 +653,7 @@ namespace
                     ws_consumer->unbindWorkspace();
                 kernel->clearGPUStreamBinding();
                 cudaStreamDestroy(stream);
-                cudaNativeVNNIGemvSweep_clearConfig();
+                cudaNativeQuantisedGemvSweep_clearConfig();
             };
 
             if (ws_consumer)
@@ -782,7 +782,7 @@ namespace
                     break;
 
                 auto weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
-                const uint8_t codebook_id = requireNativeVnniInfo(weights.get(), format.name).codebook_id;
+                const uint8_t codebook_id = requireNativeQuantisedInfo(weights.get(), format.name).codebook_id;
                 const size_t weight_bytes = weights->size_bytes();
 
                 /*
@@ -794,7 +794,7 @@ namespace
                 auto prepared = makeGpuPreparedGemm(
                     weights.get(),
                     device_,
-                    "perf.cuda_native_vnni_gemv_sweep.weight");
+                    "perf.cuda_native_quantised_gemv_sweep.weight");
                 ASSERT_NE(prepared.kernel, nullptr) << "makeGpuPreparedGemm returned null GEMM kernel";
 
                 for (const int m : cfg.m_values)

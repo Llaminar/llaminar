@@ -8,7 +8,7 @@ could not capture `layer12_down_proj` at M=4096, N=896, K=4864. The installed
 exact prefill overlay selects the wide BK256 kernel for this shape. Its
 59,392-byte dynamic shared-memory requirement exceeds the default CUDA limit.
 
-`launchNativeVNNITC_BK256` kept two process-global `smem_configured` booleans,
+`launchNativeQuantisedTC_BK256` kept two process-global `smem_configured` booleans,
 one per arithmetic specialization. CUDA function opt-in belongs to the current
 device context, not the process. GPU 0 set the flag; GPU 1 skipped its own
 opt-in and failed launch. A per-ordinal boolean would also become stale after
@@ -48,7 +48,7 @@ and the common all-format preflight remains required after this change.
 
 ## Regression contract
 
-The existing `V2_Integration_CUDANativeVNNIPrefillStaging` preflight registration
+The existing `V2_Integration_CUDANativeQuantisedPrefillStaging` preflight registration
 now includes sequential all-visible-device and concurrent participant launch
 tests. They cover narrow/wide BK256, fresh instance-owned contexts, reverse
 device order, and the actual 4096-row bucket. Each graph replays twenty times
