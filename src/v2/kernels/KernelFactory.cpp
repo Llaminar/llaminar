@@ -2050,58 +2050,6 @@ namespace llaminar
                 }
             }
 
-            llaminar2::ITensorRoPE *KernelFactory::getOrCreateRoPE(
-                const llaminar2::TensorBase *tensor,
-                llaminar2::DeviceId target_device)
-            {
-                if (!tensor)
-                {
-                    throw std::runtime_error("KernelFactory::getOrCreateRoPE: null tensor");
-                }
-
-                const DeviceKernelKey registry_key{
-                    target_device,
-                    KernelKind::ROPE,
-                    static_cast<int>(tensor->native_type())};
-
-                RoPECacheKey key{target_device, static_cast<int>(tensor->native_type())};
-
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-
-                // Phase A registry front-door (behavior-preserving shim)
-                auto reg_it = device_kernel_registry_.find(registry_key);
-                if (reg_it != device_kernel_registry_.end())
-                {
-                    LOG_DEBUG("[KernelFactory][Registry] hit kind=ROPE dev=" << static_cast<int>(target_device.type)
-                                                                             << ":" << target_device.ordinal
-                                                                             << " variant=" << static_cast<int>(tensor->native_type())
-                                                                             << " ptr=" << reg_it->second.get());
-                    return static_cast<llaminar2::ITensorRoPE *>(reg_it->second.get());
-                }
-
-                auto it = rope_cache_.find(key);
-                if (it != rope_cache_.end())
-                {
-                    auto *raw_ptr = it->second.get();
-                    device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
-                    LOG_DEBUG("[KernelFactory][Registry] backfill kind=ROPE dev=" << static_cast<int>(target_device.type)
-                                                                                  << ":" << target_device.ordinal
-                                                                                  << " variant=" << static_cast<int>(tensor->native_type())
-                                                                                  << " ptr=" << raw_ptr);
-                    return raw_ptr;
-                }
-
-                auto kernel = createRoPE(tensor, getDeviceType(target_device), target_device.ordinal);
-                auto *raw_ptr = kernel.get();
-                rope_cache_[key] = std::move(kernel);
-                device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
-                LOG_DEBUG("[KernelFactory][Registry] create kind=ROPE dev=" << static_cast<int>(target_device.type)
-                                                                            << ":" << target_device.ordinal
-                                                                            << " variant=" << static_cast<int>(tensor->native_type())
-                                                                            << " ptr=" << raw_ptr);
-                return raw_ptr;
-            }
-
             llaminar2::ITensorRMSNorm *KernelFactory::getOrCreateRMSNorm(
                 const llaminar2::TensorBase *tensor,
                 llaminar2::DeviceId target_device)
@@ -2826,7 +2774,6 @@ namespace llaminar
 
             std::mutex KernelFactory::cache_mutex_;
             std::unordered_map<KernelFactory::FusedGateUpCacheKey, std::unique_ptr<llaminar2::ITensorFusedGateUpGemm>, KernelFactory::FusedGateUpKeyHash> KernelFactory::fused_gate_up_cache_;
-            std::unordered_map<KernelFactory::RoPECacheKey, std::unique_ptr<llaminar2::ITensorRoPE>, KernelFactory::RoPECacheKeyHash> KernelFactory::rope_cache_;
             std::unordered_map<KernelFactory::RMSNormCacheKey, std::unique_ptr<llaminar2::ITensorRMSNorm>, KernelFactory::RMSNormCacheKeyHash> KernelFactory::rmsnorm_cache_;
             std::unordered_map<KernelFactory::SwiGLUCacheKey, std::unique_ptr<llaminar2::ITensorSwiGLU>, KernelFactory::SwiGLUCacheKeyHash> KernelFactory::swiglu_cache_;
             std::unordered_map<KernelFactory::SoftmaxCacheKey, std::unique_ptr<llaminar2::ITensorSoftmax>, KernelFactory::SoftmaxCacheKeyHash> KernelFactory::softmax_cache_;
@@ -2937,7 +2884,6 @@ namespace llaminar
                 }
 
                 fused_gate_up_cache_.clear();
-                rope_cache_.clear();
                 rmsnorm_cache_.clear();
                 swiglu_cache_.clear();
                 softmax_cache_.clear();
@@ -2971,7 +2917,6 @@ namespace llaminar
                 };
 
                 reset_kernel_cache(fused_gate_up_cache_);
-                reset_kernel_cache(rope_cache_);
                 reset_kernel_cache(rmsnorm_cache_);
                 reset_kernel_cache(swiglu_cache_);
                 reset_kernel_cache(softmax_cache_);
@@ -2992,8 +2937,7 @@ namespace llaminar
 
                 LOG_DEBUG("[KernelFactory] Reset dynamic state on "
                           << embedding_cache_.size() << " embedding, "
-                          << attention_cache_.size() << " attention, "
-                          << rope_cache_.size() << " RoPE kernels");
+                          << attention_cache_.size() << " attention kernels");
             }
 
             std::pair<size_t, size_t> KernelFactory::cacheStats()
@@ -3002,7 +2946,7 @@ namespace llaminar
                 size_t total_bytes = 0;
                 // Note: packed_bytes not tracked per-kernel
                 // For now, just return count (includes all caches)
-                return {fused_gate_up_cache_.size() + rope_cache_.size() + rmsnorm_cache_.size() + swiglu_cache_.size() + softmax_cache_.size() + residual_add_cache_.size() + attention_cache_.size() + embedding_cache_.size() + device_kernel_registry_.size(), total_bytes};
+                return {fused_gate_up_cache_.size() + rmsnorm_cache_.size() + swiglu_cache_.size() + softmax_cache_.size() + residual_add_cache_.size() + attention_cache_.size() + embedding_cache_.size() + device_kernel_registry_.size(), total_bytes};
             }
 
             std::shared_ptr<void> KernelFactory::getDeviceKernelEntry(const DeviceKernelKey &key)
