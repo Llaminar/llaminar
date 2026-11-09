@@ -470,3 +470,18 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   rejection — real g++-14 lookups (bare `as`→PATH; cc1plus →
   /usr/libexec/gcc/…/14/; multiarch; search-dirs) accepted; nothing to fix
   back. Reviewer SOURCE123 (source) pending.
+
+## SOURCE123 FINAL (2026-11-09) — successor scope (SOURCE124)
+
+- PATH exec semantics: empty component = executed cwd (never dropped);
+  relative entries vs RECORDED EXECUTION DIRECTORY; reject precise or
+  preserve; empty/leading/trailing + cwd-mismatch controls.
+- Epoch binding: executable/routing epoch BEFORE proof-consumed
+  observations; stable through preprocessing/plan/compile; mid-plan +
+  pre-identity mutation controls (no-receipt).
+- Depfile = native Make grammar ($$ escapes) not shlex; reject unsupported
+  escaped-name regimes; decoy + mutation controls; separate from shell/
+  symlink resolution.
+- Driver role binding: driver identity derived from the AUTHENTICATED target
+  command + lookup context (not the receipt field); copied-job-as-driver +
+  foreign-driver controls.
