@@ -673,3 +673,8 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   env (set_mempolicy/NUMA container; SYS_NICE/seccomp; in afe62c5ef reference
   set pre-rebase). ALL classified → .80 gate seal authorized. A–C → upstream
   base-defect note (Main collects). R1 remaining = WSL (4') only.
+
+- R1 .80 GATE SEALED GREEN (K14-R1-GATE-5D4E3716A-20261109): BUILD=0;
+  Unit 979/13, Preflight 2360/12, Cells 222/1 — all base/env (A/B/C/D);
+  census 12/12, proof 242/1274, lifecycle 1, 9/9 cells 0 mismatches.
+  Spot-check cancelled; .80 free. R1 remaining = WSL (4') only.
