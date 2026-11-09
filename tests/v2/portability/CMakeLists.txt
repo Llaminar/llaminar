@@ -3,8 +3,14 @@
 #
 # This test-only project compiles the real production primitives with the same
 # target/ISA policy as V2. It cannot build or certify llaminar2, replace the full
-# Unit/preflight inventory, or select a scalar implementation for ARM.
+# Unit/preflight inventory, or select a scalar implementation for ARM. Actual
+# timeout-owner JSON fields require the same CMake/CTest4 interface as full tests.
+# Retain the established policy envelope: a newer tool prerequisite must not
+# silently opt these non-module sources into a different compiler pipeline.
 cmake_minimum_required(VERSION 3.20)
+if(CMAKE_VERSION VERSION_LESS 4.0)
+    message(FATAL_ERROR "Focused test builds require CMake/CTest >=4.0 for timeout-owner JSON metadata")
+endif()
 project(llaminar_cpu_portability LANGUAGES C CXX)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)

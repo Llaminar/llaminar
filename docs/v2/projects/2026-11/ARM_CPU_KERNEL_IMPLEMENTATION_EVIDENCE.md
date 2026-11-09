@@ -69,6 +69,70 @@ Q16 FP32-square rounding/complete-block/expansion-alias seams, and unadmitted
 legacy workspace/row buffers. Those require individual executed regressions,
 repairs, explicit preflights and broader qualification; none is closed here.
 
+## Configure-host topology and evidence retirement
+
+The returned native Spark archive was independently SHA-checked together with
+all100 raw file digests. Original sysfs records and inherited affinity describe
+package36,20 singleton sibling groups and clusters56/1144. The actual `lscpu`
+CSV instead aliases20 CPUs to10 socket/core pairs; neither presentation labels
+nor cluster count are physical package authorities. A4.2KiB source-pinned,
+device-free recorded fixture retains these inputs and their archive provenance.
+
+`CPUHostTopology.py` now captures Linux inherited affinity and original kernel
+sibling sets once, validates IDs/self-membership/reciprocity/nonoverlap and
+checks affinity again before returning. Sparse interval parsing never expands
+large ranges. `V2TestHostTopology.cmake` binds this immutable observation, not
+unchecked shell pipelines or missing-field defaults. Existing shared rank
+budgets admit only a genuinely uniform accessible package/SMT projection;
+asymmetric vectors remain explicit and fail with a precise unsupported-policy
+diagnostic rather than using a minimum, maximum or invented one-core geometry.
+This configure-host scope is not runtime/rank topology or asymmetric scheduling.
+
+Admission retires the previous receipt and interrupted temporary output before
+HostOS, observation or projection can fail, then atomically publishes complete
+JSON by same-directory rename. The focused two-attempt owner regression repeats
+failed projection/observer admission and proves both files absent. On Linux the
+observer-negative reaches the deliberately missing interpreter; on Darwin it
+stops at the genuine HostOS guard. The registered recorded CMake regression
+builds the real early/late Unit and preflight marker-target inventory and checks
+all three PROCESSORS values. Nine metadata/actual-CMake cases pass on Mac and
+the native Linux SDK; a separate native observer/gate fixture authenticates the
+VM's actual1-package/10-core geometry, not the Spark's20-worker inference.
+
+## Genuine CTest ownership-metadata closure
+
+The old genuine SDK's CMake/CTest3.28.3 supports runtime timeout signals but
+omits `TIMEOUT_SIGNAL_NAME` and `TIMEOUT_SIGNAL_GRACE_PERIOD` from actual JSON.
+The same compiler-free production-shaped probe exposes SIGTERM/36 under
+CMake/CTest4.0.3. The new focused test fails on unchanged3.28 and passes on
+native4.0.3 and Mac4.3.1; missing fields are never manufactured. Official3.31
+serializer source lacks these recognized properties;4.0 source includes them.
+This interface proof does not replace real MPI timeout/retirement execution.
+
+The exact new native SDK runs SourceAdmissionDiscovery19/19, QFN source closure
+4/4 and production-parity **Unit metadata**130/130 with real original-helper
+bytes. These are not model campaigns. It also compiles/links/runs genuine
+C++23 print/atomic-shared-pointer/GMock and current native RMSNorm8+3 cases.
+Actual full factory/engine/runtime qualification remains open.
+
+The common image installer pins genuine Kitware4.0.3 next to Ninja; test builds
+reject older tools before heavy dependencies, and installed runners retain the
+builder's exact entrypoints plus native/package data. The replaced devcontainer
+latest-Kitware producer and fixed ordinary-build concurrency environment are
+retired; structural controls complement actual tool-output tests. A newer tool
+requirement retains the original compiler-policy envelope. The first LLVM
+attempt accidentally opted into module scanning and failed on an absent module
+response file; its RED remains, and response authentication was not weakened.
+
+New explicit SDK archive SHA256:
+`4e8a5adc654a7f6d571f3718248bae4a59266d2f871ab9b9176b73897b78e434`
+(320776402 bytes). OCI index`d211c0e0…68bf0`, native runtime manifest
+`06a78c8b…f42bda`, config`a78c51c7…039d1`: all9 encoded layers and uncompressed
+rootfs diff IDs were verified, retaining all7 exact oldc813 base layers.
+Old SDK/source artifacts remain unchanged. New identity must be explicitly
+admitted for a new immutable build-only successor; export is not remote import,
+retry authorization, CMake4 vendor/full-image certification or a serving proof.
+
 ## Native Spark engine build-only checkpoint
 
 Fresh packet `3bf350a5…a80ba` supersedes the withheld `662c0ac5…ac8e`;662 must
@@ -80,8 +144,9 @@ The application/Unit/preflight build command never started. Native sysfs and
 `lscpu` CSV also disagree about core identities; first-row trimming or CSV
 deduplication is not an acceptable repair. The returned archive SHA256 is
 `15497193eeb13213c06c0d202ac031f59e2a24776b38a9bc25c72a0a57362c67`.
-Main independently rechecked its archive digest; detailed raw-record inspection
-is still in progress, not replaced by the validator's report. The stopped packet remains immutable; a source-owned
+Main independently rechecked its archive digest/all100 raw record hashes and
+inspected the original sysfs/affinity, actual command/compiler and cgroup failure
+scope. Configure alone failed; app/gate compilation never began. The stopped packet remains immutable; a source-owned
 heterogeneous topology fix and a new authenticated successor precede any retry.
 No model/GPU/corpus/cluster work or broader test campaign is authorized by this
 build-only attempt.
@@ -895,18 +960,23 @@ not a smaller worker budget or a changed source branch.
 
 ## Latest functional verification
 
-The completed five-Mac checkpoint below rebuilt151 focused registrations;
+The completed five-Mac checkpoint below rebuilt159 focused registrations;
 Linux126 and Spark125 rows deliberately retain older source scopes. These are
 native CPU-only leaf/build checks, not the complete CMake-owned Unit/preflight
 inventory of the engine.
 
 | Build | Result |
 |---|---|
-| AppleClang Release, baseline NEON | PASS,151/151;4.01s |
-| AppleClang Release, NEON_DOTPROD | PASS,151/151;4.06s; explicit ASIMD/SDOT execute |
-| AppleClang Debug, strict warnings (`-Wall -Wextra -Wpedantic -Werror`) | PASS,151/151;10.61s |
-| AppleClang Integration + ASan/UBSan, NEON_DOTPROD | PASS,151/151;19.86s |
-| Homebrew LLVM Release, baseline NEON | PASS,151/151;3.98s |
+| AppleClang Release, baseline NEON | PASS,159/159;4.18s |
+| AppleClang Release, NEON_DOTPROD | PASS,159/159;4.20s; explicit ASIMD/SDOT execute |
+| AppleClang Debug, strict warnings (`-Wall -Wextra -Wpedantic -Werror`) | PASS,159/159;10.46s |
+| AppleClang Integration + ASan/UBSan, NEON_DOTPROD | PASS,159/159;20.30s |
+| Homebrew LLVM Release, baseline NEON | PASS,159/159;4.38s |
+| Current GNU14/CMake4 native Linux RMSNorm targets | PASS actual production-TU8/8 and reduction3/3; not a full focused-engine build |
+| Current native SDK4 topology/tool/production-pipeline Unit scripts | PASS9/9,3/3,243/243; read-only source checkout |
+| Current SDK4 actual MPI-helper source/QFN/parity Unit metadata | PASS19/19,4/4,130/130; helper/module and7 built-source identities checked |
+| Mac selected image-contract/fixture cases | PASS14/14; source contracts, not a Docker image build |
+| Broader Mac production-pipeline Unit script | RED243 cases,38failures+5errors in the recorded broader run; Darwin fixture/runtime closure remains open |
 | GCC13.3 Release, baseline/DotProd, native Linux/arm64 VM on this M1 | PASS,126/126 each; not a Spark rerun |
 | GCC14.2 Release, baseline/DotProd, same native Linux VM | PASS,126/126 each; genuine C++23 SDK |
 | GB10 Spark hosts×NEON/DotProd, immutable successor `391c8481…6128` | PASS,125/125 in each of four lanes;93 preflights included |
@@ -916,13 +986,19 @@ inventory of the engine.
 | Canonical pre-commit with real OpenMP configured | FAIL at the explicit native-macOS memory/placement implementation gate; full Unit/preflight not run |
 | `git diff --check` | PASS |
 
-All115 current configured preflights pass20 repetitions; raw output
-contains2300passes, with no fail/skip. Raw current logs/XML are outside the
-repository at `/tmp/llaminar-arm-policy-matrix-gYPR1Adn`; every nested testcase
-and the2300 raw passed records were independently parsed. The first expanded
-checkpoint attempt remains RED at strict compilation of unused legacy RMS
-configuration/integer-root helpers; those dead helpers were removed, not
-warning-suppressed. Historical139/105 and135/101 checkpoints also passed20.
+All121 current configured preflights pass20 repetitions; raw output contains
+2420passes, with no fail/skip. Current logs/XML are outside the repository at
+`/tmp/llaminar-arm-policy-matrix-f2nydp46`; every nested testcase and all2420 raw
+passed records were independently parsed. Historical151/115 (`gYPR1Adn`),
+155/118 (`AaIrfBXH`) and157/119 (`bt5rQaPv`) remain distinct narrower scopes.
+The first expanded RMS checkpoint remains RED at strict compilation of unused
+legacy configuration/integer-root helpers; dead helpers were removed, not
+warning-suppressed. The intermediate LLVM module-response failure (`hlqTwROx`)
+remains RED; retaining the original policy envelope repaired it without
+ignoring missing responses. Native read-only-source pipeline RED exposed a
+fixture writing into checkout; the fixture now owns lexical temporary storage,
+with explicit preflight and unchanged production pipeline code. Broader Mac
+path-fixture failures remain open. Historical139/105 and135/101 also passed20.
 The intervening
 136-test sanitizer run remains RED:135/136 pass, with
 `V2_Integration_CPUNativeNEONProjectionBatch` hitting the ordinary30-second
@@ -930,7 +1006,7 @@ boundary during concurrent vendor compilation. Contention is context, not an
 established cause. No byte assertion failed in that log. Its unchanged binary
 was copied and hashed before/after20 isolated-window repetitions: all20 pass
 in226.74s without changing workers, coverage or the timeout. The subsequent
-complete139-test five-Mac matrix/105-entry stress and current151/115 pass do
+complete139-test five-Mac matrix/105-entry stress and current159/121 pass do
 not erase or retrospectively explain the timeout. Earlier94-entry Mac and
 93-entry native Linux GNU13.3 passes retain their narrower historical scopes. Neither receipt is a claim of full engine preflight:
 native actual-owner execution, batch/leaf arithmetic, empty-team completion,
@@ -951,8 +1027,11 @@ CPU kernel/build checks, not engine certificates. The first transparency draft
 is an explicitly unqualified WIP checkpoint using the repository-documented
 WIP commit procedure; neither canonical pre-commit nor readiness is claimed.
 The periodic checkpoint again ran the registered canonical hook and got the
-same explicit Darwin memory/placement failure before complete gates. Its
-repository-documented WIP commit bypass is disclosed, not a passing gate.
+same explicit Darwin memory/placement failure before complete gates. The fresh
+default cache first failed OpenMP autodiscovery; the real Homebrew libomp was
+configured explicitly before the repeated canonical hook reached that Darwin
+fatal. Both logs are retained. The repository-documented WIP commit bypass is
+disclosed, not a passing gate.
 
 The complete NativeQuantised refresh Python file was also attempted: 118 tests ran,
 63 failed; the shell-driver fixtures encounter unported Linux-only `lscpu`

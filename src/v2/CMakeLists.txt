@@ -87,6 +87,14 @@ option(HAVE_CUDA "Enable CUDA backend" ON)
 option(HAVE_ROCM "Enable ROCm backend" ON)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
 option(LLAMINAR_BUILD_TESTS "Configure and build Llaminar V2 tests" ON)
+if(LLAMINAR_BUILD_TESTS AND CMAKE_VERSION VERSION_LESS 4.0)
+    # Earlier CTest versions execute timeout signals but omit their actual
+    # retirement properties from JSON. The mandatory ownership inventory must
+    # observe those fields; do not build a test image that cannot certify them.
+    message(FATAL_ERROR
+        "Llaminar test builds require CMake/CTest >=4.0 for timeout-owner JSON metadata. "
+        "Install the repository-pinned build tools; do not weaken MPI ownership checks.")
+endif()
 
 # Source-bound model policy: Automatic selects only the measured native owner
 # operation. Explicit Serial/Four remain first-class; no serving/env override.

@@ -155,10 +155,13 @@ arbitrary hard CPU-ID pinning; record advisory placement and actual evidence.
   Helper/KV/factory/runtime admission remains unfinished. Later class edits are
   outside the frozen Spark certificate; syntax/leaf/scope checks do not qualify
   their runtime. All four softmax and both rotation entries resolve.
-- The latest completed five-Mac focused matrix passes151/151 in baseline/DotProd
-  Release, DotProd ASan/UBSan, strict-warning Debug and LLVM Release; all115
-  configured preflights pass20 repetitions (2300 raw passes), including the new
-  native reduction/production-TU RMSNorm ownership, byte and portable-half cases. The intervening136-test sanitizer
+- The latest completed five-Mac focused matrix passes159/159 in baseline/DotProd
+  Release, DotProd ASan/UBSan, strict-warning Debug and LLVM Release; all121
+  configured preflights pass20 repetitions (2420 raw passes), including native
+  reduction/production-TU RMSNorm ownership/bytes/portable half, configure-host
+  topology/receipt, real CTest retirement metadata and image-fixture contracts.
+  The earlier151/115 and157/119 checkpoints retain their narrower scopes.
+  The intervening136-test sanitizer
   projection-batch timeout remains RED. Its unchanged hashed binary passes20
   isolated-window repetitions, then the complete current matrix passes; no
   timeout/worker budget was changed and contention remains only a hypothesis.
@@ -270,14 +273,36 @@ same-mtime bytes in the unchanged staged662 owner; its build authorization was
 withheld and it remains immutable. The current full matrix passes after repair.
 Full engine compilation next exhausted the8GiB VM on two real core TUs. The
 fresh immutable `3bf350a5…a80ba` packet received a one-Spark CPU-only build window
-and exact SDK authentication. Its validator reports successful genuine oneDNN
-installation, then a first configuration failure from repeated heterogeneous
-`lscpu` topology fields at `V2TestGateFinalization.cmake`; application/gate
-compilation never began. Raw evidence has been returned and is being audited.
-Repair truthful sysfs/cpuset-backed admission rather than trimming a first line
-or deduplicating misleading `lscpu` core IDs. No retry, worker cap, source patch
-or SDK substitution is authorized; export a new immutable successor first.
-Whole engine gates remain open.
+and exact SDK authentication. Independently checked raw records show genuine
+oneDNN installation, then a first configuration failure from unchecked multiline
+`lscpu` fields at the unchanged finalizer; application/gate compilation never
+began. All100 raw artifact hashes and original affinity/sysfs/compiler/cgroup
+scope were audited. The repaired configure-host observer now uses genuine
+inherited affinity and kernel sibling groups, preserving original IDs and
+explicit asymmetric vectors. Existing shared budgets reject unsupported
+nonuniform projections instead of inventing capacity. Receipt retirement runs
+before every producer/projection and successful publication is atomic; nine
+real Python/CMake cases and early/late gate-target inventory pass on Mac/native
+Linux, with separate recorded20-core Spark and live10-core VM observations.
+These are not live inference/rank topology certificates.
+
+Actual native MPI-bound registration also exposed old SDK CTest3.28 JSON omitting
+required timeout-owner fields despite runtime property support. A genuine
+hash-pinned4.0.3 SDK successor exports SIGTERM/36 and passes the unchanged real
+helper's19+4+130 source/Unit-metadata cases. Current native9 topology+3 tool+243
+production-pipeline Unit cases pass with read-only source and lexical fixture
+storage; selected14 image/fixture cases pass on Mac, whose broader pipeline
+path-fixture failures remain separately RED. The common installer/test-runner
+retain exact native/package tool closure; the independent latest-CMake producer
+and fixed ordinary-build parallelism are retired. The original compiler-policy
+envelope remains, without weakening missing-response codegen authentication.
+
+The new SDK is explicitly archive`4e8a5adc…8e434`/index`d211c0e0…68bf0`; all9
+encoded/rootfs layers retain the exact old7-layer base. This is not CMake4 vendor
+or full-image certification. No old3bf/662 retry, worker cap, source patch or
+silent SDK substitution is authorized. Export a new source successor, bind this
+new SDK explicitly and obtain fresh lab/capacity admission for one BUILD-ONLY
+attempt. Whole engine gates remain open.
 
 The RMSNorm frontier now has a bounded native production-TU slice. Actual
 retained1×12288 all-ones execution reproduced per-caller partial ownership
@@ -290,9 +315,10 @@ staged versus per-row inverse programs, and publish portable half tails without
 a decoded row bank. Independent formulas and actual M=1 bytes cover M1..16/31/33
 and workers1..10 in the new production-TU tests. Native BF16/FP16 factory source
 now selects original-storage primitives and its actual C++23 TU parses cleanly.
-The complete fresh five-profile checkpoint matrix passes151/151 each and115
-configured preflights×20; see the evidence log. These checks do not qualify
-factory runtime or full inference.
+The earlier151/115 checkpoint has separate current-source GNU14 native
+RMSNorm8+3 XML passes. The implementation evidence retains each newer focused
+matrix's exact source/count scope. None of these checks qualifies factory
+runtime or full inference.
 
 RMSNorm remains unfinished: residual and quantized factory/workspace routes,
 Q8 epsilon/stale gamma/no-op/narrowing defects, Q16 distinct square/geometry/
