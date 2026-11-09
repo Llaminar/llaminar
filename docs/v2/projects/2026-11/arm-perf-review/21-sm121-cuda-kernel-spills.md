@@ -140,3 +140,15 @@ Evidence: `~/llaminar-spark-results/K14-CUDA-SPILL-MIGRATION-a62696317`.
 - FIX REQUIREMENT: spill-free under EVERY partition — verified at 121-only,
   120;121, AND the full 6-arch set, with split-compile as configured.
 - Fix awaiting the operator's go-ahead (CUDA lane).
+
+## 2026-11-09 — 425002104 has the reviewed spill state (Main)
+
+- a62696317 IS in the head as eb7243a58 (byte-identical diff after token
+  map; pos 16). 7e709d60e = tensor-prefill split design doc only (170b8c6af).
+  cff351901 (bd9dcd12a demotions) = REJECTED merge, correctly excluded.
+- Open set unchanged: BK64 4–68B; BK256 ≤16B; FA2 pipelined 44–108B;
+  tensor_prefill per spec rev 2 (5 conditions). Waiting on OPERATOR's
+  go-ahead for the fixed lane (no demotion, 12.x-guarded, shipped SASS
+  identical, spill-free 121 / 120;121 / 6-arch; new commits on #43).
+- Qwen3.8-UD per-bucket trace (idea 25 Dir B) waits on the same decision +
+  the GB10 CUDA build; arm-sparks standby (.79 reserved), no probe.

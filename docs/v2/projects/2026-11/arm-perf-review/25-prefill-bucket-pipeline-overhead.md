@@ -117,3 +117,9 @@ the per-bucket trace; results → ideas 24/25.
   ratio is the structural point). Qwen3.8 numbers await Main's spill fold +
   fixed tip. Note: the earlier 2160-token filler tokenized to 9690 (rejected
   at -c8192) → used 480 fillers ≈ 2154 tokens (recorded).
+
+## 2026-11-09 — trace gating
+
+- Source-side possible at 425002104 (Qwen3.8-Flash-Next-UD schema present).
+- RUNTIME trace blocked on: operator go-ahead for the CUDA sm_121 fix lane →
+  GPU build at 425002104' → per-bucket trace (Dir B). arm-sparks standby.
