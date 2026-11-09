@@ -2958,6 +2958,14 @@ add_v2_test(V2_Unit_MPIBootstrap
     LABELS "V2;Unit;MPI;CPU;Bootstrap;Regression"
     MPI_PROCS 1
 )
+# OpenMP team wake-up made the CPU MTP verifier as costly per row as serial
+# decode; the launcher's bounded idle-spin policy is a production invariant.
+add_v2_test(V2_Integration_OpenMPIdleSpinPolicy
+    COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
+        --gtest_filter=Test__MPIBootstrap.OpenMPIdleSpinPolicyIsBoundedAndExportedByName
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CPU;Bootstrap;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPIdleSpinPolicy)
 
 # This probe owns the real production self-launch; the CTest wrapper must not
 # pre-bind it or it would skip precisely the startup path under regression.
