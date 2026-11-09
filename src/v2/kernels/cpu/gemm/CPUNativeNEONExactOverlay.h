@@ -94,32 +94,55 @@ namespace llaminar2::cpu::native_quantised
         return neon_overlay_detail::kGeneratedNativeNEONExactOverlay;
     }
 
+    namespace neon_overlay_detail
+    {
+        /** @brief Binary-search an already validated sorted table; total policy on miss. */
+        inline NativeNEONSchedule lookup(std::span<const NativeNEONExactOverlayEntry> table,
+            std::uint8_t codebook_id, bool is_superblock, int policy_n, int k, int m, int workers)
+        {
+            if (policy_n <= 0 || k <= 0 || m <= 0 || workers <= 0)
+                throw std::invalid_argument("Native ARM schedule requires positive N/K/M/workers");
+            const auto key = std::tuple{codebook_id, is_superblock, policy_n, k, m, workers};
+            const auto found = std::lower_bound(table.begin(), table.end(), key,
+                [](const NativeNEONExactOverlayEntry &entry, const auto &value) { return entry.key() < value; });
+            if (found != table.end() && found->key() == key)
+                return {found->tile, found->n_block_chunks, true};
+            return {};
+        }
+    }
+
     /**
      * @brief Resolve the automatic schedule for one native projection invocation.
+     *
+     * Hot path: the installed table is validated at compile time (static_assert
+     * above), so resolution is one O(log n) search with no per-call scan.
      * @param codebook_id Prepared execution codebook of the weights.
      * @param is_superblock Source superblock layout of the weights.
      * @param policy_n Serial-equivalent policy output width.
      * @param k Logical reduction width.
      * @param m Physical row count.
      * @param workers Invocation worker budget.
-     * @param table Sorted exact table; the installed table by default.
      * @return The exact entry's schedule for a measured key, otherwise the total
      *         four-row/one-chunk policy. Never interpolates between keys.
+     * @throws std::invalid_argument For non-positive geometry.
+     */
+    inline NativeNEONSchedule resolveNativeNEONSchedule(std::uint8_t codebook_id, bool is_superblock,
+        int policy_n, int k, int m, int workers)
+    {
+        return neon_overlay_detail::lookup(installedNativeNEONExactOverlay(), codebook_id, is_superblock,
+            policy_n, k, m, workers);
+    }
+
+    /**
+     * @brief Resolve against an explicit candidate table (tests and tooling).
+     * @param table Candidate table; validated as sorted, unique and physical on every call.
      * @throws std::invalid_argument For non-positive geometry or an invalid table.
      */
     inline NativeNEONSchedule resolveNativeNEONSchedule(std::uint8_t codebook_id, bool is_superblock,
-        int policy_n, int k, int m, int workers,
-        std::span<const NativeNEONExactOverlayEntry> table = installedNativeNEONExactOverlay())
+        int policy_n, int k, int m, int workers, std::span<const NativeNEONExactOverlayEntry> table)
     {
-        if (policy_n <= 0 || k <= 0 || m <= 0 || workers <= 0)
-            throw std::invalid_argument("Native ARM schedule requires positive N/K/M/workers");
         if (!neon_overlay_detail::validTable(table))
             throw std::invalid_argument("Native ARM exact overlay table is unsorted, duplicated or invalid");
-        const auto key = std::tuple{codebook_id, is_superblock, policy_n, k, m, workers};
-        const auto found = std::lower_bound(table.begin(), table.end(), key,
-            [](const NativeNEONExactOverlayEntry &entry, const auto &value) { return entry.key() < value; });
-        if (found != table.end() && found->key() == key)
-            return {found->tile, found->n_block_chunks, true};
-        return {};
+        return neon_overlay_detail::lookup(table, codebook_id, is_superblock, policy_n, k, m, workers);
     }
 } // namespace llaminar2::cpu::native_quantised
