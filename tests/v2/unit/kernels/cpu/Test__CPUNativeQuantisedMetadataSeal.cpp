@@ -86,9 +86,10 @@ CPUNativeQuantisedPackedWeights owner(const NativeQuantisedPreparedByteFixture &
 
 /**
  * @test The seal enforces exactly the reserved-bit rules execution used to test
- * per block, on every lane of every unit (padding columns included), and nothing more.
+ * per block, on every live column of every unit, and nothing more. Padding
+ * columns of the final chunk (never moved, never published) are not admitted.
  */
-TEST(CPUNativeQuantisedMetadataSeal, CoversExactlyTheFormerInLoopRulesOnEveryLane)
+TEST(CPUNativeQuantisedMetadataSeal, CoversExactlyTheFormerInLoopRulesOnEveryLiveColumn)
 {
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
@@ -99,8 +100,8 @@ TEST(CPUNativeQuantisedMetadataSeal, CoversExactlyTheFormerInLoopRulesOnEveryLan
         if (!hasSecondary(view))
             continue;
         const std::uint16_t mask = reservedMask(view);
-        // Column 63 of chunk 1 is padding (N=65): wider native loads read it.
-        for (const auto [chunk, block, column] : {std::array{0, 0, 0}, std::array{1, 2, 63}})
+        // N=65: chunk 1 column 0 is the last live column; column 63 is padding.
+        for (const auto [chunk, block, column] : {std::array{0, 0, 0}, std::array{0, 2, 63}, std::array{1, 2, 0}})
         {
             const auto offset = secondaryOffset(view, chunk, block, column);
             std::uint16_t original = 0;
@@ -113,6 +114,10 @@ TEST(CPUNativeQuantisedMetadataSeal, CoversExactlyTheFormerInLoopRulesOnEveryLan
                 EXPECT_NO_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor, fixture.bytes));
             store(fixture.bytes, offset, original);
         }
+        // Padding words of the final chunk may hold anything.
+        for (int column = 1; column < 64; ++column)
+            store(fixture.bytes, secondaryOffset(view, 1, 1, column), 0xffffu);
+        EXPECT_NO_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor, fixture.bytes));
         if (mask)
         {
             // The largest permitted value is still admitted.
