@@ -696,3 +696,15 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   socket hosts fail hard) — flagged to Main (gate as ≥2-socket precondition).
 - Preflight basecheck at 425002104 running (formal control); (5') b199ccfa0
   building alongside (-j2/7GB).
+
+## R1 (4') SEALED — R1 COMPLETE (2026-11-09)
+
+- WSL (4') 5d4e3716a AVX512 PASSES: addon cells 16/16; Unit 957/971 (14
+  all base/WSL); Preflight 2344/2360 (16 all base/env/single-socket); base
+  control 425002104 = 14 Unit + 17 preflight all reproduce identical, 0 Not
+  Run, no green-base/red-addon. Production src vs ae090ec81 modulo rename
+  IDENTICAL (22 files +1043/-170; test-only residue = prefix fix).
+- R1 evidence COMPLETE: reviewer source ACK; Mac owner; .80 sealed
+  (K14-R1-GATE-5D4E3716A-20261109); WSL (4') sealed. Handover to Main in
+  progress (lane preparing handover doc; A–C base bug list rides upstream
+  separately). (5') b199ccfa0 building since 16:56Z.
