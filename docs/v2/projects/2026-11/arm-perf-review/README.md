@@ -53,7 +53,8 @@ references are as of the head above and may drift.
 | 24 | GB10 GPU prefill gap vs llama.cpp (3.3×) | `24-gb10-gpu-prefill-gap.md` | Open (dig: ~80% is bucket-pipeline overhead, not kernels; see idea 25) |
 | 25 | Prefill capture/bucket-pipeline overhead reduction | `25-prefill-bucket-pipeline-overhead.md` | Open (blocked on tooling: nsys missing in uma3 image; evidence-based split filed; 15-min rerun once nsys lands) |
 | 26 | Single-rank OpenMP binding on GB10 is A725-first | `26-single-rank-openmp-binding.md` | Addressed (a7f719dfb binding-only SHA; proofs pass; pending Main cherry-pick onto PR #43) |
-| 27 | Fused NativeVNNI evidence cells fail on ARM (Pairwise/WideRows) | `27-fused-nativevnni-evidence-cells.md` | Open (base b2cf793bf; ARM lacks a Pairwise/WideRows native candidate) |
+| 27 | Fused NativeVNNI evidence cells fail on ARM (Pairwise/WideRows) | `27-fused-nativevnni-evidence-cells.md` | Addressed (fixed on PR #43; cells pass) |
+| 28 | IQ4_XS M=1 multi-thread regression after the metadata seal | `28-iq4xs-m1-multithread-regression.md` | Open (investigation; window b; fix-in-R1 or cleared+tracked) |
 
 Measured numbers for all ideas: `00-measured-baseline.md` (GB10 serving,
 stage attribution, spin sweep, thread scaling, overlay statistics).
