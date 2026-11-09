@@ -1160,6 +1160,26 @@ TEST(Test__PerfStatsCollector, QualifiedFilterEnablesItsOwningDomain)
     EXPECT_FALSE(PerfStatsCollector::isDomainEnabled("moe"));
 }
 
+/** @test Optional producer guards reuse immutable domain/name-prefix policy. */
+TEST(Test__PerfStatsCollector, RecordFamilyGateAvoidsSiblingDiagnostics)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "kernel.projection");
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+    ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("kernel"));
+    EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled("kernel","projection"));
+    EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled("kernel","projection.child"));
+    EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled("kernel","projection_sibling"));
+    EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled("kernel","cpu_native_quantised_fused_job_ownership"));
+    EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled("mtp","projection"));
+    EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled("kernel",""));
+    ASSERT_EQ(setenv("LLAMINAR_PERF_STATS_FILTER","kernel",1),0);
+    EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled("kernel","cpu_native_quantised_fused_job_ownership"));
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
+    EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled("kernel","cpu_native_quantised_fused_job_ownership"));
+}
+
 TEST(Test__PerfStatsCollector, CpuStageFilterEnablesCpuStageTiming)
 {
     ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);

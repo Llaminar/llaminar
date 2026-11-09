@@ -6945,14 +6945,14 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
-     * @brief Invocation-local ownership of already formed fused output jobs.
-     *
-     * This is independent of row arithmetic and installed exact policy. Current
-     * preserves every existing schedule, including balanced OrderedThreeRows.
-     * Contiguous is an explicit ordinary-prefill Pairwise diagnostic only; it
-     * changes worker assignment without changing the job grid or its kernels.
+     * @brief Ownership of unchanged fused output jobs, independent of row arithmetic.
+     * Current preserves the original static mapping; Contiguous is its retained
+     * large-chunk control. PanelBlocks is the measured explicit small-block path.
+     * Auto selects bounded panel blocks only for qualified AVX512 GPU-aligned
+     * ordinary Prefill in the original local-output route. Other supported
+     * execution domains retain Current; scratch and arithmetic are never changed.
      */
-    enum class FusedOutputJobOwnership { Current, Contiguous };
+    enum class FusedOutputJobOwnership { Current=0, Contiguous=1, PanelBlocks=4, Auto=5 };
 
     /**
      * @brief Name an invocation-local diagnostic without selecting arithmetic.
@@ -6965,6 +6965,8 @@ namespace llaminar2::cpu::native_quantised
         switch (ownership) {
         case FusedOutputJobOwnership::Current: return "Current";
         case FusedOutputJobOwnership::Contiguous: return "Contiguous";
+        case FusedOutputJobOwnership::PanelBlocks: return "PanelBlocks";
+        case FusedOutputJobOwnership::Auto: return "Auto";
         }
         throw std::invalid_argument("CPU fused output ownership has an unknown value");
     }
@@ -7677,17 +7679,181 @@ namespace llaminar2::cpu::native_quantised
             return four_pair_jobs / static_cast<size_t>(workers) >= 4u ? 4u : 2u;
         }
 
+        /** @brief One actual worker's deterministic whole-job block sequence. */
+        struct FusedOutputWorkerRange {
+            size_t first, end, block_width, block_stride;
+        };
+
+        /**
+         * @brief Reproduce OpenMP schedule(static,chunk) for one actual worker.
+         * @param jobs Original total job count.
+         * @param chunk Positive original static chunk, unchanged by this mapping.
+         * @param worker Actual active-team ordinal in [0,workers).
+         * @param workers Positive active team width, never omp_get_max_threads.
+         * @return Round-robin blocks with capped products; first==end means empty.
+         * @throws std::invalid_argument For an invalid team/worker/chunk.
+         * @details A stride capped to jobs cannot skip a second owned chunk:
+         * when workers*chunk >= jobs no worker has two chunks. Remaining-distance
+         * loop guards avoid overflow without changing the original assignment.
+         */
+        [[nodiscard]] inline FusedOutputWorkerRange staticFusedOutputWorkerRange(
+            size_t jobs,size_t chunk,int worker,int workers)
+        {
+            if(!chunk || workers<=0 || worker<0 || worker>=workers)
+                throw std::invalid_argument("CPU output job range requires a positive chunk and actual worker");
+            const auto capped_product=[jobs](size_t left,size_t right) {
+                return left && right>jobs/left?jobs:left*right;
+            };
+            return {capped_product(static_cast<size_t>(worker),chunk),jobs,chunk,
+                capped_product(static_cast<size_t>(workers),chunk)};
+        }
+
+        /**
+         * @brief Bound explicit panel-major cyclic blocks by the original four-wave floor.
+         * @param jobs Unchanged physical job count, including tails.
+         * @param workers Positive actual active team width.
+         * @return min(4,max(1,floor(jobs/(4*workers)))) without product overflow.
+         * @throws std::invalid_argument For a nonpositive actual team width.
+         */
+        [[nodiscard]] inline size_t panelBlockJobChunk(size_t jobs,int workers)
+        {
+            if(workers<=0)throw std::invalid_argument("Panel-block jobs require a positive actual team");
+            return std::min<size_t>(4u,std::max<size_t>(1u,(jobs/static_cast<size_t>(workers))/4u));
+        }
+
+        /** @brief Typed reason why Auto selects measured blocks or preserves Current. */
+        enum class AutoOutputJobDomain { Eligible, OtherISA, OtherRoute, OtherPurpose, OtherNumerical, OtherRowPolicy, InsufficientWork, InsufficientCache, InvalidMetadata };
+
+        /** @brief Stable diagnostic name; never a string-selected execution policy. */
+        [[nodiscard]] constexpr const char* autoOutputJobDomainName(AutoOutputJobDomain domain)
+        {
+            switch(domain) {
+            case AutoOutputJobDomain::Eligible:return "avx512_gpu_aligned_prefill_local";
+            case AutoOutputJobDomain::OtherISA:return "current_other_isa";
+            case AutoOutputJobDomain::OtherRoute:return "current_other_route";
+            case AutoOutputJobDomain::OtherPurpose:return "current_other_purpose";
+            case AutoOutputJobDomain::OtherNumerical:return "current_other_numerical";
+            case AutoOutputJobDomain::OtherRowPolicy:return "current_other_row_policy";
+            case AutoOutputJobDomain::InsufficientWork:return "current_insufficient_block_work";
+            case AutoOutputJobDomain::InsufficientCache:return "current_insufficient_block_cache";
+            case AutoOutputJobDomain::InvalidMetadata:return "invalid_metadata";
+            }
+            throw std::invalid_argument("Unknown CPU Auto output ownership domain");
+        }
+
+        /**
+         * @brief Classify immutable admitted members without changing their plans.
+         * @param descriptors Original prepared sources and typed purposes.
+         * @param plans Validated live row plans, one per descriptor.
+         * @param route Original partial-storage route, unchanged by ownership.
+         * @param avx512 Actual resolved runtime ISA, not a build advertisement.
+         * @return Qualified panel domain or the first-class Current domain.
+         */
+        [[nodiscard]] inline AutoOutputJobDomain autoOutputJobDomain(
+            std::span<const FusedVerifierRowsDesc> descriptors,std::span<const FusedVerifierRowsPlan> plans,
+            NativeQuantisedFusedPartialRoute route,bool avx512)
+        {
+            if(descriptors.empty() || descriptors.size()!=plans.size())return AutoOutputJobDomain::InvalidMetadata;
+            for(size_t p=0;p<descriptors.size();++p) {
+                if(!descriptors[p].packed || plans[p].rows<=0)return AutoOutputJobDomain::InvalidMetadata;
+                const auto purpose=descriptors[p].purpose;
+                const auto numerical=descriptors[p].packed->numerical_policy;
+                if((purpose!=ProjectionRowsPurpose::Decode && purpose!=ProjectionRowsPurpose::MTPVerifier && purpose!=ProjectionRowsPurpose::Prefill) ||
+                   (numerical!=CPUProjectionNumericalPolicy::BackendNative && numerical!=CPUProjectionNumericalPolicy::GPUAlignedExpert))
+                    return AutoOutputJobDomain::InvalidMetadata;
+            }
+            if(!avx512)return AutoOutputJobDomain::OtherISA;
+            if(route!=NativeQuantisedFusedPartialRoute::OutputTileLocal)return AutoOutputJobDomain::OtherRoute;
+            for(const auto& descriptor:descriptors)
+                if(descriptor.purpose!=ProjectionRowsPurpose::Prefill)return AutoOutputJobDomain::OtherPurpose;
+            for(const auto& descriptor:descriptors)
+                if(descriptor.packed->numerical_policy!=CPUProjectionNumericalPolicy::GPUAlignedExpert)
+                    return AutoOutputJobDomain::OtherNumerical;
+            for(const auto& plan:plans)
+                if(plan.rows>1 && plan.effective_verifier_schedule==VerifierRowsPolicy::OrderedThreeRows)
+                    return AutoOutputJobDomain::OtherRowPolicy;
+            return AutoOutputJobDomain::Eligible;
+        }
+
+        /** @brief Cache/work bounds for unchanged panel jobs; not allocation accounting. */
+        struct AutoPanelBlockChoice {
+            size_t chunk=1,work_cap=1,cache_cap=1;
+            uint64_t job_working_set=0,l2_budget=0;
+        };
+
+        /**
+         * @brief Estimate the dominant cache working set of one unchanged physical job.
+         * @param footprint Canonical prepared weight/activation/output byte geometry.
+         * @param rows Positive live descriptor M.
+         * @param physical_rows Original selected row tile (one for M1).
+         * @param run_width Original selected4/2/1 same-panel grouping.
+         * @param blocks Original K32 block count.
+         * @param partitions Original fixed arithmetic tree count, including empty leaves.
+         * @return Prepared panel + live activation/output rows + generic partial-plane estimate.
+         * @details This is an explicit cache estimate, not exact capacity/all bytes:
+         * small ordered-helper temporaries and caller frames/metadata also exist.
+         * The source-aware direct nibble3 path does not materialize a full plane.
+         */
+        [[nodiscard]] inline uint64_t outputJobWorkingSetEstimate(const NativeQuantisedPreparedFootprint& footprint,
+            size_t rows,size_t physical_rows,size_t run_width,size_t blocks,size_t partitions)
+        {
+            if(!footprint.isValid() || !rows || !physical_rows || physical_rows>4 || !run_width || run_width>4 || !blocks || !partitions)
+                throw std::invalid_argument("Auto output job cache estimate requires valid original geometry");
+            const auto multiply=[](uint64_t left,uint64_t right) {
+                if(right && left>std::numeric_limits<uint64_t>::max()/right)
+                    throw std::overflow_error("Auto output job cache estimate overflows");
+                return left*right;
+            };
+            const auto add=[](uint64_t left,uint64_t right) {
+                if(right>std::numeric_limits<uint64_t>::max()-left)
+                    throw std::overflow_error("Auto output job cache estimate overflows");
+                return left+right;
+            };
+            const auto job_rows=std::min<uint64_t>(rows,multiply(physical_rows,run_width));
+            const auto tile_rows=std::min<uint64_t>(rows,physical_rows);
+            const bool nibble=footprint.encoding==CPUNativeQuantisedEncoding::NibbleLUT ||
+                footprint.encoding==CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
+            const auto plane=tile_rows>2 && !(tile_rows==3 && nibble)
+                ?multiply(multiply(tile_rows,partitions),64u*sizeof(float)):0u;
+            return add(add(multiply(blocks,footprint.weight_bytes_per_n_chunk_k_block),
+                multiply(multiply(job_rows,blocks),footprint.activation_bytes_per_row_k_block)),
+                add(multiply(job_rows,footprint.output_bytes_per_row_n_chunk),plane));
+        }
+
+        /**
+         * @brief Bound measured panel blocks by actual work and immutable private-L2 facts.
+         * @param jobs Unchanged original job count.
+         * @param workers Positive actual active-team width.
+         * @param job_working_set Conservative maximum member estimate, never source compression.
+         * @param cache Original immutable process cache authority.
+         * @return min(measured4, originalfour-waveworkcap, cachecap), at least one.
+         * @details An indivisible oversized job streams with C1. No capacity is
+         * allocated/subtracted here; no PMA requirement or OOM behavior changes.
+         */
+        [[nodiscard]] inline AutoPanelBlockChoice autoPanelBlockChoice(size_t jobs,int workers,
+            uint64_t job_working_set,const CPUCacheGeometry& cache)
+        {
+            if(!job_working_set || !cache.isValid())throw std::invalid_argument("Auto panel blocks require published cache geometry");
+            const auto budget=associativitySafeBytes(cache.private_l2_bytes,cache.private_l2_ways);
+            const auto cache_cap=std::max<uint64_t>(1u,budget/job_working_set);
+            if(workers<=0)throw std::invalid_argument("Auto panel blocks require a positive actual team");
+            const auto work_cap=std::max<size_t>(1u,(jobs/static_cast<size_t>(workers))/4u);
+            return {static_cast<size_t>(std::min<uint64_t>(4u,std::min<uint64_t>(work_cap,cache_cap))),work_cap,
+                static_cast<size_t>(std::min<uint64_t>(cache_cap,std::numeric_limits<size_t>::max())),job_working_set,budget};
+        }
+
         /**
          * @brief Authenticate explicit ownership before any output or partial write.
-         * @param ownership Invocation-local diagnostic; Current adds no restrictions.
+         * @param ownership Requested schedule; Auto/Current add no explicit-domain restriction.
          * @param descriptors Original immutable prepared members, not inferred aliases.
          * @param plans Those members resolved by the original arithmetic planner.
          * @param route Original admitted storage/ownership route.
          * @throws std::invalid_argument Unless every explicit member is ordinary
-         *         GPU-aligned Pairwise Prefill in the original local-output route.
+         *         GPU-aligned Prefill in the original local-output route.
          *
-         * Requiring the complete bundle prevents an explicit diagnostic from
-         * silently changing unrelated M=1, verifier, FullK or shared-bank work.
+         * Each member retains its already validated decode/grouped arithmetic,
+         * including singleton, Pairwise, WideRows and ordered-three tiles.
+         * Phase, numerical contract and nonlocal storage are never substituted.
          */
         inline void requireFusedOutputJobOwnership(FusedOutputJobOwnership ownership,
             std::span<const FusedVerifierRowsDesc> descriptors,
@@ -7695,18 +7861,17 @@ namespace llaminar2::cpu::native_quantised
             NativeQuantisedFusedPartialRoute route)
         {
             (void)fusedOutputJobOwnershipName(ownership);
-            if (ownership == FusedOutputJobOwnership::Current) return;
+            if (ownership == FusedOutputJobOwnership::Current || ownership == FusedOutputJobOwnership::Auto) return;
             if (descriptors.empty() || descriptors.size() != plans.size() ||
                 route != NativeQuantisedFusedPartialRoute::OutputTileLocal)
-                throw std::invalid_argument("CPU Contiguous ownership requires the original OutputTileLocal bundle");
+                throw std::invalid_argument("CPU explicit contiguous ownership requires the original OutputTileLocal bundle");
             for (size_t member = 0; member < descriptors.size(); ++member) {
                 const auto &descriptor = descriptors[member];
                 const auto &plan = plans[member];
                 if (!descriptor.packed || descriptor.purpose != ProjectionRowsPurpose::Prefill ||
                     descriptor.packed->numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert ||
-                    plan.rows <= 1 || plan.effective_verifier_schedule != VerifierRowsPolicy::Pairwise ||
-                    plan.verifier_resolution.physical_row_tile != 2)
-                    throw std::invalid_argument("CPU Contiguous ownership requires every member's resolved GPU-aligned Pairwise ordinary Prefill");
+                    plan.rows <= 0)
+                    throw std::invalid_argument("CPU explicit contiguous ownership requires every member's validated GPU-aligned ordinary Prefill");
             }
         }
 
@@ -7747,7 +7912,7 @@ namespace llaminar2::cpu::native_quantised
      * @param M Default row count for descriptors without an explicit count.
      * @param K_blocks Common activation/weight width in 32-element blocks.
      * @param isa_path Explicit or automatically resolved physical microkernel ISA.
-     * @param job_ownership Explicit independent output ownership; Current preserves old policy.
+     * @param job_ownership Auto resource/work selection by default, or an explicit original/control schedule.
      * @return False for incomplete descriptors; true after every output is published.
      * @throws std::invalid_argument Before writes for unsupported explicit ownership.
      * @throws std::runtime_error Before any output write if the declared bank is undersized.
@@ -7773,7 +7938,7 @@ namespace llaminar2::cpu::native_quantised
         int M,
         int K_blocks,
         ISAPath isa_path = ISAPath::AUTO,
-        FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Current)
+        FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Auto)
     {
         constexpr int kMaxFusedVerifierProjections = NativeQuantisedFusedRowsPlan::capacity;
         if (!descs || num_descs <= 0 ||
@@ -7821,6 +7986,14 @@ namespace llaminar2::cpu::native_quantised
             {descs, static_cast<size_t>(num_descs)}, plans, bundle.partial_route);
         const bool use_avx512 = bundle.use_avx512;
         const bool use_avx2 = bundle.use_avx2;
+        const auto auto_domain=job_ownership==FusedOutputJobOwnership::Auto
+            ?detail::autoOutputJobDomain({descs,static_cast<size_t>(num_descs)},plans,bundle.partial_route,use_avx512)
+            :detail::AutoOutputJobDomain::Eligible;
+        if(auto_domain==detail::AutoOutputJobDomain::InvalidMetadata)
+            throw std::invalid_argument("Auto CPU output ownership received invalid admitted metadata");
+        const auto effective_ownership=job_ownership==FusedOutputJobOwnership::Auto
+            ?(auto_domain==detail::AutoOutputJobDomain::Eligible?FusedOutputJobOwnership::PanelBlocks:FusedOutputJobOwnership::Current)
+            :job_ownership;
         const bool all_full_k = bundle.partial_route == NativeQuantisedFusedPartialRoute::FullK;
         const bool all_k_partitioned = bundle.all_k_partitioned;
         const bool use_layer_local_ordered_tree =
@@ -7829,6 +8002,16 @@ namespace llaminar2::cpu::native_quantised
         const size_t fused_partial_sum_floats = bundle.sharedPartialFloats();
         if (partial_storage.size() < fused_partial_sum_floats)
             throw std::runtime_error("CPU fused projection requires admitted ordered-partial storage");
+
+        if(job_ownership==FusedOutputJobOwnership::Auto && effective_ownership==FusedOutputJobOwnership::Current &&
+            (!omp_in_parallel() || omp_get_thread_num()==0) &&
+            PerfStatsCollector::isRecordFamilyEnabled("kernel","cpu_native_quantised_fused_job_ownership"))
+            PerfStatsCollector::addCounter("kernel","cpu_native_quantised_fused_job_ownership",1.0,"gemm","cpu",
+                {{"requested_ownership","Auto"},{"effective_ownership","Current"},
+                 {"selection_reason",detail::autoOutputJobDomainName(auto_domain)},
+                 {"partition_rule","current"},{"descriptors",std::to_string(num_descs)},
+                 {"k",std::to_string(K_blocks*Q8_1Block::BLOCK_SIZE)},
+                 {"workers",std::to_string(num_threads)}});
 
         if ((!omp_in_parallel() || omp_get_thread_num() == 0) &&
             PerfStatsCollector::isDomainEnabled("kernel"))
@@ -8780,31 +8963,97 @@ namespace llaminar2::cpu::native_quantised
                         local_tree_task_ends[static_cast<size_t>(projection)] = total_local_tree_tasks;
                     }
                 }
+                const bool panel_blocks=effective_ownership==FusedOutputJobOwnership::PanelBlocks;
+                uint64_t maximum_job_working_set=0;
+                if(job_ownership==FusedOutputJobOwnership::Auto && panel_blocks)
+                    for(int projection=0;projection<num_descs;++projection) {
+                        const auto& plan=plans[static_cast<size_t>(projection)];
+                        const auto run_width=use_pair_runs?pair_run_width(projection,maximum_pair_run):1u;
+                        maximum_job_working_set=std::max(maximum_job_working_set,detail::outputJobWorkingSetEstimate(
+                            descs[projection].packed->preparedFootprint(),static_cast<size_t>(plan.rows),
+                            static_cast<size_t>(plan.rows==1?1:plan.verifier_resolution.physical_row_tile),run_width,
+                            static_cast<size_t>(K_blocks),static_cast<size_t>(plan.k_tiles)));
+                    }
                 // Current retains balanced OrderedThreeRows and original cyclic
                 // Pairwise IDs. An independently validated diagnostic may assign
                 // these SAME jobs contiguously without altering any row policy.
+                if(total_local_tree_tasks>static_cast<size_t>(std::numeric_limits<long long>::max()))
+                    throw std::overflow_error("CPU local output job count exceeds its original signed workshare index");
                 const long long static_chunk = detail::selectOrderedThreeRowStaticChunk(
-                    has_ordered_three_rows || job_ownership == FusedOutputJobOwnership::Contiguous,
+                    has_ordered_three_rows || (job_ownership!=FusedOutputJobOwnership::Auto && effective_ownership!=FusedOutputJobOwnership::Current),
                     total_local_tree_tasks, num_threads);
-                if (job_ownership == FusedOutputJobOwnership::Contiguous &&
+                const auto publish_ownership=[&](int actual_workers,size_t actual_chunk,const detail::AutoPanelBlockChoice& cache_choice,
+                    FusedOutputJobOwnership actual_effective,detail::AutoOutputJobDomain actual_reason) {
+                if ((actual_effective != FusedOutputJobOwnership::Current ||
+                     (job_ownership==FusedOutputJobOwnership::Auto && auto_domain==detail::AutoOutputJobDomain::Eligible)) &&
                     (!omp_in_parallel() || omp_get_thread_num() == 0) &&
-                    PerfStatsCollector::isDomainEnabled("kernel"))
-                    PerfStatsCollector::addCounter("kernel", "cpu_native_quantised_fused_job_ownership",
-                        1.0, "gemm", "cpu", {{"requested_ownership", fusedOutputJobOwnershipName(job_ownership)},
-                        {"effective_ownership", "Contiguous"}, {"purpose", "prefill"},
-                        {"effective_verifier_policy", "Pairwise"}, {"physical_row_tile", "2"},
-                        {"jobs", std::to_string(total_local_tree_tasks)}, {"static_chunk", std::to_string(static_chunk)},
-                        {"workers", std::to_string(num_threads)}, {"descriptors", std::to_string(num_descs)},
-                        {"k", std::to_string(K_blocks * Q8_1Block::BLOCK_SIZE)}});
+                    PerfStatsCollector::isRecordFamilyEnabled("kernel","cpu_native_quantised_fused_job_ownership"))
+                {
+                    // Bundle ownership is independent of per-member arithmetic.
+                    // Preserve original labels only when they really are uniform;
+                    // the existing projection records own mixed/decode policy proof.
+                    const auto& first=plans.front();
+                    bool uniform_grouped=first.rows>1;
+                    for(const auto& member:plans)
+                        uniform_grouped=uniform_grouped && member.rows>1 &&
+                            member.effective_verifier_schedule==first.effective_verifier_schedule &&
+                            member.verifier_resolution.physical_row_tile==first.verifier_resolution.physical_row_tile;
+                    PerfStatsCollector::Tags tags{{"requested_ownership",fusedOutputJobOwnershipName(job_ownership)},
+                        {"effective_ownership",fusedOutputJobOwnershipName(actual_effective)},{"purpose","prefill"},
+                        {"single_tile_order",actual_effective==FusedOutputJobOwnership::PanelBlocks?"panel_major":"row_major"},
+                        {"grouped_tile_order","panel_major"},
+                        {"row_policy_scope",uniform_grouped?"uniform_grouped":"preserved_per_descriptor"},
+                        {"jobs",std::to_string(total_local_tree_tasks)},
+                        {"partition_rule",actual_effective==FusedOutputJobOwnership::PanelBlocks?"block_cyclic":
+                            actual_effective==FusedOutputJobOwnership::Current?"current":"equal_job_chunks"},
+                        {"selection_reason",job_ownership==FusedOutputJobOwnership::Auto?detail::autoOutputJobDomainName(actual_reason):"explicit"},
+                        {"workers",std::to_string(actual_workers)},{"descriptors",std::to_string(num_descs)},
+                        {"k",std::to_string(K_blocks*Q8_1Block::BLOCK_SIZE)}};
+                    tags.emplace("static_chunk",std::to_string(actual_chunk));
+                    if(job_ownership==FusedOutputJobOwnership::Auto) {
+                        tags.emplace("job_working_set_estimate",std::to_string(cache_choice.job_working_set));
+                        tags.emplace("l2_budget",std::to_string(cache_choice.l2_budget));
+                        tags.emplace("measured_cap","4");
+                        tags.emplace("work_cap",std::to_string(cache_choice.work_cap));
+                        tags.emplace("cache_cap",std::to_string(cache_choice.cache_cap));
+                    }
+                    if(uniform_grouped) {
+                        tags.emplace("effective_verifier_policy",verifierRowsPolicyName(first.effective_verifier_schedule));
+                        tags.emplace("physical_row_tile",std::to_string(first.verifier_resolution.physical_row_tile));
+                    }
+                    PerfStatsCollector::addCounter("kernel","cpu_native_quantised_fused_job_ownership",
+                        1.0,"gemm","cpu",std::move(tags));
+                }
+                };
+                if(!panel_blocks)publish_ownership(num_threads,static_cast<size_t>(static_chunk),{},effective_ownership,auto_domain);
+                // One worker invocation owns the large task-local frame. Keep
+                // the physical job body directly in this loop: a per-job lambda
+                // was outlined with repeated stack probes/frame setup.
                 auto execute_layer_local_ordered_tree = [&]()
                 {
-#pragma omp for schedule(static, static_chunk) nowait
-                    for (long long global_task = 0;
-                         global_task <
-                             static_cast<long long>(total_local_tree_tasks);
-                         ++global_task)
-                    {
-                        const size_t task = static_cast<size_t>(global_task);
+                    const int worker=omp_get_thread_num(),workers=omp_get_num_threads();
+                    auto actual_chunk=static_cast<size_t>(static_chunk);
+                    auto worker_effective=effective_ownership;
+                    auto worker_reason=auto_domain;
+                    detail::AutoPanelBlockChoice cache_choice{};
+                    if(panel_blocks) {
+                        if(job_ownership==FusedOutputJobOwnership::Auto) {
+                            cache_choice=detail::autoPanelBlockChoice(total_local_tree_tasks,workers,
+                                maximum_job_working_set,CPUExecutionGeometry::local().cache);
+                            if(cache_choice.chunk>=2)actual_chunk=cache_choice.chunk;
+                            else {
+                                worker_effective=FusedOutputJobOwnership::Current;
+                                worker_reason=cache_choice.work_cap<2?detail::AutoOutputJobDomain::InsufficientWork:
+                                    detail::AutoOutputJobDomain::InsufficientCache;
+                            }
+                        } else actual_chunk=detail::panelBlockJobChunk(total_local_tree_tasks,workers);
+                        publish_ownership(workers,actual_chunk,cache_choice,worker_effective,worker_reason);
+                    }
+                    const bool worker_panel_blocks=worker_effective==FusedOutputJobOwnership::PanelBlocks;
+                    const auto range=detail::staticFusedOutputWorkerRange(total_local_tree_tasks,actual_chunk,worker,workers);
+                    for(size_t block_begin=range.first;block_begin<range.end;) {
+                        const size_t block_end=block_begin+std::min(range.block_width,range.end-block_begin);
+                        for(size_t task=block_begin;task<block_end;++task) {
                         const auto projection_it = std::lower_bound(
                             local_tree_task_ends.begin(),
                             local_tree_task_ends.begin() + num_descs,
@@ -8824,15 +9073,16 @@ namespace llaminar2::cpu::native_quantised
                         const size_t run_width = use_pair_runs ? pair_run_width(projection, maximum_pair_run) : 1u;
                         const int row_tiles = (plan.rows - 1) / row_tile_width + 1;
                         const auto row_runs = (static_cast<size_t>(row_tiles) + run_width - 1u) / run_width;
-                        // Ineligible descriptors retain their original local
-                        // order. A paired run is one (panel,row-run) job and
-                        // cannot straddle panels or descriptor boundaries.
-                        const int chunk = static_cast<int>(run_width == 1u
-                            ? local_task % static_cast<size_t>(plan.n_chunks)
-                            : local_task / row_runs);
-                        const int first_tile = static_cast<int>(run_width == 1u
-                            ? local_task / static_cast<size_t>(plan.n_chunks)
-                            : (local_task % row_runs) * run_width);
+                        // PanelBlocks permutes only the existing 2D job enumeration.
+                        // Current/Contiguous retain the original single-tile order;
+                        // no tile, grouping or fixed K operation changes.
+                        const bool panel_major = run_width > 1u || worker_panel_blocks;
+                        const int chunk = static_cast<int>(panel_major
+                            ? local_task / row_runs
+                            : local_task % static_cast<size_t>(plan.n_chunks));
+                        const int first_tile = static_cast<int>(panel_major
+                            ? (local_task % row_runs) * run_width
+                            : local_task / static_cast<size_t>(plan.n_chunks));
                         const int last_tile = std::min(row_tiles, first_tile + static_cast<int>(run_width));
                         for (int row_tile = first_tile; row_tile < last_tile; ++row_tile)
                         {
@@ -9206,8 +9456,12 @@ namespace llaminar2::cpu::native_quantised
                                     use_avx512);
                             }
                         }
+                        }
+                        // Advance from the original chunk START, never its end.
+                        if(range.block_stride>=range.end-block_begin)break;
+                        block_begin+=range.block_stride;
                     }
-
+                    // Empty workers retain the original bias and completion edges.
                     publish_layer_bias();
                 };
 

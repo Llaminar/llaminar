@@ -40,10 +40,11 @@
  * The independent one-row arithmetic oracle remains Decode.
  * Optional GATE_UP_POLICY/DOWN_POLICY independently name explicit existing
  * kernel policies; they inherit the old shared VERIFIER_POLICY by default.
- * GATE_UP_OWNERSHIP/DOWN_OWNERSHIP=Current|Contiguous independently select
- * diagnostic output-job ownership. Current preserves all original receipts;
- * Contiguous requires aligned Pairwise ordinary Prefill and records a distinct
- * ownership identity, never a new row policy or installed exact observation.
+ * GATE_UP_OWNERSHIP/DOWN_OWNERSHIP=Current|Contiguous|PanelBlocks|Auto
+ * independently select scheduling. The fixture preserves explicit Current as
+ * its original baseline; production defaults use Auto. Contiguous and
+ * PanelBlocks are explicit aligned local-Prefill controls. Auto preserves
+ * Current outside its qualified domain and publishes the actual decision.
  * MEASURE_POLICY=both|native|aligned makes timing scope explicit (default both).
  * Missing numerical-domain columns are NaN, never invented costs. Clocked
  * warmups/samples reuse the same quiescent PerfStats suppression as exact batch;
@@ -54,6 +55,9 @@
  * Phase buffers use the production64B-aligned storage type in both ownership
  * controls, preserving original tight FP32/Q8 strides. Metadata and raw clocks
  * identify this layout revision; older std::vector clocks are not relabeled.
+ * Optional ROW_COUNTS supplies positive authored live expert rows. Its exact
+ * count/sum own E/R; explicitly supplied legacy E/R fields must agree. It does
+ * not change row policies or claim a recorded model route replay.
  * Geometry is authored without reconstructing a recorded model route vector.
  */
 
@@ -71,6 +75,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <charconv>
+#include <span>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -251,7 +257,49 @@ namespace
     {
         if (value == "Current") return FusedOutputJobOwnership::Current;
         if (value == "Contiguous") return FusedOutputJobOwnership::Contiguous;
-        throw std::invalid_argument("CPU FFN ownership must be Current or Contiguous");
+        if (value == "PanelBlocks") return FusedOutputJobOwnership::PanelBlocks;
+        if (value == "Auto") return FusedOutputJobOwnership::Auto;
+        throw std::invalid_argument("CPU FFN ownership must be Current, Contiguous, PanelBlocks or Auto");
+    }
+
+    /**
+     * @brief Authenticate one fresh explicit ownership record outside clocks/profiling.
+     * @param tags Actual original kernel record, never a metadata-only substitute.
+     * @param requested Explicit mode received by the selected phase.
+     * @param k Original selected phase's physical input width.
+     * @param descriptors Actual phase member count (2E gate/up, E down), including square matrices.
+     * @throws std::runtime_error If ownership, ordering, purpose or width differs.
+     */
+    void requireOwnershipProof(const PerfStatsCollector::Tags& tags,
+        FusedOutputJobOwnership requested,int k,int descriptors)
+    {
+        const auto fail=[](){throw std::runtime_error("FFN ownership proof does not match its actual phase/mode/order");};
+        if(requested==FusedOutputJobOwnership::Current ||
+           tags.at("requested_ownership")!=fusedOutputJobOwnershipName(requested) ||
+           tags.at("k")!=std::to_string(k) || tags.at("descriptors")!=std::to_string(descriptors))fail();
+        if(requested==FusedOutputJobOwnership::Auto) {
+            if(tags.at("effective_ownership")=="Current") {
+                if(tags.at("partition_rule")!="current")fail();
+                bool known=false;
+                for(auto reason:{cpu::native_quantised::detail::AutoOutputJobDomain::OtherISA,
+                    cpu::native_quantised::detail::AutoOutputJobDomain::OtherRoute,
+                    cpu::native_quantised::detail::AutoOutputJobDomain::OtherPurpose,
+                    cpu::native_quantised::detail::AutoOutputJobDomain::OtherNumerical,
+                    cpu::native_quantised::detail::AutoOutputJobDomain::OtherRowPolicy,
+                    cpu::native_quantised::detail::AutoOutputJobDomain::InsufficientWork,
+                    cpu::native_quantised::detail::AutoOutputJobDomain::InsufficientCache})
+                    known=known || tags.at("selection_reason")==cpu::native_quantised::detail::autoOutputJobDomainName(reason);
+                if(!known)fail();
+                return;
+            }
+            if(tags.at("effective_ownership")!="PanelBlocks" ||
+               tags.at("selection_reason")!="avx512_gpu_aligned_prefill_local" ||
+               std::stoull(tags.at("job_working_set_estimate"))==0 || std::stoull(tags.at("l2_budget"))==0)fail();
+        } else if(tags.at("effective_ownership")!=fusedOutputJobOwnershipName(requested))fail();
+        const bool blocks=requested==FusedOutputJobOwnership::PanelBlocks || requested==FusedOutputJobOwnership::Auto;
+        if(tags.at("single_tile_order")!=(blocks?"panel_major":"row_major") ||
+           tags.at("grouped_tile_order")!="panel_major" || tags.at("purpose")!="prefill" ||
+           tags.at("partition_rule")!=(blocks?"block_cyclic":"equal_job_chunks"))fail();
     }
 
     /**
@@ -382,6 +430,80 @@ namespace
         return rows;
     }
 
+    /** @brief Immutable authored row geometry, never a recorded route replay. */
+    struct ExpertRowsGeometry
+    {
+        std::vector<int> counts; ///< Only active experts; each count is positive.
+        int total_rows=0; ///< Checked exact sum, never capacity padding.
+        bool explicit_counts=false; ///< Provenance only; no arithmetic choice.
+    };
+
+    /**
+     * @brief Parse explicit positive expert rows with original engine capacity bounds.
+     * @param text Comma-separated actual row counts, optionally surrounded by whitespace.
+     * @return Checked vector/sum with explicit authored provenance.
+     * @throws std::invalid_argument For empty, malformed, nonpositive or overflowing input.
+     */
+    ExpertRowsGeometry parseExpertRowCounts(std::string_view text)
+    {
+        ExpertRowsGeometry result;result.explicit_counts=true;
+        size_t first=0;
+        for(;;) {
+            const size_t comma=text.find(',',first);
+            auto token=text.substr(first,(comma==std::string_view::npos?text.size():comma)-first);
+            const auto begin=token.find_first_not_of(" \t\r\n");
+            if(begin==std::string_view::npos)
+                throw std::invalid_argument("FFN ROW_COUNTS requires nonempty positive integer entries");
+            token=token.substr(begin,token.find_last_not_of(" \t\r\n")-begin+1u);
+            int value=0;
+            const auto parsed=std::from_chars(token.data(),token.data()+token.size(),value);
+            if(parsed.ec!=std::errc{} || parsed.ptr!=token.data()+token.size() || value<=0 ||
+               result.total_rows>std::numeric_limits<int>::max()-value)
+                throw std::invalid_argument("FFN ROW_COUNTS requires positive integers with an int-sized total");
+            if(result.counts.size()>=size_t(CPUNativeQuantisedGemmKernel::kMaxBatchedPrequantizedProjections/2))
+                throw std::invalid_argument("FFN ROW_COUNTS exceeds the original gate/up descriptor capacity");
+            result.counts.push_back(value);result.total_rows+=value;
+            if(comma==std::string_view::npos)break;
+            first=comma+1u;
+        }
+        return result;
+    }
+
+    /**
+     * @brief Optional legacy scalar inputs assert, rather than replace, the authored vector.
+     * @param geometry Original parsed positive vector/sum.
+     * @param experts Explicit ACTIVE_EXPERTS, absent when no scalar assertion was supplied.
+     * @param rows Explicit ROUTE_ROWS, absent when no scalar assertion was supplied.
+     * @throws std::invalid_argument For any contradictory duplicate input.
+     */
+    void requireExpertRowAssertions(const ExpertRowsGeometry& geometry,
+        std::optional<int> experts,std::optional<int> rows)
+    {
+        if((experts && *experts!=static_cast<int>(geometry.counts.size())) ||
+           (rows && *rows!=geometry.total_rows))
+            throw std::invalid_argument("FFN authored ROW_COUNTS contradicts explicit ACTIVE_EXPERTS/ROUTE_ROWS");
+    }
+
+    /** @return Original balanced defaults, or one explicit authored row authority before allocation. */
+    ExpertRowsGeometry selectedExpertRows()
+    {
+        constexpr const char* expert_field="LLAMINAR_CPU_MOE_EXPERT_ACTIVE_EXPERTS";
+        constexpr const char* row_field="LLAMINAR_CPU_MOE_EXPERT_ROUTE_ROWS";
+        if(const char* raw=std::getenv("LLAMINAR_CPU_MOE_EXPERT_ROW_COUNTS")) {
+            auto geometry=parseExpertRowCounts(raw);
+            std::optional<int> experts,rows;
+            if(std::getenv(expert_field))experts=envPositiveInt(expert_field,static_cast<int>(geometry.counts.size()));
+            if(std::getenv(row_field))rows=envPositiveInt(row_field,geometry.total_rows);
+            requireExpertRowAssertions(geometry,experts,rows);
+            return geometry;
+        }
+        const int experts=envPositiveInt(expert_field,kDefaultActiveExperts);
+        const int rows=envPositiveInt(row_field,kDefaultLocalRouteRows);
+        if(experts>CPUNativeQuantisedGemmKernel::kMaxBatchedPrequantizedProjections/2)
+            throw std::invalid_argument("FFN expert count exceeds the original gate/up descriptor capacity");
+        return {routeRowsPerExpert(experts,rows),rows,false};
+    }
+
     /**
      * @brief Validate the original contiguous FP32 row layout without reading payloads.
      * @param base Actual output/expert-slice address from the owning aligned buffer.
@@ -498,7 +620,7 @@ namespace
     std::vector<PreparedExpert> prepareExperts(
         const test::QuantizedVerifierFormatCase &format,
         const test::QuantizedVerifierFormatCase &down_format,
-        const std::vector<int> &rows_per_expert,
+        std::span<const int> rows_per_expert,
         int d_model,
         int intermediate,
         CPUProjectionNumericalPolicy numerical_policy)
@@ -559,8 +681,7 @@ namespace
      * @brief Validate and time one production-shaped grouped expert pipeline.
      * @param format Source format for gate/up weights.
      * @param down_format Source format for down weights, independently prepared.
-     * @param active_experts Number of expert members in the transaction.
-     * @param local_route_rows Total expert-major activation rows.
+     * @param geometry Original checked authored expert vector and its exact row sum.
      * @param d_model Logical hidden width.
      * @param intermediate Logical FFN width.
      * @param numerical_policy Independent native or GPU-aligned arithmetic contract.
@@ -579,8 +700,7 @@ namespace
     PipelineTiming runFormat(
         const test::QuantizedVerifierFormatCase &format,
         const test::QuantizedVerifierFormatCase &down_format,
-        int active_experts,
-        int local_route_rows,
+        const ExpertRowsGeometry& geometry,
         int d_model,
         int intermediate,
         CPUProjectionNumericalPolicy numerical_policy,
@@ -595,8 +715,9 @@ namespace
         int profile_iterations,
         const std::string &profile_phase)
     {
-        const std::vector<int> rows_per_expert =
-            routeRowsPerExpert(active_experts, local_route_rows);
+        const auto& rows_per_expert=geometry.counts;
+        const int active_experts=static_cast<int>(rows_per_expert.size());
+        const int local_route_rows=geometry.total_rows;
         std::vector<PreparedExpert> experts =
             prepareExperts(
                 format,
@@ -692,6 +813,16 @@ namespace
             if(!alignedFFNFloatRows(descriptor.output,descriptor.ldc))
                 throw std::runtime_error("FFN down descriptor lost its actual aligned root/row stride");
         const auto publish_layout=[&]() {
+            std::cout<<"CPU_FFN_ROWS,scope="<<(geometry.explicit_counts?"explicit_authored":"balanced_authored")
+                <<",recorded_route_replay=0,format="<<format.label<<",down_format="<<down_format.label
+                <<",numerical_policy="<<(numerical_policy==CPUProjectionNumericalPolicy::GPUAlignedExpert?"GPUAlignedExpert":"BackendNative")
+                <<",purpose="<<projectionRowsPurposeName(purpose)<<",active_experts="<<active_experts
+                <<",route_rows="<<local_route_rows<<",counts=";
+            for(size_t expert=0;expert<geometry.counts.size();++expert) {
+                if(expert)std::cout<<':';
+                std::cout<<geometry.counts[expert];
+            }
+            std::cout<<",outside_timing=1,outside_profile=1\n";
             const auto emit=[&]<class T>(const char* role,const AlignedVector<T>& values,size_t row_elements) {
                 const auto base=reinterpret_cast<std::uintptr_t>(values.data());
                 if(base%AlignedVector<T>::ALIGNMENT)
@@ -934,10 +1065,14 @@ namespace
             const auto expected_descriptors=static_cast<uint64_t>(active_experts)*(profile_phase=="gate_up"?2u:1u);
             const auto routes=fresh_count(PerfStatsCollector::snapshot({route_family}),before_routes,
                 [&](const auto &tags,uint64_t count){emit("route",tags,count);});
-            const auto ownership=fresh_count(PerfStatsCollector::snapshot({ownership_family}),before_ownership,
-                [&](const auto &tags,uint64_t count){emit("ownership",tags,count);});
             const auto requested_ownership=profile_phase=="gate_up"?gate_up_ownership:down_ownership;
-            if(routes!=expected_descriptors || ownership!=uint64_t(requested_ownership==FusedOutputJobOwnership::Contiguous))
+            const auto ownership=fresh_count(PerfStatsCollector::snapshot({ownership_family}),before_ownership,
+                [&](const auto &tags,uint64_t count){
+                    requireOwnershipProof(tags,requested_ownership,profile_phase=="gate_up"?d_model:intermediate,
+                        static_cast<int>(expected_descriptors));
+                    emit("ownership",tags,count);
+                });
+            if(routes!=expected_descriptors || ownership!=uint64_t(requested_ownership!=FusedOutputJobOwnership::Current))
                 throw std::runtime_error("FFN isolated profiling requires fresh actual selected-phase route/ownership proof");
             const auto output=test::native_quantised_dispatch::profilerEnvironment(
                 test::native_quantised_dispatch::kPerfStatsPathEnvironment);
@@ -1059,14 +1194,26 @@ namespace
                 if (record.count < before) throw std::runtime_error("FFN ownership epoch changed during fresh proof");
                 const auto count = record.count - before;
                 if (!count) continue;
+                const bool gate_record=gate_up_ownership!=FusedOutputJobOwnership::Current &&
+                    record.tags.at("requested_ownership")==fusedOutputJobOwnershipName(gate_up_ownership) &&
+                    record.tags.at("k")==std::to_string(d_model) &&
+                    record.tags.at("descriptors")==std::to_string(active_experts*2);
+                const bool down_record=down_ownership!=FusedOutputJobOwnership::Current &&
+                    record.tags.at("requested_ownership")==fusedOutputJobOwnershipName(down_ownership) &&
+                    record.tags.at("k")==std::to_string(intermediate) &&
+                    record.tags.at("descriptors")==std::to_string(active_experts);
+                if(!gate_record && !down_record)
+                    throw std::runtime_error("FFN ownership proof contains an unselected phase/mode");
+                requireOwnershipProof(record.tags,gate_record?gate_up_ownership:down_ownership,
+                    gate_record?d_model:intermediate,gate_record?active_experts*2:active_experts);
                 fresh_ownership += count;
                 std::cout << "CPU_FFN_OWNERSHIP,format=" << format.label << ",down_format=" << down_format.label
                     << ",fresh_bundles=" << count;
                 for (const auto &[name,value] : record.tags) std::cout << ',' << name << '=' << value;
                 std::cout << ",outside_timing=1\n";
             }
-            const auto expected = uint64_t(gate_up_ownership == FusedOutputJobOwnership::Contiguous) +
-                uint64_t(down_ownership == FusedOutputJobOwnership::Contiguous);
+            const auto expected = uint64_t(gate_up_ownership != FusedOutputJobOwnership::Current) +
+                uint64_t(down_ownership != FusedOutputJobOwnership::Current);
             if (fresh_ownership != expected)
                 throw std::runtime_error("Explicit FFN ownership requires its fresh outside-timing ownership PerfStats proof");
         }
@@ -1117,6 +1264,7 @@ namespace
                     <<",d_model="<<d_model<<",intermediate="<<intermediate
                     <<",active_experts="<<active_experts<<",route_rows="<<local_route_rows
                     <<",ffn_output_layout=aligned_phase_roots_v1"
+                    <<",row_vector_scope="<<(geometry.explicit_counts?"explicit_authored":"balanced_authored")
                     <<",phase="<<phases[phase]<<",warmups="<<(phase==5?1:warmup)
                     <<",repeats="<<batch_iterations<<",sample="<<sample
                     <<",us="<<raw_samples[phase][sample];
@@ -1157,8 +1305,30 @@ TEST(Perf_CPUMoEExpertVerifierRows, ExplicitRoleAndNumericalPolicyContract)
     EXPECT_THROW((void)parseVerifierPolicy(""),std::invalid_argument);
     EXPECT_EQ(parseJobOwnership("Current"),FusedOutputJobOwnership::Current);
     EXPECT_EQ(parseJobOwnership("Contiguous"),FusedOutputJobOwnership::Contiguous);
+    EXPECT_EQ(parseJobOwnership("PanelBlocks"),FusedOutputJobOwnership::PanelBlocks);
+    EXPECT_EQ(parseJobOwnership("Auto"),FusedOutputJobOwnership::Auto);
+    for(auto mode:{FusedOutputJobOwnership::Contiguous,FusedOutputJobOwnership::PanelBlocks,FusedOutputJobOwnership::Auto}) {
+        const bool blocks=mode!=FusedOutputJobOwnership::Contiguous;
+        PerfStatsCollector::Tags proof{{"requested_ownership",fusedOutputJobOwnershipName(mode)},
+            {"effective_ownership",mode==FusedOutputJobOwnership::Auto?"PanelBlocks":fusedOutputJobOwnershipName(mode)},
+            {"single_tile_order",blocks?"panel_major":"row_major"},{"grouped_tile_order","panel_major"},
+            {"purpose","prefill"},{"k","2560"},{"descriptors","2"},
+            {"partition_rule",blocks?"block_cyclic":"equal_job_chunks"},
+            {"selection_reason","avx512_gpu_aligned_prefill_local"},{"job_working_set_estimate","1"},{"l2_budget","2"}};
+        EXPECT_NO_THROW(requireOwnershipProof(proof,mode,2560,2));
+        EXPECT_THROW(requireOwnershipProof(proof,mode,2560,1),std::runtime_error);
+        EXPECT_THROW(requireOwnershipProof(proof,mode,512,2),std::runtime_error);
+        proof["single_tile_order"]="foreign";
+        EXPECT_THROW(requireOwnershipProof(proof,mode,2560,2),std::runtime_error);
+    }
+    PerfStatsCollector::Tags preserved{{"requested_ownership","Auto"},{"effective_ownership","Current"},
+        {"selection_reason","current_insufficient_block_work"},{"partition_rule","current"},{"k","2560"},{"descriptors","2"}};
+    EXPECT_NO_THROW(requireOwnershipProof(preserved,FusedOutputJobOwnership::Auto,2560,2));
+    preserved["selection_reason"]="foreign";
+    EXPECT_THROW(requireOwnershipProof(preserved,FusedOutputJobOwnership::Auto,2560,2),std::runtime_error);
+    EXPECT_THROW((void)parseJobOwnership("PanelContiguous"),std::invalid_argument);
+    EXPECT_THROW((void)parseJobOwnership("LiveRowPanelContiguous"),std::invalid_argument);
     EXPECT_THROW((void)parseJobOwnership(""),std::invalid_argument);
-    EXPECT_THROW((void)parseJobOwnership("Auto"),std::invalid_argument);
     EXPECT_THROW((void)parseJobOwnership("contiguous"),std::invalid_argument);
     // Pure validation: no weights, OpenMP team, perf_event_open or filesystem access.
     for(const auto policy:{ProfilePolicy::Native,ProfilePolicy::Aligned}) {
@@ -1185,6 +1355,25 @@ TEST(Perf_CPUMoEExpertVerifierRows, ExplicitRoleAndNumericalPolicyContract)
     EXPECT_EQ(parseMeasurementPolicy("aligned"),MeasurementPolicy::Aligned);
     EXPECT_THROW((void)parseMeasurementPolicy(""),std::invalid_argument);
     EXPECT_THROW((void)parseMeasurementPolicy("unknown"),std::invalid_argument);
+}
+
+/** @test Authored row vectors have one positive bounded authority; no recorded-route claim. */
+TEST(Perf_CPUMoEExpertVerifierRows, ExpertRowCountsContract)
+{
+    const auto geometry=parseExpertRowCounts("1, 2,3,4,50,72,77,351");
+    EXPECT_EQ(geometry.counts,(std::vector<int>{1,2,3,4,50,72,77,351}));
+    EXPECT_EQ(geometry.total_rows,560);
+    EXPECT_TRUE(geometry.explicit_counts);
+    EXPECT_NO_THROW(requireExpertRowAssertions(geometry,8,560));
+    EXPECT_THROW(requireExpertRowAssertions(geometry,7,560),std::invalid_argument);
+    EXPECT_THROW(requireExpertRowAssertions(geometry,8,559),std::invalid_argument);
+    for(const auto text:{""," ","0","-1","1,","1,,2","1.5","2x","2147483648","2147483647,1"})
+        EXPECT_THROW((void)parseExpertRowCounts(text),std::invalid_argument)<<text;
+    const auto maximum=CPUNativeQuantisedGemmKernel::kMaxBatchedPrequantizedProjections/2;
+    std::string too_many="1";
+    for(int i=0;i<maximum;++i)too_many+=",1";
+    EXPECT_THROW((void)parseExpertRowCounts(too_many),std::invalid_argument);
+    EXPECT_EQ(routeRowsPerExpert(4,7),(std::vector<int>{2,2,2,1}));
 }
 
 /** @test Aligned phase roots retain tight FP32/Q8 extents and reject shifted output slices. */
@@ -1248,12 +1437,9 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
     const int intermediate = envPositiveInt(
         "LLAMINAR_CPU_MOE_EXPERT_INTERMEDIATE",
         kDefaultIntermediate);
-    const int active_experts = envPositiveInt(
-        "LLAMINAR_CPU_MOE_EXPERT_ACTIVE_EXPERTS",
-        kDefaultActiveExperts);
-    const int local_route_rows = envPositiveInt(
-        "LLAMINAR_CPU_MOE_EXPERT_ROUTE_ROWS",
-        kDefaultLocalRouteRows);
+    const auto geometry=selectedExpertRows();
+    const int active_experts=static_cast<int>(geometry.counts.size());
+    const int local_route_rows=geometry.total_rows;
     const int warmup = envPositiveInt(
         "LLAMINAR_CPU_MOE_EXPERT_WARMUP",
         3);
@@ -1286,7 +1472,9 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
     const ProjectionRowsPurpose purpose = selectedProjectionPurpose();
     const bool ordered_three=gate_up_schedule==VerifierRowsPolicy::OrderedThreeRows ||
         down_schedule==VerifierRowsPolicy::OrderedThreeRows;
-    if(ordered_three || ownership_diagnostic) {
+    const bool explicit_ownership=(gate_up_ownership!=FusedOutputJobOwnership::Current && gate_up_ownership!=FusedOutputJobOwnership::Auto) ||
+        (down_ownership!=FusedOutputJobOwnership::Current && down_ownership!=FusedOutputJobOwnership::Auto);
+    if(ordered_three || explicit_ownership) {
         ASSERT_EQ(purpose,ProjectionRowsPurpose::Prefill);
         if(profile_iterations>0)ASSERT_EQ(profile_policy,ProfilePolicy::Aligned);
         else ASSERT_EQ(measurement_policy,MeasurementPolicy::Aligned)
@@ -1299,7 +1487,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
         cpuNativeQuantisedSerialEquivalentPolicyN(intermediate);
     const int down_policy_n =
         cpuNativeQuantisedSerialEquivalentPolicyN(d_model);
-    ASSERT_LE(active_experts, 256);
+    ASSERT_LE(active_experts, CPUNativeQuantisedGemmKernel::kMaxBatchedPrequantizedProjections/2);
     ASSERT_GE(local_route_rows, active_experts);
     ASSERT_EQ(d_model % static_cast<int>(Q8_1Block::BLOCK_SIZE), 0)
         << "d_model must contain complete Q8_1 blocks";
@@ -1340,7 +1528,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                "aligned_complete_us,aligned_persistent_us,"
                "aligned_over_native_persistent,purpose,gate_up_policy_n,down_policy_n,requested_gate_up_policy,requested_down_policy,measured_numerics";
         if (ownership_diagnostic) csv << ",requested_gate_up_ownership,requested_down_ownership";
-        csv << ",ffn_output_layout\n";
+        csv << ",ffn_output_layout,row_vector_scope,expert_row_counts\n";
     }
     int executed = 0;
     std::cout
@@ -1374,7 +1562,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
             // Do not even prepare the unselected numerical policy: its oracle
             // and setup kernels would belong to a different profiler launch.
             (void)runFormat(
-                format, down_format, active_experts, local_route_rows, d_model, intermediate,
+                format, down_format, geometry, d_model, intermediate,
                 profile_policy == ProfilePolicy::Aligned
                     ? CPUProjectionNumericalPolicy::GPUAlignedExpert
                     : CPUProjectionNumericalPolicy::BackendNative,
@@ -1392,8 +1580,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
             native = runFormat(
                 format,
                 down_format,
-                active_experts,
-                local_route_rows,
+                geometry,
                 d_model,
                 intermediate,
                 CPUProjectionNumericalPolicy::BackendNative,
@@ -1412,8 +1599,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
             aligned = runFormat(
                 format,
                 down_format,
-                active_experts,
-                local_route_rows,
+                geometry,
                 d_model,
                 intermediate,
                 CPUProjectionNumericalPolicy::GPUAlignedExpert,
@@ -1476,7 +1662,12 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 << (include_native?(include_aligned?"both":"native"):"aligned");
             if (ownership_diagnostic) csv << ',' << fusedOutputJobOwnershipName(gate_up_ownership)
                 << ',' << fusedOutputJobOwnershipName(down_ownership);
-            csv << ",aligned_phase_roots_v1" << '\n';
+            csv << ",aligned_phase_roots_v1,"<<(geometry.explicit_counts?"explicit_authored":"balanced_authored")<<',';
+            for(size_t expert=0;expert<geometry.counts.size();++expert) {
+                if(expert)csv<<':';
+                csv<<geometry.counts[expert];
+            }
+            csv << '\n';
         }
         if(include_native)EXPECT_GT(native_speedup, 1.0)
             << format.label

@@ -106,6 +106,16 @@ namespace llaminar2
         static bool isDomainEnabled(std::string_view domain);
 
         /**
+         * @brief Guard one optional producer before constructing its diagnostics.
+         * @param domain Existing collection domain.
+         * @param name Exact record family, including any hierarchical suffix.
+         * @return Immutable-policy domain/name-prefix selection without allocation.
+         * @details Broad domain collection is unchanged. Focused producers can
+         * avoid formatting tags for sibling families excluded by the export filter.
+         */
+        static bool isRecordFamilyEnabled(std::string_view domain, std::string_view name);
+
+        /**
          * @brief Return whether per-stage CPU wall-clock timing is requested.
          *
          * A generic PerfStats export does not enable this hot-path

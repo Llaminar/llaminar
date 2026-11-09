@@ -766,6 +766,24 @@ namespace llaminar2
         return collectionPolicy().requestsDomain(domain);
     }
 
+    bool PerfStatsCollector::isRecordFamilyEnabled(std::string_view domain, std::string_view name)
+    {
+        const auto& policy=collectionPolicy();
+        if(name.empty() || !policy.requestsDomain(domain))return false;
+        if(policy.collect_all_domains ||
+           ((domain=="stage_cpu" || domain=="stage_cpu_detail") && policy.collect_cpu_stage_family) ||
+           ((domain=="stage_gpu" || domain=="mtp_stage_gpu") && policy.collect_gpu_stage_family))return true;
+        for(const auto& filter:policy.filters) {
+            if(filter=="*" || filter=="all" || filter==domain)return true;
+            if(filter.size()>domain.size() && filter.starts_with(domain) && filter[domain.size()]=='.') {
+                const auto requested=std::string_view(filter).substr(domain.size()+1u);
+                if(name==requested || (name.size()>requested.size() && name.starts_with(requested) &&
+                   name[requested.size()]=='.'))return true;
+            }
+        }
+        return false;
+    }
+
     bool PerfStatsCollector::cpuStageTimingEnabled()
     {
         return collectionPolicy().cpu_stage_timing;

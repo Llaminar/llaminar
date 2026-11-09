@@ -1261,7 +1261,7 @@ namespace llaminar2::cpu::native_quantised
             int descriptor_count,
             int k,
             std::span<float> partial_storage,
-            FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Current)
+            FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Auto)
         {
             if (!descriptors || descriptor_count <= 0 ||
                 descriptor_count > kMaxBatchedPrequantizedProjections ||
@@ -1394,8 +1394,8 @@ namespace llaminar2::cpu::native_quantised
          * @param down_descriptors Down projections for all local experts.
          * @param down_count Number of valid down descriptors.
          * @param partial_storage Admitted bank reused only after each phase's readers retire.
-         * @param gate_up_ownership Independent explicit gate/up output ownership.
-         * @param down_ownership Independent explicit down output ownership.
+         * @param gate_up_ownership Independent requested gate/up ownership; defaults to typed Auto.
+         * @param down_ownership Independent requested down ownership; defaults to typed Auto.
          * @return `true` only when every team participant completes every phase.
          * @throws std::invalid_argument Before any phase writes for unsupported explicit ownership.
          */
@@ -1412,8 +1412,8 @@ namespace llaminar2::cpu::native_quantised
             const BatchedPrequantizedProjectionDesc *down_descriptors,
             int down_count,
             std::span<float> partial_storage,
-            FusedOutputJobOwnership gate_up_ownership = FusedOutputJobOwnership::Current,
-            FusedOutputJobOwnership down_ownership = FusedOutputJobOwnership::Current)
+            FusedOutputJobOwnership gate_up_ownership = FusedOutputJobOwnership::Auto,
+            FusedOutputJobOwnership down_ownership = FusedOutputJobOwnership::Auto)
         {
             if (!gate_up_descriptors || gate_up_count <= 0 ||
                 !down_descriptors || down_count <= 0 ||
@@ -1816,7 +1816,7 @@ namespace llaminar2::cpu::native_quantised
          * @brief Reject an unsupported explicit phase before any FFN payload write.
          * @param descriptors Original already validated source members.
          * @param count Live descriptor prefix.
-         * @param ownership Explicit ownership; Current performs no extra planning.
+         * @param ownership Explicit control or Auto; Auto/Current perform no diagnostic preplanning.
          * @throws std::invalid_argument Unless the original planner admits the requested diagnostic.
          *
          * Uses invocation-local fixed storage and the original live-prefix planner.
@@ -1826,7 +1826,7 @@ namespace llaminar2::cpu::native_quantised
             int count, FusedOutputJobOwnership ownership)
         {
             (void)fusedOutputJobOwnershipName(ownership);
-            if (ownership == FusedOutputJobOwnership::Current) return;
+            if (ownership == FusedOutputJobOwnership::Current || ownership == FusedOutputJobOwnership::Auto) return;
             alignas(FusedVerifierRowsDesc) std::array<std::byte,
                 sizeof(FusedVerifierRowsDesc) * kMaxBatchedPrequantizedProjections> descriptor_storage;
             auto *const fused = ::new (static_cast<void *>(descriptor_storage.data()))
