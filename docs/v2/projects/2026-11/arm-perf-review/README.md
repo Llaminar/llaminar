@@ -190,3 +190,5 @@ After i8mm merge (same tile / post-merge):
   routine step on any base pickup (candidates: compile-only ARM target
   build in preflight or CI image gate). Mac record (lane) continues with
   ninja -k 0 (affected = BUILD-BREAK, not env); ETA ~1h.
+
+| 30 | ARMv9 ISA bundle (SVE2 + FP16/fp16fml) | `30-armv9-sve2-fp16fml-bundle.md` | Open (proposal; operator decision) |
