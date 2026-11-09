@@ -14,7 +14,6 @@
 #include "CPUNativeQuantisedPackedWeights.h"
 #include "CPUNativeNEONProjectionBatch.h"
 #include "CPUNativeQuantisedScalarReference.h"
-#include "CPUNativeQuantisedWeightPacker.h"
 #include "CPUProjectionQ8Publication.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
 #include <algorithm>
