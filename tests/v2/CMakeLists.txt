@@ -3,6 +3,8 @@
 # Canonical registration for Unit, integration, production parity, E2E and
 # performance. Build gates derive dependencies from these same registrations,
 # including executables passed as arguments to script-based test drivers.
+# Native topology eligibility and CPU budgets consume one checked affinity/sysfs
+# snapshot; hybrid presentation fields and missing observations never invent capacity.
 
 # Note: enable_testing() is called in parent CMakeLists.txt (src/v2/CMakeLists.txt)
 
@@ -103,45 +105,23 @@ endfunction()
 # =============================================================================
 # CPU Topology Detection for Test Configuration
 # =============================================================================
-# Detect system topology to configure optimal MPI/OpenMP settings for tests
-execute_process(
-    COMMAND bash -c "lscpu | grep 'Socket(s):' | awk '{print $2}'"
-    OUTPUT_VARIABLE V2_TEST_SOCKETS
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-execute_process(
-    COMMAND bash -c "lscpu | grep 'Core(s) per socket:' | awk '{print $4}'"
-    OUTPUT_VARIABLE V2_TEST_CORES_PER_SOCKET
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-execute_process(
-    COMMAND bash -c "lscpu | grep 'Thread(s) per core:' | awk '{print $4}'"
-    OUTPUT_VARIABLE V2_TEST_THREADS_PER_CORE
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
+# Observe inherited affinity and kernel sibling groups once. Presentation lscpu
+# sections/ordinals are not physical identity on hybrid CPUs. The checked
+# uniform projection is the sole authority for the existing shared test budget.
+include(cmake/V2TestHostTopology.cmake)
+v2_observe_test_host_topology()
 
-if(NOT V2_TEST_SOCKETS OR V2_TEST_SOCKETS EQUAL "")
-    set(V2_TEST_SOCKETS 1)
-endif()
-if(NOT V2_TEST_CORES_PER_SOCKET OR V2_TEST_CORES_PER_SOCKET EQUAL "")
-    set(V2_TEST_CORES_PER_SOCKET 1)
-endif()
-if(NOT V2_TEST_THREADS_PER_CORE OR V2_TEST_THREADS_PER_CORE EQUAL "")
-    set(V2_TEST_THREADS_PER_CORE 1)
-endif()
-
-# Always use at least 2 MPI ranks for testing (even on single-socket systems)
+# Two protocol ranks on one accessible package are explicit oversubscription,
+# never evidence that two distinct physical sockets exist.
 if(V2_TEST_SOCKETS LESS 2)
     set(V2_TEST_MIN_RANKS 2)
     set(V2_TEST_NEEDS_OVERSUBSCRIBE TRUE)
-    message(STATUS "V2 Test Configuration: ${V2_TEST_SOCKETS} socket(s), ${V2_TEST_CORES_PER_SOCKET} cores/socket, ${V2_TEST_THREADS_PER_CORE} threads/core")
-    message(STATUS "V2 Tests will use: mpirun -np 2 --oversubscribe with OMP_NUM_THREADS=${V2_TEST_CORES_PER_SOCKET}")
 else()
     set(V2_TEST_MIN_RANKS ${V2_TEST_SOCKETS})
     set(V2_TEST_NEEDS_OVERSUBSCRIBE FALSE)
-    message(STATUS "V2 Test Configuration: ${V2_TEST_SOCKETS} sockets, ${V2_TEST_CORES_PER_SOCKET} cores/socket, ${V2_TEST_THREADS_PER_CORE} threads/core")
-    message(STATUS "V2 Tests will use: mpirun -np ${V2_TEST_SOCKETS} with OMP_NUM_THREADS=${V2_TEST_CORES_PER_SOCKET}")
 endif()
+message(STATUS "V2 Test Configuration: ${V2_TEST_SOCKETS} accessible package(s), ${V2_TEST_CORES_PER_SOCKET} eligible cores/package, ${V2_TEST_THREADS_PER_CORE} available threads/core")
+message(STATUS "V2 Tests: protocol ranks=${V2_TEST_MIN_RANKS}, oversubscribe=${V2_TEST_NEEDS_OVERSUBSCRIBE}, OMP_NUM_THREADS=${V2_TEST_CORES_PER_SOCKET}")
 
 # =============================================================================
 # Release-mode performance defaults and explicit native test selection
