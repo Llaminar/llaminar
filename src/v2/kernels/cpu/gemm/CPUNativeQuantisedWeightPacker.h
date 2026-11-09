@@ -461,7 +461,8 @@ namespace llaminar2::cpu::native_quantised
         const size_t interleaved_total =
             static_cast<size_t>(N_chunks) * blocks_per_row *
             static_cast<size_t>(out.interleaved_block_stride);
-        out.native_interleaved = placement.allocate<uint8_t>(interleaved_total);
+        out.native_interleaved.replace(placement.allocate<uint8_t>(interleaved_total));
+        const auto interleaved = out.native_interleaved.beginRewrite();
 
         constexpr int kBlocksPerTile = 8;
         constexpr int kColumnsPerChunk = 64;
@@ -589,7 +590,7 @@ namespace llaminar2::cpu::native_quantised
                              static_cast<size_t>(kb)) *
                             static_cast<size_t>(out.interleaved_block_stride);
                         uint8_t *const destination =
-                            out.native_interleaved.data() + block_offset;
+                            interleaved.data() + block_offset;
 
                         const int zmm = column / 16;
                         const int lane = column % 16;
@@ -657,6 +658,7 @@ namespace llaminar2::cpu::native_quantised
                 }
             }
         }
+        out.sealPublication();
     }
 
 #include "CPUNativeQuantisedWindowPacking.inc"
@@ -805,6 +807,7 @@ namespace llaminar2::cpu::native_quantised
                     appendNativeWeightGroups(*unpackable,*fmt,K,row_start+row,kb,1,
                         std::min(blocks_per_window,blocks_per_row-kb),row,kb,bytes,out);
             }
+            out.sealPublication();
             return true;
         }
 
@@ -956,7 +959,8 @@ namespace llaminar2::cpu::native_quantised
             // The following parallel pass writes every byte. Avoid a
             // single-threaded zero fill here because it first-touches the whole
             // permanent weight buffer on the allocator thread's NUMA node.
-            out.native_interleaved = placement.allocate<uint8_t>(interleaved_total);
+            out.native_interleaved.replace(placement.allocate<uint8_t>(interleaved_total));
+            const auto interleaved = out.native_interleaved.beginRewrite();
 
 #pragma omp parallel for schedule(static) collapse(2)
             for (int chunk = 0; chunk < N_chunks; ++chunk)
@@ -966,7 +970,7 @@ namespace llaminar2::cpu::native_quantised
                     int n_cols = std::min(64, N - chunk * 64);
 
                     size_t block_offset = ((size_t)chunk * blocks_per_row + kb) * out.interleaved_block_stride;
-                    uint8_t *interleaved_dst = out.native_interleaved.data() + block_offset;
+                    uint8_t *interleaved_dst = interleaved.data() + block_offset;
 
                     // Interleave: [8 groups][4 ZMMs][64 bytes]
                     // Group g covers INT8[g*4..g*4+3] for each column
@@ -1039,6 +1043,7 @@ namespace llaminar2::cpu::native_quantised
         // The AVX-512 GEMV uses only native_interleaved; int8_flat is dead weight.
         // For FFN_Down (7B): frees ~68 MB, reducing TLB and virtual memory pressure.
         out.releaseDecodedBuffer();
+        out.sealPublication();
 
         return true;
     }

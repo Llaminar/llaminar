@@ -618,8 +618,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         // Function contraction/reassociation is disabled above;
                         // each source multiply remains a separate FP32 edge.
                         const I metadata = Ops::words(packed.chunkMins(chunk, kb) + column);
-                        if (!Ops::metadataFits(metadata, 255u))
-                            throw std::invalid_argument("IQ2_S coefficient contains reserved bits");
+                        // A sealed view's coefficients were admitted at publication;
+                        // owners without a seal keep the per-block check.
+                        if constexpr (!requires { Packed::metadata_admitted; })
+                            if (!Ops::metadataFits(metadata, 255u))
+                                throw std::invalid_argument("IQ2_S coefficient contains reserved bits");
                         const F low_coefficient = __builtin_convertvector(metadata & 15, F);
                         const F high_coefficient = __builtin_convertvector((metadata >> 4) & 15, F);
                         const F base = scale0;

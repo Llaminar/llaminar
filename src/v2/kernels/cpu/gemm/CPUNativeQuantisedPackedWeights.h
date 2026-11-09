@@ -10,6 +10,7 @@
  * is needed to inspect/use a published owner.
  */
 #pragma once
+#include "CPUNativeQuantisedPublishedBytes.h"
 #include "CPUNativeQuantisedWeightView.h"
 #include "CPUNativeQuantisedPreparedFootprint.h"
 #include "tensors/AlignedVector.h"
@@ -54,7 +55,9 @@ namespace llaminar2::cpu::native_quantised
         ///
         /// When deferred packing is active (workspace_data_ is set), this may be empty.
         /// Accessor methods automatically use workspace_data_ when set.
-        AlignedVector<uint8_t> native_interleaved;
+        /// Readers have const access; every write opens a new publication
+        /// generation that a producer must seal before native execution.
+        CPUNativeQuantisedPublishedBytes native_interleaved;
 
         /// Flat INT8 buffer used as intermediate during packing (INT8 pre-decoded formats only).
         /// Layout: [N_chunks][blocks_per_row][64][32] int8_t
@@ -206,12 +209,7 @@ namespace llaminar2::cpu::native_quantised
         {
             if (workspace_data_)
                 throw std::logic_error("Native CPU read view requires resident prepared weights, not a deferred workspace binding");
-            const auto view = CPUNativeQuantisedWeightView::fromPublished({
-                .columns = N, .reduction_width = K,
-                .source = {.codebook_id = codebook_id, .is_superblock = is_superblock, .present = true},
-                .encoding = encoding, .numerical_policy = numerical_policy,
-                .is_asymmetric = is_asymmetric,
-            }, {native_interleaved.data(), native_interleaved.size()});
+            const auto view = native_interleaved.admittedView(descriptor());
             // Direct preparation retains the input codec width; migrated/slot
             // ExpandedInt8 owners publish 32. The read view separates original
             // codec width from physical execution width without changing either
@@ -224,6 +222,28 @@ namespace llaminar2::cpu::native_quantised
                 throw std::logic_error("Native CPU prepared owner and resident publication geometry disagree");
             return view;
         }
+
+        /** @return Metadata interpretation of this owner's published bytes. */
+        [[nodiscard]] CPUNativeQuantisedWeightDescriptor descriptor() const noexcept
+        {
+            return {
+                .columns = N, .reduction_width = K,
+                .source = {.codebook_id = codebook_id, .is_superblock = is_superblock, .present = true},
+                .encoding = encoding, .numerical_policy = numerical_policy,
+                .is_asymmetric = is_asymmetric,
+            };
+        }
+
+        /**
+         * @brief Seal the current byte generation after its producer's last write.
+         * @throws std::invalid_argument For invalid structure or reserved metadata bits.
+         * @details One pass over the metadata plane; see CPUNativeQuantisedMetadataSeal
+         * for the per-encoding rules. Producers call this, readers never do.
+         */
+        void sealPublication() { native_interleaved.seal(descriptor()); }
+
+        /** @return Whether the current byte generation is sealed for this owner's interpretation. */
+        [[nodiscard]] bool publicationSealed() const noexcept { return native_interleaved.sealedFor(descriptor()); }
 
         // -------------------------------------------------------------------
         // Deferred packing (workspace) support
@@ -477,7 +497,7 @@ namespace llaminar2::cpu::native_quantised
         /// Also releases the payload array since native blocks are the primary storage.
         void releaseInterleavedData()
         {
-            { AlignedVector<uint8_t> empty; native_interleaved.swap(empty); }
+            native_interleaved.release();
             payload.clear();
             payload.shrink_to_fit();
         }

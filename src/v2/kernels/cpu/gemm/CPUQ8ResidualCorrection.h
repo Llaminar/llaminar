@@ -76,7 +76,8 @@ inline void validateCPUQ8ResidualSource(const CPUNativeQuantisedPackedWeights&pa
     packed.numerical_policy!=CPUProjectionNumericalPolicy::BackendNative)
   throw std::invalid_argument("Two-term CPU quantized projection requires its exact canonical prepared source tuple and geometry");
 #if defined(__aarch64__) && defined(__ARM_NEON)
- (void)packed.readView(); // Reject unbounded/deferred storage before any publication.
+ // Reject unsealed/deferred storage and unimplemented tuples before any team.
+ CPUNativeNEONProjectionTile<1>::requireExecutable(packed.readView());
 #endif
 }
 /**

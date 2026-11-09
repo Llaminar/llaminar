@@ -157,34 +157,34 @@ TEST(CPUNativeQuantisedWeightView, EverySingleFactorAndRotatedSourceHasBoundedZe
     }
 }
 
-/** @test Invalid input descriptors and borrowed extents never create a readable matrix. */
+/** @test Invalid input descriptors and borrowed extents never pass publication admission. */
 TEST(CPUNativeQuantisedWeightView, RejectsIncompleteForeignAndOverflowingPublications)
 {
     PreparedBytes fixture(native_quantised_formats::Q4_0);
     auto descriptor = fixture.descriptor;
     descriptor.source.present = false;
-    EXPECT_THROW((void)CPUNativeQuantisedWeightView::fromPublished(descriptor, fixture.bytes), std::invalid_argument);
+    EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(descriptor, fixture.bytes), std::invalid_argument);
     descriptor = fixture.descriptor;
     descriptor.source.codebook_id = 255;
-    EXPECT_THROW((void)CPUNativeQuantisedWeightView::fromPublished(descriptor, fixture.bytes), std::invalid_argument);
+    EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(descriptor, fixture.bytes), std::invalid_argument);
     descriptor = fixture.descriptor;
     descriptor.encoding = CPUNativeQuantisedEncoding::Q6KNativeDualScale;
-    EXPECT_THROW((void)CPUNativeQuantisedWeightView::fromPublished(descriptor, fixture.bytes), std::invalid_argument);
+    EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(descriptor, fixture.bytes), std::invalid_argument);
     descriptor = fixture.descriptor;
     descriptor.numerical_policy = static_cast<CPUProjectionNumericalPolicy>(255);
-    EXPECT_THROW((void)CPUNativeQuantisedWeightView::fromPublished(descriptor, fixture.bytes), std::invalid_argument);
+    EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(descriptor, fixture.bytes), std::invalid_argument);
     descriptor = fixture.descriptor;
     descriptor.is_asymmetric = true;
-    EXPECT_THROW((void)CPUNativeQuantisedWeightView::fromPublished(descriptor, fixture.bytes), std::invalid_argument);
+    EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(descriptor, fixture.bytes), std::invalid_argument);
     descriptor = fixture.descriptor;
     descriptor.columns = 0;
-    EXPECT_THROW((void)CPUNativeQuantisedWeightView::fromPublished(descriptor, fixture.bytes), std::invalid_argument);
+    EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(descriptor, fixture.bytes), std::invalid_argument);
     descriptor = fixture.descriptor;
     descriptor.columns = std::numeric_limits<int>::max();
-    EXPECT_THROW((void)CPUNativeQuantisedWeightView::fromPublished(descriptor, fixture.bytes), std::overflow_error);
-    EXPECT_THROW((void)CPUNativeQuantisedWeightView::fromPublished(fixture.descriptor, fixture.bytes.first(1)), std::invalid_argument);
-    EXPECT_THROW((void)CPUNativeQuantisedWeightView::fromPublished(fixture.descriptor, {}), std::invalid_argument);
-    EXPECT_THROW((void)CPUNativeQuantisedWeightView::fromPublished(fixture.descriptor,
+    EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(descriptor, fixture.bytes), std::overflow_error);
+    EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor, fixture.bytes.first(1)), std::invalid_argument);
+    EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor, {}), std::invalid_argument);
+    EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor,
         std::span<const std::uint8_t>(fixture.bytes.data() + 1, fixture.bytes.size())), std::invalid_argument);
 }
 } // namespace llaminar2::test

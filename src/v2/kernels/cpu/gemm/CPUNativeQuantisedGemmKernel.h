@@ -481,18 +481,44 @@ namespace llaminar2::cpu::native_quantised
          * @brief Expose final storage to the ticket-gated overlay slot arena.
          *
          * The arena holds this engine for the model lifetime and writes only
-         * while its physical slot is inactive. Returning the vector's existing
-         * range does not resize, allocate, or change the GEMM object's address.
+         * while its physical slot is inactive. Returning the existing range
+         * does not resize, allocate, change the GEMM object's address or the
+         * current publication: an adopted static engine keeps serving until its
+         * slot is acquired, which opens a rewrite through
+         * beginRetiredCPUNativeQuantisedRewrite().
          */
         std::span<std::uint8_t>
         exportRetiredCPUNativeQuantisedStorage() noexcept override
         {
             if (!valid_ || packed_.native_interleaved.empty())
                 return {};
-            return {
-                packed_.native_interleaved.data(),
-                packed_.native_interleaved.size(),
-            };
+            return packed_.native_interleaved.retainedSlotRoot();
+        }
+
+        /**
+         * @brief Open a new publication generation for an acquired overlay slot.
+         * @return The same final byte range; it stays unadmitted until resealed.
+         */
+        std::span<std::uint8_t> beginRetiredCPUNativeQuantisedRewrite() noexcept override
+        {
+            if (!valid_ || packed_.native_interleaved.empty())
+                return {};
+            return packed_.native_interleaved.beginRewrite();
+        }
+
+        /**
+         * @brief Admit completely written slot bytes before their engine becomes reachable.
+         * @throws std::invalid_argument For reserved metadata bits; the engine stays unadmitted.
+         * @throws std::logic_error For a retired engine.
+         * @details A current seal is left untouched, so republishing an unchanged
+         * engine never writes state that concurrent readers observe.
+         */
+        void admitCPUNativeQuantisedPublication() override
+        {
+            if (!valid_)
+                throw std::logic_error("Retired CPU NativeQuantised engine cannot publish weights");
+            if (!packed_.publicationSealed())
+                packed_.sealPublication();
         }
 
         // -------------------------------------------------------------------
@@ -553,6 +579,18 @@ namespace llaminar2::cpu::native_quantised
             if (!packed_.hasInterleavedData())
             {
                 LOG_ERROR("[CPUNativeQuantisedGemmKernel] Attached CPU_NATIVE_QUANTISED weights have no eager interleaved data");
+                packed_ = CPUNativeQuantisedPackedWeights{};
+                return false;
+            }
+            // Attachment publishes received or detached bytes to execution.
+            try
+            {
+                if (!packed_.publicationSealed())
+                    packed_.sealPublication();
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR("[CPUNativeQuantisedGemmKernel] Attached CPU_NATIVE_QUANTISED weights failed metadata admission: " << error.what());
                 packed_ = CPUNativeQuantisedPackedWeights{};
                 return false;
             }

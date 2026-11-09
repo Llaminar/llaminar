@@ -124,7 +124,7 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, NativeCpuRectanglesKeepStagin
         packed.data_stride=cpu::native_quantised::preparedDataStride(packed.encoding);
         packed.interleaved_block_stride=cpu::native_quantised::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric);
         packed.native_interleaved.resize_uninitialized(size_t(6)*packed.interleaved_block_stride);
-        for(size_t i=0;i<packed.native_interleaved.size();++i)packed.native_interleaved[i]=uint8_t(i*37+11);
+        {const auto written=packed.native_interleaved.beginRewrite();for(size_t i=0;i<written.size();++i)written[i]=uint8_t(i*37+11);}
         const auto manifest=makeMoEOverlayRemoteCpuProjectionManifest(identity,packed,73).forCPUIntersection(intersection);
         ASSERT_TRUE(manifest.valid());EXPECT_EQ(manifest.total_bytes,size_t(69*2)*(packed.interleaved_block_stride/64));
         EXPECT_LT(manifest.total_bytes,packed.native_interleaved.size());

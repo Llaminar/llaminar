@@ -804,6 +804,11 @@ namespace llaminar2
                     EXPECT_FALSE(projection.destination_bytes.empty());
                     const auto *packed = projection.engine->exportCPUNativeQuantisedPackedWeights();
                     ASSERT_NE(packed, nullptr);
+                    // An acquired slot is unadmitted until its arrival writes
+                    // every byte; zero words satisfy every metadata rule.
+                    EXPECT_FALSE(packed->publicationSealed());
+                    std::fill(projection.destination_bytes.begin(), projection.destination_bytes.end(), std::uint8_t{0});
+                    projection.engine->admitCPUNativeQuantisedPublication();
                     const auto view = packed->readView();
                     EXPECT_EQ(view.interleavedBase(), projection.destination_bytes.data());
                     EXPECT_EQ(view.bytes().size(), projection.destination_bytes.size());
@@ -813,6 +818,81 @@ namespace llaminar2
                 lease.reset();
                 EXPECT_EQ(pool->usedSlots(), 0u);
             }
+        }
+
+        /**
+         * @test Slot reuse: every acquisition opens a new publication generation
+         * at the same address, so bytes of an earlier epoch can never stay
+         * admitted, and reserved metadata written by an arrival fails admission.
+         */
+        TEST(CpuExpertSlotPool, AcquisitionWithdrawsAdmissionUntilArrival)
+        {
+            const NativeQuantisedSourceIdentity identity{
+                .codebook_id = native_quantised_formats::IQ3_S.codebook_id,
+                .is_superblock = native_quantised_formats::IQ3_S.is_superblock,
+                .present = true,
+            };
+            auto pool = CpuExpertSlotPool::createForTest({
+                .participant_id = 0,
+                .layer_idx = 0,
+                .capacity = 1,
+                .projections = cpuSlotProjectionSpecs(identity),
+                .memory_placement = CpuExpertSlotPool::MemoryPlacement::aggregateDomain(),
+                .perf_device = "cpu-slot-reuse-test",
+            });
+            const std::uint8_t *root = nullptr;
+            for (std::uint64_t epoch = 1; epoch <= 3; ++epoch)
+            {
+                SCOPED_TRACE(epoch);
+                auto lease = pool->acquire(4, epoch);
+                ASSERT_TRUE(lease.has_value());
+                const auto &projection = lease->projections.front();
+                const auto *packed = projection.engine->exportCPUNativeQuantisedPackedWeights();
+                ASSERT_NE(packed, nullptr);
+                if (!root) root = projection.destination_bytes.data();
+                EXPECT_EQ(projection.destination_bytes.data(), root);
+                EXPECT_FALSE(packed->publicationSealed());
+                EXPECT_DEATH((void)packed->readView(), "not admitted");
+                std::fill(projection.destination_bytes.begin(), projection.destination_bytes.end(),
+                    static_cast<std::uint8_t>(epoch));
+                // IQ3_S coefficient words must stay <= 15: 0x0303 has reserved bits.
+                if (epoch == 3)
+                {
+                    EXPECT_THROW(projection.engine->admitCPUNativeQuantisedPublication(), std::invalid_argument);
+                    EXPECT_FALSE(packed->publicationSealed());
+                    continue;
+                }
+                projection.engine->admitCPUNativeQuantisedPublication();
+                EXPECT_TRUE(packed->publicationSealed());
+                EXPECT_EQ(packed->readView().interleavedBase(), root);
+                // Republishing an unchanged engine keeps its seal.
+                const auto generation = packed->native_interleaved.generation();
+                projection.engine->admitCPUNativeQuantisedPublication();
+                EXPECT_EQ(packed->native_interleaved.generation(), generation);
+            }
+        }
+
+        /** @test A deep copy of sealed bytes is admitted at its own root; a copy of stale bytes is not. */
+        TEST(CpuExpertSlotPool, PublicationCopyInheritsOnlyACurrentSeal)
+        {
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+            const auto physical = migrationStableDeviceVnniFormat(native_quantised_formats::Q4_K);
+            auto gpu = makeProjection(physical.codebook_id, physical.payload_bytes_per_block,
+                physical.is_asymmetric, native_quantised_formats::Q4_K.is_superblock);
+            gpu.source_codebook_id = native_quantised_formats::Q4_K.codebook_id;
+            gpu.has_emins = physical.has_emins;
+            if (physical.has_emins)
+                gpu.emins.assign(gpu.scales.size(), 0xac002c00u);
+            std::string error;
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu, &error)) << error;
+            ASSERT_TRUE(cpu.publicationSealed());
+            const auto copy = cpu;
+            EXPECT_NE(copy.native_interleaved.data(), cpu.native_interleaved.data());
+            EXPECT_TRUE(copy.publicationSealed());
+            EXPECT_EQ(copy.readView().interleavedBase(), copy.native_interleaved.data());
+            (void)cpu.native_interleaved.beginRewrite();
+            const auto stale = cpu;
+            EXPECT_FALSE(stale.publicationSealed());
         }
 
         TEST(

@@ -942,6 +942,28 @@ v2_add_core_free_test(V2_Integration_CPUNativeQuantisedWeightView
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_weight_view>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Quantization Regression)
 
+# Prepared metadata is admitted once per publication generation; execution
+# never tests reserved bits inside a worker team. Coverage equals the former
+# in-loop rules on every lane, and every mutation (slot rewrite included)
+# withdraws admission until a producer reseals.
+add_executable(v2_unit_cpu_native_metadata_seal
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeQuantisedMetadataSeal.cpp")
+target_compile_features(v2_unit_cpu_native_metadata_seal PRIVATE cxx_std_20)
+target_include_directories(v2_unit_cpu_native_metadata_seal PRIVATE
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
+target_link_libraries(v2_unit_cpu_native_metadata_seal PRIVATE GTest::gtest_main)
+v2_add_core_free_test(V2_Unit_CPUNativeQuantisedMetadataSeal
+    COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
+    LABELS V2 Unit CPU DeviceFree NativeQuantised Metadata)
+v2_add_core_free_test(V2_Integration_CPUNativeQuantisedMetadataSealCoverage
+    COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
+        --gtest_filter=CPUNativeQuantisedMetadataSeal.CoversExactlyTheFormerInLoopRulesOnEveryLane:CPUNativeQuantisedMetadataSeal.ViewRequiresTheSealOfItsExactBytesAndInterpretation
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Metadata Regression)
+v2_add_core_free_test(V2_Integration_CPUNativeQuantisedMetadataSealLifecycle
+    COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
+        --gtest_filter=CPUNativeQuantisedMetadataSeal.EveryMutationWithdrawsAdmission:CPUNativeQuantisedMetadataSeal.RejectedResealLeavesThePublicationUnadmitted:CPUNativeQuantisedMetadataSeal.UnsealedAndStalePublicationsAreFatal:CPUNativeQuantisedMetadataSeal.SlotRewriteAtTheSameAddressNeedsAReseal
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Metadata Lifecycle Regression)
+
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     add_executable(v2_test_neon_integer_rope
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__NEONIntegerRoPE.cpp"

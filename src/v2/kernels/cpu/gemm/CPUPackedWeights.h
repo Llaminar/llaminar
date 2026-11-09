@@ -113,7 +113,16 @@ namespace llaminar2::cpu::native_quantised
                     std::memcpy(storage.data(), section.data(), section.size() * sizeof(T));
                 return storage;
             };
-            copy.native_interleaved = clone_storage(source.native_interleaved);
+            {
+                auto storage = destination.allocate<uint8_t>(source.native_interleaved.size());
+                if (!source.native_interleaved.empty())
+                    std::memcpy(storage.data(), source.native_interleaved.data(), source.native_interleaved.size());
+                copy.native_interleaved.replace(std::move(storage));
+            }
+            // The copy is a new publication of identical bytes: a sealed source
+            // stays sealed after one fresh metadata pass over the new root.
+            if (source.publicationSealed())
+                copy.sealPublication();
             copy.payload = clone_storage(source.payload);
             copy.int8_flat = clone_storage(source.int8_flat);
             return std::make_unique<CPUPackedWeights>(std::move(copy));

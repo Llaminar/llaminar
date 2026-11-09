@@ -74,7 +74,9 @@ CPUNativeQuantisedPackedWeights owner(const NativeQuantisedFormatInfo &source, i
     result.numerical_policy = policy; result.data_stride = view.data_stride;
     result.interleaved_block_stride = view.interleaved_block_stride;
     result.native_interleaved.resize(fixture.bytes.size());
-    std::copy(fixture.bytes.begin(), fixture.bytes.end(), result.native_interleaved.begin());
+    const auto bytes = result.native_interleaved.beginRewrite();
+    std::copy(fixture.bytes.begin(), fixture.bytes.end(), bytes.begin());
+    result.sealPublication();
     return result;
 }
 
@@ -400,7 +402,8 @@ TEST_F(CPUNativeNEONExecution, RejectsInputPublicationAndBetaWorkAliasesBeforeWr
     // An interior cross-row alias corrupts unread FP32 values unless the first
     // (writing) phase is proved separately from the later projection input.
     reject({reinterpret_cast<Q8_1Block *>(source.data() + 32), activation.size()}, nullptr);
-    reject({reinterpret_cast<Q8_1Block *>(packed.native_interleaved.data()), activation.size()}, nullptr);
+    // An alias test only borrows the address; it writes nothing, so the seal stays current.
+    reject({reinterpret_cast<Q8_1Block *>(const_cast<std::uint8_t *>(packed.native_interleaved.data())), activation.size()}, nullptr);
     std::vector<std::int32_t> words(activation.size() * sizeof(Q8_1Block) / sizeof(std::int32_t), 0);
     words[32] = 3;
     const auto work = ProjectionRowWork::fromPrefix(DeviceRowRange::deviceCounted(rows, &words[32]));

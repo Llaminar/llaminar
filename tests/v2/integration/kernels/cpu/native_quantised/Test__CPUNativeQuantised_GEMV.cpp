@@ -65,7 +65,19 @@ namespace
     {
         NativeQuantisedPreparedByteFixture fixture(native_quantised_formats::IQ2_S, 64, 32);
         fixture.seedPayloadAndMetadata();
-        const auto packed = fixture.view();
+        // x86 kernels consume the owner type, not a sealed view: the owner
+        // retains the per-block reserved-bit checks this test certifies.
+        const auto layout = fixture.view();
+        CPUNativeQuantisedPackedWeights packed;
+        packed.N = layout.N; packed.K = layout.K; packed.N_padded = layout.N_padded;
+        packed.blocks_per_row = layout.blocks_per_row; packed.payload_bytes = layout.source_payload_bytes;
+        packed.codebook_id = layout.codebook_id; packed.is_superblock = layout.is_superblock;
+        packed.is_asymmetric = layout.is_asymmetric; packed.encoding = layout.encoding;
+        packed.numerical_policy = layout.numerical_policy; packed.data_stride = layout.data_stride;
+        packed.interleaved_block_stride = layout.interleaved_block_stride;
+        packed.native_interleaved.resize(fixture.bytes.size());
+        const auto owned = packed.native_interleaved.beginRewrite();
+        std::copy(fixture.bytes.begin(), fixture.bytes.end(), owned.begin());
         Q8_1Block activation{};
         activation.d = 0x3c00;
         activation.sum_qs = 32;
@@ -79,7 +91,7 @@ namespace
             for (int bad_column = 0; bad_column < 64; ++bad_column)
             {
                 SCOPED_TRACE(::testing::Message() << "lanes=" << Lanes << " bad_column=" << bad_column);
-                auto *word = fixture.bytes.data() + packed.data_stride + 128 + bad_column * 2;
+                auto *word = owned.data() + packed.data_stride + 128 + bad_column * 2;
                 std::uint16_t original = 0;
                 std::memcpy(&original, word, sizeof(original));
                 const std::uint16_t invalid = 0xffff;
