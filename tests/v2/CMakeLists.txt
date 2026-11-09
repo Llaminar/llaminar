@@ -5284,6 +5284,14 @@ set_tests_properties(V2_Unit_MTPIterationBenchmarkMatrix PROPERTIES
     LABELS "V2;Unit;MTP;Benchmark;Regression"
     TIMEOUT 30
 )
+add_test(NAME V2_Unit_PerfBaselineIdentity
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_perf_baseline.py
+)
+set_tests_properties(V2_Unit_PerfBaselineIdentity PROPERTIES
+    LABELS "V2;Unit;Benchmark;Tooling;Regression"
+    TIMEOUT 30
+)
 add_test(NAME V2_Integration_MTPBenchmarkPolicyEvidence
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_mtp_iteration_benchmark_matrix.py
@@ -19032,6 +19040,29 @@ add_v2_test(V2_Perf_CPUNativeQuantised_ThreadScaling
     MPI_PROCS 1
     TIMEOUT 120
 )
+
+# Performance Test: CPU NativeQuantised M=1 decode bandwidth against the prepared working set.
+add_executable(v2_perf_cpu_native_quantised_decode_bandwidth
+    performance/kernels/cpu/native_quantised/Perf__CPUNativeQuantised_DecodeBandwidth.cpp)
+target_link_libraries(v2_perf_cpu_native_quantised_decode_bandwidth
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_perf_cpu_native_quantised_decode_bandwidth PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Perf_CPUNativeQuantised_DecodeBandwidth
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_decode_bandwidth>
+            --gtest_filter=Perf__CPUNativeQuantisedDecodeBandwidth.Ladder
+    LABELS "V2;Performance;GEMV;NativeQuantised;CPU;Bandwidth"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 600)
+add_v2_test(V2_Integration_CPUNativeQuantisedDecodeBandwidthContract
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_decode_bandwidth>
+            --gtest_filter=Perf__CPUNativeQuantisedDecodeBandwidth.ContractTinyLadder
+    LABELS "V2;Integration;CPU;NativeQuantised;AllFormats;ByteExact;Contract;Bandwidth"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=2")
 
 if(V2_CPU_TARGET_X86)
 add_v2_test(V2_Perf_CPUNativeQuantised_VerifierRows
