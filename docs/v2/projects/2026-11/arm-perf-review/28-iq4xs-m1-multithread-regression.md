@@ -426,3 +426,9 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   separate.
 - NOTE: GNU job validation + -H PCH check first REAL build on GB10 census
   (requested); 74 tests; Mac E2E 3 configs.
+
+- SOURCE122 census FULLY GREEN (sealed K14-SOURCE122-CENSUS-20261109): PASS
+  176; 4/4; proof GNU-14 NEON_I8MM 242/1274 (GNU objdump 2.42); lifecycle 1;
+  9/9 cells single=0 grouped=budget 0 mismatches. NO driver-authority
+  rejection — the REAL GNU-14 cc1plus+as jobs + -H PCH validation accepted
+  (nothing real to fix back). Reviewer SOURCE122 (source) pending.
