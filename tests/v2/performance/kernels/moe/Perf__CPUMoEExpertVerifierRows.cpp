@@ -58,6 +58,13 @@
  * Optional ROW_COUNTS supplies positive authored live expert rows. Its exact
  * count/sum own E/R; explicitly supplied legacy E/R fields must agree. It does
  * not change row policies or claim a recorded model route replay.
+ * GATE_UP_CANDIDATE=EligibleOrderedThreeRows is a separately labeled fixture
+ * experiment: legal gate/up members use existing OrderedThreeRows; other
+ * members retain Auto, and down remains Auto. Gate ownership may independently
+ * request Auto or existing explicit PanelBlocks; down ownership remains Auto.
+ * Under Auto ownership, a selected three-row member puts the WHOLE gate bundle on original
+ * balanced Current ownership; ineligible members preserve arithmetic, not
+ * their former AutoPanel worker assignment. Old scalar controls are unchanged.
  * Geometry is authored without reconstructing a recorded model route vector.
  */
 
@@ -329,6 +336,136 @@ namespace
     {
         const char* raw=std::getenv("LLAMINAR_CPU_MOE_EXPERT_MEASURE_POLICY");
         return parseMeasurementPolicy(raw?raw:"both");
+    }
+
+    /** @brief Fixture-only candidate identity; never a production dispatch mode. */
+    enum class GateUpCandidate { ScalarPolicy, EligibleOrderedThreeRows };
+
+    /**
+     * @brief Parse a distinct experiment without reinterpreting scalar policy receipts.
+     * @param value Exact fixture candidate token.
+     * @return The requested typed candidate.
+     * @throws std::invalid_argument If the token is unknown.
+     */
+    GateUpCandidate parseGateUpCandidate(std::string_view value)
+    {
+        if(value=="ScalarPolicy")return GateUpCandidate::ScalarPolicy;
+        if(value=="EligibleOrderedThreeRows")return GateUpCandidate::EligibleOrderedThreeRows;
+        throw std::invalid_argument("CPU FFN gate candidate must be ScalarPolicy or EligibleOrderedThreeRows");
+    }
+
+    /**
+     * @brief Stable fixture evidence label for the independently requested candidate.
+     * @param value Validated candidate identity.
+     * @return Its stable evidence label.
+     * @throws std::invalid_argument If the enum is invalid.
+     */
+    const char* gateUpCandidateName(GateUpCandidate value)
+    {
+        switch(value) {
+        case GateUpCandidate::ScalarPolicy:return "ScalarPolicy";
+        case GateUpCandidate::EligibleOrderedThreeRows:return "EligibleOrderedThreeRows";
+        }
+        throw std::invalid_argument("Unknown CPU FFN gate candidate");
+    }
+
+    /**
+     * @brief Reject contradictory controls before preparing weights or opening clocks.
+     * @param candidate Independently selected fixture experiment.
+     * @param purpose Original projection phase.
+     * @param measurement Numerical policy requested for timing.
+     * @param gate Scalar gate/up row policy; mixed selection requires Auto.
+     * @param down Scalar down row policy, independently retained as Auto.
+     * @param gate_ownership Whole gate/up bundle ownership request.
+     * @param down_ownership Independent down bundle ownership request.
+     * @throws std::invalid_argument If the candidate or controls conflict.
+     */
+    void requireMixedGateOptions(GateUpCandidate candidate,ProjectionRowsPurpose purpose,
+        MeasurementPolicy measurement,VerifierRowsPolicy gate,VerifierRowsPolicy down,
+        FusedOutputJobOwnership gate_ownership,FusedOutputJobOwnership down_ownership)
+    {
+        (void)gateUpCandidateName(candidate);
+        if(candidate==GateUpCandidate::ScalarPolicy)return;
+        if(purpose!=ProjectionRowsPurpose::Prefill || measurement!=MeasurementPolicy::Aligned ||
+           gate!=VerifierRowsPolicy::Auto || down!=VerifierRowsPolicy::Auto ||
+           (gate_ownership!=FusedOutputJobOwnership::Auto && gate_ownership!=FusedOutputJobOwnership::PanelBlocks) ||
+           down_ownership!=FusedOutputJobOwnership::Auto)
+            throw std::invalid_argument("EligibleOrderedThreeRows requires aligned Prefill, scalar Auto policies, gate Auto/PanelBlocks and down Auto ownership");
+    }
+
+    /**
+     * @brief Bind the mixed gate's original requested and actual whole-bundle ownership.
+     * @param tags Fresh actual gate counter, produced outside timing/profiling.
+     * @param requested Explicit gate request; down remains independently authenticated.
+     * @throws std::runtime_error Unless Auto retains Current/OtherRowPolicy or
+     *         explicit PanelBlocks reports its own requested/effective identity.
+     */
+    void requireMixedGateOwnership(const PerfStatsCollector::Tags& tags,FusedOutputJobOwnership requested)
+    {
+        const bool auto_current=requested==FusedOutputJobOwnership::Auto &&
+            tags.at("requested_ownership")=="Auto" && tags.at("effective_ownership")=="Current" &&
+            tags.at("selection_reason")=="current_other_row_policy";
+        const bool explicit_blocks=requested==FusedOutputJobOwnership::PanelBlocks &&
+            tags.at("requested_ownership")=="PanelBlocks" && tags.at("effective_ownership")=="PanelBlocks" &&
+            tags.at("selection_reason")=="explicit";
+        if(!auto_current && !explicit_blocks)
+            throw std::runtime_error("Mixed gate lost its requested/actual Auto-Current or explicit PanelBlocks ownership");
+    }
+
+    /**
+     * @brief Choose only an already-supported original row body from validated metadata.
+     * @param descriptor Original prepared source/purpose; no tensor values are read.
+     * @param plan Original Auto planner's actual M and serial-K partition geometry.
+     * @param use_avx512 Actual original planner ISA, not a compiler advertisement.
+     * @return Existing OrderedThreeRows for its domain, otherwise unchanged Auto.
+     */
+    VerifierRowsPolicy eligibleThreeGatePolicy(
+        const cpu::native_quantised::FusedVerifierRowsDesc& descriptor,
+        const cpu::native_quantised::FusedVerifierRowsPlan& plan,bool use_avx512)
+    {
+        using namespace cpu::native_quantised;
+        if(!descriptor.packed || plan.rows<=0)throw std::invalid_argument("Mixed gate candidate requires validated live metadata");
+        const auto& packed=*descriptor.packed;
+        const auto* source=native_quantised_formats::forSourceIdentity(packed.codebook_id,packed.is_superblock);
+        if(descriptor.purpose==ProjectionRowsPurpose::Prefill &&
+           packed.numerical_policy==CPUProjectionNumericalPolicy::GPUAlignedExpert &&
+           packed.usesNibbleLUT() && is_nibble_lut_format(packed.codebook_id) && source &&
+           source->is_asymmetric==packed.is_asymmetric &&
+           verifierRowsPolicySupportsRuntime(VerifierRowsPolicy::OrderedThreeRows,use_avx512,plan.rows,plan.k_tiles))
+            return VerifierRowsPolicy::OrderedThreeRows;
+        return VerifierRowsPolicy::Auto;
+    }
+
+    /** @brief Complete per-member request identity used by fresh outside-clock evidence. */
+    using MixedGateRouteKey=std::array<std::string,5>;
+    using MixedGateRouteCounts=std::map<MixedGateRouteKey,uint64_t>;
+
+    /**
+     * @brief Consume original route observations without inferring a per-member policy.
+     * @param remaining Exact expected live-member multiset, decremented on success.
+     * @param tags Original production projection observation.
+     * @param count Number of fresh matching members in this observation.
+     * @throws std::runtime_error If the identity, count or selected body disagrees.
+     */
+    void consumeMixedGateRouteProof(MixedGateRouteCounts& remaining,const PerfStatsCollector::Tags& tags,uint64_t count)
+    {
+        const MixedGateRouteKey key{tags.at("m"),tags.at("n"),tags.at("k"),tags.at("codebook"),tags.at("requested_verifier_policy")};
+        const auto found=remaining.find(key);
+        if(tags.at("purpose")!="prefill" || !count || found==remaining.end() || count>found->second ||
+           (key.back()=="OrderedThreeRows" && (tags.at("effective_verifier_policy")!="OrderedThreeRows" || tags.at("physical_row_tile")!="3")))
+            throw std::runtime_error("Mixed gate candidate lacks exact fresh per-member row-policy evidence");
+        found->second-=count;
+    }
+
+    /**
+     * @brief Require observations for every live member, including singleton/pair requests.
+     * @param remaining Exact multiset after consuming fresh production evidence.
+     * @throws std::runtime_error If any expected member remains unobserved.
+     */
+    void requireMixedGateProofComplete(const MixedGateRouteCounts& remaining)
+    {
+        for(const auto& entry:remaining)if(entry.second)
+            throw std::runtime_error("Mixed gate candidate has missing fresh descriptor observations");
     }
 
     /** @brief Parse the one policy that a profiler launch may exercise. */
@@ -695,6 +832,7 @@ namespace
      * @param batch_iterations Transactions per timing interval.
      * @param profile_iterations Isolated profiler iterations; zero selects timing.
      * @param profile_phase Exactly one operation to repeat in profiler mode.
+     * @param gate_candidate Fixture-only per-descriptor experiment; scalar controls remain unchanged.
      * @return Phase/transaction medians, or an empty record for profiler-only work.
      */
     PipelineTiming runFormat(
@@ -713,7 +851,8 @@ namespace
         int samples,
         int batch_iterations,
         int profile_iterations,
-        const std::string &profile_phase)
+        const std::string &profile_phase,
+        GateUpCandidate gate_candidate = GateUpCandidate::ScalarPolicy)
     {
         const auto& rows_per_expert=geometry.counts;
         const int active_experts=static_cast<int>(rows_per_expert.size());
@@ -802,6 +941,47 @@ namespace
                 .verifier_schedule = down_schedule,
                 .purpose = purpose,
             });
+        }
+
+        const bool mixed_gate=gate_candidate==GateUpCandidate::EligibleOrderedThreeRows;
+        MixedGateRouteCounts mixed_gate_expected,mixed_down_expected;
+        size_t three_gate_members=0,three_gate_rows=0,auto_gate_rows=0;
+        if(mixed_gate) {
+            // Cold fixture setup uses the ORIGINAL planner for K parts/source
+            // validation. No planner, selector or timer is added to production.
+            using namespace cpu::native_quantised;
+            std::vector<FusedVerifierRowsDesc> original;
+            original.reserve(gate_up_descriptors.size());
+            for(const auto& descriptor:gate_up_descriptors)original.push_back({
+                .packed=&descriptor.kernel->packedWeights(),.output=descriptor.output,
+                .bias=descriptor.bias,.N=descriptor.n,.ldc=descriptor.ldc,.rows=descriptor.rows,
+                .input=descriptor.input_q8,.purpose=descriptor.purpose});
+            const auto baseline=planNativeQuantisedFusedRows(original,1,omp_get_max_threads());
+            for(size_t member=0;member<original.size();++member) {
+                const auto policy=eligibleThreeGatePolicy(original[member],baseline.projections[member],baseline.use_avx512);
+                gate_up_descriptors[member].verifier_schedule=policy;
+                original[member].verifier_schedule=policy;
+                if(policy==VerifierRowsPolicy::OrderedThreeRows) {
+                    ++three_gate_members;three_gate_rows+=static_cast<size_t>(original[member].rows);
+                } else auto_gate_rows+=static_cast<size_t>(original[member].rows);
+            }
+            if(!three_gate_members)throw std::invalid_argument("EligibleOrderedThreeRows has no supported gate/up members in this actual domain");
+            const auto admitted=planNativeQuantisedFusedRows(original,1,omp_get_max_threads());
+            if(admitted.partial_route!=NativeQuantisedFusedPartialRoute::OutputTileLocal)
+                throw std::invalid_argument("Mixed gate experiment requires the original OutputTileLocal bundle");
+            const auto remember=[](MixedGateRouteCounts& expected,const auto& descriptors,int k) {
+                for(const auto& member:descriptors)++expected[{std::to_string(member.rows),std::to_string(member.n),
+                    std::to_string(k),std::to_string(member.kernel->packedWeights().codebook_id),
+                    verifierRowsPolicyName(member.verifier_schedule)}];
+            };
+            remember(mixed_gate_expected,gate_up_descriptors,d_model);
+            remember(mixed_down_expected,down_descriptors,intermediate);
+            std::cout<<"CPU_FFN_MIXED_GATE,candidate="<<gateUpCandidateName(gate_candidate)
+                <<",three_members="<<three_gate_members<<",three_projection_rows="<<three_gate_rows
+                <<",auto_members="<<gate_up_descriptors.size()-three_gate_members<<",auto_projection_rows="<<auto_gate_rows
+                <<",gate_ownership_scope="<<(gate_up_ownership==FusedOutputJobOwnership::Auto?"whole_bundle_current_if_any_three":"whole_bundle_panel_blocks")
+                <<",gate_requested_ownership="<<fusedOutputJobOwnershipName(gate_up_ownership)
+                <<",down_requested_policy=Auto,down_requested_ownership=Auto,outside_timing=1\n";
         }
 
         // The production phase roots are64B aligned. Keep exact original
@@ -1063,11 +1243,17 @@ namespace
                 std::cout<<",outside_profile=1\n";
             };
             const auto expected_descriptors=static_cast<uint64_t>(active_experts)*(profile_phase=="gate_up"?2u:1u);
+            auto mixed_profile_remaining=profile_phase=="gate_up"?mixed_gate_expected:mixed_down_expected;
             const auto routes=fresh_count(PerfStatsCollector::snapshot({route_family}),before_routes,
-                [&](const auto &tags,uint64_t count){emit("route",tags,count);});
+                [&](const auto &tags,uint64_t count){
+                    if(mixed_gate)consumeMixedGateRouteProof(mixed_profile_remaining,tags,count);
+                    emit("route",tags,count);
+                });
+            if(mixed_gate)requireMixedGateProofComplete(mixed_profile_remaining);
             const auto requested_ownership=profile_phase=="gate_up"?gate_up_ownership:down_ownership;
             const auto ownership=fresh_count(PerfStatsCollector::snapshot({ownership_family}),before_ownership,
                 [&](const auto &tags,uint64_t count){
+                    if(mixed_gate && profile_phase=="gate_up")requireMixedGateOwnership(tags,gate_up_ownership);
                     requireOwnershipProof(tags,requested_ownership,profile_phase=="gate_up"?d_model:intermediate,
                         static_cast<int>(expected_descriptors));
                     emit("ownership",tags,count);
@@ -1094,7 +1280,9 @@ namespace
                 <<",requested_gate_up_policy="<<cpu::native_quantised::verifierRowsPolicyName(gate_up_schedule)
                 <<",requested_down_policy="<<cpu::native_quantised::verifierRowsPolicyName(down_schedule)
                 <<",requested_gate_up_ownership="<<fusedOutputJobOwnershipName(gate_up_ownership)
-                <<",requested_down_ownership="<<fusedOutputJobOwnershipName(down_ownership)<<",bytes_pass=1\n";
+                <<",requested_down_ownership="<<fusedOutputJobOwnershipName(down_ownership);
+            if(mixed_gate)std::cout<<",gate_up_candidate="<<gateUpCandidateName(gate_candidate);
+            std::cout<<",bytes_pass=1\n";
             publish_layout();
             return {}; // Never enter legacy repeat loops or canonical timing clocks.
         }
@@ -1204,12 +1392,14 @@ namespace
                     record.tags.at("descriptors")==std::to_string(active_experts);
                 if(!gate_record && !down_record)
                     throw std::runtime_error("FFN ownership proof contains an unselected phase/mode");
+                if(mixed_gate && gate_record)requireMixedGateOwnership(record.tags,gate_up_ownership);
                 requireOwnershipProof(record.tags,gate_record?gate_up_ownership:down_ownership,
                     gate_record?d_model:intermediate,gate_record?active_experts*2:active_experts);
                 fresh_ownership += count;
                 std::cout << "CPU_FFN_OWNERSHIP,format=" << format.label << ",down_format=" << down_format.label
                     << ",fresh_bundles=" << count;
                 for (const auto &[name,value] : record.tags) std::cout << ',' << name << '=' << value;
+                if(mixed_gate)std::cout<<",gate_up_candidate="<<gateUpCandidateName(gate_candidate);
                 std::cout << ",outside_timing=1\n";
             }
             const auto expected = uint64_t(gate_up_ownership != FusedOutputJobOwnership::Current) +
@@ -1217,6 +1407,8 @@ namespace
             if (fresh_ownership != expected)
                 throw std::runtime_error("Explicit FFN ownership requires its fresh outside-timing ownership PerfStats proof");
         }
+        auto mixed_remaining=mixed_gate_expected;
+        for(const auto& [key,count]:mixed_down_expected)mixed_remaining[key]+=count;
         uint64_t fresh_descriptors=0;bool saw_ordered_three=false;
         for(const auto& record:PerfStatsCollector::snapshot({route_counter})) {
             const auto found=prior.find(record.tags);
@@ -1225,6 +1417,7 @@ namespace
             const auto count=record.count-before;
             if(!count)continue;
             fresh_descriptors+=count;
+            if(mixed_gate)consumeMixedGateRouteProof(mixed_remaining,record.tags,count);
             saw_ordered_three=saw_ordered_three || record.tags.at("effective_verifier_policy")=="OrderedThreeRows";
             std::cout<<"CPU_FFN_RESOLVED,format="<<format.label<<",down_format="<<down_format.label
                 <<",numerical_policy="<<(numerical_policy==CPUProjectionNumericalPolicy::GPUAlignedExpert?"GPUAlignedExpert":"BackendNative")
@@ -1234,7 +1427,8 @@ namespace
                 std::cout<<','<<name<<'='<<record.tags.at(name);
             std::cout<<",outside_timing=1\n";
         }
-        if(gate_up_schedule==VerifierRowsPolicy::OrderedThreeRows || down_schedule==VerifierRowsPolicy::OrderedThreeRows) {
+        if(mixed_gate)requireMixedGateProofComplete(mixed_remaining);
+        if(mixed_gate || gate_up_schedule==VerifierRowsPolicy::OrderedThreeRows || down_schedule==VerifierRowsPolicy::OrderedThreeRows) {
             if(!saw_ordered_three || fresh_descriptors!=3u*static_cast<uint64_t>(active_experts))
                 throw std::runtime_error("Explicit OrderedThreeRows FFN diagnostic requires the exact projection PerfStats filter for fresh outside-timing route proof");
         }
@@ -1273,6 +1467,7 @@ namespace
                         << ",requested_down_ownership=" << fusedOutputJobOwnershipName(down_ownership)
                         << ",ownership_scope=" << (phase == 5 ? "serial_oracle_unchanged" :
                             phase == 1 ? "activation_unchanged" : "production_grouped");
+                if(mixed_gate)std::cout<<",gate_up_candidate="<<gateUpCandidateName(gate_candidate);
                 std::cout << ",outside_timing=1\n";
             }
         std::cout.precision(original_precision);
@@ -1355,6 +1550,83 @@ TEST(Perf_CPUMoEExpertVerifierRows, ExplicitRoleAndNumericalPolicyContract)
     EXPECT_EQ(parseMeasurementPolicy("aligned"),MeasurementPolicy::Aligned);
     EXPECT_THROW((void)parseMeasurementPolicy(""),std::invalid_argument);
     EXPECT_THROW((void)parseMeasurementPolicy("unknown"),std::invalid_argument);
+}
+
+/** @test Mixed candidate requests preserve typed scalar controls and exact evidence multiplicity. */
+TEST(Perf_CPUMoEExpertVerifierRows, MixedGateCandidateContract)
+{
+    using namespace cpu::native_quantised;
+    constexpr auto candidate=GateUpCandidate::EligibleOrderedThreeRows;
+    EXPECT_EQ(parseGateUpCandidate("ScalarPolicy"),GateUpCandidate::ScalarPolicy);
+    EXPECT_EQ(parseGateUpCandidate("EligibleOrderedThreeRows"),candidate);
+    for(const auto* invalid:{"","OrderedThreeRows","eligible","Auto"})
+        EXPECT_THROW((void)parseGateUpCandidate(invalid),std::invalid_argument);
+    EXPECT_NO_THROW(requireMixedGateOptions(candidate,ProjectionRowsPurpose::Prefill,MeasurementPolicy::Aligned,
+        VerifierRowsPolicy::Auto,VerifierRowsPolicy::Auto,FusedOutputJobOwnership::Auto,FusedOutputJobOwnership::Auto));
+    for(auto purpose:{ProjectionRowsPurpose::Decode,ProjectionRowsPurpose::MTPVerifier})
+        EXPECT_THROW(requireMixedGateOptions(candidate,purpose,MeasurementPolicy::Aligned,VerifierRowsPolicy::Auto,
+            VerifierRowsPolicy::Auto,FusedOutputJobOwnership::Auto,FusedOutputJobOwnership::Auto),std::invalid_argument);
+    for(auto measurement:{MeasurementPolicy::Both,MeasurementPolicy::Native})
+        EXPECT_THROW(requireMixedGateOptions(candidate,ProjectionRowsPurpose::Prefill,measurement,VerifierRowsPolicy::Auto,
+            VerifierRowsPolicy::Auto,FusedOutputJobOwnership::Auto,FusedOutputJobOwnership::Auto),std::invalid_argument);
+    EXPECT_THROW(requireMixedGateOptions(candidate,ProjectionRowsPurpose::Prefill,MeasurementPolicy::Aligned,VerifierRowsPolicy::Pairwise,
+        VerifierRowsPolicy::Auto,FusedOutputJobOwnership::Auto,FusedOutputJobOwnership::Auto),std::invalid_argument);
+    EXPECT_THROW(requireMixedGateOptions(candidate,ProjectionRowsPurpose::Prefill,MeasurementPolicy::Aligned,VerifierRowsPolicy::Auto,
+        VerifierRowsPolicy::WideRows,FusedOutputJobOwnership::Auto,FusedOutputJobOwnership::Auto),std::invalid_argument);
+    EXPECT_THROW(requireMixedGateOptions(candidate,ProjectionRowsPurpose::Prefill,MeasurementPolicy::Aligned,VerifierRowsPolicy::Auto,
+        VerifierRowsPolicy::Auto,FusedOutputJobOwnership::Current,FusedOutputJobOwnership::Auto),std::invalid_argument);
+    EXPECT_THROW(requireMixedGateOptions(candidate,ProjectionRowsPurpose::Prefill,MeasurementPolicy::Aligned,VerifierRowsPolicy::Auto,
+        VerifierRowsPolicy::Auto,FusedOutputJobOwnership::Auto,FusedOutputJobOwnership::Current),std::invalid_argument);
+    EXPECT_NO_THROW(requireMixedGateOptions(candidate,ProjectionRowsPurpose::Prefill,MeasurementPolicy::Aligned,VerifierRowsPolicy::Auto,
+        VerifierRowsPolicy::Auto,FusedOutputJobOwnership::PanelBlocks,FusedOutputJobOwnership::Auto));
+    EXPECT_THROW(requireMixedGateOptions(candidate,ProjectionRowsPurpose::Prefill,MeasurementPolicy::Aligned,VerifierRowsPolicy::Auto,
+        VerifierRowsPolicy::Auto,FusedOutputJobOwnership::Contiguous,FusedOutputJobOwnership::Auto),std::invalid_argument);
+    PerfStatsCollector::Tags ownership{{"requested_ownership","Auto"},{"effective_ownership","Current"},
+        {"selection_reason","current_other_row_policy"}};
+    EXPECT_NO_THROW(requireMixedGateOwnership(ownership,FusedOutputJobOwnership::Auto));
+    EXPECT_THROW(requireMixedGateOwnership(ownership,FusedOutputJobOwnership::PanelBlocks),std::runtime_error);
+    ownership["selection_reason"]="current_insufficient_block_work";
+    EXPECT_THROW(requireMixedGateOwnership(ownership,FusedOutputJobOwnership::Auto),std::runtime_error);
+    ownership["requested_ownership"]="PanelBlocks";ownership["effective_ownership"]="PanelBlocks";ownership["selection_reason"]="explicit";
+    EXPECT_NO_THROW(requireMixedGateOwnership(ownership,FusedOutputJobOwnership::PanelBlocks));
+    EXPECT_THROW(requireMixedGateOwnership(ownership,FusedOutputJobOwnership::Auto),std::runtime_error);
+    ownership["effective_ownership"]="Current";
+    EXPECT_THROW(requireMixedGateOwnership(ownership,FusedOutputJobOwnership::PanelBlocks),std::runtime_error);
+    CPUNativeQuantisedPackedWeights packed;
+    packed.codebook_id=5;packed.is_superblock=true;packed.encoding=CPUNativeQuantisedEncoding::NibbleLUT;
+    const auto* source=native_quantised_formats::forSourceIdentity(packed.codebook_id,packed.is_superblock);
+    ASSERT_NE(source,nullptr);packed.is_asymmetric=source->is_asymmetric;
+    packed.numerical_policy=CPUProjectionNumericalPolicy::GPUAlignedExpert;
+    FusedVerifierRowsDesc descriptor{.packed=&packed,.purpose=ProjectionRowsPurpose::Prefill};
+    FusedVerifierRowsPlan plan;plan.k_tiles=16;
+    for(int rows:{1,2,3,4,39}) {
+        plan.rows=rows;
+        EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,true),rows>=3?VerifierRowsPolicy::OrderedThreeRows:VerifierRowsPolicy::Auto);
+        EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,false),VerifierRowsPolicy::Auto);
+    }
+    plan.rows=3;plan.k_tiles=1;EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,true),VerifierRowsPolicy::Auto);
+    plan.k_tiles=16;packed.is_asymmetric=!source->is_asymmetric;
+    EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,true),VerifierRowsPolicy::Auto);
+    packed.is_asymmetric=source->is_asymmetric;packed.numerical_policy=CPUProjectionNumericalPolicy::BackendNative;
+    EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,true),VerifierRowsPolicy::Auto);
+    packed.numerical_policy=CPUProjectionNumericalPolicy::GPUAlignedExpert;descriptor.purpose=ProjectionRowsPurpose::MTPVerifier;
+    EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,true),VerifierRowsPolicy::Auto);
+    descriptor.purpose=ProjectionRowsPurpose::Prefill;packed.encoding=CPUNativeQuantisedEncoding::ExpandedInt8;
+    EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,true),VerifierRowsPolicy::Auto);
+    MixedGateRouteCounts remaining{{{"3","320","2560","5","OrderedThreeRows"},2},{{"1","320","2560","5","Auto"},2}};
+    PerfStatsCollector::Tags three{{"m","3"},{"n","320"},{"k","2560"},{"codebook","5"},
+        {"requested_verifier_policy","OrderedThreeRows"},{"effective_verifier_policy","OrderedThreeRows"},
+        {"physical_row_tile","3"},{"purpose","prefill"}};
+    auto wrong=three;wrong["effective_verifier_policy"]="Pairwise";
+    EXPECT_THROW(consumeMixedGateRouteProof(remaining,wrong,2),std::runtime_error);
+    EXPECT_THROW(consumeMixedGateRouteProof(remaining,three,3),std::runtime_error);
+    EXPECT_NO_THROW(consumeMixedGateRouteProof(remaining,three,2));
+    EXPECT_THROW(requireMixedGateProofComplete(remaining),std::runtime_error);
+    auto singleton=three;singleton["m"]="1";singleton["requested_verifier_policy"]="Auto";
+    singleton["effective_verifier_policy"]="Auto";singleton["physical_row_tile"]="1";
+    EXPECT_NO_THROW(consumeMixedGateRouteProof(remaining,singleton,2));
+    EXPECT_NO_THROW(requireMixedGateProofComplete(remaining));
+    EXPECT_THROW(consumeMixedGateRouteProof(remaining,singleton,1),std::runtime_error);
 }
 
 /** @test Authored row vectors have one positive bounded authority; no recorded-route claim. */
@@ -1464,17 +1736,20 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
     const VerifierRowsPolicy down_schedule=selectedVerifierPolicy("LLAMINAR_CPU_MOE_EXPERT_DOWN_POLICY",verifier_schedule);
     const auto gate_up_ownership=selectedJobOwnership("LLAMINAR_CPU_MOE_EXPERT_GATE_UP_OWNERSHIP");
     const auto down_ownership=selectedJobOwnership("LLAMINAR_CPU_MOE_EXPERT_DOWN_OWNERSHIP");
+    const char* candidate_raw=std::getenv("LLAMINAR_CPU_MOE_EXPERT_GATE_UP_CANDIDATE");
+    const auto gate_candidate=parseGateUpCandidate(candidate_raw?candidate_raw:"ScalarPolicy");
     const bool ownership_diagnostic=gate_up_ownership!=FusedOutputJobOwnership::Current ||
         down_ownership!=FusedOutputJobOwnership::Current;
     const auto measurement_policy=selectedMeasurementPolicy();
     const bool include_native=measurement_policy!=MeasurementPolicy::Aligned;
     const bool include_aligned=measurement_policy!=MeasurementPolicy::Native;
     const ProjectionRowsPurpose purpose = selectedProjectionPurpose();
+    requireMixedGateOptions(gate_candidate,purpose,measurement_policy,gate_up_schedule,down_schedule,gate_up_ownership,down_ownership);
     const bool ordered_three=gate_up_schedule==VerifierRowsPolicy::OrderedThreeRows ||
         down_schedule==VerifierRowsPolicy::OrderedThreeRows;
     const bool explicit_ownership=(gate_up_ownership!=FusedOutputJobOwnership::Current && gate_up_ownership!=FusedOutputJobOwnership::Auto) ||
         (down_ownership!=FusedOutputJobOwnership::Current && down_ownership!=FusedOutputJobOwnership::Auto);
-    if(ordered_three || explicit_ownership) {
+    if(ordered_three || explicit_ownership || gate_candidate!=GateUpCandidate::ScalarPolicy) {
         ASSERT_EQ(purpose,ProjectionRowsPurpose::Prefill);
         if(profile_iterations>0)ASSERT_EQ(profile_policy,ProfilePolicy::Aligned);
         else ASSERT_EQ(measurement_policy,MeasurementPolicy::Aligned)
@@ -1528,7 +1803,9 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                "aligned_complete_us,aligned_persistent_us,"
                "aligned_over_native_persistent,purpose,gate_up_policy_n,down_policy_n,requested_gate_up_policy,requested_down_policy,measured_numerics";
         if (ownership_diagnostic) csv << ",requested_gate_up_ownership,requested_down_ownership";
-        csv << ",ffn_output_layout,row_vector_scope,expert_row_counts\n";
+        csv << ",ffn_output_layout,row_vector_scope,expert_row_counts";
+        if(gate_candidate!=GateUpCandidate::ScalarPolicy)csv<<",gate_up_candidate";
+        csv<<'\n';
     }
     int executed = 0;
     std::cout
@@ -1567,7 +1844,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                     ? CPUProjectionNumericalPolicy::GPUAlignedExpert
                     : CPUProjectionNumericalPolicy::BackendNative,
                 gate_up_schedule, down_schedule, gate_up_ownership, down_ownership, purpose, warmup, samples, batch_iterations,
-                profile_iterations, profile_phase);
+                profile_iterations, profile_phase,gate_candidate);
             ++executed;
             continue;
         }
@@ -1592,7 +1869,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 profile_policy == ProfilePolicy::Native
                     ? profile_iterations
                     : 0,
-                profile_phase);
+                profile_phase,gate_candidate);
         };
         auto measure_aligned = [&]
         {
@@ -1611,7 +1888,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 profile_policy == ProfilePolicy::Aligned
                     ? profile_iterations
                     : 0,
-                profile_phase);
+                profile_phase,gate_candidate);
         };
         /* Alternate first policy to avoid systematic cache-temperature bias. */
         if ((executed & 1) != 0)
@@ -1667,6 +1944,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
                 if(expert)csv<<':';
                 csv<<geometry.counts[expert];
             }
+            if(gate_candidate!=GateUpCandidate::ScalarPolicy)csv<<','<<gateUpCandidateName(gate_candidate);
             csv << '\n';
         }
         if(include_native)EXPECT_GT(native_speedup, 1.0)

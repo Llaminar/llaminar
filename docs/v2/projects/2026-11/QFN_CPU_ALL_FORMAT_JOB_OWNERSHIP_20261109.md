@@ -531,3 +531,129 @@ Evidence: r1141 `passive-comparison.json`, `passive/benchmark.json` and original
 native receipts; `/tmp/qfn-post-auto-attribution-r1142/model-trace/post-auto-evidence/`
 and its closed original profiler/retirement records. No full preflight,
 OpenCode application or long-duration leak certificate is claimed by this slice.
+
+## Matched host attribution and mixed-row follow-up
+
+r1143 compares fresh Current and restored Auto Release builds with identical
+host-only diagnostic filters. Each performs one warmup and three measured
+512-input/16-generated requests. Both native lifetimes, driver observers,
+resource observation and process retirement pass; both owned prefix caches
+are removed. All 48 output IDs, MTP work, public configuration and initial
+placement match. The default remains Auto in the restored production binary.
+
+| Root measured prefill scope, 288 calls | Current, ms | Auto, ms |
+|---|---:|---:|
+| Native complete FFN | 1,866.721 | 1,712.120 |
+| Endpoint compute submission | 2,150.187 | 1,994.837 |
+| Canonical route-slot publication | 94.900 | 92.954 |
+| Transported router-Q8 publication | 106.436 | 108.100 |
+| Route scheduling/bundle validation | 38.313 | 38.154 |
+
+These scopes are not all additive. The actual FFN reduction is **8.28%**;
+the FFN occupies 33.84% of Current's total measured prefill time. Total
+prefill latency falls 117.694 ms across three requests, while FFN time falls
+154.601 ms. The observed throughput change is 278.451 to 284.521 tok/s,
+**+2.18%**. This explains the dilution without projecting the authored
+component fixture's 26–31% gain onto the whole model. Canonical unprofiled
+512/256 throughput remains the earlier 292.594/39.764 result; these added host
+clocks and short decode workload are a separate diagnostic.
+
+Routed work is close but not identical: root live route rows rise 506,687 to
+506,964 (+0.055%); active-expert observations rise 25,959 to 26,077 (+0.455%).
+Only 70 of 288 full layer/row/expert marginals match exactly. Later expert
+movement also differs. Therefore neither the sampled workload nor this
+attribution supplies a reconstructed identical joint expert vector. Follower
+whole-lifetime FFN falls 10.47%; its 492 calls include 12 setup calls outside
+the 480 layer-execute cohort and must not be divided into invented requests.
+
+The host `captured_ticket_publication_wait` is **GPU-to-CPU input readiness**:
+`MoEExpertDispatchStage` waits for the mapped dispatch input publication before
+local computation. It is not a nested FFN/compute-submission timer. The
+separate GPU `awaitCanonicalRouteTicketKernel` waits for CPU-to-GPU results.
+Confusing these opposite directions would incorrectly treat the almost-flat
+host wait as proof that the FFN saving was ineffective.
+
+The original FFN fixture now supports an explicit per-descriptor
+`EligibleOrderedThreeRows` experiment. Legal gate/up members use the existing
+three-row implementation; M1/M2 retain Auto and down independently retains
+Auto. This changes no production dispatch. Any three-row member currently
+makes gate ownership Auto choose the complete original Current schedule.
+Fresh evidence checks every member and that whole-bundle ownership consequence.
+
+Five focused registrations pass, including mixed-row forward/reverse native
+byte/lifecycle cases. Eight original-owner timings use the already-paid
+E84/R3208, H2560/F320, Q4_K gate/up and Q5_1 down vectors, 28 physical workers,
+32 warmups and 30 samples, in Auto/candidate/candidate/Auto order. Persistent
+FFN drops 6.738–6.739 to 6.474–6.476 ms in ascending order (**3.89–3.94%**),
+and 6.745 to 6.511–6.514 ms reversed (**3.43–3.47%**). All byte and fresh
+selection proofs pass; processes/session state retire. These component gains
+are not yet model or automatic-dispatch qualification.
+
+Evidence: `/tmp/qfn-cpu-auto-host-ab-r1143/analysis/NOTE.md`, its original
+`comparison.json` and closed native records; mixed fixture/timing records in
+`/tmp/qfn-cpu-mixed-three-gate-auto-down-next/`. The scoped fixture build first
+exposed an incorrect test-only encoding enum spelling; it was corrected to
+the existing `ExpandedInt8` before the successful build and tests.
+
+## Three-row eligibility and contrary measurements
+
+The explicit mixed fixture also permits gate/up PanelBlocks while leaving
+down Auto. Its forward/reverse byte and selection contracts pass, but the
+QFN-shaped timings regress **0.52–2.38%** against the existing three-row
+Auto/Current ownership. Keep the current ownership guard. A row-reuse win
+does not imply that both scheduling changes compose into another win.
+
+The remaining eligible canonical nibble sources were measured on the same
+E84/R3208, H2560/F320, 28-worker workload. Q4_0 improves persistent complete
+FFN **3.98–6.26%**, IQ4_NL **8.84–9.10%**, IQ4_XS **8.96–9.98%**, and
+Q4_1 **1.77–3.50%**. The Q4_K measurements above are retained rather than
+reswept. Every run passes the original serial-row byte oracle, fresh member
+selection proof and session retirement. IQ4_XS uses the existing canonical
+nibble source-scale representation; no tensor is requantized.
+
+Broader aspect and work holdouts rule out promoting three rows for every
+projection with N no larger than K. At K512/N512, Q4_0 and Q4_K gate/up lose
+roughly 22–31%; K2048/N768 also regresses. K2560/N320 with two M64 experts
+loses 7.46–8.13% complete FFN, whereas eight such experts improve
+4.86–5.16%. Work and aspect therefore both matter.
+
+A K/N bound of eight is still only a candidate, not a qualified general rule.
+At K2560/N640 with 28 workers, Q4_K gate/up loses 1.82–2.98%; at K4096/N512
+it is approximately flat. On the original K2560/N320 shape with 16 mixed-row
+experts and seven workers, Q4_1 and Q4_K gate/up lose **6.44–7.80%** and the
+separate complete operation loses **2.69–3.00%**. The persistent-team samples
+in that last case visibly change regime within the timed series, falling
+from about 4 ms toward 2.8–3.1 ms. Their apparent gains do not qualify the
+dispatch decision. The raw chronological samples remain available; no rows
+or inconvenient runs are discarded. Cache and worker effects need attribution
+before installing a rule across positive worker counts.
+
+Evidence: `/tmp/qfn-cpu-mixed-three-panel-cross-next/economy/`,
+`/tmp/qfn-cpu-mixed-three-eligible-formats-r1144/`,
+`/tmp/qfn-cpu-three-aspect-work-r1145/` and
+`/tmp/qfn-cpu-three-ratio-boundaries-r1146/`. These are authored component
+holdouts, not reconstructed model traces or full-model qualification.
+
+The existing isolated profiler subsequently measured the same Q4_K gate/up
+operation at 7/28 workers and E16/E84, two fresh observations each. Three-row
+execution lowers instructions about 6–7% and L1 load misses about 29–30% in
+all four cases. Small E16/seven-worker cycles rise 5.05% with essentially
+unchanged effective frequency; IPC falls 11.38%. Large E84 cases reduce
+cycles 0.79–3.11%. Fewer loads alone do not establish faster execution.
+One-call profiler durations are not canonical timing results.
+
+A declared 128-warmup/40-sample follow-up retains all earlier observations.
+E16/28 workers is approximately flat: gate/up −0.79/+1.04%, complete
+persistent FFN −1.09/−0.19%. E84/seven workers improves gate/up
+3.83–6.68% and complete persistent FFN 2.27–2.99%. These clocks use the
+original FFN owner and pass bytes, source/binary closure and retirement.
+Evidence: `/tmp/qfn-cpu-three-worker-profiles-r1148/` and
+`/tmp/qfn-cpu-three-settled-holdouts-r1149/`.
+
+**Automatic three-row promotion is held.** A cache-footprint condition could
+exclude the small resident workloads, but summing descriptor bytes would
+double-count aliased weights. Sorting ranges in the current planner would
+repeat on every worker; an allocation-order-sensitive estimate is also not
+an attractive dispatch contract. The private prototype is not installed.
+Keep the proven Auto panel scheduler and the focused comparison harness while
+investigating a simpler explanation or a more valuable throughput target.

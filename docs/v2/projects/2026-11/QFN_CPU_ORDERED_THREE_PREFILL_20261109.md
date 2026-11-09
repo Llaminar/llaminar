@@ -1,9 +1,13 @@
 # QFN CPU three-row Prefill candidate
 
 Status: explicit diagnostic, **not selected by Auto or installed exact tables**.
-The last qualified model checkpoint is `84f29461a`:285.983 prefill /40.013
-benchmark decode tok/s (39.857 after-prefill) on2×MI50+2×CPU socket TP. Nothing
+The latest qualified scheduling checkpoint is `2ae33375f`:292.594 prefill /39.764
+benchmark decode tok/s (39.609 after-prefill) on2×MI50+2×CPU socket TP. Nothing
 below is a new full-model gain. The500/40 goal remains open.
+
+The newer [mixed-row and worker holdouts](QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md#three-row-eligibility-and-contrary-measurements)
+retain target-shape wins and counterexamples. General automatic three-row
+promotion remains held; the existing Auto panel scheduler stays installed.
 
 ## Arithmetic and implementation
 

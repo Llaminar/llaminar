@@ -27312,10 +27312,33 @@ add_v2_test(V2_Perf_CPUMoEExpertVerifierRows
 # Device-free fixture controls share the original FFN owner; no weight preparation.
 add_v2_test(V2_Integration_CPUMoEExpertExplicitPolicyTimingContract
     COMMAND $<TARGET_FILE:v2_perf_cpu_moe_expert_verifier_rows>
-        --gtest_filter=Perf_CPUMoEExpertVerifierRows.ExplicitPurposeSelectionContract:Perf_CPUMoEExpertVerifierRows.ExplicitRoleAndNumericalPolicyContract:Perf_CPUMoEExpertVerifierRows.TimingCollectionScopeContract:Perf_CPUMoEExpertVerifierRows.OutputLayoutContract:Perf_CPUMoEExpertVerifierRows.ExpertRowCountsContract
+        --gtest_filter=Perf_CPUMoEExpertVerifierRows.ExplicitPurposeSelectionContract:Perf_CPUMoEExpertVerifierRows.ExplicitRoleAndNumericalPolicyContract:Perf_CPUMoEExpertVerifierRows.TimingCollectionScopeContract:Perf_CPUMoEExpertVerifierRows.OutputLayoutContract:Perf_CPUMoEExpertVerifierRows.ExpertRowCountsContract:Perf_CPUMoEExpertVerifierRows.MixedGateCandidateContract
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Prefill;Lifecycle;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+
+# Original FFN owner: legal mixed M1/M2/three-row tails, independently Auto down.
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    foreach(_mixed_gate_order forward reverse)
+        if(_mixed_gate_order STREQUAL "forward")
+            set(_mixed_gate_rows "1,2,3,4,5,9")
+        else()
+            set(_mixed_gate_rows "9,5,4,3,2,1")
+        endif()
+        foreach(_mixed_gate_ownership Auto PanelBlocks)
+            set(_mixed_gate_suffix "")
+            if(_mixed_gate_ownership STREQUAL "PanelBlocks")
+                set(_mixed_gate_suffix "_PanelBlocks")
+            endif()
+            add_v2_test(V2_Integration_CPUMoEExpertMixedGateLifecycle_${_mixed_gate_order}${_mixed_gate_suffix}_AVX512
+                COMMAND $<TARGET_FILE:v2_perf_cpu_moe_expert_verifier_rows>
+                    --gtest_filter=Perf_CPUMoEExpertVerifierRows.ProductionGeometryByteExactAndEconomical
+                LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;Prefill;AVX512;ByteExact;Lifecycle;Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+                ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;LLAMINAR_ISA_LEVEL=avx512;OMP_NUM_THREADS=3;OMP_DYNAMIC=false;LLAMINAR_PERF_STATS_SUMMARY=1;LLAMINAR_PERF_STATS_FILTER=kernel.cpu_native_quantised_fused_verifier_rows_projection_launch,kernel.cpu_native_quantised_fused_job_ownership;LLAMINAR_CPU_MOE_EXPERT_PURPOSE=prefill;LLAMINAR_CPU_MOE_EXPERT_FORMATS=Q4_K;LLAMINAR_CPU_MOE_EXPERT_DOWN_FORMAT=Q5_1;LLAMINAR_CPU_MOE_EXPERT_D_MODEL=512;LLAMINAR_CPU_MOE_EXPERT_INTERMEDIATE=320;LLAMINAR_CPU_MOE_EXPERT_ACTIVE_EXPERTS=6;LLAMINAR_CPU_MOE_EXPERT_ROUTE_ROWS=24;LLAMINAR_CPU_MOE_EXPERT_ROW_COUNTS=${_mixed_gate_rows};LLAMINAR_CPU_MOE_EXPERT_MEASURE_POLICY=aligned;LLAMINAR_CPU_MOE_EXPERT_GATE_UP_POLICY=Auto;LLAMINAR_CPU_MOE_EXPERT_DOWN_POLICY=Auto;LLAMINAR_CPU_MOE_EXPERT_GATE_UP_OWNERSHIP=${_mixed_gate_ownership};LLAMINAR_CPU_MOE_EXPERT_DOWN_OWNERSHIP=Auto;LLAMINAR_CPU_MOE_EXPERT_GATE_UP_CANDIDATE=EligibleOrderedThreeRows;LLAMINAR_CPU_MOE_EXPERT_WARMUP=1;LLAMINAR_CPU_MOE_EXPERT_SAMPLES=1;LLAMINAR_CPU_MOE_EXPERT_BATCH_ITERATIONS=1")
+        endforeach()
+    endforeach()
+endif()
 
 # Performance: exact cross-tier floating expert projections at production shape.
 add_executable(v2_perf_cpu_floating_moe_expert
@@ -36797,6 +36820,17 @@ if(TEST V2_Integration_CPUMoEExpertExplicitPolicyTimingContract)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_CPUMoEExpertExplicitPolicyTimingContract)
 endif()
+
+foreach(_mixed_gate_order forward reverse)
+    if(TEST V2_Integration_CPUMoEExpertMixedGateLifecycle_${_mixed_gate_order}_AVX512)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+            V2_Integration_CPUMoEExpertMixedGateLifecycle_${_mixed_gate_order}_AVX512)
+    endif()
+    if(TEST V2_Integration_CPUMoEExpertMixedGateLifecycle_${_mixed_gate_order}_PanelBlocks_AVX512)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+            V2_Integration_CPUMoEExpertMixedGateLifecycle_${_mixed_gate_order}_PanelBlocks_AVX512)
+    endif()
+endforeach()
 
 # Completed CPU expert observation and exact profiler/reset equivalence.
 if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_unit_moe_graph_native_profiling_metrics)

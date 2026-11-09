@@ -74,6 +74,26 @@ required for safe progress. Tests must prove actual communication extents for
 partial buckets, empty participants, skewed ownership, and large-to-small
 replays; correct output alone does not prove economical communication.
 
+### GPU Launch Work
+
+**Size GPU launches to the actual live work.** Every CUDA/ROCm grid, including
+captured grids, must cover the live rows, tiles, experts or other work items
+required by that invocation. Allocation capacity and maximum admitted shape
+are never the launch extent. Capturing or replaying an oversized grid and
+discarding excess blocks through bounds checks, sentinels or early returns is
+**forbidden**. Skip compute launches when their live work is empty; launch only
+the bounded control work genuinely required for protocol progress. Necessary
+rounding of the final partial block to the kernel's execution granularity does
+not justify additional wholly inactive blocks or empty kernel families.
+
+Graph capture is not an exception: retained storage may cover the worst case,
+but launch selection and geometry must follow device-owned live work. Do not
+introduce host count readbacks, blocking synchronization or recapture to satisfy
+this rule. Tests must verify actual submitted launch dimensions and work
+coverage for partial buckets, empty participants, skewed expert loads and
+large-to-small replays. Correct outputs or an early-exit guard alone do not
+prove economical GPU execution.
+
 ### GPU Execution and Memory
 
 8. **GPU inference is device-resident end to end.** After request admission,
