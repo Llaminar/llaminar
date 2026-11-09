@@ -175,3 +175,12 @@ the source policy). Dead persistent_state parameter removed.
 - LATENCY: p50/p95 not needed for the mean-tok/s gate; timer table in the
   extra-B CSV; new prefill_chunk_host_wall/family timers populate only on GPU
   bucketed prefill, not CPU runs.
+
+## 3rd ABBA repeat — VERDICT (2026-11-09)
+
+- 35B-nomtp decode, n=4/arm: A 23.450±0.100 vs B 23.638±0.104 →
+  **+0.80%** (4v4, consistent sign every pair, ≈8σ vs rep noise). The +0.66%
+  was NOT noise — reproducibly +0.7–0.8%.
+- Memo-deletion gate condition MET (no regression anywhere: 27B 0.0%/−0.28%,
+  35B-mtp +0.31%); prefill no-gain (+0.20% jitter). +0.8% decode = branch
+  BONUS (recorded in the handover).
