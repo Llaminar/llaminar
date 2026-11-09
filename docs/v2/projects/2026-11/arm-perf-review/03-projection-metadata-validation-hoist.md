@@ -65,3 +65,15 @@ separate (shared) path with the same pattern but different owners.
   10/10, NumericalContract 5/5, writer negatives 5/5; run<> 44045→37434
   instructions. Syntax-only: gcc-16 ARM + clang x86_64-AVX512. Pending:
   core-linked tests (.80) + WSL x86 gate. x86 loadScales checks untouched.
+
+## Reviewer P1 #2 (2026-11-09, R1 @ 09cba9963) — stale test fixture
+
+- CpuExpertSlotPool.AcquisitionWithdrawsAdmissionUntilArrival fills the whole
+  native stream with byte(epoch): epoch1 → IQ3_S 0x0101=257, epoch2 →
+  0x0202=514 — both violate ≤15 (not only epoch3's 0x0303) — so the new seal
+  correctly rejects at epoch1 while the test expected success for 1/2.
+- The PRODUCTION seal is right (in-loop-only validation previously let
+  invalid metadata through until compute); the FIXTURE must be fixed: seed
+  valid secondary words for accepted epochs (epoch-distinct in-range values
+  OK), corrupt a single coefficient only in the rejected epoch. Needs the
+  .80 core-linked run (not covered by core-free/M1 suites).
