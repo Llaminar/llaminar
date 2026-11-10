@@ -196,3 +196,17 @@ artifacts exist.
   baseline binary/core hashes + 4-split stats unchanged. Main
   investigating the 8192 diagnostic (ownership/qualification) before
   completion/handback. No inference/profiling ran.
+
+### #74 — 8192 root-caused (Main, 2026-11-10, ~23:10Z): separate narrow follow-up
+
+Root: the row selector intentionally returns a NONFITTING MANDATORY
+diagnostic plan; ordinary candidate admission passed it into optional-ngram
+selection BEFORE canonical admission → invalid_argument aborted the search
+rather than a typed capacity rejection. #74 fix (narrow): the canonical
+PhysicalMemoryPlanAdmissionCertificate on the frozen base BEFORE optional
+selection; NO byte estimates/reserve, no row/quota retry, no placement
+workaround. Focused CPU/CUDA/ROCm budget-exhaustion regression running
+against the old caller before the patch. Same real commands rechecked after
+source ACK/green. #71 fix = 4096 REAL proof; 8192 = separate #74. Main
+retains exclusive .79 for this bounded follow-up only (no inference/
+profiling).
