@@ -385,3 +385,28 @@ After i8mm merge (same tile / post-merge):
   3027/8fcc optional (trees still present) — provenance was independently
   verified via compile_commands.
 - MTP trace-inventory sweep queued (read-only).
+
+### Reviewer #164: idea-31+selector re-pin ACK at df15aca96 — census does NOT auto-transfer
+
+- Bounded mechanical/source re-pin ACK: chain 28ddbe253 → 4950e6101 →
+  870bb545e (install) → 8e23691d8 → df15aca96; range-diff 8fcc..042a vs
+  28dd..df15 = 4/4 `=`; same 5-file +423/−35 delta; endpoint files
+  byte-identical; PS-1 admission preserved.
+- Ancestry independently confirmed: 8fcc NOT an ancestor of 28dd (none of
+  its 11 R2 objects in ancestry); Main's re-land ends at **cd0f95150** (IS
+  an ancestor; 29351..8fcc vs 96e19ccc3..cd0 = 11/11 `=`; Q16 endpoint
+  matches) — preservation evidence, not fresh R2 qualification.
+- **CENSUS QUALIFICATION (decisive):** `=` alone does NOT prove the 3027
+  receipt qualifies 870bb545e — the canonical census binds dependency
+  bytes/resolved paths, configured command+directory, compiler/assembler
+  identities, object, checker/envelope/budget, disassembler. Main must
+  authenticate complete binding against the new configured tree OR obtain
+  FRESH new-pin evidence. DECISION: run the fresh census at 870bb545e
+  (tree seeding by the addon; arm-sparks executes) — supersedes the
+  earlier content-bound-receipt default.
+- Changed base NOT globally identical (175 files; the GEMM family's
+  differing Gemv patch = AVX512 pair-dot work, outside this ACK); witness/
+  probe/budgets/checker/envelope/portability + rounding registrations +
+  tournament contract entries unchanged at base.
+- Source ACK ≠ FF/INSTALLABLE/integration/merge grant. B9 = next, separate
+  review (#165); #159 did not cover its grammar.
