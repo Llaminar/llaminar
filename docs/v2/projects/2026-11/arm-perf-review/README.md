@@ -1120,3 +1120,8 @@ mechanisms (pre-fix fixed-out-dir reuse [grep artifact] + the .80 disk-full
 retry existed; existing fixes close both; RECOMMENDATION = document benign
 (reordering Debug first is cosmetic). Pending: pin the specific mechanism
 from the retained g-*.census.log files on .80 (arm-sparks to cat).
+- SHA CORRECTION (addon): control (c) was AMENDED (comment-only — the
+  [x10,#4] case reads [404,408), interior to the slot [400,408)) → final
+  (c) SHA = **825fe8deb** (not 0185f69b3). Final strengthening SHAs:
+  3ed993968 (a) / f3faa540c (b) / 825fe8deb (c). Content byte-identical to
+  the validated composition; analysis shard 64/64 green after the edit.
