@@ -11,6 +11,11 @@
  * facts once, before any worker team exists, so the row programs themselves
  * carry no per-call validation (and cannot throw inside a team).
  *
+ * The proof also covers the consumers' own arithmetic: every int index the
+ * row programs form (global head, row strides, query-row x head task count)
+ * is representable, and a format with fixed per-row scratch (Q16) admits its
+ * head width against that capacity.
+ *
  * Banks are synchronous borrows; their owners retain storage for the call.
  * Tensor entry points admit their actual allocation extents; raw-pointer entry
  * points admit the extents their geometry declares. Core-free.
@@ -48,16 +53,21 @@ struct CPUAttentionInvocationRequest
     int gqa_n_rep = 0;            ///< Explicit query heads per K/V head; zero derives it.
     std::size_t key_row_bytes = 0;   ///< Bytes of one physical K row (all K/V heads).
     std::size_t value_row_bytes = 0; ///< Bytes of one physical V row (all K/V heads).
+    /// Head-width capacity of the format's fixed per-row scratch; zero means kMaxHeadDim.
+    int scratch_head_dim = 0;
 };
 
 /**
  * @brief Proof that an invocation's row arithmetic stays inside admitted banks.
  *
  * Only admit() constructs it. Holding one means: dimensions are positive and
- * representable; head_dim is at most kMaxHeadDim; every query head maps to a
- * K/V head below kv_heads; query/output banks hold query_rows rows of
- * query_heads*head_dim FP32 values; K/V banks hold kv_physical_rows rows; no
- * bank is null; and the output bank overlaps neither the query nor the K/V banks.
+ * representable; head_dim is at most kMaxHeadDim and at most the format's
+ * scratch capacity; every query head maps to a K/V head below kv_heads; the
+ * consumers' int quantities head_start + query_heads - 1, query_heads *
+ * head_dim, kv_heads * head_dim and query_rows * query_heads fit in int;
+ * query/output banks hold query_rows rows of query_heads*head_dim FP32 values;
+ * K/V banks hold kv_physical_rows rows; no bank is null; and the output bank
+ * overlaps neither the query nor the K/V banks.
  */
 class CPUAttentionInvocationAdmission final
 {
@@ -82,8 +92,15 @@ public:
         if (r.query_rows <= 0 || r.kv_physical_rows <= 0 || r.query_heads <= 0 || r.kv_heads <= 0 ||
             r.head_dim <= 0 || r.head_start < 0 || r.gqa_n_rep < 0 || r.key_row_bytes == 0 || r.value_row_bytes == 0)
             return reject("CPU attention invocation requires positive geometry");
-        if (r.head_dim > kMaxHeadDim)
+        if (r.head_dim > kMaxHeadDim || r.scratch_head_dim < 0 ||
+            (r.scratch_head_dim > 0 && r.head_dim > r.scratch_head_dim))
             return reject("CPU attention head width exceeds the admitted maximum");
+        // The row programs form these in int; each must be representable.
+        constexpr std::int64_t int_max = std::numeric_limits<int>::max();
+        if ((r.gqa_n_rep > 0 && std::int64_t(r.head_start) + r.query_heads - 1 > int_max) ||
+            std::int64_t(r.query_heads) * r.head_dim > int_max || std::int64_t(r.kv_heads) * r.head_dim > int_max ||
+            std::int64_t(r.query_rows) * r.query_heads > int_max)
+            return reject("CPU attention geometry overflows the row programs' int indices");
         if (r.gqa_n_rep == 0 && r.query_heads % r.kv_heads != 0)
             return reject("CPU attention query heads must divide evenly over K/V heads");
         const std::int64_t heads_per_kv = r.gqa_n_rep > 0 ? r.gqa_n_rep : r.query_heads / r.kv_heads;
