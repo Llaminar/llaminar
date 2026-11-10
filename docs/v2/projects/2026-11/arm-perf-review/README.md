@@ -727,3 +727,30 @@ NOT SETTLED yet.
   spills; baseline full6 compile green; no kernel change published yet —
   the budget targets reachable WITHOUT loosening (standing-rule compliant).
   NOT SETTLED.
+
+## SETTLED FOR HANDOVERS (2026-11-10, ~15:07Z): e8866ec044d69e4d5821a7a8ed43fa45c53b2b64
+
+#43 = 176 commits on 2948b1e49. .79 GPU returned to arm-sparks. Final
+exact-source selected CUDA gate GREEN: 10 native cells + fixture (JUnit
+11/11, zero skips/errors), both new invocation contracts repeated 20/20;
+final non-attached driver window clean. Resource contract remains
+<=48regs/>=10CTAs, now includes source-scale IQ4 on 12.x; CB4/13/24
+registers 62/56/56 → 48/40/45, ZERO SPILLS. Changed TU guarded
+121,120;121; full6 green; shipped SASS encodings unchanged (only nvcc
+source-digest symbol salts normalized). Matched Integration event delta
+~0.6% within noise; NO Release/E2E speedup claim. Profiler safety HOLD
+remains (no NCU/NSYS until the NVRM attachment issue resolves).
+Evidence: .79 slot-probes/final2-runtime.log, final/results.xml,
+final/test-inventory.txt, final2-driver-report.json; source clean.
+
+Overlap list since 28dd: tests/v2/CMakeLists.txt adds 2 invocation aliases
+at tail; ops/padding/GemmParity test bodies, CUDA/ROCm rectangular
+fixtures, CUDAMoEGroupedPrefillKernels.cu, Perf__MoEVerifierPrefill.cpp,
+ARM plan/evidence docs. NO CPU gemm/tournament/checker/budget
+modifications.
+
+CASCADE DIRECTIVES: combined idea31+B9 rebase/re-pin now → ONE final
+18-cell canonical proof set (per #166/#167); Bundle-1 follows SEPARATELY on
+the post-FF tip; bounded source review of the 3 CUDA commits requested from
+the reviewer. The settle notice is not a merge or unrelated qualification
+grant.
