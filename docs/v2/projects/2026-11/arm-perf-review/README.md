@@ -221,3 +221,9 @@ After i8mm merge (same tile / post-merge):
   needs a FULL ARM COMPILE; configure+policy tests insufficient (matches the
   no-regate nuance entry). research/gdn_leaf_elimination __m256 = not
   CMake-built; left (Main). Arm tip = f69446e3c (151 commits @ 07d4f2085).
+
+- OPERATOR (2026-11-09): the DGX-station session keeps the implementation role for
+  performance work (it is a fast implementer). Routing rule: perf implementation
+  (idea-31 S=4 slices, FP16/FMLAL, follow-ups) -> DGX perf lane; Spark-first
+  verification; gates/reviewer/evidence unchanged. Keep the pipeline fed so the
+  fast implementer can move immediately when a checkpoint releases.
