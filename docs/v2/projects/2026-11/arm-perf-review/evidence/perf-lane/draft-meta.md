@@ -15,3 +15,7 @@
 777f7a52a; v1 superseded by v2 — reviewer independently found Rows/Strips).
 #2 (with #143) = half-perf-cell checkpoint (oracle/entry overlap).
 #144 = Bundle-1 15 classifications/CSVs. #145 = 01 harness @ 1b93abe52.
+
+- #144 assessment COMPLETED (source-bounds; revision applied).
+  #145 = 01 harness bounded 4-file review (in progress). #146 = rev3 narrow
+  recheck (queued; successor of #144). Half-cell checkpoint separate.
