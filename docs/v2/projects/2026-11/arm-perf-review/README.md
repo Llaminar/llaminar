@@ -1068,3 +1068,9 @@ helpers — scoped follow-up, does not reopen the five blockers.
 Static source ACK only; Linux build/replay/preflight + GDN geometry/trace +
 final bound evidence + economy = owner/Main obligations. Source-review gate
 CLOSED for the half-perf cell.
+- #173 Doxygen follow-up committed: **b512e25a3f4514d4f1b134d67484d2a9219a3683**
+  (comments-only, scoped #173; on codex/arm-half-perf-cell after 1ea08211).
+  → HANDOVER PIN FINAL = b512e25a; Linux validation (.80) targets this tip
+  (comment-only delta over the #172-ACKed 1ea08211). Reviewer light
+  confirmation requested per the 717b precedent. Lane pending: Linux
+  validation → merge-ready → Main.
