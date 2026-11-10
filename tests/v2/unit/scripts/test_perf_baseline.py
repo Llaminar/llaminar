@@ -422,15 +422,48 @@ class PerfBaselineTest(unittest.TestCase):
             report = self.diff(*order, *waivers)
             self.assertEqual(report.returncode, 0, report.stderr)
             self.assertEqual(json.loads(report.stdout)["metrics"][0]["tolerance_pct"], 2.0)
+        # Decided asymmetry: 1e300/1e-300 overflows and is refused; 1e-300/1e300 rounds to a
+        # ratio of 0, i.e. a -100 % change that is exact to double precision (the true value is
+        # -100 + 1e-598 %), so it is reported as a regression rather than refused.
         tiny, huge = record(1e-300), record(1e300)
-        for order in ((tiny, huge), (huge, tiny)):
+        refused = self.diff(tiny, huge, *waivers)
+        self.assertEqual(refused.returncode, 2, "an unrepresentable ratio is refused, never published")
+        self.assertIn("not representable", refused.stderr)
+        self.assertNotIn("Infinity", refused.stdout)
+        collapsed = self.diff(huge, tiny, *waivers)
+        self.assertEqual(collapsed.returncode, 1, collapsed.stderr)
+        row = json.loads(collapsed.stdout)["metrics"][0]
+        self.assertEqual((row["change_pct"], row["verdict"]), (-100.0, "regressed"))
+
+    def test_subnormal_samples_keep_exact_medians(self) -> None:
+        waivers = [arg for field in ("argv", "launch_env", "cwd", "cpu_affinity")
+                   for arg in ("--allow-identity-change", field)]
+        d = 5e-324  # smallest positive subnormal double
+
+        def record(value: float, samples: list[float]) -> Path:
+            return self.import_record(kernel_document(value, samples), kind="kernel-metrics")[1]
+
+        smallest_a, smallest_b = record(d, [d, d]), record(d, [d, d])
+        for order in ((smallest_a, smallest_b), (smallest_b, smallest_a)):
             report = self.diff(*order, *waivers)
-            if order[0] == tiny:
-                self.assertEqual(report.returncode, 2, "an unrepresentable ratio is refused, never published")
-                self.assertIn("not representable", report.stderr)
-            else:
-                self.assertIn(report.returncode, (0, 1), report.stderr)
-            self.assertNotIn("Infinity", report.stdout)
+            self.assertEqual(report.returncode, 0, report.stderr)
+            self.assertNotIn("Traceback", report.stderr)
+            row = json.loads(report.stdout)["metrics"][0]
+            self.assertEqual((row["change_pct"], row["tolerance_pct"]), (0.0, 2.0))
+        # Constant samples carry no noise: 7d -> 3d is a -57.1 % regression, not tolerance.
+        seven, three = record(7 * d, [7 * d, 7 * d]), record(3 * d, [3 * d, 3 * d])
+        regressed = self.diff(seven, three, *waivers)
+        self.assertEqual(regressed.returncode, 1, regressed.stderr)
+        row = json.loads(regressed.stdout)["metrics"][0]
+        self.assertEqual(row["tolerance_pct"], 2.0)
+        self.assertAlmostEqual(row["change_pct"], -57.142857, places=4)
+        self.assertEqual(row["verdict"], "regressed")
+        improved = self.diff(three, seven, *waivers)
+        self.assertEqual(improved.returncode, 0, improved.stderr)
+        row = json.loads(improved.stdout)["metrics"][0]
+        self.assertEqual(row["tolerance_pct"], 2.0)
+        self.assertAlmostEqual(row["change_pct"], 133.333333, places=4)
+        self.assertEqual(row["verdict"], "improved")
 
     def test_declared_input_binding(self) -> None:
         if not self.require_linux_run():

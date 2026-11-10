@@ -668,11 +668,19 @@ IDENTITY_FIELDS: dict[str, Callable[[Mapping[str, Any]], Any]] = {
 
 
 def _median(values: Sequence[float]) -> float:
-    """Median without summing two large middle values (a/2 + b/2 cannot overflow)."""
+    """Median of non-negative values, range-safe at both ends.
+
+    For the even case the midpoint is a + (b - a) / 2 with a <= b: it neither
+    overflows (b - a <= b) nor rounds equal subnormals away (a + 0 == a), so a
+    constant sample set has exactly its own value as median.
+    """
 
     ordered = sorted(values)
     middle = len(ordered) // 2
-    return ordered[middle] if len(ordered) % 2 else ordered[middle - 1] / 2 + ordered[middle] / 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    low, high = ordered[middle - 1], ordered[middle]
+    return low + (high - low) / 2
 
 
 def _derived(value: float, what: str) -> float:
@@ -689,6 +697,7 @@ def _relative_spread(metric: Mapping[str, Any], name: str) -> float:
     if len(samples) < 2:
         return 0.0
     median = _median(samples)
+    _require(math.isfinite(median) and median > 0, f"metric {name!r} sample median is not positive and finite")
     ratios = [_derived(sample / median, f"metric {name!r} sample ratio") for sample in samples]
     return _derived(1.4826 * _median([abs(ratio - 1.0) for ratio in ratios]), f"metric {name!r} spread")
 
