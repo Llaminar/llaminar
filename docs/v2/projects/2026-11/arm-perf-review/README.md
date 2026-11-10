@@ -1436,3 +1436,11 @@ Merge-readiness package routes to the reviewer with that attribution.
   final Unit + 5-GTest preflight 20x underway. .79 owner (arm-sparks)
   preparing the corrected pin; the Dir-B trace launch held until green.
   Addon #175 HOLD unchanged; no FF.
+- #71 native validation GREEN at 35a827a2a (Main, ~21:36Z): complete
+  MemoryPlanner suite + 5-GTest preflight, then 20 consecutive preflight
+  repetitions; the exact-old count-expression replacement control had the 2
+  expected pricing failures; correct source restores green. Reviewer
+  176/177 source-ACK exact 35. GREEN/READY → arm-sparks for the reserved
+  .79 real-model 4096+8192 plan-only proof at 35 (canonical driver
+  begin/finish). #71 completes after the independent model outcomes. Addon
+  #175/bound-artifact HOLD unchanged.
