@@ -147,3 +147,19 @@ acceptance); the CPU controller records counters, not clocks;
 `MTPDepthCostProfile.h` is ROCm/QFN-MoE-scoped (no CPU-dense authority);
 canonical replay = `v2_test_mtp_depth_trace_replay` (cannot produce
 counterfactual acceptance streams or end-to-end speedups).
+
+### A-execution note (2026-11-10): station build constraint + approved diagnostic path
+
+The station's monitor-owned c007 configure stops BEFORE compile/test:
+`OneDNNBuild.cmake:160` needs `external/onednn/build-neon_i8mm.llaminar.lock`
+inside the READ-ONLY dependency mount (failed receipt retained; lane
+correctly refused to make shared externals writable, install, disable
+backends, or edit build policy). APPROVED resolution for the A audit only:
+**core-free direct linkage of UNCHANGED owning sources** (MTPDepthTraceReplay
+files + actual MTPDepthController.cpp, official MTPDepthReplayIdentity.cmake
+generator, GTest, unchanged Perf__MTPDepthController.cpp for wall-ns),
+labeled **owner-test/self-check only** — NOT canonical CTest/full-preflight
+or production certification; exact compile flags + file SHAs recorded;
+canonical CTest evidence, if the reviewer requires it later, runs on .80
+(SHARED_CORE=ON runbook). Read-only lifecycle/fixture audit continues in
+parallel.
