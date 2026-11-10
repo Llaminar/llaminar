@@ -27,7 +27,12 @@ public:
             const auto add=[&](std::string name,std::vector<std::uint64_t> shape,GGUFTensorType type=GGUFTensorType::Q4_0) {
                 model.tensors.push_back({.name=std::move(name),.dimensions=std::move(shape),.type=type});
             };
+            // Keep the legacy gain as a negative control: the schema terminal
+            // consumes the HC mixer instead, on one compact final-token row.
             add("output_norm.weight",{2560},GGUFTensorType::F32);
+            add("output_hc_norm.weight",{10240},GGUFTensorType::F32);
+            add("output_hc_down.weight",{320,10240});
+            add("output_hc_up.weight",{10240,320});
             for(int layer=0;layer<48;++layer) {
                 const auto p="blk."+std::to_string(layer)+".";
                 for(const auto *role:{"attn_norm","post_attention_norm"})add(p+role+".weight",{2560},GGUFTensorType::F32);
@@ -36,11 +41,18 @@ public:
                     for(const auto *role:{"attn_k","attn_v"})add(p+role+".weight",{512,2560});
                     add(p+"attn_output.weight",{2560,6144});
                     for(const auto *role:{"attn_q_norm","attn_k_norm"})add(p+role+".weight",{256},GGUFTensorType::F32);
+                    for(const auto *role:{"indexer.q_norm","indexer.k_norm"})add(p+role+".weight",{128},GGUFTensorType::F32);
                 } else {
                     add(p+"attn_qkv.weight",{10240,2560});add(p+"ssm_out.weight",{2560,6144});
                     add(p+"attn_gate.weight",{6144,2560});
                     for(const auto *role:{"ssm_alpha","ssm_beta"})add(p+role+".weight",{48,2560},GGUFTensorType::F16);
                     add(p+"ssm_conv1d.weight",{10240,4},GGUFTensorType::F32);
+                }
+                if(layer==1) {
+                    add(p+"ple_key.weight",{10240,2560});add(p+"ple_value.weight",{2560,2560});
+                    for(const auto *role:{"ple_norm_key","ple_norm_query","ple_norm_conv"})
+                        add(p+role+".weight",{10240},GGUFTensorType::F32);
+                    add(p+"ple_conv1d.weight",{10240,4},GGUFTensorType::F32);
                 }
                 add(p+"ffn_gate_exps.weight",{2560,640,512});add(p+"ffn_up_exps.weight",{2560,640,512});
                 add(p+"ffn_down_exps.weight",{640,2560,512});

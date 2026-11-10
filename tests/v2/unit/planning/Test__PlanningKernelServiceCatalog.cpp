@@ -19,6 +19,7 @@
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "../../utils/PlanningHostServiceFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <nlohmann/json.hpp>
 #include <gtest/gtest.h>
@@ -767,11 +768,22 @@ namespace
         return {memoryCatalog(cluster, .000001), std::move(kernels)};
     }
 
-    /** @return Exact admitted rank-zero candidate; no model payload or accelerator is loaded. */
+    /**
+     * @brief Admit the exact rank-zero candidate without model payloads or accelerators.
+     * @param source Retained metadata-only GGUF source.
+     * @param cluster Synthetic physical observations consumed by canonical admission.
+     * @param backend Compute family requested by this test.
+     * @param strategy Exact candidate family to visit.
+     * @param movement Explicit residency-maintenance policy, not assumed savings.
+     * @param routed Declared routed-expert ownership policy.
+     * @param host_services Explicit original-rank service fixtures when a model requires them.
+     * @return Physically admitted candidate retaining its original ownership.
+     */
     AdmittedOrchestrationCandidate requestCandidate(const PlanningModelSource &source, const ClusterInventory &cluster,
         DeviceType backend, OrchestrationStrategy strategy,
         MoERebalanceRuntimeMode movement = MoERebalanceRuntimeMode::Off,
-        RoutedExpertComputePolicy routed = RoutedExpertComputePolicy::Apportioned)
+        RoutedExpertComputePolicy routed = RoutedExpertComputePolicy::Apportioned,
+        PlanningHostServiceBudgets host_services = {})
     {
         OrchestrationConfig request;
         request.model_path = source.path();
@@ -788,7 +800,7 @@ namespace
             if (found || candidate.membership.discoveryRanks() != std::vector<int>{0}) return;
             found = AdmittedOrchestrationCandidate::admit(std::move(candidate), source,
                 {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
-                 .maximum_cached_prefill_buckets = 8});
+                 .maximum_cached_prefill_buckets = 8, .retained_host_services = host_services});
         });
         if (!found) throw std::logic_error("No request-cost fixture candidate");
         return std::move(*found);
@@ -889,7 +901,9 @@ TEST(PlanningRequestCostModel, FlashNextWorkHasTypedTerminalAndImmutableLookupCo
     for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
     {
         SCOPED_TRACE(deviceTypeToString(backend));
-        const auto candidate = requestCandidate(source, cluster, backend, OrchestrationStrategy::SingleDevice);
+        const auto candidate = requestCandidate(source, cluster, backend, OrchestrationStrategy::SingleDevice,
+            MoERebalanceRuntimeMode::Off, RoutedExpertComputePolicy::Apportioned,
+            planningHostServiceBudgets(cluster.world_size));
         for (const auto phase : {PlanningMainForwardPhase::Prefill, PlanningMainForwardPhase::Decode})
         {
             const auto work = compilePlanningForwardWeightWork(source.metadata(), candidate, phase);
