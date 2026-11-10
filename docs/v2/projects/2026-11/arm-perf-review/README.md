@@ -912,3 +912,9 @@ clean). Addresses both P2s:
   checker identical); if arm-sparks hadn't started, retarget to
   trees/717b2bfe6. Awaiting arm-sparks' answer on which SHA its run is
   against. Reviewer light-confirmation of the comment-only delta requested.
+- Reviewer confirmation: ee7bf0596 → 717b2bfe6 = direct single-line
+  comment-only correction (seven-format default list); the #169 SOURCE ACK
+  EXTENDS to this exact pin; the prose follow-up is CLOSED. Source-only —
+  not receipt authentication or FF permission. Review side COMPLETE for the
+  combined candidate; remaining FF gate = GNU driver receipt + focused set
+  at 717b2bfe6 (arm-sparks, in flight) → Main.
