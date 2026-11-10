@@ -168,3 +168,34 @@ compared, not counts; unchanged failures do not prove non-ARM causality;
 outside-class = triage candidate, not automatically an ARM regression; no
 qualification transfer from historical B10 receipts (different rewritten
 ancestry).
+
+### Refinements from the lane's independent artifact inspection (2026-11-10)
+
+The batch-inference coordinator independently copied + hashed the station
+artifacts (9/9 SHA256s match; JUnit 3408→3410, failed sets identical by
+lane) and extracted concrete diagnostics that REFINE the classification:
+
+1. **ModelKLDCanary is NOT fixture-missing-GGUF** (correcting my entry): it
+   fails on a MISSING DOCKER EXECUTABLE for a subprocess + installed-receipt
+   build/inventory mismatch. Class: environment/tooling.
+2. **GroupedSealedPlan = a PYTHON TEST-HARNESS defect**: 10 errors,
+   `SimpleNamespace lacks physical_launch_evidence` at
+   adaptive_tournament.py:188 — the tournament test harness expects an
+   attribute the production/publication path may have changed. **Possibly
+   ARM-STACK-INDUCED staleness** (the panel-tournament publication contract
+   evolved in #43) → triage candidate for the addon lane.
+3. **CPUShardRouteCollective/FusedFinalAdd** (:336): fails because
+   `preweightMoEOverlayCanonicalRouteRows` returns FALSE (workers=1,
+   columns=1, degree=2) — a POLICY REJECTION of the degenerate config, NOT
+   a byte mismatch. Consistent across scalar/neon/neon_i8mm (common cause).
+4. **NUMAAllocator B11 sequence**: logs show EPERM querying memory policy →
+   null allocations → SIGSEGV during NUMABufferIterators. Hypothesis:
+   unhandled EPERM (memory-policy query blocked, cf. the G1/G2 seccomp
+   masking evidence) → null-propagation → deref. The non-MPI repro remains
+   the discriminator; the null-deref path may be a REAL base defect
+   (error-path hardening), not env.
+5. CAVEATS: "zero skips" is CTest-level only — embedded GTest skips exist
+   (NUMAFirstTouchPolicyIsolation, model-loader cases, CUDA PendingProducer,
+   ISA-specific tests); some system-out truncated at 1024 bytes — do NOT
+   claim all native cases executed or full-signature equality from those
+   excerpts.
