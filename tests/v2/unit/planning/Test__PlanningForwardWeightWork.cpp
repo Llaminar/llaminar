@@ -129,6 +129,27 @@ namespace
     }
 }
 
+/** @test Every declared Flash Next operand has explicit work semantics before request selection. */
+TEST(PlanningForwardWeightWork, FlashNextSourceRolesHaveExplicitWorkKinds)
+{
+    using Kind = PlanningOrdinaryWeightKind;
+    for (const auto &[role, expected] : std::array{
+         std::pair{WeightRole::HyperConnectionProjection, Kind::Projection},
+         std::pair{WeightRole::HyperConnectionNorm, Kind::NonProjection},
+         std::pair{WeightRole::SparseIndexerProjection, Kind::Projection},
+         std::pair{WeightRole::SparseIndexerNorm, Kind::NonProjection},
+         std::pair{WeightRole::PerLayerEmbeddingProjection, Kind::Projection},
+         std::pair{WeightRole::PerLayerEmbeddingNorm, Kind::NonProjection},
+         std::pair{WeightRole::PerLayerEmbeddingConvolution, Kind::NonProjection},
+         std::pair{WeightRole::ImmutableRowTable, Kind::ImmutableLookup},
+         std::pair{WeightRole::PredictorProjection, Kind::Projection}})
+    {
+        SCOPED_TRACE(toString(role));
+        EXPECT_EQ(planningOrdinaryWeightKind(role), expected);
+    }
+    EXPECT_EQ(planningOrdinaryWeightKind(WeightRole::Other), PlanningOrdinaryWeightKind::Unclassified);
+}
+
 TEST(PlanningForwardWeightWork, MainInvocationExcludesRetainedDepthFifteenAndPreservesRankIdentity)
 {
     test::PlanningGGUFFixture file(false, true);

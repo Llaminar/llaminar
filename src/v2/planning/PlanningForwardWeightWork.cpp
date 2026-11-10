@@ -14,20 +14,25 @@
 #include "planning/PlanningForwardWeightWork.h"
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
+#include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
 
 namespace llaminar2
 {
     PlanningOrdinaryWeightKind planningOrdinaryWeightKind(WeightRole role) noexcept
     {
+        if (isFlashNextProjectionRole(role)) return PlanningOrdinaryWeightKind::Projection;
+        if (isImmutableFP32WeightRole(role)) return PlanningOrdinaryWeightKind::NonProjection;
         switch (role)
         {
         case WeightRole::Embedding: return PlanningOrdinaryWeightKind::Embedding;
+        case WeightRole::ImmutableRowTable: return PlanningOrdinaryWeightKind::ImmutableLookup;
         case WeightRole::MoERouter: return PlanningOrdinaryWeightKind::Router;
         case WeightRole::LMHead: case WeightRole::AttentionQ: case WeightRole::AttentionK:
         case WeightRole::AttentionV: case WeightRole::AttentionWO: case WeightRole::FusedQKV:
@@ -219,6 +224,8 @@ namespace llaminar2
                 return PlanningRouterWeight{std::move(weight)};
             case PlanningOrdinaryWeightKind::NonProjection:
                 return PlanningNonProjectionWeight{std::move(weight)};
+            case PlanningOrdinaryWeightKind::ImmutableLookup:
+                throw std::logic_error("Immutable lookup work requires its decoder-layer consumer");
             default:
                 return PlanningUnclassifiedWeight{std::move(weight)};
             }
@@ -233,6 +240,9 @@ namespace llaminar2
             throw std::invalid_argument("Unknown main-forward planning phase");
         const auto &profile = model.memoryProfile();
         const int main_layers = model.mainLayerCount();
+        std::set<std::string> terminal_sources;
+        for (const auto *name : SchemaFactoryRegistry::getFactory(profile.architecture)->terminalInputWeightNames())
+            terminal_sources.emplace(name);
         const auto &ranks = candidate.rankPlans();
         const auto &membership = candidate.membership().discoveryRanks();
         const bool explicit_head = std::any_of(profile.tensors.begin(), profile.tensors.end(), [](const auto &tensor) {
@@ -297,7 +307,10 @@ namespace llaminar2
                     PreparedWeightRepresentationContract::resolve(role, tensor.quant_type, tensor.name, profile.architecture,
                         debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic),
                     std::move(geometry), PreparedWeightRepresentationContract::operandPrecision(
-                        role, tensor.name, profile.architecture, debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic)};
+                        role, tensor.name, profile.architecture, debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic),
+                    role == WeightRole::Embedding ? PlanningWeightInvocationSite::Entry :
+                        role == WeightRole::LMHead || terminal_sources.contains(tensor.name) ? PlanningWeightInvocationSite::Terminal :
+                        PlanningWeightInvocationSite::Layer};
             };
             for (const auto &tensor : profile.tensors)
             {
@@ -331,8 +344,28 @@ namespace llaminar2
                     continue;
                 }
                 if (!continuation) continue;
+                if (role == WeightRole::ImmutableRowTable)
+                {
+                    if (!profile.flash_next || !profile.flash_next->ple_heads ||
+                        profile.flash_next->ple_heads > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+                        profile.flash_next->ple_decoder_layer >= static_cast<uint32_t>(main_layers))
+                        throw std::invalid_argument("Immutable lookup work lacks validated decoder-layer geometry");
+                    const auto &lookup = *profile.flash_next;
+                    const int consumer_layer = static_cast<int>(lookup.ple_decoder_layer);
+                    if (consumer_layer < first || consumer_layer > last) continue;
+                    auto table = operand(tensor, role, true);
+                    requireMatrix(table);
+                    if (table.geometry.matrix()->rows != lookup.ple_table_rows ||
+                        table.geometry.matrix()->columns != lookup.ple_row_elements ||
+                        tensor.native_bytes != lookup.ple_table_native_bytes)
+                        throw std::invalid_argument("Immutable lookup work disagrees with its original native row extent");
+                    work.ordinary.push_back(PlanningImmutableLookupWeight{std::move(table), consumer_layer,
+                        static_cast<int>(lookup.ple_heads)});
+                    continue;
+                }
                 if (role == WeightRole::Embedding && !device.owns_embedding) continue;
-                if ((role == WeightRole::LMHead || role == WeightRole::OutputNorm) && !head) continue;
+                if ((role == WeightRole::LMHead || terminal_sources.contains(tensor.name)) && !head) continue;
+                if (role == WeightRole::OutputNorm && !terminal_sources.contains(tensor.name)) continue;
                 const bool complete = role == WeightRole::Embedding ? full_embedding : role == WeightRole::LMHead ? full_head : full_decode;
                 work.ordinary.push_back(classify(operand(tensor, role, complete)));
             }

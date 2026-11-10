@@ -27380,6 +27380,14 @@ add_v2_test(V2_Unit_MemoryPlanner
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_PlanningFlashNextWeightWorkContract
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningForwardWeightWork.FlashNextSourceRolesHaveExplicitWorkKinds:PlanningRequestCostModel.FlashNextWorkHasTypedTerminalAndImmutableLookupConsumers
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Qwen4Exp;Weights;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningFlashNextWeightWorkContract)
+
 # Immediate native packers use the same capped append workspace as streamed loading.
 add_v2_test(V2_Integration_ImmediateNativeWeightPackingEconomy
     COMMAND $<TARGET_FILE:v2_test_memory_planner>

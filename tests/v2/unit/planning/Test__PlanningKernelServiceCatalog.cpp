@@ -18,10 +18,12 @@
 #include "utils/DebugEnv.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "../../utils/PlanningGGUFFixture.h"
+#include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <nlohmann/json.hpp>
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cmath>
 #include <set>
 
 using namespace llaminar2;
@@ -843,6 +845,80 @@ TEST(PlanningRequestCostModel, CPUAllocatorDoesNotUseNUMAAffinityAsDeviceOrdinal
             if (affinity == 3)
                 EXPECT_EQ(physical.find({0, DeviceId{DeviceType::CPU, 3}}), nullptr);
         }
+}
+
+/**
+ * @test Published Flash Next source roles compose finite work on every backend.
+ *
+ * Sparse GGUF payloads remain unread. Capacity and positive service observations
+ * are synthetic metadata, not hardware measurements. The real candidate compiler,
+ * PMA admission, weight-work compiler and request-cost evaluator are exercised.
+ */
+TEST(PlanningRequestCostModel, FlashNextWorkHasTypedTerminalAndImmutableLookupConsumers)
+{
+    Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    auto cluster = requestInventory(true);
+    for (auto &rank : cluster.ranks)
+    {
+        rank.cpu.memory_bytes = rank.cpu.free_memory_bytes = rank.cpu_memory_bytes = size_t{1} << 40;
+        for (auto &socket : rank.cpu_socket_info) socket.memory_bytes = size_t{1} << 40;
+        for (auto &gpu : rank.gpus) gpu.memory_bytes = gpu.free_memory_bytes = size_t{1} << 40;
+    }
+    cluster.buildNodeAggregations();
+    const auto sampled = PlanningWeightServiceModel::samples(source.metadata());
+    for (const auto &sample : sampled)
+        if (const auto *matrix = std::get_if<PlanningModelSampleRequest>(&sample))
+            EXPECT_NE(matrix->tensor_name, "per_layer_token_embd.weight")
+                << "An immutable gather must never become a representative whole-table GEMM";
+    const PlanningRequestCostModel costs(source.metadata(), cluster, requestWeights(source, cluster),
+        requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}));
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    {
+        SCOPED_TRACE(deviceTypeToString(backend));
+        const auto candidate = requestCandidate(source, cluster, backend, OrchestrationStrategy::SingleDevice);
+        for (const auto phase : {PlanningMainForwardPhase::Prefill, PlanningMainForwardPhase::Decode})
+        {
+            const auto work = compilePlanningForwardWeightWork(source.metadata(), candidate, phase);
+            ASSERT_EQ(work.size(), 1u);
+            int terminal_hc = 0, lookups = 0;
+            for (const auto &operation : work.front().ordinary)
+            {
+                EXPECT_FALSE(std::holds_alternative<PlanningUnclassifiedWeight>(operation));
+                std::visit([&](const auto &value) {
+                    const auto &weight = value.weight;
+                    if (weight.source_name.starts_with("output_hc_"))
+                    {
+                        EXPECT_EQ(weight.invocation_site, PlanningWeightInvocationSite::Terminal);
+                        EXPECT_EQ(weight.layer, -1);
+                        ++terminal_hc;
+                    }
+                    EXPECT_NE(weight.source_name, "output_norm.weight")
+                        << "The Flash Next terminal mixer replaces legacy output normalization";
+                }, operation);
+                if (const auto *lookup = std::get_if<PlanningImmutableLookupWeight>(&operation))
+                {
+                    ++lookups;
+                    EXPECT_EQ(lookup->consumer_layer, source.metadata().memoryProfile().flash_next->ple_decoder_layer);
+                    EXPECT_EQ(lookup->lookups_per_token, source.metadata().memoryProfile().flash_next->ple_heads);
+                    EXPECT_EQ(lookup->weight.layer, -1);
+                    EXPECT_EQ(lookup->weight.geometry.matrix()->columns, 160u);
+                }
+            }
+            EXPECT_EQ(terminal_hc, 3);
+            EXPECT_EQ(lookups, 1);
+        }
+        const auto prediction = costs.evaluate(candidate, {64, 16});
+        EXPECT_TRUE(std::isfinite(prediction.prefillSeconds()));
+        EXPECT_GT(prediction.prefillSeconds(), 0);
+        EXPECT_TRUE(std::isfinite(prediction.decodeSecondsPerToken()));
+        EXPECT_GT(prediction.decodeSecondsPerToken(), 0);
+        EXPECT_NE(prediction.evidence().find("immutable row gathers"), std::string::npos);
+        auto invalid = source.metadata().memoryProfile();
+        invalid.flash_next->ple_heads = 0;
+        EXPECT_THROW(compilePlanningForwardWeightWork(PlanningModelMetadata(invalid, 48), candidate,
+            PlanningMainForwardPhase::Decode), std::invalid_argument);
+    }
 }
 
 TEST(PlanningRequestCostModel, SingleDeviceHasNoLinksAndLiveContextCostsMoreAcrossBackendsAndFormats)
