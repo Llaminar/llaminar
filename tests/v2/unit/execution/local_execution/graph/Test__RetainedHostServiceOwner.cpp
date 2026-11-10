@@ -9,6 +9,7 @@
 #include "fixtures/execution/RetainedHostServiceReplayAccess.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
+#include <omp.h>
 #include <latch>
 #include <array>
 #include <atomic>
@@ -204,5 +205,71 @@ TEST(RetainedHostServiceOwner, OriginalEvidenceRequiresCurrentTLSResourceAcrossR
     }()),::testing::ExitedWithCode(0),"");
 }
 #endif
+
+/**
+ * @brief Exercise actual teams outside a death-test macro's preprocessor argument.
+ *
+ * OpenMP directives must bind to their own lexical blocks, not GoogleTest's
+ * macro-generated death-test control flow. The isolated child calls this body
+ * while retaining the original admitted program and worker lifecycle.
+ * @param workers Original positive worker budget for this process authority.
+ * @param dynamic Original dynamic-team policy for this process authority.
+ */
+static void verifyOriginalOpenMPBudget(int workers,int dynamic)
+{
+        const int saved_threads=omp_get_max_threads(),saved_dynamic=omp_get_dynamic();
+        {
+            omp_set_num_threads(workers);
+            omp_set_dynamic(dynamic);
+            const auto program=RetainedHostServiceReplayAccess::program(RetainedHostServiceRole::ExecutorParentTicket);
+            auto memory=admit(program.bom(cpu()));
+            // Materialization may run on a foreign TP task. Its incidental ICVs
+            // cannot replace the admitted declaration's original worker budget.
+            omp_set_num_threads(workers+1);
+            omp_set_dynamic(!dynamic);
+            auto owner=PreparedRetainedHostService::materialize(RetainedHostServiceReplayAccess::claim(memory,program));
+            // A subsequent caller change cannot retune an already admitted worker.
+            omp_set_num_threads(workers+2);
+            omp_set_dynamic(!dynamic);
+            for (int repeat=0;repeat<2;++repeat)
+            {
+                struct Observation {int expected,expected_dynamic,maximum=0,dynamic=-1,actual=0;} observed{workers,dynamic};
+                const auto task=owner->worker().dispatch([](void* opaque){
+                    auto& value=*static_cast<Observation*>(opaque);
+                    value.maximum=omp_get_max_threads();value.dynamic=omp_get_dynamic();
+#pragma omp parallel
+                    {
+#pragma omp single
+                        value.actual=omp_get_num_threads();
+                    }
+                    return value.maximum==value.expected && value.dynamic==value.expected_dynamic &&
+                        (value.expected_dynamic ? value.actual>0&&value.actual<=value.expected : value.actual==value.expected);
+                },&observed);
+                EXPECT_TRUE(owner->worker().await(task));
+                EXPECT_EQ(observed.maximum,workers);EXPECT_EQ(observed.dynamic,dynamic);
+                EXPECT_GT(observed.actual,0);EXPECT_LE(observed.actual,workers);
+                if(!dynamic)EXPECT_EQ(observed.actual,workers);
+                EXPECT_EQ(omp_get_max_threads(),workers+2);EXPECT_EQ(omp_get_dynamic(),!dynamic);
+            }
+        }
+        omp_set_num_threads(saved_threads);omp_set_dynamic(saved_dynamic);
+}
+
+/** @test The actual admitted pthread retains original-program ICVs before and across dispatches. */
+TEST(RetainedHostServiceOwner, OriginalCallerOpenMPBudgetSurvivesForeignServiceEntry)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    // Each original process root owns one admission authority. Exercise each
+    // declared budget in its own child, then join before the next case starts.
+    for (const int workers : {1,3})
+    for (const int dynamic : {0,1})
+    {
+        SCOPED_TRACE(::testing::Message()<<"workers="<<workers<<" dynamic="<<dynamic);
+        ASSERT_EXIT(([&]{
+            verifyOriginalOpenMPBudget(workers,dynamic);
+            GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?2:0);
+        }()),::testing::ExitedWithCode(0),"");
+    }
+}
 
 }

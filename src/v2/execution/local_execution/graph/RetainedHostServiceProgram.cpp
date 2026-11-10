@@ -14,6 +14,7 @@
 #include "utils/Sha256.h"
 #include "utils/DebugEnv.h"
 #include "utils/ScopedOpenMPPartitionAffinity.h"
+#include <omp.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <signal.h>
@@ -251,8 +252,11 @@ struct RetainedHostServiceProgram::State {
     MetadataAuthority origin=MetadataAuthority::Installed;
     std::shared_ptr<const Evidence> evidence;
     bool hasAttributes=false;
-    explicit State(RetainedHostServiceRole r,MetadataAuthority from):role(r),origin(from){
+    int originalOpenMPThreads=0,originalOpenMPDynamic=0; ///< Immutable original-rank task ICVs, never remote guesses.
+    explicit State(RetainedHostServiceRole r,MetadataAuthority from,const State* declared_task=nullptr):role(r),origin(from){
         if(from!=MetadataAuthority::InstalledWire){
+            originalOpenMPThreads=declared_task?declared_task->originalOpenMPThreads:omp_get_max_threads();
+            originalOpenMPDynamic=declared_task?declared_task->originalOpenMPDynamic:omp_get_dynamic();
             const auto result=::pthread_getattr_default_np(&attributes);if(result)throw std::system_error(result,std::generic_category(),"CPU service original pthread defaults");
             hasAttributes=true;
         }
@@ -273,11 +277,11 @@ RetainedHostServiceProgram RetainedHostServiceProgram::original(RetainedHostServ
 RetainedHostServiceProgram RetainedHostServiceProgram::original(RetainedHostServiceRole role,std::shared_ptr<const Evidence> evidence){
     if(!evidence)throw std::invalid_argument("CPU service original session evidence is missing");return snapshot(role,MetadataAuthority::Installed,std::move(evidence));
 }
-RetainedHostServiceProgram RetainedHostServiceProgram::snapshot(RetainedHostServiceRole role,MetadataAuthority origin,std::shared_ptr<const Evidence> evidence){
+RetainedHostServiceProgram RetainedHostServiceProgram::snapshot(RetainedHostServiceRole role,MetadataAuthority origin,std::shared_ptr<const Evidence> evidence,const State* declared_task){
     switch(role){case RetainedHostServiceRole::ImmutableLookupIO:case RetainedHostServiceRole::ExecutorParentTicket:break;default:throw std::invalid_argument("Unknown retained CPU service role");}
     if(evidence)evidence->requireCurrent();
     detail::requireRetainedHostServiceABI(::gnu_get_libc_version(),sizeof(void*));
-    auto s=std::make_shared<State>(role,origin);s->evidence=std::move(evidence);const auto page=::sysconf(_SC_PAGESIZE);if(page<=0)throw std::runtime_error("CPU service page geometry unavailable");s->declaration.pageBytes=page;
+    auto s=std::make_shared<State>(role,origin,declared_task);s->evidence=std::move(evidence);const auto page=::sysconf(_SC_PAGESIZE);if(page<=0)throw std::runtime_error("CPU service page geometry unavailable");s->declaration.pageBytes=page;
     int detach=0,inherit=0,policy=0;struct sched_param parameter{};cpu_set_t affinity{};sigset_t signalMask{};
     if(pthread_attr_getstacksize(&s->attributes,&s->declaration.stackBytes)||pthread_attr_getguardsize(&s->attributes,&s->declaration.guardBytes)||
        pthread_attr_getdetachstate(&s->attributes,&detach)||pthread_attr_getinheritsched(&s->attributes,&inherit)||
@@ -293,7 +297,8 @@ RetainedHostServiceProgram RetainedHostServiceProgram::snapshot(RetainedHostServ
     std::ostringstream identity;identity<<s->resourceIdentity<<':'<<s->evidence->resourcePolicy<<':'<<s->evidence->liveLoader<<':'
         <<s->declaration.stackBytes<<':'<<s->declaration.guardBytes<<':'<<s->declaration.pageBytes<<':'
         <<s->declaration.objectBytes<<':'<<s->declaration.objectAlignment<<':'<<s->declaration.tlsBytes<<':'<<s->declaration.opaqueBytes<<':'
-        <<inherit<<':'<<policy<<':'<<parameter.sched_priority<<':'<<signals<<':';
+        <<inherit<<':'<<policy<<':'<<parameter.sched_priority<<':'<<signals<<':'
+        <<s->originalOpenMPThreads<<':'<<s->originalOpenMPDynamic<<':';
     for(int cpu=0;cpu<CPU_SETSIZE;++cpu)if(CPU_ISSET(cpu,&affinity))identity<<cpu<<',';
     if(signals==0)for(int signal=1;signal<NSIG;++signal)identity<<sigismember(&signalMask,signal);
     s->identity=digest(identity.str());s->declaration.requireValid();
@@ -324,7 +329,9 @@ RetainedHostServiceProgram RetainedHostServiceProgram::recordedWithEvidence(Reta
 }
 void RetainedHostServiceProgram::requireCurrent()const{
     if(state_->origin==MetadataAuthority::InstalledWire)throw std::logic_error("CPU service wire projection cannot authorize local native creation");
-    if(snapshot(role(),state_->origin,state_->evidence).identity()!=identity())throw std::logic_error("CPU service original pthread defaults/runtime changed after declaration");
+    // Native process defaults remain live observations. The original program's
+    // task budget is immutable and must not be replaced by a foreign materializer's ICVs.
+    if(snapshot(role(),state_->origin,state_->evidence,state_.get()).identity()!=identity())throw std::logic_error("CPU service original pthread defaults/runtime changed after declaration");
 }
 PhysicalMemoryPlan RetainedHostServiceProgram::bom(PhysicalMemoryResource cpu)const{
     if(!cpu.valid()||cpu.device!=DeviceId::cpu())throw std::invalid_argument("CPU service BOM requires original physical CPU0");
@@ -405,6 +412,8 @@ std::unique_ptr<PreparedRetainedHostService> PreparedRetainedHostService::materi
     (void)token.program();
     auto s=std::move(token.state_);
     s->program.requireCurrent(); // A delayed token cannot hide new TLS/default policy before mapping.
+    if(s->program.state_->originalOpenMPThreads<=0)
+        throw std::logic_error("CPU service lacks its original admitted OpenMP task budget");
     std::optional<ScopedOpenMPPartitionAffinity> originalIOScope;
     if(s->program.creatorPolicy()==RetainedHostServiceCreatorPolicy::OriginalOpenMPPartition)originalIOScope.emplace();
     s->mapping=mmap(nullptr,s->program.allocationBytes()+s->program.guardBytes(),PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK,-1,0);
@@ -412,7 +421,8 @@ std::unique_ptr<PreparedRetainedHostService> PreparedRetainedHostService::materi
     auto* stack=static_cast<std::byte*>(s->mapping)+s->program.guardBytes();
     if(mprotect(stack,s->program.allocationBytes(),PROT_READ|PROT_WRITE))throw std::system_error(errno,std::generic_category(),"CPU service exact mprotect");
     for(std::size_t at=0;at<s->program.allocationBytes();at+=s->program.pageBytes())reinterpret_cast<volatile std::byte*>(stack)[at]=std::byte{};
-    s->worker=new(stack+s->program.stackBytes())RetainedParentTicketServiceWorker(pthread_t{});
+    s->worker=new(stack+s->program.stackBytes())RetainedParentTicketServiceWorker(pthread_t{},
+        s->program.state_->originalOpenMPThreads,s->program.state_->originalOpenMPDynamic);
     const auto retain=[](void* value){auto& state=*static_cast<RetainedHostServiceInstanceState*>(value);GPUDeviceProcessLifetime::retainHostServiceRoot(state.opaque);};
     auto resultOwner=std::unique_ptr<PreparedRetainedHostService>(new PreparedRetainedHostService(std::move(s)));
     auto& owned=*resultOwner->state_;

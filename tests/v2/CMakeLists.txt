@@ -2949,6 +2949,9 @@ set_property(GLOBAL PROPERTY
 add_executable(v2_integration_cluster_inventory_bootstrap
     integration/app/Test__ClusterInventoryBootstrap.cpp)
 target_link_libraries(v2_integration_cluster_inventory_bootstrap llaminar2_core)
+target_include_directories(v2_integration_cluster_inventory_bootstrap PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# Includes first/repeated real retained-service OpenMP teams after pre-main
+# binding, preserving one unique core place (possibly both SMT IDs) per worker.
 add_v2_test(V2_Integration_ClusterInventoryBootstrap
     COMMAND $<TARGET_FILE:v2_integration_cluster_inventory_bootstrap>
     LABELS "V2;Integration;CPU;MPI;Bootstrap;Inventory;Regression"
@@ -2956,6 +2959,12 @@ add_v2_test(V2_Integration_ClusterInventoryBootstrap
     NO_MPI NO_MODELS
     TIMEOUT 60
 )
+
+add_v2_test(V2_Integration_MPIBootstrapOpenMPPlacement
+    COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
+        --gtest_filter=Test__MPIBootstrap.PortableOpenMPPlacementPreservesRankLocalWorkerGeometry
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MPI;Bootstrap;OpenMP;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
 # Command discovery must not lose a GPU on another CPU socket. Both vendors
 # exercise the same model-free MPI invariant with their actual drivers.
@@ -28553,6 +28562,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CPUAttentionKeyQ8
     V2_Integration_CPUStartupAffinity
     V2_Integration_ClusterInventoryBootstrap
+    V2_Integration_MPIBootstrapOpenMPPlacement
     V2_Integration_CPUSeededSamplingPositionIdentity
     V2_Integration_PrefixCacheCoordinatorMPI
     # The campaign prerequisite first builds and runs the complete V2_Unit_*

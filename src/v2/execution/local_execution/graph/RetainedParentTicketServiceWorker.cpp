@@ -11,12 +11,15 @@
 
 #include "../../../utils/Logger.h"
 
+#include <omp.h>
 #include <exception>
 #include <stdexcept>
 
 namespace llaminar2
 {
-    RetainedParentTicketServiceWorker::RetainedParentTicketServiceWorker(pthread_t) noexcept {}
+    RetainedParentTicketServiceWorker::RetainedParentTicketServiceWorker(
+        pthread_t,int original_threads,int original_dynamic) noexcept
+        : original_num_threads_(original_threads), original_dynamic_(original_dynamic) {}
 
     void* RetainedParentTicketServiceWorker::invoke(void* state) noexcept
     {
@@ -121,6 +124,13 @@ namespace llaminar2
 
     void RetainedParentTicketServiceWorker::run() noexcept
     {
+        // A foreign pthread starts a different initial OpenMP task. Startup's
+        // omp_set_num_threads/dynamic calls affect its caller, not this task.
+        // Borrow the original program declaration's exact budget once; incidental
+        // materializer/caller ICVs cannot replace it. Place selection was installed
+        // before exec by the existing launcher. No task/replay rebind occurs.
+        omp_set_num_threads(original_num_threads_);
+        omp_set_dynamic(original_dynamic_);
         for (;;)
         {
             Task task = nullptr;

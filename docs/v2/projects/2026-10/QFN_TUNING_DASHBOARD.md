@@ -7,15 +7,17 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Latest unchanged-default ROCm 10.1 control: **299.003 P /38.292
-after-prefill D**; all 768 IDs/MTP/initial placement match. Historical remote-GPU
-rates are numerical controls, **not a placement speedup baseline**. Passive
-PID masks are local, but benchmark rank→PID publication is missing; nonzero DRM
-discovery bytes do not prove ownership. Native inventory/ownership gates pass.
+Latest ROCm 10.1 core-place correction: **305.221 P /38.528 after-prefill D**,
+versus automatic control **297.572/37.389** (+2.57%/+3.05%, one comparison).
+All 768 IDs/MTP/initial placement match. Seven focused registrations pass;
+profiling confirms a second expert team had retained socket-wide places.
+[Placement fix and limits](../2026-11/QFN_CPU_OPENMP_TEAM_PLACEMENT_20261110.md).
+Historical remote-GPU rates are numerical controls, **not a placement speedup
+baseline**. Standalone benchmark rank→PID publication remains open.
 [SDK status](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md).
 Short-prefill indexer elision saves **36 kernels/chunk/GPU**; its matched
 control showed **+7.09% P**, with unchanged output IDs/MTP.
-Saved resolved GPU quotas: **8066 total, 4033/card**. Fresh automatic sizing is next.
+Fresh automatic sizing confirms **8066 total, 4033/card**, with identical placement.
 Context stays 262144 with dynamic MTP/balancing, RAM ngrams, local GPU caches
 and 16/32 GiB RAM/disk prefix budgets.
 
@@ -38,11 +40,9 @@ in reversed timing order; production retains paired rows. [Decision](../2026-11/
 placement match. Runtime pause-loop cycle shares are not removable wall time.
 [OpenMP evidence](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
 **Native Q8 candidates stay unpromoted:** MI50 **1.106–1.366×**, XTX
-**1.088–1.103×** component wins; 24 profiles/card and nine installed-Auto
-registrations/card pass. Four model lifetimes preserve IDs/MTP/config, but
-candidate decode **36.960/37.736** trails controls **38.152/38.292**. Defaults
-retained; fresh automatic GPU residency sizing is next. Table-only application
-rebuild takes **3.90s** without HIP shard compilation.
+**1.088–1.103×** component wins; installed-Auto gates pass, but model decode
+results overlap the control noise. Table-only rebuild takes **3.90s**.
+Next: first-core maintenance-planner contention, then CPU expert work.
 [Scope/results](../2026-11/QFN_ROCM_NATIVE_Q8_PREFILL_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
 [timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md),

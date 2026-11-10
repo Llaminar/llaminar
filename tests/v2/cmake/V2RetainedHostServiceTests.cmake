@@ -4,7 +4,8 @@ if(NOT COMMAND llaminar_native_source_fingerprint)
     include(${CMAKE_CURRENT_LIST_DIR}/../../../cmake/NativeSourceFingerprint.cmake)
 endif()
 
-if(NOT V2_PERF_TESTS_ONLY)
+v2_test_target_selected(v2_test_retained_host_service V2_RETAINED_HOST_SERVICE_OWNER_SELECTED)
+if(NOT V2_PERF_TESTS_ONLY OR V2_RETAINED_HOST_SERVICE_OWNER_SELECTED)
     add_library(v2_host_service_tls_control MODULE
         unit/execution/local_execution/graph/support/HostServiceTLSControl.cpp)
     add_library(v2_host_service_non_tls_control MODULE
@@ -30,6 +31,13 @@ if(NOT V2_PERF_TESTS_ONLY)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedHostServiceOwnerReplay)
+    add_v2_test(V2_Integration_RetainedHostServiceOpenMPBudget
+        COMMAND $<TARGET_FILE:v2_test_retained_host_service>
+            --gtest_filter=RetainedHostServiceOwner.OriginalCallerOpenMPBudgetSurvivesForeignServiceEntry
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;OpenMP;Ownership;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedHostServiceOpenMPBudget)
 endif()
 # Real loaded TLS code is unchanged by hardlink/permission metadata; replacement still rejects.
 if(TARGET v2_test_retained_host_service)

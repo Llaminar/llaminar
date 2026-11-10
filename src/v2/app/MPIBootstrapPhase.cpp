@@ -15,6 +15,7 @@
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 #include "utils/NUMATopology.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 #include <omp.h>
 #include <sched.h>
 #include <iostream>
@@ -456,6 +457,10 @@ namespace llaminar2
 
     void MPIBootstrapPhase::configureClusterRankThreads(const OrchestrationConfig &config)
     {
+        // Pre-exec core places can bind the initial thread before main. Derive
+        // the rank budget from its already-admitted partition, not just that
+        // first place, and restore the caller's exact original mask afterward.
+        const ScopedOpenMPPartitionAffinity admitted_partition;
         cpu_set_t affinity;
         CPU_ZERO(&affinity);
         if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0)

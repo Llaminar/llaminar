@@ -433,3 +433,43 @@ TEST(Test__MPIBootstrap, ExistingMPIKeepsExplicitRankConfigurationWithoutRelaunc
     EXPECT_EQ(result.action, BootstrapResult::Action::CONTINUE);
     EXPECT_EQ(config.mpi_procs, 4);
 }
+
+/** @test Core places precede exec on every launch path; explicit placement remains authoritative. */
+TEST(Test__MPIBootstrap, PortableOpenMPPlacementPreservesRankLocalWorkerGeometry)
+{
+    using namespace llaminar2;
+    ScopedLaunchEnvironment places("OMP_PLACES", nullptr);
+    ScopedLaunchEnvironment binding("OMP_PROC_BIND", nullptr);
+    ScopedLaunchEnvironment threads("OMP_NUM_THREADS", "7");
+    for (const char *hostfile : {"", "/cluster/hosts"})
+    for (const int ranks : {1, 2, 4, 8})
+    for (const char *selected_places : {"cores", "threads", "sockets", "{2},{4}"})
+    for (const char *selected_binding : {"close", "spread", "false"})
+    {
+        MPILaunchConfig launch;
+        EXPECT_EQ(launch.omp_places, "cores");
+        launch.hostfile = hostfile;
+        launch.num_procs = ranks;
+        launch.omp_places = selected_places;
+        launch.omp_proc_bind = selected_binding;
+        MPIBootstrap::configureOpenMPPlacement(launch);
+        EXPECT_STREQ(std::getenv("OMP_PLACES"), selected_places);
+        EXPECT_STREQ(std::getenv("OMP_PROC_BIND"), selected_binding);
+        EXPECT_STREQ(std::getenv("OMP_NUM_THREADS"), "7");
+        const auto command = buildCommand(launch, {});
+        for (const char *name : {"OMP_PLACES", "OMP_PROC_BIND"})
+        {
+            const auto at = std::find(command.begin(), command.end(), name);
+            ASSERT_NE(at, command.end());
+            ASSERT_NE(at, command.begin());
+            EXPECT_EQ(*(at - 1), "-x");
+            EXPECT_EQ(std::count(command.begin(), command.end(), name), 1);
+        }
+        EXPECT_FALSE(contains(command, "OMP_NUM_THREADS"));
+        EXPECT_TRUE(launch.bind_to_socket);
+        EXPECT_TRUE(launch.map_by_socket);
+    }
+    MPILaunchConfig invalid;
+    invalid.omp_places.clear();
+    EXPECT_THROW(MPIBootstrap::configureOpenMPPlacement(invalid), std::invalid_argument);
+}

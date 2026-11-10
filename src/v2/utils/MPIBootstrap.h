@@ -52,7 +52,7 @@ namespace llaminar2
         // Per-rank OpenMP configuration
         int omp_threads_per_rank = 0;   ///< OMP_NUM_THREADS (0 = auto)
         bool use_physical_cores = true; ///< Restrict to physical cores only
-        std::string omp_places = "sockets";
+        std::string omp_places = "cores"; ///< One place per physical core, including its allowed SMT siblings.
         std::string omp_proc_bind = "close";
         std::string cpu_set; ///< Optional OpenMPI --cpu-set for explicit CPU NUMA targeting
     };
@@ -115,11 +115,19 @@ namespace llaminar2
         static CPUTopology detectCPUTopology();
 
         /**
+         * @brief Publish only portable placement before any child loads libgomp.
+         * @param config Existing explicit launch policy; no host-local CPU count is exported.
+         * @throws std::runtime_error If the exact selected environment cannot be published.
+         * @throws std::invalid_argument For empty placement or binding policy.
+         */
+        static void configureOpenMPPlacement(const MPILaunchConfig &config);
+
+        /**
          * @brief Configure OpenMP environment for optimal performance
          *
          * Sets environment variables:
          * - OMP_NUM_THREADS: Based on cores per socket (or forced value)
-         * - OMP_PLACES: sockets
+         * - OMP_PLACES: selected placement (physical core places by default)
          * - OMP_PROC_BIND: close
          * - MKL_NUM_THREADS: Match OMP
          *

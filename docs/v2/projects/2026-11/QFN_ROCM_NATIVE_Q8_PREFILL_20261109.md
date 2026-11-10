@@ -145,13 +145,23 @@ simple capacity-row explanation but does not establish timing causality. Current
 passive artifacts also lack per-projection exact-hit counters. Keep the measured
 component candidates and this unresolved model trend explicit.
 
-The next independent experiment is fresh automatic GPU residency sizing. The
-current4033 experts/card are saved resolved per-layer quotas, revalidated rather
-than maximized during these runs. The closed peak resident VRAM is about30GiB
+A separate fresh automatic GPU residency experiment is now complete. The
+4033 experts/card in the four table comparisons were saved resolved quotas,
+revalidated rather than maximized during those runs. The closed peak resident VRAM is about30GiB
 per selected GPU; post-teardown free bytes do not establish live admission
-headroom. Clear only derived quotas/placements in a separate config and let the
-original PMA solve retain every context/MTP/cache charge. No accounting reserve
-is removed and no larger quota is presumed to fit.
+headroom. The independent arm clears only both tiers' resolved quota vectors
+and derived placements, retaining every context/MTP/cache charge. Fresh admission
+accepts262144 in7.42s and resolves the same8066 GPU/17022 CPU-cohort logical
+experts across49 main/MTP layers. Full inference then passes at297.572 prefill
+and37.389 decode tok/s. Its entire resolved routed-expert plan, all768 output IDs
+and actual MTP work equal the fixed-plan control. No extra GPU capacity or speed
+gain is established, and no accounting reserve was removed.
+
+This additional **old-table** observation overlaps candidate decode rates. It
+weakens attribution of the earlier decode trend to the table; it does not create
+a controlled proof that the table is performance-neutral. Keep all five
+lifetimes, retain the conservative default, and investigate dominant CPU expert
+work/maintenance cadence rather than repeat short model clocks indefinitely.
 
 ## Evidence and remaining qualification
 
@@ -166,6 +176,6 @@ collection remains under `/tmp/qfn-rocm-native-q8-exact-sdk101/`.
 `/tmp/qfn-rocm-native-q8-installed-sdk101/` retains temporary installed-Auto
 proofs and actual tuple assertions; `/tmp/qfn-native-q8-model-ab-sdk101/` retains
 all four model lifetimes, semantic comparisons, passive journals and cleanup
-receipts. `/tmp/qfn-current-gpu-capacity-next/PLAN.md` describes the still-unrun
-fresh automatic sizing arm. The target500/40 and full production preflight remain
+receipts. `/tmp/qfn-current-gpu-capacity-next/{PLAN.md,ADMISSION_RESULT.md,automatic-arm/}`
+retains the separate automatic sizing configuration and completed evidence. The target500/40 and full production preflight remain
 open. Keep local timing/profile payloads outside the source commit.

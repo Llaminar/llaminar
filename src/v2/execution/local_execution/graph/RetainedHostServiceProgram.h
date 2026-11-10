@@ -85,8 +85,19 @@ private:
     /** @brief Same production provider validator with recorded selected-address input for device-free replay. */
     static void requireTLSProviderEvidence(const std::shared_ptr<const TLSProviderEvidence>&,const void*);
     enum class MetadataAuthority {Installed,Recorded,UnqualifiedDiagnostic,InstalledWire};
-    static RetainedHostServiceProgram snapshot(RetainedHostServiceRole,MetadataAuthority,std::shared_ptr<const Evidence>);
     struct State;
+    /**
+     * @brief Observe current native creation inputs with an explicit task-policy origin.
+     * @param role Original service role being declared or revalidated.
+     * @param origin Authority for the native resource observation.
+     * @param evidence Original declaration-session loader/provider evidence.
+     * @param declared_task Null for a new declaration; otherwise retain that
+     *        declaration's immutable OpenMP task budget while revalidating current
+     *        pthread defaults. A materializer's task ICVs are not mutable process defaults.
+     * @return One sealed program whose native inputs and execution policy are explicit.
+     */
+    static RetainedHostServiceProgram snapshot(RetainedHostServiceRole,MetadataAuthority,
+        std::shared_ptr<const Evidence>,const State* declared_task=nullptr);
     explicit RetainedHostServiceProgram(std::shared_ptr<const State>);
     /** @brief Closed replay selection; no installed override or public numeric constructor exists. */
     /** @brief Authenticate peer declaration against installed data; result can price but can NEVER materialize. */

@@ -19,6 +19,9 @@
  * device. Native workers/caches retire before process exit and MPI finalization.
  */
 #include "backends/GPUDeviceProcessLifetime.h"
+#include "fixtures/execution/RetainedHostServiceReplayAccess.h"
+#include "execution/local_execution/graph/RetainedParentTicketServiceWorker.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 #include "utils/MPISessionOwner.h"
 #include "app/MPIBootstrapPhase.h"
 #include "app/RuntimeInitPhase.h"
@@ -35,6 +38,11 @@
 #include <omp.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
+#include <memory>
+#include <atomic>
+#include <set>
+#include <sched.h>
 #include <cerrno>
 #include <cstdio>
 #include <fstream>
@@ -65,6 +73,75 @@ namespace
         ~Hostfile() { std::remove(path.c_str()); }
         std::string path;
     };
+
+    /**
+     * @brief Replay the actual retained service's first and repeated OpenMP teams.
+     * @param cpu Original gathered rank CPU observation used by its existing PMA domain.
+     * @param details Precise failed worker/partition invariant.
+     * @return True only for the creator's whole physical-core budget and one
+     *         unique admitted core place per worker; SMT siblings in a place are legal.
+     */
+    bool verifyRetainedServiceTeam(const PhysicalMemoryResource& cpu,std::string& details)
+    try
+    {
+        cpu_set_t partition;
+        CPU_ZERO(&partition);
+        {
+            const ScopedOpenMPPartitionAffinity admitted_partition;
+            if(sched_getaffinity(0,sizeof(partition),&partition)!=0)
+            {details="cannot observe admitted OpenMP partition";return false;}
+        }
+        std::set<int> physical;
+        for(int cpu=0;cpu<CPU_SETSIZE;++cpu)if(CPU_ISSET(cpu,&partition))
+            physical.insert(MPIBootstrapPhase::physicalRepresentativeForCpu(cpu));
+        const int expected=omp_get_max_threads();
+        if(physical.empty()||physical.contains(-1)||expected!=static_cast<int>(physical.size()))
+        {details="pre-main core place collapsed the rank's physical worker budget";return false;}
+        const auto program=test::RetainedHostServiceReplayAccess::program(RetainedHostServiceRole::ExecutorParentTicket);
+        auto memory=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(program.bom(cpu)),cpu.world_rank);
+        auto owner=PreparedRetainedHostService::materialize(test::RetainedHostServiceReplayAccess::claim(memory,program));
+        for(int repeat=0;repeat<2;++repeat)
+        {
+            struct Observation {int expected,maximum=0,dynamic=-1,actual=0;std::vector<cpu_set_t> masks;std::atomic<bool> failed{false};};
+            Observation observed{expected,0,-1,0,std::vector<cpu_set_t>(static_cast<std::size_t>(expected))};
+            const auto ticket=owner->worker().dispatch([](void* opaque){
+                auto& value=*static_cast<Observation*>(opaque);
+                value.maximum=omp_get_max_threads();value.dynamic=omp_get_dynamic();
+#pragma omp parallel
+                {
+#pragma omp single
+                    value.actual=omp_get_num_threads();
+                    const int worker=omp_get_thread_num();
+                    if(worker>=value.expected || sched_getaffinity(0,sizeof(cpu_set_t),&value.masks[worker])!=0)
+                        value.failed.store(true,std::memory_order_relaxed);
+                }
+                return !value.failed.load()&&value.maximum==value.expected&&value.actual==value.expected&&value.dynamic==0;
+            },&observed);
+            if(!owner->worker().await(ticket))
+            {details="retained pthread changed the original program declaration's OpenMP budget";return false;}
+            std::set<int> assigned;
+            for(const auto& mask:observed.masks)
+            {
+                std::set<int> place;
+                for(int id=0;id<CPU_SETSIZE;++id)if(CPU_ISSET(id,&mask))
+                {
+                    if(!CPU_ISSET(id,&partition))
+                    {details="retained worker escaped its original rank partition";return false;}
+                    place.insert(MPIBootstrapPhase::physicalRepresentativeForCpu(id));
+                }
+                if(place.size()!=1||place.contains(-1)||!assigned.insert(*place.begin()).second)
+                {details="retained OpenMP workers do not own unique physical core places";return false;}
+            }
+        }
+        details="retained creator budget and unique physical core places verified";
+        return true;
+    }
+    catch(const std::exception& error)
+    {
+        details=error.what();
+        return false;
+    }
 
     /** @brief Enter production MPI bootstrap and prove each child's inventory. */
     int probe(int argc, char **argv)
@@ -98,6 +175,12 @@ namespace
             const auto topology = MPIBootstrap::detectCPUTopology();
             std::string detail;
             const bool affinity_ok = MPIBootstrapPhase::verifyStartupThreadAffinity(-1, true, detail);
+            std::string retained_detail;
+            const PhysicalMemoryResource observed_cpu{context->rank(),DeviceId::cpu(),
+                local_observation.cpu.memory_bytes,local_observation.cpu.free_memory_bytes};
+            const bool retained_affinity_ok=verifyRetainedServiceTeam(observed_cpu,retained_detail);
+            passed=passed&&retained_affinity_ok;
+            if(!retained_affinity_ok)std::cerr<<"retained_team_affinity rank="<<context->rank()<<" "<<retained_detail<<std::endl;
             passed = passed && inventory.world_size == topology.numa_nodes &&
                 inventory.ranks.size() == static_cast<std::size_t>(context->world_size()) &&
                 inventory.node_count == 1 && inventory.total_gpus == 0 && affinity_ok;

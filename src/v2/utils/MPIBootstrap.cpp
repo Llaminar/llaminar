@@ -489,6 +489,15 @@ namespace llaminar2
     // OpenMP Environment Configuration
     // ========================================================================
 
+    void MPIBootstrap::configureOpenMPPlacement(const MPILaunchConfig &config)
+    {
+        if (config.omp_places.empty() || config.omp_proc_bind.empty())
+            throw std::invalid_argument("MPI OpenMP placement and binding policy must be explicit");
+        if (setenv("OMP_PLACES", config.omp_places.c_str(), 1) != 0 ||
+            setenv("OMP_PROC_BIND", config.omp_proc_bind.c_str(), 1) != 0)
+            throw std::runtime_error("Cannot publish MPI OpenMP placement before exec");
+    }
+
     void MPIBootstrap::configureOpenMPEnvironment(const CPUTopology &topology,
                                                   const MPILaunchConfig &config)
     {
@@ -502,8 +511,7 @@ namespace llaminar2
 
         // Set OpenMP environment variables
         setenv("OMP_NUM_THREADS", std::to_string(omp_threads).c_str(), 1);
-        setenv("OMP_PLACES", config.omp_places.c_str(), 1);
-        setenv("OMP_PROC_BIND", config.omp_proc_bind.c_str(), 1);
+        configureOpenMPPlacement(config);
         setenv("OMP_NESTED", "false", 1);
         setenv("OMP_DYNAMIC", "false", 1);
 
@@ -666,6 +674,14 @@ namespace llaminar2
         // Linux hosts). A CLI override would disable that path and also defeat
         // an operator's inherited MCA setting. Preserve both sources of intent.
 
+        // Placement names are portable; remote ranks still observe their own
+        // allowed places and derive their numeric physical-worker budget.
+        // Name-only exports retain the selected value, including place syntax.
+        for (const char *name : {"OMP_PLACES", "OMP_PROC_BIND"})
+        {
+            cmd.emplace_back("-x");
+            cmd.emplace_back(name);
+        }
         appendDiagnosticEnvironment(cmd);
 
         // MPI owns this explicit option/application delimiter. The shared
@@ -716,6 +732,8 @@ namespace llaminar2
         // Configure OpenMP environment before exec (inherited by child processes)
         if (config.hostfile.empty())
             configureOpenMPEnvironment(topology, config);
+        else
+            configureOpenMPPlacement(config); // Never export the launcher's numeric geometry.
         configureLauncherEnvironment();
 
         // Build command

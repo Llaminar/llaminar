@@ -128,8 +128,12 @@ namespace llaminar2
          */
         BorrowedDispatchEntry* next_borrowed_entry_ = nullptr;
 
-        /** @brief Construct complete idle data; only the admitted owner can start the entry. */
-        explicit RetainedParentTicketServiceWorker(pthread_t) noexcept;
+        /**
+         * @brief Bind the original program declaration's ICVs before its admitted thread starts.
+         * @param original_threads Positive worker budget sealed by the original program declaration.
+         * @param original_dynamic Dynamic-team policy from that same immutable declaration.
+         */
+        explicit RetainedParentTicketServiceWorker(pthread_t,int original_threads,int original_dynamic) noexcept;
         /** @brief Enter the original run loop, terminating on any escaping exception. */
         static void* invoke(void*) noexcept;
         /** @brief Complete typed lifecycle of the worker's single task slot. */
@@ -142,13 +146,15 @@ namespace llaminar2
             Stopping, ///< Destructor has prohibited future dispatch.
         };
 
-        /** @brief Persistent thread loop; all state transitions hold mutex_. */
+        /** @brief Apply original program task policy once, then run the mutex-owned ticket lifecycle. */
         void run() noexcept;
 
         mutable std::mutex mutex_;
         std::condition_variable work_ready_;
         std::condition_variable work_complete_;
         pthread_t worker_{};
+        int original_num_threads_ = 1; ///< Original program's admitted OpenMP task budget, sealed before pthread_create.
+        int original_dynamic_ = 0; ///< Original program's dynamic-team ICV; applied once on the service thread.
         bool running_=false; ///< Published only after pthread_create succeeds.
         State state_ = State::Idle;
         Task task_ = nullptr;
