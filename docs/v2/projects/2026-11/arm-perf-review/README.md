@@ -1226,3 +1226,24 @@ My "compile-only candidate, not published" framing was STALE. Corrections:
   path identical; whether a re-run with the repaired driver is required =
   Main's call; a rerun is ~25 min if requested). Reviewer light note on the
   driver-script commit requested (717b-precedent class).
+
+### ADMISSION BLOCKER (Main, 2026-11-10, ~17:56Z): the Mac "717b2bfe6" receipt is bound to c4536cf3c — WITHDRAWN
+
+Main's artifact inspection found the Mac
+'register-gate-717b2bfe6-appleclang' receipt is actually fresh-bound to
+CLEAN **c4536cf3c** at /Users/floriankinder/repo/llaminar-addon (summary +
+configure.command + compiler jobs): the actual PreparedProjection header
+hash ad00ac6a… vs the combined 717/252's 991a4347… — i.e. PRE-S4 source,
+not merely a stale Git label. REQUIRED: withdrawal + a CORRECT-SOURCE Mac
+9×14 canonical qualification at the ACTUAL combined tip (clean worktree at
+252da4a53; binding must prove the combined source; NO relabeling/copying).
+GNU 717 artifacts: not automatically invalidated, under inspection. New
+candidate 252da4a53 adds only the repaired coordinator (driver) — bounded
+reviewer source ACK requested. FF HOLD remains. Count = 9 commits over
+e8866ec04.
+
+IMPLICATION: the driver's reconcile trusted the DECLARED identity and did
+not catch the source-tree mismatch (Main caught it via header hashes) — a
+driver-strengthening candidate (verify the configured source tree against
+the expected identity, e.g. via compile_commands paths + header hash) is
+now evident. The earlier owner "tree stamp = a16591eed" claim was wrong.
