@@ -19173,6 +19173,13 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
             $<TARGET_FILE:v2_perf_cpu_native_neon_panel_tournament>
         LABELS "V2;Performance;CPU;NEON;NativeQuantised"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+    # Contract controls of the tournament itself: hostile inputs are rejected
+    # before allocation, and omitted/stale/escaped publication is detected.
+    add_v2_test(V2_Unit_CPUNativeNEONPanelTournamentContract
+        COMMAND ${CMAKE_COMMAND} -E env LLAMINAR_PANEL_SELF_TEST=1
+            $<TARGET_FILE:v2_perf_cpu_native_neon_panel_tournament>
+        LABELS "V2;Unit;CPU;NEON;NativeQuantised;DeviceFree"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 endif()
 
 if(V2_CPU_TARGET_X86)
