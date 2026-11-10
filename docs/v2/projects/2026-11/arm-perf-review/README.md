@@ -966,3 +966,37 @@ behavior, not a defect); running NOW from a proper Integration build at
 717b2bfe6 (SHARED_CORE=ON, df15 pattern; the 6 cells incl. the NEW
 InstalledWidth). FF gate after: focused set green → Main takes the
 combined branch.
+
+### Reviewer #171 COMPLETE — HOLD at adb1c98e9, five P2s, one comprehensive fix-back requested
+
+Scope confirmed (3 paths/+288; no production edits; v2.1 body = released
+69ad). Findings:
+- **HP-1:** Fixture::check() compares FP16Tensor::data() (dequantized FP32
+  cache) vs uint16_t arrays → use typed_data() + exact native extents
+  (positive/mutation controls).
+- **HP-2:** completion-discriminating fixtures all use alpha=.5/beta=.25
+  (exact products; fusion/splitting indistinguishable) → add public-entry
+  test-owned literal controls distinguishing rounding boundaries + absent-
+  bias vs explicit +0 signed-zero (examples: e=2^-23, dot=1-e, alpha=1+e,
+  bias=-1; beta=1+e, C0=1-e, value=-1); retain K257; exercise the ACTUAL
+  warmup/sample/postcheck interval path with nonzero beta (no second
+  timing/reset implementation).
+- **HP-3:** identity — hash the SELECTED native storage (not always
+  halfWords-as-physical_A_hash); record declared profiling mode (not
+  hardcoded none); scope fegetround() to caller rounding + record remaining
+  external/unobserved fields; Git stamp ≠ compilation authentication.
+- **HP-4:** enforce timing-only selection/fresh-process mode (generic
+  gtest_main runs ContractReplay's 13 configs before timing → mixed
+  invocation could publish an accepted single-case sample).
+- **HP-5:** whole-case admission — one admitted case owns ALL
+  geometry/extents/FP-policy validation BEFORE the first fixture allocates
+  (N=9999/K=10000 second-derivation and N=65536→65537 examples;
+  ContractReplay positives bypass validate) + boundary rejection controls.
+  Harness-admission findings, not a demonstrated production overrun.
+- RETAIN: borrowed ctor/API order, borrowed-mode-per-plan, public-entry
+  usage, test-owned walk/tree/completion, K257, C0-per-interval restoration,
+  off-clock validation/stats. Registration settled: Performance smoke +
+  Integration/preflight correctness (no Unit timing alias). Doxygen
+  standard for the new source. Generated diagnostics ≠ recorded GDN
+  capture; Linux validation stays outstanding.
+- No builds/tests/auth performed. Await ONE exact comprehensive successor.
