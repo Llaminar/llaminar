@@ -29,7 +29,9 @@ namespace llaminar2
     enum class PlanningMainForwardPhase { Prefill, Decode };
 
     /** @brief Semantic work family, shared by operand compilation and representative sampling. */
-    enum class PlanningOrdinaryWeightKind { Projection, Router, Embedding, NonProjection, Unclassified };
+    enum class PlanningOrdinaryWeightKind { Projection, Router, Embedding, NonProjection, Unclassified, ImmutableLookup };
+    /** @brief Graph ownership and row-selection boundary, independent of source storage. */
+    enum class PlanningWeightInvocationSite { Layer, Entry, Terminal };
     /** @return The one main-forward classification of a semantic role; unknown roles stay explicit. */
     PlanningOrdinaryWeightKind planningOrdinaryWeightKind(WeightRole role) noexcept;
 
@@ -43,6 +45,7 @@ namespace llaminar2
         ModelPreparedWeightRepresentation representation;
         WeightShardGeometry geometry;
         FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native; ///< Immutable observed arithmetic family.
+        PlanningWeightInvocationSite invocation_site = PlanningWeightInvocationSite::Layer; ///< Schema-owned execution boundary; terminal work consumes one real row.
 
         /** @return Actual runtime scalar/codebook label, not an assumed source format. */
         std::string_view executionFormat() const noexcept
@@ -59,12 +62,19 @@ namespace llaminar2
     struct PlanningRouterWeight { PlanningWeightOperand weight; };
     /** @brief Indexed embedding access, never vocabulary-sized GEMM work per token. */
     struct PlanningEmbeddingWeight { PlanningWeightOperand weight; };
+    /** @brief Native row gathers issued by one declared decoder-layer consumer, never a table-sized GEMM. */
+    struct PlanningImmutableLookupWeight
+    {
+        PlanningWeightOperand weight;
+        int consumer_layer;
+        int lookups_per_token;
+    };
     /** @brief Norm, gate, bias or recurrent parameter; no GEMM shape is implied. */
     struct PlanningNonProjectionWeight { PlanningWeightOperand weight; };
     /** @brief Explicitly unresolved semantics; a cost consumer must not price this as zero. */
     struct PlanningUnclassifiedWeight { PlanningWeightOperand weight; };
     using PlanningOrdinaryWeightWork = std::variant<PlanningProjectionWeight, PlanningRouterWeight,
-        PlanningEmbeddingWeight, PlanningNonProjectionWeight, PlanningUnclassifiedWeight>;
+        PlanningEmbeddingWeight, PlanningImmutableLookupWeight, PlanningNonProjectionWeight, PlanningUnclassifiedWeight>;
 
     /** @brief How a participant issues owned projections in this graph phase. */
     enum class PlanningExpertExecution

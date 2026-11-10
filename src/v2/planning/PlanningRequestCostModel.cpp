@@ -169,7 +169,7 @@ namespace llaminar2
                 std::visit([&](const auto &value) {
                     using Operation = std::decay_t<decltype(value)>;
                     const auto &weight = value.weight;
-                    const int count = weight.role == WeightRole::LMHead || weight.role == WeightRole::OutputNorm ? 1 : rows;
+                    const int count = weight.invocation_site == PlanningWeightInvocationSite::Terminal ? 1 : rows;
                     double seconds = 0;
                     if constexpr (std::is_same_v<Operation, PlanningUnclassifiedWeight>)
                         throw std::invalid_argument("Unclassified request work: " + weight.source_name);
@@ -204,23 +204,45 @@ namespace llaminar2
                             2.0 * count * shape->columns * share,
                             count * (parameterBytes(weight) / shape->rows * share + sizeof(float) * profile.d_model));
                     }
+                    else if constexpr (std::is_same_v<Operation, PlanningImmutableLookupWeight>)
+                    {
+                        const auto &shape = *weight.geometry.matrix();
+                        if (value.lookups_per_token <= 0 || !shape.rows)
+                            throw std::invalid_argument("Immutable lookup request work has no positive row geometry");
+                        const double lookups = double(count) * value.lookups_per_token;
+                        result.qualifications.insert("immutable row gathers use consumer-local source-byte/FP32 proxies; backing-tier and cache latency not fitted");
+                        seconds = scalarSeconds(participant.discovery_rank, participant.device, count,
+                            2.0 * lookups * shape.columns,
+                            lookups * (parameterBytes(weight) / shape.rows + sizeof(float) * shape.columns));
+                    }
                     else
                     {
                         const double elements = weight.geometry.elements();
-                        const bool norm = weight.role == WeightRole::Norm || weight.role == WeightRole::OutputNorm;
+                        const bool norm = weight.role == WeightRole::Norm || weight.role == WeightRole::OutputNorm ||
+                            (isImmutableFP32WeightRole(weight.role) && weight.role != WeightRole::PerLayerEmbeddingConvolution);
                         const double coordinates = norm ? std::max(elements, double(profile.d_model)) : elements;
                         const double operations = weight.role == WeightRole::GDNSsmParam ? 0 :
-                            count * coordinates * (norm ? 8.0 : weight.role == WeightRole::SharedExpertInputGate ? 2.0 : 1.0);
+                            count * coordinates * (norm ? 8.0 : weight.role == WeightRole::SharedExpertInputGate ||
+                                weight.role == WeightRole::PerLayerEmbeddingConvolution ? 2.0 : 1.0);
                         seconds = scalarSeconds(participant.discovery_rank, participant.device, count, operations,
                             parameterBytes(weight) + 2.0 * sizeof(float) * count * coordinates);
                     }
-                    if (weight.role == WeightRole::Embedding) cost.entry += seconds;
-                    else if (weight.role == WeightRole::LMHead || weight.role == WeightRole::OutputNorm) cost.terminal += seconds;
-                    else
+                    switch (weight.invocation_site)
                     {
-                        if (weight.layer < 0 || weight.layer >= layers)
+                    case PlanningWeightInvocationSite::Entry: cost.entry += seconds; break;
+                    case PlanningWeightInvocationSite::Terminal: cost.terminal += seconds; break;
+                    case PlanningWeightInvocationSite::Layer:
+                    {
+                        const int layer = [&] {
+                            if constexpr (std::is_same_v<Operation, PlanningImmutableLookupWeight>) return value.consumer_layer;
+                            else return weight.layer;
+                        }();
+                        if (layer < 0 || layer >= layers)
                             throw std::invalid_argument("Ordinary request operation has no main-layer owner");
-                        cost.ordinary[weight.layer] += seconds;
+                        cost.ordinary[layer] += seconds;
+                        break;
+                    }
+                    default: throw std::invalid_argument("Ordinary request operation has an unknown execution boundary");
                     }
                 }, operation);
 
