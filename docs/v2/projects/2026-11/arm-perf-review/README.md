@@ -820,3 +820,27 @@ e8866ec04), static code/registration only:
 - Both new invocation aliases explicitly in ProductionTestPreflight.
 - Limits: source correspondence only; owner runtime reports stay owner
   evidence; no FF/merge grant. #169 (combined re-pin) now unblocked.
+
+### Reviewer #169 HOLD on the 6th commit (a16591eed) — two P2s; 5-patch re-pin ACK stands
+
+- **I31-C1 [P2]:** the new cell sets LLAMINAR_PANEL_STRIPS=0
+  (tests/v2/CMakeLists.txt:19183-19188) but the tournament's admit():177
+  parses [1,4] excluding 0 → main():557/597-600 returns 2 ("must be an
+  integer in [1,4]: '0'") BEFORE allocation/reference/timing; and
+  runStrips():248-256 has only 1/2/4 — widening admission alone would
+  abort, not execute the installed path. FIX: correct installed-mode
+  admission AND dispatch, positive coverage for the real entry, update the
+  advertised grammar. Forced-4 substitution does NOT satisfy the
+  installed-selection contract.
+- **I31-C2 [P2]:** the invocation inherits formats Q4_K/Q6_K/IQ3_S/IQ4_XS/
+  Q8_0 (tournament:194), OMITTING Q4_0 and IQ4_NL — the actual no-minimum
+  NibbleLUT S4 branch (PreparedProjection.h:195-203); IQ4_XS is
+  NibbleLUTSourceScale and stays S2. FIX: explicitly include both intended
+  centered/nonlinear sources; retain the metamorphic production-batch-0-vs-1
+  byte/dirty/guard/immutable checks.
+- Confirmed: 6 commits over e8866ec04; 4/4 `=` + 1/1 `=`; all endpoint files
+  byte-identical to reviewed predecessors; #165 deferral not a cause.
+- IMPLICATION: the Mac 9/14 core-free receipt does NOT execute this new
+  full-project CMake registration (portability ≠ tests/v2/CMakeLists.txt) —
+  the native proofs stand but are NOT execution of the new cell; #166/#167
+  binding/final-set rules unchanged. Corrected successor requested.
