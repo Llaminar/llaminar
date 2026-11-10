@@ -1336,3 +1336,27 @@ evidence-conditional; B3 retained-team per layer DEFERRED; B4 spin re-tune
 only with idle-cost evidence. No overlap with the register-gate/B9/idea-31
 tooling set. Tracker idea-26 reframe updates via coordinator after the plan
 lands.
+
+### Half-perf cell HP-FINAL gate (arm-sparks, 2026-11-10, ~21:12Z): b512e25a GREEN
+
+CFG=0 BUILD=0; **Unit 990/16 failed, Preflight 2419/23 failed**; **half-
+operand cells 5/5 PASSED** (incl. the +249-line Perf__CPUHalfOperandProjection
+rework from #173). Failure classification = the R1/R2-known base+env set,
+SAME NAMES as the sealed runs at e8866ec04/7d1a94479 (cross-checked, 0 new
+names). Count caveat for the reviewer: Unit 990 vs 979 earlier = BASE GREW
+(failed-name SET identical). Logs: .80 build/hpb-{unit,pre,cells}.log +
+hp-b512.status. Economy receipts: the hpb-cells outputs at b512e25a = the
+plan-v2.1 evidence (no separate run unless the reviewer requires a specific
+form). Then merge-ready → Main.
+
+### Main corrections + tip movement (2026-11-10, ~21:13Z)
+
+- Main CORRECTED itself: GroupedSealedPlan is NOT in 58dcdaff5 (that was
+  #71 typed work classification only); #72 stub + #73 FusedFinalAdd triage
+  remain QUEUED/unimplemented.
+- **Latest tip: 0d6f09919** (#71 cont.): complete sparse-source + explicit
+  host-service fixture; new focused preflight now GREEN; the affected
+  Unit_MemoryPlanner + 20x cases = the #71 fix's own code-path reach (not
+  env) — underway. The combined candidate's re-rebase target updates to the
+  latest tip when #71 completes (always-push).
+- idea-05 rider scope accepted; PR prose = per-member tail evidence wording.
