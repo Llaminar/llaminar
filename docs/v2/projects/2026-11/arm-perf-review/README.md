@@ -596,3 +596,20 @@ not compose). No authentication/branch-protection/merge grants in the ruling.
   `V2_Unit_CPUNativeNEONTileRegisters` + `V2_Integration_CPUNativeNEONTileRegisters`;
   the required checker shards COMPLEMENT each cell's native build/verify
   evidence. A proper build directory alone changes nothing about this.
+
+### Final-evidence composition specified (reviewer #167) — committed verbatim
+
+**register-gate-final-composition.md**. Core: 18 required cells (GNU-14 +
+AppleClang-21 × Debug/Release/Integration × NEON/NEON_DOTPROD/NEON_I8MM) via
+the core-free portability project; ADDITION = the companion
+compiler-envelope proof (`v2_cpu_codegen_envelope_proof`) alongside the
+native proof target; per cell = config identity + compile DB + 14 CTest
+aliases (native/envelope/checker, Unit+Integration); receipt = proof.json +
+proof.o/dis/i + envelope proof.s/target.txt + compile DB + exit statuses +
+inventories; final acceptance = the aliases re-running the SAME verifier
+after final inputs fix (no third verifier); driver = completeness/binding
+coordinator, NOT a new authority; native verification is host/toolchain-bound
+(no cross-host JSON splicing); Debug = real config flags into the OPTIMIZED
+witness (never omitted/loosened/copied); shared budget key → max across
+configurations, never lowest/average. Old idea-31/B9 receipts still cannot
+substitute. Spec only — no driver approval/execution/merge grant.
