@@ -711,3 +711,19 @@ sm121 tile inventory + idea21b probe. NOT SETTLED yet.
   WITHOUT budget loosening (real kernel improvement first — consistent with
   the standing rule's escape-hatch discipline). Finishing durable summary.
 NOT SETTLED yet.
+
+### GPU slot: profiler-attachment safety finding (2026-11-10, ~14:48Z)
+
+- During idea-21b baseline profiling on .79: NCU produced its report and the
+  test passed, but the owned driver window FAILED on repeated new NVRM
+  refcntRequestReference_IMPL warnings (state1/current0/status0x56). No
+  Xid/reset seen; Main STOPPED further NCU/NSYS attachment for this slot
+  (safety-first). Evidence: /home/factory/idea25/slot-profile-baseline.log +
+  slot-driver2-report.json + slot-profiles/grouped-cb4-baseline.ncu-rep;
+  first failed attempt (session-root path admission) retained separately.
+- ROUTE CHANGE: non-attached CUDA tests + compiler/SASS inspection only;
+  clean non-profiled driver window check before more runtime work.
+- Compile-only occupancy candidate status: CB4 48 regs / CB13 40 regs, zero
+  spills; baseline full6 compile green; no kernel change published yet —
+  the budget targets reachable WITHOUT loosening (standing-rule compliant).
+  NOT SETTLED.
