@@ -80,3 +80,28 @@ gate set includes these two as base-class until Main takes the fix.
   79c1f62ab (worker records a compaction request arriving during
   Copying/Publishing and schedules exactly one more rewrite after its own
   publication; 18/18 + 20/20 pass in-container; .80 repeat-proof requested).
+
+## A1 LANDED (arm-addon3, 2026-11-10, ~21:46Z): 1d9141934 on codex/arm-idea26-openmp-wakeup (base e8866ec04; 8 files, +319)
+
+"perf(cpu): measure OpenMP team fork/join counts at owned boundaries":
+- Counter authority: inline-variable relaxed fetch-add noteOpenMPTeamFork +
+  snapshot accessor; observed at EVERY real fork branch (OMP_WORKSHARE/_SYNC/
+  _IF + both collapses, OMP_LAYER_PARALLEL, the two FA decode raw sites),
+  inserted before the pragma (outlined bodies untouched); retained reuse
+  counts nothing; prep-only raw sites exempt by name; consumer contract =
+  snapshot DELTAS (never absolutes).
+- Summary openmp_team_forks_decode_step: exact window delta in
+  ForwardExecutionEngine::executeCacheHit under the PerfStats gate AND
+  record-family selection — default serving materializes nothing.
+- Per-stage family openmp_team_forks_stage: both DeviceGraphExecutor CPU
+  stage loops, riding the SAME owned boundary as the stage-clock pair,
+  under the stage-timing gate; GPU entries publish nothing.
+- COST = EVIDENCE: preflight cells measure the amortized per-note cost over
+  1M invocations (2.26 ns direct / 2.32 ns CTest; ceiling asserted at 100
+  ns) + the off-default check (no policy → no omp record while forks count).
+- TESTS: core-free fixture +2 (exact fork contract; registered as the
+  SHARED preflight alias V2_Integration_OpenMPTeamForkCounterContract);
+  publication/default/cost cell V2_Integration_OpenMPTeamForkCounterPublication
+  (preflight-appended); FULL portability CTest 293/293 green (Mac);
+  Linux-engine targets syntax-validated under stubs (runtime validation at
+  the canonical Linux gates at landing). A2 rider set BOOKED next (.80).
