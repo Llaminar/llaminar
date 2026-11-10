@@ -150,6 +150,45 @@ llaminar2::native_quantised::NativeQuantisedGPUHardware actualQ8Hardware(
 {
     return {architecture, 3, 60, native_wave, 1024, lds};
 }
+/** @brief Measured tuples remain installed; missing-row isolation uses an authored span. */
+TEST_F(ROCmDensePrefillOverlay, NativeQ8MeasuredM448SelectionAndActualRowIsolation)
+{
+    using Arch = llaminar2::native_quantised::NativeQuantisedArchitecture;
+    auto mi50 = actualQ8Hardware(Arch::rocm(9, 0, 6));
+    auto xtx = actualQ8Hardware(Arch::rocm(11, 0, 0), 32);
+    for (int k : {2560, 10240})
+    {
+        // This deliberately M448-only span proves actual-row isolation without
+        // forbidding independent future installed measurements at other rows.
+        auto measured_mi50 = nativeQ8Row(Arch::rocm(9, 0, 6), 16);
+        auto measured_xtx = nativeQ8Row(Arch::rocm(11, 0, 0), 32);
+        measured_mi50.k = measured_xtx.k = k;
+        const std::array measured{measured_mi50, measured_xtx};
+        for (const auto *actual : {&mi50, &xtx})
+        {
+            const auto selected = selectDensePrefillExactConfig(19, 448, 320, k,
+                DensePrefillWeightFamily::NativeQuantised, actual);
+            ASSERT_TRUE(selected);
+            EXPECT_EQ(std::tuple(selected->n_tile, selected->m_tile, selected->min_blocks,
+                                 selected->unroll, selected->full_tiles, selected->producer),
+                      std::tuple(64, actual == &mi50 ? 16 : 32, 1, 2, false,
+                                 VNNIPrefillProducer::NativeCooperative));
+            const auto authored = selectDensePrefillExactConfigFromEntries(measured,
+                19, 448, 320, k, DensePrefillWeightFamily::NativeQuantised, actual);
+            ASSERT_TRUE(authored);
+            EXPECT_EQ(authored->m_tile, selected->m_tile);
+            // Architecture proximity must never become nearest-M selection.
+            for (int m = 1; m < 128; ++m)
+                EXPECT_FALSE(selectDensePrefillExactConfigFromEntries(measured,
+                    19, m, 320, k, DensePrefillWeightFamily::NativeQuantised, actual)) << m;
+            for (int m : {128, 256, 447, 449, 512})
+                EXPECT_FALSE(selectDensePrefillExactConfigFromEntries(measured,
+                    19, m, 320, k, DensePrefillWeightFamily::NativeQuantised, actual)) << m;
+            EXPECT_FALSE(selectDensePrefillExactConfigFromEntries(measured,
+                19, 448, 320, k, DensePrefillWeightFamily::NativeQuantised));
+        }
+    }
+}
 /** @brief Actual architecture outranks nearby clocks, including native-wave32 devices. */
 TEST_F(ROCmDensePrefillOverlay, NativeQ8ActualArchitecturePrecedesNearestMeasured)
 {
