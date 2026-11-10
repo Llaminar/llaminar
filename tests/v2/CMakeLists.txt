@@ -1705,6 +1705,17 @@ add_v2_routed_expert_policy_unit(
     V2_Unit_MoEOverlayResidencyMaintenanceService
     unit/execution/moe/Test__MoEOverlayResidencyMaintenanceService.cpp
 )
+# The actual host planner inherits its admitted OpenMP partition once at
+# creation; this focused lifecycle gate preserves the caller's core place.
+if(TARGET v2_unit_moe_overlay_residency_maintenance_service)
+    target_link_libraries(v2_unit_moe_overlay_residency_maintenance_service OpenMP::OpenMP_CXX)
+    add_v2_test(V2_Integration_MoEMaintenanceControlAffinity
+        COMMAND ${CMAKE_COMMAND} -E env OMP_PROC_BIND=close OMP_PLACES=cores OMP_NUM_THREADS=2
+            $<TARGET_FILE:v2_unit_moe_overlay_residency_maintenance_service>
+            --gtest_filter=Test__MoEOverlayResidencyMaintenanceService.IndependentControlInheritsPartitionAndRestoresCaller
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Threading;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+endif()
 # The backend-specific async-histogram integration cells prove that captured
 # CUDA and ROCm producers publish and drain their device-owned banks.  This
 # reduced component integration closes the next production boundary: exact
@@ -28651,6 +28662,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_DynamicMaintenanceCadenceLifecycle
     V2_Integration_DynamicDeviceHistogramCadenceLifecycle
     V2_Integration_ExpertOverlayLocalMaintenanceDrain
+    V2_Integration_MoEMaintenanceControlAffinity
     V2_Integration_DynamicDependentCycleCohortLifecycle
     V2_Integration_MoEOverlayHostDemandAdmission
     V2_Integration_MoEOverlayHostRoutingWork

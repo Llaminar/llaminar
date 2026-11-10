@@ -7,10 +7,10 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Latest ROCm 10.1 core-place correction: **305.221 P /38.528 after-prefill D**,
-versus automatic control **297.572/37.389** (+2.57%/+3.05%, one comparison).
-All 768 IDs/MTP/initial placement match. Seven focused registrations pass;
-profiling confirms a second expert team had retained socket-wide places.
+Latest ROCm 10.1 maintenance placement: **314.868 P /40.035 after-prefill D**,
+versus core-place control **305.221/38.528** (+3.16%/+3.91%, one comparison).
+All 768 IDs/MTP/initial placement match. Five focused registrations pass,
+including the original-worker RED/GREEN affinity regression. Goal remains open.
 [Placement fix and limits](../2026-11/QFN_CPU_OPENMP_TEAM_PLACEMENT_20261110.md).
 Historical remote-GPU rates are numerical controls, **not a placement speedup
 baseline**. Standalone benchmark rank→PID publication remains open.
@@ -42,7 +42,7 @@ placement match. Runtime pause-loop cycle shares are not removable wall time.
 **Native Q8 candidates stay unpromoted:** MI50 **1.106–1.366×**, XTX
 **1.088–1.103×** component wins; installed-Auto gates pass, but model decode
 results overlap the control noise. Table-only rebuild takes **3.90s**.
-Next: first-core maintenance-planner contention, then CPU expert work.
+Next: CPU expert work and bounded movement economics toward 500P.
 [Scope/results](../2026-11/QFN_ROCM_NATIVE_Q8_PREFILL_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
 [timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md),

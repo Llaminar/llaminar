@@ -10,12 +10,15 @@
  * extra transfer, stream wait or device synchronization.
  * After publication, reclaiming still owns this worker. Only a fully quiescent
  * authority permits the next frozen-window proposal to consume maintenance CPU.
+ * The worker inherits the admitted OpenMP partition at construction; existing
+ * compute threads and the caller retain their original masks and team budget.
  */
 
 #include "MoEOverlayResidencyMaintenanceService.h"
 
 #include "interfaces/IMPIContext.h"
 #include "utils/Logger.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
@@ -157,9 +160,14 @@ namespace llaminar2
              * object, and distributed composition phase is complete.
              * stopAndDrain() joins this worker before member destruction.
              */
-            worker_ = std::jthread(
-                [this](std::stop_token stop_token)
-                { run(stop_token); });
+            {
+                // Admission grants this independent control worker the original
+                // rank partition, while the creator keeps its compute place.
+                const ScopedOpenMPPartitionAffinity control_affinity;
+                worker_ = std::jthread(
+                    [this](std::stop_token stop_token)
+                    { run(stop_token); });
+            }
         }
         catch (const std::exception &error)
         {

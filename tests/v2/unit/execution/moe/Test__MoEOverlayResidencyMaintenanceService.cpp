@@ -18,6 +18,9 @@
 #include "utils/ObservedExpertDemandFixture.h"
 
 #include <gtest/gtest.h>
+#include <omp.h>
+#include "utils/ScopedCallerThreadAffinity.h"
+#include <sched.h>
 
 #include <array>
 #include <atomic>
@@ -418,6 +421,11 @@ namespace llaminar2::test
                 const MoEOverlayResidencyTransaction &transaction) override
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                cpu_set_t current;
+                CPU_ZERO(&current);
+                if (sched_getaffinity(0, sizeof(current), &current) != 0)
+                    throw std::runtime_error("Cannot observe actual maintenance worker affinity");
+                begin_mask_ = current;
                 ++begin_calls_;
                 const auto *window = transaction.histogram_window.get();
                 if (begin_calls_ == 1)
@@ -454,6 +462,13 @@ namespace llaminar2::test
                     .status = MoEOverlayResidencyStageStartStatus::Started,
                     .wave = std::make_unique<Wave>(this),
                 };
+            }
+
+            /** @return The scheduler mask observed inside the original worker's transport callback. */
+            std::optional<cpu_set_t> beginMask() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return begin_mask_;
             }
 
             /** @brief Enable or defer destination-slot reservation. */
@@ -544,6 +559,7 @@ namespace llaminar2::test
             bool prepare_ready_ = false;
             bool publication_ready_ = false;
             bool fail_start_ = false;
+            std::optional<cpu_set_t> begin_mask_;
             int begin_calls_ = 0;
             int waves_started_ = 0;
             int stage_polls_ = 0;
@@ -816,6 +832,71 @@ namespace llaminar2::test
             return service;
         }
     } // namespace
+
+    /** @brief Actual maintenance callbacks inherit the partition while the construction caller is restored. */
+    TEST(Test__MoEOverlayResidencyMaintenanceService, IndependentControlInheritsPartitionAndRestoresCaller)
+    {
+        // Force the known first-place creator even if native fixture discovery
+        // changed its mask; restore the pre-test caller on every exit.
+        const ScopedCallerThreadAffinity test_caller;
+        if (omp_get_proc_bind() != omp_proc_bind_false)
+        {
+            const int place = omp_get_place_num();
+            ASSERT_GE(place, 0);
+            const int width = omp_get_place_num_procs(place);
+            ASSERT_GT(width, 0);
+            std::vector<int> cpus(static_cast<std::size_t>(width));
+            omp_get_place_proc_ids(place, cpus.data());
+            cpu_set_t first_place;
+            CPU_ZERO(&first_place);
+            for (int cpu : cpus)
+            {
+                ASSERT_GE(cpu,0);ASSERT_LT(cpu,CPU_SETSIZE);
+                CPU_SET(cpu, &first_place);
+            }
+            ASSERT_EQ(sched_setaffinity(0, sizeof(first_place), &first_place), 0);
+        }
+        cpu_set_t original;
+        CPU_ZERO(&original);
+        ASSERT_EQ(sched_getaffinity(0, sizeof(original), &original), 0);
+        cpu_set_t expected = original;
+        if (omp_get_proc_bind() != omp_proc_bind_false)
+        {
+            CPU_ZERO(&expected);
+            const int count=omp_get_partition_num_places();
+            ASSERT_GT(count,0);
+            std::vector<int> places(static_cast<std::size_t>(count));
+            omp_get_partition_place_nums(places.data());
+            for (const int place : places)
+            {
+                const int width=omp_get_place_num_procs(place);
+                ASSERT_GT(width,0);
+                std::vector<int> cpus(static_cast<std::size_t>(width));
+                omp_get_place_proc_ids(place, cpus.data());
+                for (int cpu : cpus)
+                {
+                    ASSERT_GE(cpu,0);ASSERT_LT(cpu,CPU_SETSIZE);
+                    CPU_SET(cpu, &expected);
+                }
+            }
+            if(count>1)ASSERT_FALSE(CPU_EQUAL(&original,&expected));
+        }
+        auto histogram = fullMovementHistogram();
+        auto authority = dynamicAuthority(histogram.get());
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->setStartEnabled(false);
+        auto service = startService(authority, transport);
+        cpu_set_t restored;
+        CPU_ZERO(&restored);
+        ASSERT_EQ(sched_getaffinity(0, sizeof(restored), &restored), 0);
+        EXPECT_TRUE(CPU_EQUAL(&original, &restored));
+        ASSERT_TRUE(waitUntil([&] { return transport->beginMask().has_value(); }));
+        const auto actual = *transport->beginMask();
+        EXPECT_TRUE(CPU_EQUAL(&actual, &expected));
+        service->stopAndDrain(MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+        ASSERT_EQ(sched_getaffinity(0, sizeof(restored), &restored), 0);
+        EXPECT_TRUE(CPU_EQUAL(&original, &restored));
+    }
 
     TEST(
         Test__MoEOverlayResidencyMaintenanceService,

@@ -108,14 +108,47 @@ is approximately 36.01/77.07 GiB, versus 36.01/77.11 GiB in the control; these
 per-process observations are not summed into physical-memory use or a leak
 certificate. Native, driver and process-tree retirement all pass.
 
-## Separate follow-ups
+## Independent maintenance-worker placement
 
 The profile identifies the CPU28 singleton control thread as the actual
 `MoEOverlayResidencyMaintenanceService` placement planner, chiefly
 `buildMinimumCostPlacement` and `scoreObservedMigrationSet`. Its CPU demand
-could contend with a core-bound expert worker. An existing maintenance-only
-partition-inheritance patch and original-worker regression remain separate
-from this experiment; no benefit is inferred from its sampled CPU time.
+could contend with a core-bound expert worker. The separate correction scopes
+the existing `ScopedOpenMPPartitionAffinity` around this service's existing
+`std::jthread` construction. The planner inherits the admitted rank partition;
+the creator's compute-place mask is restored immediately. No planner decision,
+cadence, team budget, memory policy or per-token affinity operation changes.
+
+The new actual-worker regression fails on the original production body because
+the transport callback observes only its creator's first place. With the scope
+installed, that regression and four related registrations pass in 2.27 seconds:
+the complete maintenance-service Unit owner, explicit preflight
+`V2_Integration_MoEMaintenanceControlAffinity`, dynamic-device histogram cadence,
+local maintenance drain and retirement progress. The test independently
+enumerates the admitted OpenMP partition and checks caller restoration after
+both start and stop. It does not assume two sockets or enumerate unrelated
+host CPUs.
+
+Fresh full-context admission passes in 7.215 seconds. The matched original
+Release owner then completes and retires cleanly in 251.412 seconds:
+
+| Policy | Prefill tok/s | After-prefill decode tok/s |
+|---|---:|---:|
+| Core places and retained task budget | 305.221 | 38.528 |
+| Also give maintenance its admitted partition | 314.868 | 40.035 |
+
+This comparison improves prefill by 3.16% and decode by 3.91%. Individual
+requests are 319.175/301.430/324.971 prefill and 40.021/39.865/40.221 decode.
+All 768 token IDs, complete MTP records and the resolved initial expert plan
+match; configuration differences remain only the two output paths. Dynamic
+balancing stays enabled and its wave timing differs (1/2/1 versus 1/1/2).
+The decode average reaches 40 in this run, but the 500/40 goal remains open;
+one comparison does not certify general throughput or isolate contention cost.
+Peak compute-process RSS is approximately 36.01/77.11 GiB. Native, driver and
+process-tree retirement checks pass. Focused qualification does not replace
+the deferred full preflight or OpenCode gates.
+
+## Separate follow-up
 
 Another source audit found an already-empty CPU expert invocation repeats
 clearing six pointer tables plus the mask: 24,576 bytes plus mask at 512 experts.
@@ -129,9 +162,16 @@ clear is a separate lifecycle optimization, currently unimplemented/unmeasured.
 - Focused build/tests: `/tmp/qfn-cpu-eight-row-rocm101-root/openmp-team-binding-*`.
 - Original unprofiled control: `/tmp/qfn-current-gpu-capacity-next/automatic-arm`.
 - Candidate benchmark: `/tmp/qfn-current-gpu-capacity-next/openmp-core-binding-arm`.
+- Maintenance worker: `/tmp/qfn-moe-maintenance-control-affinity-next/`, including
+  `model-comparison.json`; native evidence is
+  `/tmp/qfn-current-gpu-capacity-next/maintenance-partition-arm`.
+- Original-code RED and installed GREEN tests:
+  `/tmp/qfn-cpu-eight-row-rocm101-root/maintenance-affinity-*`.
 - Redundant-clear audit: `/tmp/qfn-cpu-joint-rebind-audit-next/NOTE.md`.
 
 The profiled lifetime retired successfully and reclaimed 727,912,512 bytes of
 owned prefix blobs; the unprofiled candidate reclaimed another 727,912,505 bytes.
 Both cleanups use metadata only, without hashing or reading cache payloads.
+The maintenance candidate likewise reclaimed 727,912,505 bytes from 18 files,
+reading only 28,681 metadata bytes and zero payload bytes after retirement.
 Large local records remain outside the source repository.
