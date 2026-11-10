@@ -29,6 +29,7 @@
 #include "../../moe/MoEOverlayRetainedParentComposer.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -4032,6 +4033,14 @@ namespace llaminar2
         bool executed_deferred_main_decode_sync = false;
 
         auto exec_t0 = std::chrono::high_resolution_clock::now();
+        /* One relaxed atomic load: the execution window between here and the
+         * cached-graph completion is the fork/join domain the wake-up work
+         * item optimizes, and the measured region count of that window is the
+         * production truth for it on CPU decode. GPU devices fork no OpenMP
+         * regions; capturing a baseline unconditionally avoids a second
+         * predicate. */
+        const std::uint64_t openmp_forks_at_exec_entry =
+            llaminar::v2::openMPTeamForkSnapshot();
         if (profiling_setup)
         {
             ForwardPassProfiler::resetReplayTimings();
@@ -4567,6 +4576,30 @@ namespace llaminar2
                 input.device.toString(),
                 {{"phase3_active", forward_cache.phase3_active ? "true" : "false"},
                  {"sequence_rows", std::to_string(input.seq_len)},
+                 {"used_graph_replay", used_graph_replay ? "true" : "false"}});
+        }
+
+        /* The always-on summary counter for the OpenMP wake-up work item: the
+         * exact team fork/join count of one cached-forward CPU decode step.
+         * The fork sites increment a relaxed atomic whether or not anyone
+         * collects; this publisher stays under the broad PerfStats gate and
+         * the record-family selection, so default serving materializes nothing
+         * and every evidence run retains the structure it must be able to
+         * assert. The per-stage detail family is published separately by the
+         * graph executor under the explicit CPU stage-timing gate. */
+        if (success && is_decode && !input.device.is_gpu() &&
+            PerfStatsCollector::isRecordFamilyEnabled(
+                "omp", "openmp_team_forks_decode_step"))
+        {
+            PerfStatsCollector::addCounter(
+                "omp",
+                "openmp_team_forks_decode_step",
+                static_cast<double>(
+                    llaminar::v2::openMPTeamForkSnapshot() -
+                    openmp_forks_at_exec_entry),
+                "decode",
+                input.device.toString(),
+                {{"context", forwardGraphPerfContext(signature)},
                  {"used_graph_replay", used_graph_replay ? "true" : "false"}});
         }
 

@@ -15,6 +15,8 @@
 #include "utils/DebugEnv.h"
 #include "utils/MPISessionOwner.h"
 #include "fixtures/cpu/RecordedGB10NativeCorePlaces.h"
+#include "utils/OpenMPUtils.h"
+#include "utils/PerfStatsCollector.h"
 #include "app/MPIBootstrapPhase.h"
 #include "backends/ComputeBackend.h"
 #include "backends/HardwareInventory.h"
@@ -30,6 +32,9 @@
 #include <fstream>
 #include <unistd.h>
 #include <optional>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
 #include <string>
 #include <vector>
 #include <array>
@@ -183,6 +188,81 @@ TEST(Test__MPIBootstrap, OpenMPIdleSpinPolicyIsBoundedAndExportedByName)
         llaminar2::MPIBootstrap::configureOpenMPWaitPolicy();
         EXPECT_STREQ(std::getenv("GOMP_SPINCOUNT"), "30000000");
     }
+}
+
+/**
+ * @brief The OpenMP team-fork counter's publication and self-cost contract.
+ *
+ * Default serving materializes no "omp" record: the fork sites increment a
+ * relaxed atomic unconditionally (the production truth survives every run),
+ * while both publication families stay behind the collection policy, so an
+ * off-default process carries the one-atomic cost and nothing else. Under an
+ * evidence configuration the summary and stage families publish through the
+ * same authority the engine and graph executors use, and the note's own
+ * amortized per-invocation cost is measured and recorded: the wake-up work
+ * item's ns-scale claim becomes a published receipt, not an assertion.
+ */
+TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
+{
+    using namespace llaminar2;
+    // Off-default: no collection policy selected anything.
+    {
+        const ScopedLaunchEnvironment no_filter("LLAMINAR_PERF_STATS_FILTER", nullptr);
+        const ScopedLaunchEnvironment no_summary("LLAMINAR_PERF_STATS_SUMMARY", nullptr);
+        const ScopedLaunchEnvironment no_table("LLAMINAR_PERF_STATS_TABLE", nullptr);
+        const ScopedLaunchEnvironment no_json("LLAMINAR_PERF_STATS_JSON", nullptr);
+        const ScopedLaunchEnvironment no_csv("LLAMINAR_PERF_STATS_CSV", nullptr);
+        const ScopedLaunchEnvironment no_profiling("LLAMINAR_PROFILING", nullptr);
+        const ScopedLaunchEnvironment no_cpu_timing("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", nullptr);
+        const ScopedLaunchEnvironment no_gpu_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", nullptr);
+        mutableDebugEnv().reload();
+        PerfStatsCollector::reloadConfigurationFromEnvironment();
+        PerfStatsCollector::reset();
+        EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled(
+            "omp", "openmp_team_forks_decode_step"));
+        EXPECT_FALSE(PerfStatsCollector::isRecordFamilyEnabled(
+            "omp", "openmp_team_forks_stage"));
+        // Forks still count in production truth while nothing materializes.
+        const std::uint64_t before = llaminar::v2::openMPTeamForkSnapshot();
+        auto work = [] {};
+        OMP_WORKSHARE_REGION(work);
+        OMP_WORKSHARE_REGION_SYNC(work);
+        EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - before, 2u);
+    }
+
+    // Evidence configuration: both families selected, publication shape held.
+    const ScopedLaunchEnvironment filter("LLAMINAR_PERF_STATS_FILTER", "omp");
+    const ScopedLaunchEnvironment summary("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    mutableDebugEnv().reload();
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
+    EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled(
+        "omp", "openmp_team_forks_decode_step"));
+    EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled(
+        "omp", "openmp_team_forks_stage"));
+
+    // Self-cost evidence: amortized ns per note over a million observations,
+    // recorded in the collector and logged. Asserted only against a bound
+    // generous against a loaded shared runner; the fork it describes costs
+    // microseconds, so the observation must never approach that scale.
+    constexpr std::uint64_t kMeasuredNotes = 1u << 20;
+    const std::uint64_t cost_before = llaminar::v2::openMPTeamForkSnapshot();
+    const auto cost_start = std::chrono::steady_clock::now();
+    for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
+        llaminar::v2::noteOpenMPTeamFork();
+    const auto cost_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - cost_start)
+            .count());
+    EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - cost_before, kMeasuredNotes);
+    const double ns_per_note =
+        static_cast<double>(cost_ns) / static_cast<double>(kMeasuredNotes);
+    PerfStatsCollector::addCounter(
+        "omp", "openmp_team_fork_note_self_cost", ns_per_note, "evidence",
+        "host", {{"basis", std::to_string(kMeasuredNotes) + "_invocations"}});
+    std::cout << "[evidence] openmp_team_fork_note_self_cost=" << ns_per_note
+              << " ns/invocation over " << kMeasuredNotes << " invocations"
+              << std::endl;
+    EXPECT_LT(ns_per_note, 100.0);
 }
 
 /** Credentials and rank-local hardware policy must not become cluster-wide settings. */
