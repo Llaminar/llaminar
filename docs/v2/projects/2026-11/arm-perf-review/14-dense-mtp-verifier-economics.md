@@ -178,3 +178,12 @@ cannot establish economic loss; the C-era trajectory stays unproven without
 its inputs. Full packet + digests: evidence/idea14-A-owner-selfcheck.md.
 Decision gate = Plan B (booked paired GB10 wave). Routed to reviewer at
 c007a59a2.
+
+### Reviewer #163 on A: source audit SUPPORTED; two P2 record corrections en route to unqualified ACK
+
+Disposition upheld (no readiness defect; no change from A alone; C
+conditional; negative B = necessary not sufficient). Corrections: [I14-A-1]
+candidate-path agreement ≠ baseline validation by this executable (exact
+flags to be recorded); [I14-A-2] the owner build wrapper is not a c007 file
+— 14/14 tracked SHAs blob-verified, wrapper/binary hashes = owner evidence.
+Details in evidence/idea14-A-owner-selfcheck.md.

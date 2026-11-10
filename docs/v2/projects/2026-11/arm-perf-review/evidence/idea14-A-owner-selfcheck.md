@@ -167,3 +167,40 @@ result, with separate Main-owned exact-pin review and a ProductionTestPreflight
 replay regression for any production change. Canonical .80 owner-test run
 only if review requires. Full literal compile/archive/link commands are in
 the lane packet (retained on the station; relayable on request).
+
+## Reviewer result #163 (2026-11-10): source audit SUPPORTED; two P2 record corrections
+
+Disposition upheld: no readiness defect follows from the terminal summaries;
+no controller/profile/default change justified by A alone; C stays
+conditional (a negative B = necessary evidence, NOT sufficient attribution/
+approval/implementation grant); complete compatible historical inputs remain
+needed for the old trajectory; inventory PENDING. Reviewer verified **14/14
+tracked-file SHAs against pinned Git blobs** (source correspondence only).
+Corrections required before an unqualified A-record ACK:
+
+- **[I14-A-1, P2]** "recorded confirmation paths pass their declared
+  baseline contract" is imprecise: Test__MTPDepthTraceReplay.cpp:889-917
+  asserts intent=candidate, status=same_observed_depth_path,
+  **baseline_validated_by_this_executable=false, economy_claim=false** —
+  recorded-input candidate-path agreement against a saved original-baseline
+  chronology, NOT baseline validation by this executable
+  (MTPDepthTraceReplay.cpp:428-434 makes the distinction authoritative).
+  Record the exact candidate status/false flags.
+- **[I14-A-2, P2]** the "all unmodified c007 files" heading wrongly covers
+  `artifacts/idea14/owner-selfcheck/CMakeLists.txt` (NOT in the c007 tree —
+  newly authored owner build wrapper). Split: 14 tracked source/fixture/
+  generator files (reviewer-verified) vs the wrapper + generated/build/
+  binary hashes = explicitly owner evidence. No rerun needed to fix this.
+- **Minor:** PolicyScopeProjection CPU-primary branch = lines 49-50 (not
+  45-46), following remote-PP/no-capacity/global-TP exclusions; the
+  "19-source hash table below" locator conflates the generator's 19-source
+  enumeration with the packet's 14-tracked + wrapper list — point to the
+  retained packet/generated identity instead.
+
+Reviewer-supported additions to the audit: prefill admission explicitly
+RESETS the controller (Runner:4276, including prefix-full-hit requests;
+clearCache :17553); readiness need not mean demotion (hold/cooldown/probe
+policy separate); declared test counts verified 71/29/1 with no skip
+markers. The reviewer did not authenticate station logs/binaries/wrapper/
+original captures or the packet digest; no .80 run required/booked;
+execution/gate sufficiency stays with Main.
