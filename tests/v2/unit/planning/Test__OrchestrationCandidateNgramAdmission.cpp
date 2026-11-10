@@ -24,8 +24,10 @@ ClusterInventory candidateInventory(DeviceType backend,int ranks=1,bool gpu_ever
     ClusterInventory result;result.world_size=ranks;
     for(int rank=0;rank<ranks;++rank) {
         RankInventory r;r.rank=rank;r.node_id=rank;r.local_rank=0;r.hostname="candidate-"+std::to_string(rank);
-        r.cpu.numa_node=0;r.cpu.memory_bytes=512ull<<30;r.cpu.free_memory_bytes=500ull<<30;
-        r.cpu.compute_units=r.cpu_cores=r.cpu_worker_threads=8;r.numa_nodes=1;
+        // The bound endpoint is NUMA3; CPU allocation still belongs to CPU0.
+        // Discovery visibility alone must not authorize a foreign GPU owner.
+        r.cpu.numa_node=3;r.cpu.memory_bytes=512ull<<30;r.cpu.free_memory_bytes=500ull<<30;
+        r.cpu.compute_units=r.cpu_cores=r.cpu_worker_threads=8;r.numa_nodes=4;
         r.cpu_execution=test::kSyntheticCPUExecutionGeometry;
         if(backend!=DeviceType::CPU&&(rank==0||gpu_every_rank))
             r.gpus.push_back({.type=backend,.local_device_id=2,.memory_bytes=512ull<<30,
