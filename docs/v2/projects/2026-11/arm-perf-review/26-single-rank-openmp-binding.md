@@ -136,3 +136,33 @@ serialization workaround):
   self-cost loop = uncontended only (not contended/multi-executor).
   293/293 + 2.26/2.32 ns = unauthenticated owner reports. No A2 evidence
   acceptance or merge grant. Main: A1 HOLD respected; no FF.
+
+### A1 fix-back (#179 successor) landed: 0ce033b6c (arm-addon3, 2026-11-10, ~23:46Z)
+
+codex/arm-idea26-openmp-wakeup @ **0ce033b6c** (parent 1d9141934; 53 files,
++1128/−89; pushed). One comprehensive successor, all four P2s:
+- **A1-1 exhaustive:** ALL live runtime raw forks now note — the 4 named
+  misses (Qwen4ExpBranchConcat:52, MoEOverlaySparseCollective:1059,
+  MoELocalExpertStage:4255, HostBackend ×16 collective sites) + full audit
+  (ShmemSpinBackend, DeviceContext, DeviceGraphOrchestrator expert-mask,
+  RoPEPrimitives, CPUBackend first-touch, the whole tensor family) = 174
+  mechanical one-line notes across 42 files; NAMED one-time exemptions in
+  the header (10 files, per-file reasons); LOCKED by
+  check_cpu_openmp_fork_note_policy.py (note within 6 lines or file named;
+  orphan rejected; fails closed; rc=0: 176 noted / 10 exempt). Negative
+  controls (8 cases) green; both registered core-free.
+- **A1-2 owner-scoped:** thread-affine owner-cell stack
+  (OpenMPTeamForkCell/Scope); concurrent scopes count each other only in
+  the total; nested scopes observe the same fork; NO serialization;
+  publishers read CELLS never global deltas; overclaim comments rewritten.
+  Concurrent-overlap + nesting regressions GREEN.
+- **A1-3 race fixed:** baseline captured outside the retained region.
+- **A1-4 publishers under test:** publishers moved to
+  utils/OpenMPTeamForkEvidence.h owning their gates + GPU refusal
+  (enforced in the publisher); actual-path regressions (engine decode
+  off/filter/exact/repeat/GPU-absence; CPU graph executor off/exact 2+5/
+  repeat/GPU-refusal); env evidence config RESTORES caller env + reloads
+  both configuration authorities (leak closed, also in the bootstrap cell).
+VALIDATION: portability 295/295 green (Mac); Linux targets syntax-validated
+under stubs (runtime at the canonical gates). A2 outputs held pending the
+re-review ACK.
