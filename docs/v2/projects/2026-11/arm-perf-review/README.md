@@ -1022,3 +1022,26 @@ validation remains merge-gating. Routed to the reviewer for #172 re-review;
   FF gate GREEN (owner-verified). The reviewer's comment-only ack for
   717b2bfe6 was already given (15:48Z). Remaining FF item: the focused set
   (status requested from arm-sparks — .80 seen idle at 16:52Z).
+
+### FOCUSED SET 8/8 GREEN at 717b2bfe6 (2026-11-10, ~16:58Z) — COMBINED-CANDIDATE EVIDENCE COMPLETE
+
+Integration SHARED_CORE=ON NEON_I8MM, 0 failed:
+**V2_Integration_CPUNativeNEONPanelTournamentInstalledWidth PASSED (0.05s —
+the reviewer-held cell now executes for real)** + PanelTournamentContract
+Unit+Integration, PreparedProjection Unit+Integration,
+PanelTailsMatchSerial, I8MMOperandGrouping, I8MMTailsMatchSDOT.
+
+FF-GATE STATUS: COMPLETE —
+1. Review chain: #161 (idea-31 rebase ACK) → #162 (PS-1 closed) → #164
+   (stack re-pin ACK) → #169 (fix-back ACK, C1/C2 closed) → the 717b2bfe6
+   comment-only extension CONFIRMED (#169 ACK extends to the exact tip).
+2. GNU-14 register-gate receipt 9/9 (owner-verified by the addon: binding,
+   hashes cross-host-identical to the Mac proofs, provenance clean).
+3. Mac AppleClang-21 register-gate receipt 9/9 (owner report, #167-class).
+4. Focused set 8/8 incl. InstalledWidth.
+5. Ratchet clean (no grouped key lowered; budget JSON diff vs e8866ec04
+   empty); composition #167-conformant; B9 strengthening deferred by ruling.
+→ Main FF request sent: codex/arm-s4-nibble-witness @ 717b2bfe6 → #43
+   (7 commits). Queued next: half-perf Linux validation at the FIX-BACK tip
+   1ea08211 (not adb1c98e9 — the fix-back is what would merge) + idea-16
+   Phase A window.
