@@ -31,6 +31,7 @@
 #include "kernels/cuda/ops/CUDARMSNormKernelT.h"
 #include "kernels/cuda/ops/CUDASwiGLUKernelT.h"
 #include "kernels/cuda/ops/CUDARoPEKernelT.h"
+#include "kernels/cuda/ops/CUDAResidualAddKernelT.h"
 #include "kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "kernels/cpu/ops/CPURoPEKernelT.h"
@@ -1075,17 +1076,11 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_PartialRotaryKeepsFullHeadStride)
 // Residual Add Parity Tests
 // ============================================================================
 
-// Forward declarations for CUDA kernels
-extern "C"
-{
-    bool cudaOps_residual_add_fp32(const float *input, const float *residual, float *output, int size, int device_idx);
-    bool cudaOps_residual_add_bf16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx);
-    bool cudaOps_residual_add_fp16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx);
-}
-
 TEST_F(Test__CUDAOpsParity, ResidualAdd_FP32_Small)
 {
     SKIP_IF_NO_CUDA();
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
 
     constexpr int size = 256;
 
@@ -1107,13 +1102,14 @@ TEST_F(Test__CUDAOpsParity, ResidualAdd_FP32_Small)
     cudaMalloc(&d_residual, size * sizeof(float));
     cudaMalloc(&d_output, size * sizeof(float));
 
-    cudaMemcpy(d_input, input_data.data(), size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_residual, residual_data.data(), size * sizeof(float), cudaMemcpyHostToDevice);
+    ASSERT_EQ(cudaMemcpyAsync(d_input, input_data.data(), size * sizeof(float), cudaMemcpyHostToDevice, stream.get()), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_residual, residual_data.data(), size * sizeof(float), cudaMemcpyHostToDevice, stream.get()), cudaSuccess);
 
-    ASSERT_TRUE(cudaOps_residual_add_fp32(d_input, d_residual, d_output, size, 0));
-    cudaDeviceSynchronize();
+    ASSERT_TRUE(cudaOps_residual_add_fp32(d_input, d_residual, d_output, size, cuda_ordinal_, stream.get()));
 
-    cudaMemcpy(cuda_output.data(), d_output, size * sizeof(float), cudaMemcpyDeviceToHost);
+    ASSERT_EQ(cudaMemcpyAsync(cuda_output.data(), d_output, size * sizeof(float), cudaMemcpyDeviceToHost, stream.get()), cudaSuccess);
+
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     cudaFree(d_input);
     cudaFree(d_residual);
@@ -1134,6 +1130,8 @@ TEST_F(Test__CUDAOpsParity, ResidualAdd_FP32_Small)
 TEST_F(Test__CUDAOpsParity, ResidualAdd_FP32_Large)
 {
     SKIP_IF_NO_CUDA();
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
 
     constexpr int size = 896 * 128; // Typical hidden_dim * seq_len
 
@@ -1155,13 +1153,14 @@ TEST_F(Test__CUDAOpsParity, ResidualAdd_FP32_Large)
     cudaMalloc(&d_residual, size * sizeof(float));
     cudaMalloc(&d_output, size * sizeof(float));
 
-    cudaMemcpy(d_input, input_data.data(), size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_residual, residual_data.data(), size * sizeof(float), cudaMemcpyHostToDevice);
+    ASSERT_EQ(cudaMemcpyAsync(d_input, input_data.data(), size * sizeof(float), cudaMemcpyHostToDevice, stream.get()), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_residual, residual_data.data(), size * sizeof(float), cudaMemcpyHostToDevice, stream.get()), cudaSuccess);
 
-    ASSERT_TRUE(cudaOps_residual_add_fp32(d_input, d_residual, d_output, size, 0));
-    cudaDeviceSynchronize();
+    ASSERT_TRUE(cudaOps_residual_add_fp32(d_input, d_residual, d_output, size, cuda_ordinal_, stream.get()));
 
-    cudaMemcpy(cuda_output.data(), d_output, size * sizeof(float), cudaMemcpyDeviceToHost);
+    ASSERT_EQ(cudaMemcpyAsync(cuda_output.data(), d_output, size * sizeof(float), cudaMemcpyDeviceToHost, stream.get()), cudaSuccess);
+
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     cudaFree(d_input);
     cudaFree(d_residual);
@@ -1181,6 +1180,8 @@ TEST_F(Test__CUDAOpsParity, ResidualAdd_FP32_Large)
 TEST_F(Test__CUDAOpsParity, ResidualAdd_BF16)
 {
     SKIP_IF_NO_CUDA();
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
 
     constexpr int size = 896 * 32;
 
@@ -1210,14 +1211,15 @@ TEST_F(Test__CUDAOpsParity, ResidualAdd_BF16)
     cudaMalloc(&d_residual, size * sizeof(uint16_t));
     cudaMalloc(&d_output, size * sizeof(uint16_t));
 
-    cudaMemcpy(d_input, input_bf16.data(), size * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_residual, residual_bf16.data(), size * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    ASSERT_EQ(cudaMemcpyAsync(d_input, input_bf16.data(), size * sizeof(uint16_t), cudaMemcpyHostToDevice, stream.get()), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_residual, residual_bf16.data(), size * sizeof(uint16_t), cudaMemcpyHostToDevice, stream.get()), cudaSuccess);
 
-    ASSERT_TRUE(cudaOps_residual_add_bf16(d_input, d_residual, d_output, size, 0));
-    cudaDeviceSynchronize();
+    ASSERT_TRUE(cudaOps_residual_add_bf16(d_input, d_residual, d_output, size, cuda_ordinal_, stream.get()));
 
     std::vector<uint16_t> cuda_output_bf16(size);
-    cudaMemcpy(cuda_output_bf16.data(), d_output, size * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    ASSERT_EQ(cudaMemcpyAsync(cuda_output_bf16.data(), d_output, size * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream.get()), cudaSuccess);
+
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     cudaFree(d_input);
     cudaFree(d_residual);
@@ -1241,6 +1243,8 @@ TEST_F(Test__CUDAOpsParity, ResidualAdd_BF16)
 TEST_F(Test__CUDAOpsParity, ResidualAdd_FP16)
 {
     SKIP_IF_NO_CUDA();
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
 
     constexpr int size = 896 * 32;
 
@@ -1270,14 +1274,15 @@ TEST_F(Test__CUDAOpsParity, ResidualAdd_FP16)
     cudaMalloc(&d_residual, size * sizeof(uint16_t));
     cudaMalloc(&d_output, size * sizeof(uint16_t));
 
-    cudaMemcpy(d_input, input_fp16.data(), size * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_residual, residual_fp16.data(), size * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    ASSERT_EQ(cudaMemcpyAsync(d_input, input_fp16.data(), size * sizeof(uint16_t), cudaMemcpyHostToDevice, stream.get()), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_residual, residual_fp16.data(), size * sizeof(uint16_t), cudaMemcpyHostToDevice, stream.get()), cudaSuccess);
 
-    ASSERT_TRUE(cudaOps_residual_add_fp16(d_input, d_residual, d_output, size, 0));
-    cudaDeviceSynchronize();
+    ASSERT_TRUE(cudaOps_residual_add_fp16(d_input, d_residual, d_output, size, cuda_ordinal_, stream.get()));
 
     std::vector<uint16_t> cuda_output_fp16(size);
-    cudaMemcpy(cuda_output_fp16.data(), d_output, size * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    ASSERT_EQ(cudaMemcpyAsync(cuda_output_fp16.data(), d_output, size * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream.get()), cudaSuccess);
+
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     cudaFree(d_input);
     cudaFree(d_residual);
