@@ -1849,7 +1849,8 @@ namespace llaminar2
          * @param actual Actual FP32 query/output extents; raw-pointer callers pass none
          * and admit their declared geometry.
          * @return The request (actual K/V allocations, Q16 row bytes, the Q16 query
-         * scratch capacity), or empty for a K/V row count beyond int.
+         * scratch capacity), or empty for a K/V row count beyond int or a row
+         * byte stride that is not representable.
          */
         static std::optional<cpu::CPUAttentionInvocationRequest> q16Request(const float *Q,
             const Q16_1Tensor *K_q16, const Q16_1Tensor *V_q16, const float *output, int seq_len, int n_heads,
@@ -1867,8 +1868,13 @@ namespace llaminar2
             }
             request.key = {k_raw, K_q16->size_bytes()};
             request.value = {v_raw, V_q16->size_bytes()};
-            request.key_row_bytes = request.value_row_bytes =
-                K_q16->blocks_per_row() * q16_block_size_bytes(K_q16->q16_block_size());
+            // The row stride must be the real one: a wrapped product would let a
+            // small physical bank certify a much wider logical row. Admission then
+            // proves rows x stride against the actual allocations.
+            const std::size_t block_bytes = q16_block_size_bytes(K_q16->q16_block_size());
+            if (block_bytes == 0 || K_q16->blocks_per_row() > std::numeric_limits<std::size_t>::max() / block_bytes)
+                return std::nullopt;
+            request.key_row_bytes = request.value_row_bytes = K_q16->blocks_per_row() * block_bytes;
             request.scratch_head_dim = detail::kMaxI16RowStride;
             return request;
         }
