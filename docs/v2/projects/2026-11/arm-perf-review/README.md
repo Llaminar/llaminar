@@ -1290,3 +1290,29 @@ driver ACK:
   build/test parallelism (separate from register policy).
 - Main seq115 = attributed context only. #175 tracks the fixes. Narrow ACK:
   the preserved 717 machinery + the Python-exit closure ONLY.
+
+### Admission-blocker responses delivered (addon, 2026-11-10, ~20:21Z)
+
+1. **Formal withdrawal + binding-failure acknowledgment:** the Mac receipt
+   claimed as 717b2bfe6-appleclang was bound to c4536cf3c (pre-S4 header
+   ad00ac6a…) — the driver ran against the addon worktree without verifying
+   its HEAD, then was mislabeled; the earlier "tree stamp = a16591eed"
+   claim was the same class. Withdrawn unchanged at
+   arm-addon-notes/evidence/withdrawn/receipt-c4536cf3c-WITHDRAWN-17-19z/
+   with a cause note. Nothing relabeled.
+2. **Correct-source Mac 9×14 delivered:** fresh clean worktree at
+   **252da4a53** (/tmp/mac-final) → 9/9 cells, 14/14 aliases/cell, Rows1=0,
+   sites 1415/2003/2171, provenance verified PRE-delivery (configure.command
+   + all compile_commands → /tmp/mac-final; header 991a4347…; tree-own
+   budget/checker hashes). Receipt: arm-addon-notes/evidence/
+   register-gate-252da4a53-appleclang/ + BUILDER_MAPPING.txt.
+   Host/toolchain-bound — inspection on the Mac.
+3. **#175 successor in progress** per #174: coordinator-owned override
+   rejection (with spellings), configured-source validation (compile_commands
+   root + production header hash vs candidate) BEFORE build, one-epoch
+   input/manifest authentication at publication, explicit rc accounting
+   (cleanup/metadata/inventory/retention), and a fast device-free regression
+   driving the ACTUAL shell coordinator against a synthetic tree (negative
+   tests: cleanup/retention/override/inventory/drift/publication) —
+   ProductionTestPreflight-registered. Successor SHA + a new Mac rerun (if
+   epoch semantics change) to follow.
