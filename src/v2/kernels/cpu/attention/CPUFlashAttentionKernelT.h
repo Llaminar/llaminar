@@ -4653,6 +4653,7 @@ namespace llaminar2
             }
             else
             {
+                ::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel num_threads(requested_threads)
                 {
                     work();
@@ -5614,6 +5615,7 @@ namespace llaminar2
             }
             else
             {
+                ::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel num_threads(attn_threads)
                 {
                     work();

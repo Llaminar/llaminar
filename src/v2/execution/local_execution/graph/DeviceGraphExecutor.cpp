@@ -19,6 +19,7 @@
 #include "snapshots/SnapshotNativeSource.h"
 #include "snapshots/SnapshotStorageLayout.h"
 #include "../../../snapshots/SnapshotSemanticObservation.h"
+#include "utils/OpenMPUtils.h"
 #include "DeviceGraphExecutor.h"
 #include "RetainedHostServiceProgram.h"
 #include "RetainedParentTicketServiceWorker.h"
@@ -3185,6 +3186,14 @@ namespace llaminar2
             const auto cpu_stage_start =
                 cpu_stage_timing_active ? PerfStatsCollector::Clock::now()
                                         : PerfStatsCollector::Clock::time_point{};
+            /* Fork counts are read only under the same explicit gate that
+             * costs the clock read: parallel waves cannot run alongside this
+             * family, so the executor thread owns every fork inside the stage
+             * and the global delta attributes exactly. */
+            const std::uint64_t openmp_forks_before_stage =
+                cpu_stage_timing_active
+                    ? llaminar::v2::openMPTeamForkSnapshot()
+                    : std::uint64_t{0};
             bool stage_ok = false;
             try
             {
@@ -3245,6 +3254,23 @@ namespace llaminar2
                     ctx->deviceId().to_string(),
                     PerfStatsCollector::Tags{
                         {"attribution", "cpu_wall"},
+                        {"source", "device_graph_executor"},
+                        {"stage_type", stage_type_name},
+                        {"index", std::to_string(i)}});
+                /* The fork delta rides the same owned boundary as the clock
+                 * pair, so one gate costs both observations and neither needs
+                 * its own synchronization. Attribution is exact because stage
+                 * timing serializes waves onto this executor thread. */
+                PerfStatsCollector::addCounter(
+                    "omp",
+                    "openmp_team_forks_stage",
+                    static_cast<double>(
+                        llaminar::v2::openMPTeamForkSnapshot() -
+                        openmp_forks_before_stage),
+                    executionPhasePerfName(GraphExecutorStats::currentPhase()),
+                    ctx->deviceId().to_string(),
+                    PerfStatsCollector::Tags{
+                        {"attribution", "retained_or_standalone_fork_count"},
                         {"source", "device_graph_executor"},
                         {"stage_type", stage_type_name},
                         {"index", std::to_string(i)}});
@@ -4518,6 +4544,14 @@ namespace llaminar2
             const auto stage_begin =
                 cpu_stage_timing ? PerfStatsCollector::Clock::now()
                                  : PerfStatsCollector::Clock::time_point{};
+            /* CPU fork attribution rides the same gate as the clock read; a
+             * GPU stage executes no OpenMP fork and must publish no fork
+             * record. Waves are serial while this family is active, so the
+             * delta belongs to exactly this entry even with mixed devices. */
+            const bool cpu_fork_attribution = cpu_stage_timing && entry.device.is_cpu();
+            const std::uint64_t openmp_forks_before_stage =
+                cpu_fork_attribution ? llaminar::v2::openMPTeamForkSnapshot()
+                                     : std::uint64_t{0};
             bool stage_ok = false;
             if (general_stage_controller)
             {
@@ -4569,6 +4603,22 @@ namespace llaminar2
                      {"index", std::to_string(index)},
                      {"stage_type",
                       computeStageTypeName(node->stage->type())}});
+                if (cpu_fork_attribution)
+                {
+                    PerfStatsCollector::addCounter(
+                        "omp",
+                        "openmp_team_forks_stage",
+                        static_cast<double>(
+                            llaminar::v2::openMPTeamForkSnapshot() -
+                            openmp_forks_before_stage),
+                        executionPhasePerfName(
+                            GraphExecutorStats::currentPhase()),
+                        entry.device.to_string(),
+                        {{"attribution", "retained_or_standalone_fork_count"},
+                         {"index", std::to_string(index)},
+                         {"stage_type",
+                          computeStageTypeName(node->stage->type())}});
+                }
             }
             return stage_ok;
         };
