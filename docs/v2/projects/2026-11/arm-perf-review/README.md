@@ -1166,3 +1166,39 @@ tip 825fe8deb (3ed993968 a / f3faa540c b / 825fe8deb c), not landed,
 byte-identical to the validated B9 composition (analysis 64/64, binding
 4/4). Both arm-addon3 items CLOSED; standing by for the fold-time
 re-rebase or new assignment.
+
+### STATE CORRECTION (Main, 2026-11-10): idea-21b is PUBLISHED + natively evaluated IN the settled tip
+
+My "compile-only candidate, not published" framing was STALE. Corrections:
+- idea-21b is ALREADY PUBLISHED and natively evaluated at
+  **e8866ec04** (the settled push; head = "retain narrow grouped IMMA
+  occupancy on sm12"). Baseline 371f5ab35; source 12.x C32 CB4/13/24 launch
+  bound 10: registers 62/56/56 → **48/40/45, zero local bytes**; resource
+  tests pass unchanged ≤48/≥10 thresholds (source24 included on 12.x);
+  changed TU guarded 121,120;121 full6; shipped 80/86/89/90 instruction
+  bytes unchanged (only source-digest symbol salts normalized).
+- Non-attached protocol ALREADY EXECUTED: cudaFuncGetAttributes +
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor (compiler resources +
+  POSSIBLE CTAs — NOT achieved residency); existing preflight
+  compiler-resource/all-codebook + paired all-format captured serial-row
+  byte gates + staged-metadata captured gate; production-shaped native
+  event-timed trainer (h2048/r512/e256/top8, M512 power_law, IQ2_S gate/up,
+  IQ4_XS down; 24 candidates + raw samples + full-byte certificate,
+  baseline vs candidate); clean owned driver windows. No NCU/NSYS/CUPTI.
+- RESULT: resource+byte gates GREEN; candidate down 45 regs/10 possible
+  CTAs vs 56/9; 15-sample median 3336.51 → 3315.53 µs (~0.6%, within
+  noise) — NOT a Release/E2E speedup claim. Final 10-native-cell
+  selection+fixture 11/11 no skips; invocation regressions 20/20; clean
+  final driver window.
+- EPISTEMIC BOUNDARY: PerfStats proves executed routes/work; events prove
+  elapsed intervals; NEITHER yields achieved occupancy or measured
+  resident-CTA counters — "do not invent such a metric"; a residency
+  requirement reports UNAVAILABLE non-attached, not a failed ≥10
+  potential-CTA contract.
+- Durable summary: ARM_CPU_KERNEL_IMPLEMENTATION_EVIDENCE.md 'GB10 CUDA
+  maintenance evidence — 2026-11-10' + the kernel-plan maintenance
+  frontier. Tile5 = coverage geometry (fixed 371f5ab35). Raw evidence:
+  .79 /home/factory/idea25/slot-probes/. No second candidate publication
+  needed. arm-sparks' state corrected: its .79 window = B11 attribution
+  (NOW unblocked — the CUDA chain is settled) + the Dir-B trace (blocked on
+  Main engine item #71).
