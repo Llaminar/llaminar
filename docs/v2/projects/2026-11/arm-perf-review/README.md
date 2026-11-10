@@ -1428,3 +1428,11 @@ Merge-readiness package routes to the reviewer with that attribution.
   review BEFORE any acceptance**; no FF or .80 rerun booking yet; the
   review follows #71/#177 row-policy correction priority; no new lane
   execution implicitly approved. Receipts preserved.
+- #71 progress (Main, ~21:34Z): tip **35a827a2a** (181 above base;
+  MERGEABLE/CLEAN). Reviewer #176/#177 SOURCE ACK closes the HC row-policy
+  issue: all HC/norm = full forward rows; only LM head = compact. The
+  native exact-original BAD-count-expression control FAILED 2 CostModel
+  tests while 3 passed (desired discrimination); corrected source restored;
+  final Unit + 5-GTest preflight 20x underway. .79 owner (arm-sparks)
+  preparing the corrected pin; the Dir-B trace launch held until green.
+  Addon #175 HOLD unchanged; no FF.
