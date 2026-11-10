@@ -100,3 +100,21 @@ future 64K ARM; x86 unaffected (hwloc path) for B5, 4K-normal for B1/B2/B6.
 - RECOMMENDED (test-side): align those cells with B3 semantics (filter
   memory-only nodes / compare CPU-bearing sets); no engine change.
   Memory-only-node Delta = next host-qual doc item (15 env classes).
+
+## B10 PINNED + FIXED (2026-11-10) — ce9ddb326 (#43, 157 commits)
+- ROOT CAUSE: Main's own bug in 524afd11e —
+  `for (const auto &node : NodeTopology::detect().numaNodes())` iterates a
+  reference into a TEMPORARY NodeTopology that C++20 range-for destroys
+  before the loop body -> numa_node read from FREED memory (use-after-free)
+  = the run-variant garbage (5 runs, 5 values). Registry test had the same
+  pattern (Mac passed only because freed memory still held old values).
+- FIX: registry binds the topology to a local; numaNodes()/interSocketLinks()
+  REF-QUALIFIED (lvalue lends vector; temporary returns owned copy) ->
+  dangling form unrepresentable; static asserts + temporary-iteration
+  regression in the preflight membership cell. Mac build + cells pass.
+- Counter-evidence story: (a) false (node1-8 cpulist EMPTY), (c) N/A (sysfs
+  used); size/ABI/objdump probes clean; clean-rebuild reproduced new garbage
+  -> real defect, NOT a test-semantics mismatch; tests stay as-is.
+- Grace close-out at ce9ddb326 in flight (NUMATopologyCPUList* + DeviceRegistry
+  + membership cells). Memory-only-node Delta = B10 (solved) + ClusterInventory
+  Bootstrap (known env) + expectations correct.
