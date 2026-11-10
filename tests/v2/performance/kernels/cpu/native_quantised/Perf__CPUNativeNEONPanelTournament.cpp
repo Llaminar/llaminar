@@ -29,8 +29,9 @@
  * the output span, the weights and the activations are checked after each
  * cell. LLAMINAR_PANEL_SELF_TEST=1 runs, instead of timing, admission controls
  * (hostile inputs and an admissible workload) and publication controls through
- * the real reference and timing wrappers (complete, omitted, no-op, stale,
- * dirt-valued and nonfinite writers).
+ * the real reference and timing wrappers on a multithreaded team, with
+ * workshare callbacks shaped like execute(): complete, omitted, no-op, stale,
+ * dirt-valued, nonfinite, and a good warmup followed by a no-op measurement.
  *
  * Environment (all optional; every value is admitted before any allocation;
  * numbers are canonical decimals, so list entries are unique by value):
@@ -432,30 +433,64 @@ int selfTest()
     }
 
     // Publication controls run the real reference and timing wrappers over 64
-    // live words with callbacks that write completely, omit, or do nothing.
+    // live words. Every callback is a genuine workshare, like execute(): an
+    // orphaned omp for that splits the words disjointly over the calling team
+    // and closes with its implicit barrier (outside a team it runs serially).
     constexpr std::size_t live = 64;
     GuardedOutput output(live);
-    const auto write_all = [&] { for (std::size_t i = 0; i < live; ++i) output.live()[i] = float(i); };
+    const auto words = output.live();
+    const auto write_except = [&](std::size_t skipped) {
+#pragma omp for schedule(static)
+        for (std::size_t i = 0; i < live; ++i)
+            if (i != skipped) words[i] = float(i);
+    };
+    const auto write_all = [&] { write_except(live); };
+    const auto skip_one = [&] { write_except(5); };
+    const auto no_op = [&] {
+#pragma omp barrier
+    };
     const auto reference = completeReference(output, write_all);
     expect(reference.size() == live, "complete finite reference accepted");
-    const auto skip_one = [&] { for (std::size_t i = 0; i < live; ++i) if (i != 5) output.live()[i] = float(i); };
     expect(completeReference(output, skip_one).empty(), "omitted reference element rejected");
-    const auto dirt_writer = [&] { output.dirty(0); };
+    const auto dirt_writer = [&] {
+#pragma omp for schedule(static)
+        for (std::size_t i = 0; i < live; ++i) words[i] = std::bit_cast<float>(GuardedOutput::kDirty[0]);
+    };
     expect(completeReference(output, dirt_writer).empty(), "reference equal to a dirt sentinel rejected");
     const auto nonfinite = [&] {
-        write_all();
-        output.live()[7] = std::numeric_limits<float>::infinity();
+#pragma omp for schedule(static)
+        for (std::size_t i = 0; i < live; ++i) words[i] = i == 7 ? std::numeric_limits<float>::infinity() : float(i);
     };
     expect(completeReference(output, nonfinite).empty(), "stable nonfinite reference rejected");
-    const auto times = [&](const std::function<void()> &invoke, int warmup, int iters) {
-        return timeCell(output, reference, warmup, iters, invoke).published;
-    };
-    expect(times(write_all, 0, 3), "complete invocations published");
-    expect(!times(skip_one, 0, 1), "omitted element detected by timeCell");
-    expect(!times([] {}, 0, 1), "no-op invocation detected by timeCell");
+
+    // Timing controls observe a real multithreaded team.
+    const int saved_threads = omp_get_max_threads();
+    const int saved_dynamic = omp_get_dynamic();
+    omp_set_dynamic(0);
+    omp_set_num_threads(4);
+    const auto cell = timeCell(output, reference, 0, 3, write_all);
+    expect(cell.observed_threads >= 2, "timing controls ran on a multithreaded team");
+    expect(cell.published && cell.samples.size() == 3, "complete invocations published");
+    expect(!timeCell(output, reference, 0, 1, skip_one).published, "omitted element detected by timeCell");
+    expect(!timeCell(output, reference, 0, 1, no_op).published, "no-op invocation detected by timeCell");
     write_all(); // Leave a correct result behind: a stale-bytes pass would need timeCell not to dirty.
-    expect(!times([] {}, 0, 1), "stale correct bytes detected by timeCell");
-    expect(!times([] {}, 1, 1), "no-op after warmup detected by timeCell");
+    expect(!timeCell(output, reference, 0, 1, no_op).published, "stale correct bytes detected by timeCell");
+    // A successful warmup followed by a no-op measured invocation: the
+    // transition alone must fail (warmup itself publishes correctly).
+    int calls = 0;
+    const auto warm_then_no_op = [&] {
+        const bool write = calls < 1; // Read by every member before the workshare's barrier.
+#pragma omp for schedule(static)
+        for (std::size_t i = 0; i < live; ++i)
+            if (write) words[i] = float(i);
+#pragma omp single
+        ++calls;
+    };
+    expect(timeCell(output, reference, 1, 1, write_all).published, "complete warmup and measurement published");
+    expect(!timeCell(output, reference, 1, 1, warm_then_no_op).published, "no-op measured after a good warmup");
+    expect(calls == 2, "warmup and measured invocation both ran");
+    omp_set_num_threads(saved_threads);
+    omp_set_dynamic(saved_dynamic);
     expect(output.guardsIntact(), "guards intact after controls");
     output.poke(live, 0); // One word past the live span.
     expect(!output.guardsIntact(), "escaped write rejected");
