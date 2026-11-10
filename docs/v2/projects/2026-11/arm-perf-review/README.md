@@ -1316,3 +1316,23 @@ driver ACK:
    tests: cleanup/retention/override/inventory/drift/publication) —
    ProductionTestPreflight-registered. Successor SHA + a new Mac rerun (if
    epoch semantics change) to follow.
+
+### OpenMP wake-up/binding plan APPROVED (arm-addon3, 2026-11-10): A1 counter GO
+
+Full plan approved with amendments: (1) A1 region-creation counter — always-
+on summary (omp_region_creations_per_decode_step) + gated per-stage family;
+fork sites hoisted through one inline helper in OpenMPUtils.h + the two FA
+raw sites; prep-only sites count-exempt with a named allowlist; retained
+teams don't count; Unit tests + a ProductionTestPreflight Perf__ cell
+asserting the canonical decode graph's EXACT region inventory AND measuring
+the counter's own cost; counter-off default check. (2) A2 = ONE combined
+.80 rider set (per-step inventory 35B+27B, fork micro-cost attribution,
+sched_getcpu idea-26 closure); x86 spin rider DEFERRED pending WSL
+coordination. (3) Phase B evidence-gated: B1 = pool the serial SwiGLU batch
+into the fused down launcher (19/20 cores idle-spin through it; byte-
+neutral via the admitted serial fallback's exact per-expert arithmetic),
+implementation gated on A2 evidence; B2 router-Q8 consolidation
+evidence-conditional; B3 retained-team per layer DEFERRED; B4 spin re-tune
+only with idle-cost evidence. No overlap with the register-gate/B9/idea-31
+tooling set. Tracker idea-26 reframe updates via coordinator after the plan
+lands.
