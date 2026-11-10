@@ -45,3 +45,11 @@ future 64K ARM; x86 unaffected (hwloc path) for B5, 4K-normal for B1/B2/B6.
 - 64K unmasked window: DGX Grace (the only 64K host); booked via the DGX lane
   when the fix lands (Unit + page-size-parameterized regressions + B1/B2/B6/B7
   direct repro checks); .80 proves no 4KiB regression.
+
+- B9 OWNER CONFIRMED (addon lane): separate follow-up AFTER the R2 handover
+  (NOT inside R2 — 777f7a52a gates are running; tooling change would
+  invalidate the tip review; nothing installed needs it — Q6_K S=2 classifies
+  cleanly; forced-S4 probes only). Scope: admit post-index general-register
+  load `ldr x,[xN],#imm` (analyzer register/footprint semantics) + positive/
+  negative controls in the test shards + re-census at idea-31 S=4 showing Q6_K
+  cells classify. Tracked in the R2 handover doc plus here.
