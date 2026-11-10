@@ -30,6 +30,8 @@
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "memory/BufferArena.h"
 #include "utils/DebugEnv.h"
+#include "utils/OpenMPUtils.h"
+#include "utils/OpenMPTeamForkEvidence.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../../mocks/MockComputeStage.h" // MockDeviceContext
 #include "../../../../mocks/MockWorkerGPUContext.h"
@@ -4807,4 +4809,149 @@ TEST_F(Test__ForwardExecutionEngine, ComposedForwardSnapshotsRetainOriginalCaptu
     engine.invalidateAll();
     EXPECT_FALSE(engine.publishComposedForwardSnapshots(signatures[0],captures[0],&parent_stream,&error));
     EXPECT_FALSE(engine.lastExecutedForwardGraph());
+}
+
+/**
+ * @brief The decode-step team-fork summary publishes from the actual engine path.
+ *
+ * The wake-up work item's evidence must survive the deletion of either
+ * production publisher, so these regressions drive the real engine: a decode
+ * execution whose single graph stage forks an exact number of teams through
+ * the production macro family, observed through the PerfStats snapshot the
+ * exports serve. The off-default shape (no collection policy, no record), the
+ * filter-negative shape (a foreign filter publishes no omp record), the
+ * exact per-step value, and the GPU absence (the engine refuses to publish a
+ * CPU-fork summary for a GPU device step) are each asserted on the actual
+ * path. The evidence environment restores the caller's complete environment
+ * and both configuration authorities afterwards, so no export selection
+ * leaks beyond the test.
+ */
+namespace
+{
+    /** @brief Select one PerfStats configuration and restore everything afterwards. */
+    class ScopedForkEvidenceConfig final
+    {
+    public:
+        explicit ScopedForkEvidenceConfig(const char *filter)
+        {
+            if (filter)
+            {
+                ::setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+                ::setenv("LLAMINAR_PERF_STATS_FILTER", filter, 1);
+            }
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
+            PerfStatsCollector::reset();
+        }
+        ~ScopedForkEvidenceConfig()
+        {
+            ::unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
+            ::unsetenv("LLAMINAR_PERF_STATS_FILTER");
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
+        }
+        ScopedForkEvidenceConfig(const ScopedForkEvidenceConfig &) = delete;
+        ScopedForkEvidenceConfig &operator=(const ScopedForkEvidenceConfig &) = delete;
+    };
+} // namespace
+
+TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwnerScopeDelta)
+{
+    // The off-default shape: without any collection policy the engine step
+    // runs, the fork sites count, and no omp record materializes.
+    {
+        const ScopedForkEvidenceConfig off_default(nullptr);
+        auto engine = makeEngine(true);
+        MockForwardExecutionHost host(&mock_ctx_);
+        host.graph_stage_count = 1;
+        const std::vector<int> tokens = {50};
+        const std::vector<int> positions = {0};
+        auto input = makeTestInput(1, 1, DeviceId::cpu(), tokens.data(), positions.data());
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input, output, host));
+        EXPECT_TRUE(PerfStatsCollector::snapshot({"omp"}).empty());
+    }
+
+    // The filter-negative shape: a foreign filter must not retain omp either.
+    {
+        const ScopedForkEvidenceConfig foreign("kernel");
+        auto engine = makeEngine(true);
+        MockForwardExecutionHost host(&mock_ctx_);
+        host.graph_stage_count = 1;
+        const std::vector<int> tokens = {51};
+        const std::vector<int> positions = {1};
+        auto input = makeTestInput(1, 1, DeviceId::cpu(), tokens.data(), positions.data());
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input, output, host));
+        EXPECT_TRUE(PerfStatsCollector::snapshot({"omp"}).empty());
+    }
+
+    // The selected shape: one decode step publishes its window cell, and the
+    // value is exactly the forks the stage's hook performed.
+    {
+        const ScopedForkEvidenceConfig selected("omp");
+        auto engine = makeEngine(true);
+        MockForwardExecutionHost host(&mock_ctx_);
+        host.graph_stage_count = 1;
+        constexpr int kForksPerStage = 3;
+        host.graph_stage_factories = {
+            [](const std::string &name, DeviceId device)
+            {
+                auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+                    ComputeStageType::GEMM, name, device);
+                stage->setOnExecute([](IDeviceContext *)
+                {
+                    auto work = [] {};
+                    OMP_WORKSHARE_REGION(work);
+                    OMP_WORKSHARE_REGION(work);
+                    OMP_WORKSHARE_REGION(work);
+                });
+                return std::unique_ptr<IComputeStage>(std::move(stage));
+            }};
+        const std::vector<int> tokens = {52};
+        const std::vector<int> positions = {2};
+        auto input = makeTestInput(1, 1, DeviceId::cpu(), tokens.data(), positions.data());
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input, output, host));
+        const auto records = PerfStatsCollector::snapshot({"omp"});
+        ASSERT_FALSE(records.empty());
+        for (const auto &record : records)
+            if (record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily)
+                EXPECT_EQ(record.value, static_cast<double>(kForksPerStage))
+                    << "the decode window must count exactly the stage's forks";
+        ASSERT_TRUE(std::any_of(records.begin(), records.end(),
+            [](const PerfStatRecord &record)
+            { return record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily; }));
+
+        // A second step publishes its own window cell with the same exact
+        // value; a drifted accumulation would mean the window leaked forks.
+        ASSERT_TRUE(engine.execute(input, output, host));
+        for (const auto &record : PerfStatsCollector::snapshot({"omp"}))
+            if (record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily)
+                EXPECT_EQ(record.value, static_cast<double>(kForksPerStage));
+    }
+
+    // The GPU absence: the engine publishes no CPU-fork summary for a GPU
+    // device step, whatever else the mock backend reports about the step.
+    {
+        const ScopedForkEvidenceConfig selected("omp");
+        llaminar2::testing::MockDeviceContext gpu_context{DeviceId::cuda(0),
+            ComputeBackendType::GPU_CUDA};
+        auto engine = makeEngine(true);
+        MockForwardExecutionHost host(&gpu_context);
+        host.graph_stage_count = 1;
+        const std::vector<int> tokens = {53};
+        const std::vector<int> positions = {3};
+        auto input = makeTestInput(1, 1, DeviceId::cuda(0), tokens.data(), positions.data());
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        ForwardOutput output{};
+        engine.execute(input, output, host);
+        for (const auto &record : PerfStatsCollector::snapshot({"omp"}))
+            EXPECT_FALSE(record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily &&
+                         record.phase == "decode" && record.device == "CUDA:0")
+                << "a GPU device step must never publish a CPU fork summary";
+    }
 }

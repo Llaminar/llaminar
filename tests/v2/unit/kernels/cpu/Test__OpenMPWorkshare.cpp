@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +35,7 @@ namespace llaminar2::test
 namespace
 {
 using llaminar::v2::TeamPlacement;
+using llaminar::v2::OpenMPTeamForkScope;
 using llaminar::v2::beginWorkshare;
 using llaminar::v2::inActiveParallelRegion;
 using llaminar::v2::inLexicalWorkshare;
@@ -621,9 +623,12 @@ TEST(OpenMPWorkshare, TeamForkCounterCountsExactlyTheRealForks)
     EXPECT_EQ(openMPTeamForkSnapshot() - before, 1u);
 
     // Retained reuse re-executes the exact team without any fork at all.
+    // The baseline is captured outside the region and stays immutable: the
+    // team members only read it, so no shared cell is ever written from
+    // inside the parallel region.
+    before = openMPTeamForkSnapshot();
 #pragma omp parallel num_threads(2)
     {
-        before = openMPTeamForkSnapshot();
         OMP_WORKSHARE_REGION(one_work);
         OMP_WORKSHARE_REGION_SYNC(one_work);
         OMP_WORKSHARE_REGION_IF(one_work, false);
@@ -631,6 +636,62 @@ TEST(OpenMPWorkshare, TeamForkCounterCountsExactlyTheRealForks)
         OMP_LAYER_PARALLEL({});
         EXPECT_EQ(openMPTeamForkSnapshot() - before, 0u);
     }
+}
+
+/**
+ * @brief Owner-scoped attribution stays exact under overlap and nesting.
+ *
+ * Two threads hold concurrent scopes and fork through the production macro
+ * family at the same time: each scope's cell must observe exactly its own
+ * forks (concurrent executors count each other only in the process total),
+ * and the process total must stay complete. A nested scope observes the same
+ * fork as its enclosing scope (both are current owners), and the enclosing
+ * scope keeps counting after the inner one ends. No production serialization
+ * is involved: the overlap is the contract.
+ */
+TEST(OpenMPWorkshare, TeamForkScopeAttributesExactlyUnderOverlapAndNesting)
+{
+    const TeamPolicy policy;
+    const NumThreadsGuard threads(4);
+    constexpr std::uint64_t kForksPerThread = 8;
+
+    auto one_work = [] {};
+    std::atomic<std::uint64_t> scope_a{0}, scope_b{0};
+    const std::uint64_t total_before = openMPTeamForkSnapshot();
+    std::barrier<> rendezvous(2);
+    auto owner = [&](std::atomic<std::uint64_t> &observed)
+    {
+        OpenMPTeamForkScope scope;
+        rendezvous.arrive_and_wait(); // Both owners are current at once.
+        for (std::uint64_t fork = 0; fork < kForksPerThread; ++fork)
+            OMP_WORKSHARE_REGION(one_work);
+        observed.store(scope.forks(), std::memory_order_relaxed);
+    };
+    std::thread a([&] { owner(scope_a); });
+    std::thread b([&] { owner(scope_b); });
+    a.join();
+    b.join();
+    EXPECT_EQ(scope_a.load(), kForksPerThread);
+    EXPECT_EQ(scope_b.load(), kForksPerThread);
+    EXPECT_EQ(openMPTeamForkSnapshot() - total_before, 2 * kForksPerThread);
+
+    // Nesting: the inner scope and the enclosing scope both observe the same
+    // fork; the enclosing scope keeps observing after the inner one ends.
+    const std::uint64_t nesting_before = openMPTeamForkSnapshot();
+    OpenMPTeamForkScope outer;
+    OMP_WORKSHARE_REGION(one_work);
+    std::uint64_t inner_seen = 0;
+    {
+        OpenMPTeamForkScope inner;
+        OMP_WORKSHARE_REGION(one_work);
+        OMP_WORKSHARE_REGION(one_work);
+        inner_seen = inner.forks();
+    }
+    EXPECT_EQ(inner_seen, 2u);
+    EXPECT_EQ(outer.forks(), 3u);
+    OMP_WORKSHARE_REGION(one_work);
+    EXPECT_EQ(outer.forks(), 4u);
+    EXPECT_EQ(openMPTeamForkSnapshot() - nesting_before, 4u);
 }
 
 /**

@@ -15,6 +15,7 @@
  */
 
 #include "BlockStructures.h" // Must be included FIRST (defines all block structures)
+#include "../utils/OpenMPUtils.h"
 #include "IQQuantTables.h"   // Lookup tables: kvalues_iq4nl, iq2xxs_grid, etc.
 #include "../utils/CPUFeatures.h"
 #include "FP16Utils.h"
@@ -832,6 +833,7 @@ namespace llaminar2
             const float *col_scales,
             const float *bias)
         {
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
             for (int r = 0; r < rows; ++r)
             {
