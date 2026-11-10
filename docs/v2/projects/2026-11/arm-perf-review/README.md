@@ -1360,3 +1360,22 @@ form). Then merge-ready → Main.
   env) — underway. The combined candidate's re-rebase target updates to the
   latest tip when #71 completes (always-push).
 - idea-05 rider scope accepted; PR prose = per-member tail evidence wording.
+
+### Half-perf FINAL BINDING RUN at b512e25a (arm-sparks, 2026-11-10, ~21:22Z) — + attribution
+
+CFG=0 BUILD=0 (SHARED_CORE=ON, NEON_I8MM); Unit 990/16; Preflight 2419/23;
+**HalfOperand cells 5/5 PASSED** (smoke+replay+NEON/NEON_I8MM). Failure
+sets = the known base/env classes PLUS the #71-pending ngram/defaults class
+(MTPHardwareDefaults, NativeSourceFinalRetirement,
+NativeQuantisedGPUPrefillTrainerPolicy, CandidateNgram*/HostAdaptive*/
+MTPTerminalHeadDefaults/QFNOrdinaryTP4HeadDefaults/PlanningHostService*/
+PipelineHostService* — the stale-ngram-observation class from the
+coordinator's 415/9-era focused description, exactly what Main's #71 fix
+targets). COORDINATOR CORRECTION: my retarget note ("comments-only delta ⇒
+near-fully reused") was WRONG — b512e25a vs adb1c98e9 includes the FULL
+fix-back (+102/−21 functional rework); the early-signal run was pre-fix-
+back and the final run is the real one. arm-sparks caught it. Attribution
+ANSWER to arm-sparks's question: YES — the ngram/defaults pre-failures =
+base-pending-#71 (Main's fix), NOT lane regressions (names known from the
+415/9-era observations before the cell existed; zero other new names).
+Merge-readiness package routes to the reviewer with that attribution.
