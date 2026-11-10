@@ -1465,3 +1465,14 @@ notice** (the tip moves under it).
   NONFINITE bit-oracle's diagnostic policy only, with RAII restoration +
   separate default-on rejection / finite-admission / empty-work tests. NO
   production validation weakening or optimization disable.
+
+### #73 fix pushed (Main, 2026-11-10, ~23:28Z): e33bf1de6 (184; CLEAN)
+
+Test-only: reproduced the exact workers1/cols1/degree2 false; confirmed the
+CORRECT rejection of authored NaN/Inf under default fail_on_nan (NOT a
+single-worker gap). The diagnostic byte oracle gets an explicit RAII bool
+scope; separate default finite-accept / nonfinite-reject / empty /
+source-bytes / policy-restore contract tests; existing preflight ISA
+aliases auto-select them. NO production validation/dispatch change.
+Native Unit + scalar/NEON aliases 20x + review running. Main thanks for
+the DirB scope pause; no gate waiver / no implicit GPU qualification.
