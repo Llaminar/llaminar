@@ -667,3 +667,21 @@ negatives = identity mismatch (reconcile), unregistered alias (inventory
 Archived: evidence/register-gate-trial2-c4536cf3c-appleclang/ (125 MB).
 Post-SETTLED usage: .80 GNU-14 + Mac AppleClang-21 at the combined tip.
 Holding until SETTLED.
+
+### .79 4-cell rerun COMPLETE at e5ee7f672 (2026-11-10, ~14:07Z) — handover condition MET
+
+- CUDAResidualAddParity PASSED (9/9 focused set incl. TailExtents +
+  GroupedVerifierRows_CUDA_ResidualAdd); CUDAFlashAttention_DecodeKVLen
+  PASSED (incl. SmallMFP16KVRowsMatchSerialReference);
+  CUDAAttentionPaddingParity CausalMask+NonCausal PASSED, the 2 known
+  arena/transfer cases still failing = Main's expected known set.
+- NEW: CUDAOpsParity SEGFAULT (signal 11) in ResidualAdd_FP32_Small,
+  reproducible 2/2; the 15 prior cases PASS (RMSNorm×3, SwiGLU×6, RoPE×3),
+  then the FIRST ResidualAdd case inside CUDAOpsParity segfaults while
+  CUDAResidualAddParity's identical-class cases pass → fixture-level
+  (CUDAOpsParity ResidualAdd setup path), NOT the null-stream class (no
+  timer exception). Fix-back item for Main's slot.
+- 20+ stream-fixed cases GREEN + the 2 known fails = handover condition
+  met; .79 GPU FREE; Main's ~2h slot agenda: (0) CUDAOpsParity segfault,
+  (a) 2 arena/transfer cases, (b) sm_121 tile inventory, (c) idea-21b
+  grouped-IMMA probe. SETTLED after the slot + focused rerun.
