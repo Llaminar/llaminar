@@ -8,11 +8,15 @@
  * FMA order. Integer dots accumulate in int32 under a typed Q16ReductionBound
  * whose closed form makes every partial sum exact. Nonfinite weights and query
  * codes outside the bound are fatal at the point of use, never exceptions that
- * could strand a worker team. The *Rows kernels carry no geometry checks: a
- * CPUAttentionInvocationAdmission proved rows and width for the whole
- * invocation. The span overloads validate one call and then run the same
- * kernels; they serve tests and cold callers. Spans are synchronous borrows,
- * not capacity or cache-lease proofs.
+ * could strand a worker team. The row programs that carry no row geometry
+ * checks are private members of AdmittedRows: only the owning flash-attention
+ * kernel, whose public entries admit every bank before any team
+ * (CPUAttentionInvocationAdmission), and the checked span overloads here can
+ * call them. Row/weight metadata is passed by value, so it cannot alias an
+ * output, and an integer reduction wider than its Q16ReductionBound is fatal.
+ * The span overloads validate one call and then run the same programs; they
+ * serve tests and cold callers. Spans are synchronous borrows, not capacity or
+ * cache-lease proofs.
  */
 #pragma once
 #if !defined(__aarch64__) || !defined(__ARM_NEON)
@@ -34,6 +38,12 @@
 #include <span>
 #include <stdexcept>
 #include <type_traits>
+
+namespace llaminar2
+{
+enum class ActivationPrecision;
+template <ActivationPrecision Precision> class CPUFlashAttentionKernelT;
+} // namespace llaminar2
 
 namespace llaminar2::cpu::neon_attention
 {
@@ -117,184 +127,222 @@ template<Storage Format>inline float scalar(Unit<Format>original)noexcept
         return std::bit_cast<float>(bits);
     }
 }
-/** @brief Shared native row program over rows an invocation admission already proved.
- * @tparam Format Original cache encoding; @tparam Rows Native register rows, one/two/four.
- * @param query First FP32 query coordinate; @param keys First coordinate of each key row.
- * @param width Admitted head width; every row holds at least @p width coordinates.
- * @return Original-order dot words after the same two-chain fold as native serial M1.
- * @details No validation: CPUAttentionInvocationAdmission (or the checked
- * overload below) proved every row and the width before any worker team.
+struct AdmittedRowsTestAccess;
+
+/**
+ * @brief Native row programs and their checked single-call overloads.
+ * @details The bodies that trust row geometry are private. They are reachable
+ * only from the owning CPUFlashAttentionKernelT, whose public entry points
+ * admit every bank before any worker team, and from the checked overloads,
+ * which validate one call first. AdmittedRowsTestAccess is defined only by
+ * focused regressions of the private bodies' own fatal guards.
  */
-template<Storage Format,std::size_t Rows>
-inline std::array<float,Rows> dotRows(const float*query,const std::array<const Unit<Format>*,Rows>&keys,int width)noexcept
+class AdmittedRows final
 {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#pragma clang fp reassociate(off)
-#endif
-    static_assert(Rows==1||Rows==2||Rows==4);
-    const std::size_t count=std::size_t(width);
-    float32x4_t lo[Rows],hi[Rows];
-    for(std::size_t row=0;row<Rows;++row){lo[row]=vdupq_n_f32(0.0f);hi[row]=vdupq_n_f32(0.0f);}
-    std::size_t coordinate=0;
-    for(;coordinate+8<=count;coordinate+=8)
+public:
+    /** @brief Share each original query load across independent original key borrows.
+     * @tparam Format Original cache encoding; @tparam Rows Native register rows, one/two/four.
+     * @param query Original FP32 query; @param keys Original complete key rows, possibly noncontiguous.
+     * @return Original-order dot words after the same two-chain fold as native serial M1.
+     * @throws std::invalid_argument For inconsistent or invalid original spans.
+     */
+    template<Storage Format,std::size_t Rows>
+    static std::array<float,Rows> dot(std::span<const float>query,const std::array<std::span<const Unit<Format>>,Rows>&keys)
     {
-        const auto q0=vld1q_f32(query+coordinate),q1=vld1q_f32(query+coordinate+4);
-#pragma GCC unroll 4
+        requireSpan(query);
+        std::array<const Unit<Format>*,Rows> rows;
+        for(std::size_t row=0;row<Rows;++row)
+        {requireSpan(keys[row]);if(keys[row].size()!=query.size())throw std::invalid_argument("CPU native attention key/query geometry mismatch");rows[row]=keys[row].data();}
+        return dotRows<Format,Rows>(query.data(),rows,int(query.size()));
+    }
+    /** @brief Retain the single-row native FMA program while sharing each output load/store across rows.
+     * @tparam Format Original value encoding; @tparam Rows One/two/four original value rows.
+     * @param output Original FP32 numerator; @param values Complete original disjoint cache borrows.
+     * @param weights Original separately derived finite weights, in increasing key-row order.
+     * @throws std::invalid_argument For malformed geometry or aliasing before writes.
+     */
+    template<Storage Format,std::size_t Rows>
+    static void accumulate(std::span<float>output,const std::array<std::span<const Unit<Format>>,Rows>&values,const std::array<float,Rows>&weights)
+    {
+        requireSpan(output);
+        if(overlaps(output.data(),output.size_bytes(),values.data(),sizeof(values))||
+            overlaps(output.data(),output.size_bytes(),weights.data(),sizeof(weights)))
+            throw std::invalid_argument("CPU native attention numerator overlaps original invocation metadata");
+        std::array<const Unit<Format>*,Rows> rows;
         for(std::size_t row=0;row<Rows;++row)
         {
-            lo[row]=vfmaq_f32(lo[row],q0,load4<Format>(keys[row]+coordinate));
-            hi[row]=vfmaq_f32(hi[row],q1,load4<Format>(keys[row]+coordinate+4));
+            requireSpan(values[row]);
+            if(values[row].size()!=output.size()||
+                overlaps(output.data(),output.size_bytes(),values[row].data(),values[row].size_bytes()))
+                throw std::invalid_argument("CPU native attention requires disjoint complete value/numerator banks");
+            rows[row]=values[row].data();
         }
+        accumulateRows<Format,Rows>(output.data(),rows,weights,int(output.size()));
     }
-    std::array<float,Rows> output;
-    for(std::size_t row=0;row<Rows;++row)output[row]=vaddvq_f32(vaddq_f32(lo[row],hi[row]));
-    for(;coordinate<count;++coordinate)
-#pragma GCC unroll 4
+    /** @brief Share original int16 query loads across rows with exact int32 accumulation.
+     * @tparam Rows Native one/two/four-row register program.
+     * @param bound Typed reduction proof whose limit quantized @p query.
+     * @param query Original quantized query; @param keys Complete original native int16 key rows.
+     * @return Exact original-row int32 dots, equal to the int64 sums.
+     * @throws std::invalid_argument For malformed geometry or more products than the bound admits.
+     */
+    template<std::size_t Rows>
+    static std::array<std::int32_t,Rows> integerDot(const Q16ReductionBound&bound,std::span<const std::int16_t>query,
+        const std::array<std::span<const std::int16_t>,Rows>&keys)
+    {
+        requireSpan(query);
+        std::array<const std::int16_t*,Rows> rows;
         for(std::size_t row=0;row<Rows;++row)
-            output[row]=std::fma(query[coordinate],scalar<Format>(keys[row][coordinate]),output[row]);
-    return output;
-}
-/** @brief Share each original query load across independent original key borrows.
- * @tparam Format Original cache encoding; @tparam Rows Native register rows, one/two/four.
- * @param query Original FP32 query; @param keys Original complete key rows, possibly noncontiguous.
- * @return Original-order dot words after the same two-chain fold as native serial M1.
- * @throws std::invalid_argument For inconsistent or invalid original spans.
- */
+        {requireSpan(keys[row]);if(keys[row].size()!=query.size())throw std::invalid_argument("CPU native integer attention row geometry mismatch");rows[row]=keys[row].data();}
+        if(query.size()>std::size_t(bound.terms()))
+            throw std::invalid_argument("CPU native integer attention reduction exceeds its proven int32 term count");
+        return integerDotRows<Rows>(bound,query.data(),rows,int(query.size()));
+    }
+
+private:
+    template <ActivationPrecision Precision> friend class ::llaminar2::CPUFlashAttentionKernelT;
+    friend struct AdmittedRowsTestAccess;
+
+    /** @brief Shared native row program over rows an invocation admission already proved.
+     * @tparam Format Original cache encoding; @tparam Rows Native register rows, one/two/four.
+     * @param query First FP32 query coordinate; @param keys First coordinate of each key row.
+     * @param width Admitted head width; every row holds at least @p width coordinates.
+     * @return Original-order dot words after the same two-chain fold as native serial M1.
+     * @details No row validation: CPUAttentionInvocationAdmission (or the checked
+     * overload below) proved every row and the width before any worker team.
+     */
+    template<Storage Format,std::size_t Rows>
+    static std::array<float,Rows> dotRows(const float*query,const std::array<const Unit<Format>*,Rows>keys,int width)noexcept
+    {
+    #if defined(__clang__)
+    #pragma clang fp contract(off)
+    #pragma clang fp reassociate(off)
+    #endif
+        static_assert(Rows==1||Rows==2||Rows==4);
+        const std::size_t count=std::size_t(width);
+        float32x4_t lo[Rows],hi[Rows];
+        for(std::size_t row=0;row<Rows;++row){lo[row]=vdupq_n_f32(0.0f);hi[row]=vdupq_n_f32(0.0f);}
+        std::size_t coordinate=0;
+        for(;coordinate+8<=count;coordinate+=8)
+        {
+            const auto q0=vld1q_f32(query+coordinate),q1=vld1q_f32(query+coordinate+4);
+    #pragma GCC unroll 4
+            for(std::size_t row=0;row<Rows;++row)
+            {
+                lo[row]=vfmaq_f32(lo[row],q0,load4<Format>(keys[row]+coordinate));
+                hi[row]=vfmaq_f32(hi[row],q1,load4<Format>(keys[row]+coordinate+4));
+            }
+        }
+        std::array<float,Rows> output;
+        for(std::size_t row=0;row<Rows;++row)output[row]=vaddvq_f32(vaddq_f32(lo[row],hi[row]));
+        for(;coordinate<count;++coordinate)
+    #pragma GCC unroll 4
+            for(std::size_t row=0;row<Rows;++row)
+                output[row]=std::fma(query[coordinate],scalar<Format>(keys[row][coordinate]),output[row]);
+        return output;
+    }
+    /** @brief Weighted value update over rows an invocation admission already proved.
+     * @tparam Format Original value encoding; @tparam Rows One/two/four original value rows.
+     * @param output First FP32 numerator coordinate, disjoint from every value row.
+     * @param values First coordinate of each value row, by value.
+     * @param weights Increasing key-row order, by value.
+     * @param width Admitted head width.
+     * @details Only the weights are tested: one vector test (w - w == +0 exactly
+     * for finite w, NaN otherwise) before the first write; a nonfinite weight is
+     * fatal, never an exception inside a team. The row addresses and weights are
+     * the callee's own copies, so no numerator store can alter them.
+     */
+    template<Storage Format,std::size_t Rows>
+    static void accumulateRows(float*output,const std::array<const Unit<Format>*,Rows>values,const std::array<float,Rows>weights,int width)noexcept
+    {
+    #if defined(__clang__)
+    #pragma clang fp contract(off)
+    #pragma clang fp reassociate(off)
+    #endif
+        static_assert(Rows==1||Rows==2||Rows==4);
+        {
+            float lanes[4]={0.0f,0.0f,0.0f,0.0f};
+            for(std::size_t row=0;row<Rows;++row)lanes[row]=weights[row];
+            const auto w=vld1q_f32(lanes);
+            if(vminvq_u32(vceqq_f32(vsubq_f32(w,w),vdupq_n_f32(0.0f)))==0)
+                rejectAttentionData("nonfinite attention weight");
+        }
+        const std::size_t count=std::size_t(width);
+        std::size_t coordinate=0;
+        for(;coordinate+4<=count;coordinate+=4)
+        {
+            auto value=vld1q_f32(output+coordinate);
+    #pragma GCC unroll 4
+            for(std::size_t row=0;row<Rows;++row)value=vfmaq_n_f32(value,load4<Format>(values[row]+coordinate),weights[row]);
+            vst1q_f32(output+coordinate,value);
+        }
+        for(;coordinate<count;++coordinate)
+    #pragma GCC unroll 4
+            for(std::size_t row=0;row<Rows;++row)output[coordinate]=std::fma(scalar<Format>(values[row][coordinate]),weights[row],output[coordinate]);
+    }
+    /** @brief Exact int32 integer dots over rows an invocation admission already proved.
+     * @tparam Rows Native one/two/four-row register program.
+     * @param bound Typed reduction proof whose limit quantized @p query.
+     * @param query First query code; @param keys First code of each key row.
+     * @param width Reduction width; fatal unless in [0, bound.terms()].
+     * @return Exact original-row int32 dots, equal to the int64 sums.
+     * @details Under the bound, sum(|q*k|) <= bound.worstMagnitude() <= INT32_MAX,
+     * so every lane partial and the fold are exact. The width is part of that
+     * proof, so it is checked here rather than trusted (one compare per call).
+     * The query magnitude is folded into the loop (one saturating abs/max per
+     * eight codes, shared by all rows); a code beyond the bound is fatal, since
+     * the sum could have wrapped.
+     */
+    template<std::size_t Rows>
+    static std::array<std::int32_t,Rows> integerDotRows(const Q16ReductionBound&bound,const std::int16_t*query,
+        const std::array<const std::int16_t*,Rows>keys,int width)noexcept
+    {
+        static_assert(Rows==1||Rows==2||Rows==4);
+        if(width<0||width>bound.terms())rejectAttentionData("Q16 reduction width outside its int32 term bound");
+        const std::size_t count=std::size_t(width);
+        int32x4_t sums[Rows];for(auto&sum:sums)sum=vdupq_n_s32(0);
+        int16x8_t peak=vdupq_n_s16(0);
+        std::size_t coordinate=0;
+        for(;coordinate+8<=count;coordinate+=8)
+        {
+            const auto q=vld1q_s16(query+coordinate);
+            peak=vmaxq_s16(peak,vqabsq_s16(q));
+    #pragma GCC unroll 4
+            for(std::size_t row=0;row<Rows;++row)
+            {
+                const auto key=vld1q_s16(keys[row]+coordinate);
+                sums[row]=vmlal_s16(sums[row],vget_low_s16(q),vget_low_s16(key));
+                sums[row]=vmlal_high_s16(sums[row],q,key);
+            }
+        }
+        // Every query code is admitted before any scalar arithmetic that relies on
+        // the bound: the fold and the tail run only on proven input. Vector lanes
+        // above are modular SIMD adds, so invalid input cannot have caused UB yet.
+        int magnitude=vmaxvq_s16(peak);
+        for(std::size_t tail=coordinate;tail<count;++tail)
+            magnitude=std::max(magnitude,std::abs(int(query[tail]))); // Widened: -32768 stays out of bound.
+        if(magnitude>bound.queryLimit())rejectAttentionData("Q16 query code outside its int32 reduction bound");
+        std::array<std::int32_t,Rows> result;
+        for(std::size_t row=0;row<Rows;++row)result[row]=vaddvq_s32(sums[row]);
+        for(;coordinate<count;++coordinate)
+            for(std::size_t row=0;row<Rows;++row)result[row]+=std::int32_t(query[coordinate])*keys[row][coordinate];
+        return result;
+    }
+};
+
+/** @brief Checked single-call floating dot; see AdmittedRows::dot. */
 template<Storage Format,std::size_t Rows>
 inline std::array<float,Rows> dot(std::span<const float>query,const std::array<std::span<const Unit<Format>>,Rows>&keys)
-{
-    requireSpan(query);
-    std::array<const Unit<Format>*,Rows> rows;
-    for(std::size_t row=0;row<Rows;++row)
-    {requireSpan(keys[row]);if(keys[row].size()!=query.size())throw std::invalid_argument("CPU native attention key/query geometry mismatch");rows[row]=keys[row].data();}
-    return dotRows<Format,Rows>(query.data(),rows,int(query.size()));
-}
-/** @brief Weighted value update over rows an invocation admission already proved.
- * @tparam Format Original value encoding; @tparam Rows One/two/four original value rows.
- * @param output First FP32 numerator coordinate, disjoint from every value row.
- * @param values First coordinate of each value row; @param weights Increasing key-row order.
- * @param width Admitted head width.
- * @details Only the weights are tested: one vector test (w - w == +0 exactly
- * for finite w, NaN otherwise) before the first write; a nonfinite weight is
- * fatal, never an exception inside a team.
- */
-template<Storage Format,std::size_t Rows>
-inline void accumulateRows(float*output,const std::array<const Unit<Format>*,Rows>&values,const std::array<float,Rows>&weights,int width)noexcept
-{
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#pragma clang fp reassociate(off)
-#endif
-    static_assert(Rows==1||Rows==2||Rows==4);
-    {
-        float lanes[4]={0.0f,0.0f,0.0f,0.0f};
-        for(std::size_t row=0;row<Rows;++row)lanes[row]=weights[row];
-        const auto w=vld1q_f32(lanes);
-        if(vminvq_u32(vceqq_f32(vsubq_f32(w,w),vdupq_n_f32(0.0f)))==0)
-            rejectAttentionData("nonfinite attention weight");
-    }
-    const std::size_t count=std::size_t(width);
-    std::size_t coordinate=0;
-    for(;coordinate+4<=count;coordinate+=4)
-    {
-        auto value=vld1q_f32(output+coordinate);
-#pragma GCC unroll 4
-        for(std::size_t row=0;row<Rows;++row)value=vfmaq_n_f32(value,load4<Format>(values[row]+coordinate),weights[row]);
-        vst1q_f32(output+coordinate,value);
-    }
-    for(;coordinate<count;++coordinate)
-#pragma GCC unroll 4
-        for(std::size_t row=0;row<Rows;++row)output[coordinate]=std::fma(scalar<Format>(values[row][coordinate]),weights[row],output[coordinate]);
-}
-/** @brief Retain the single-row native FMA program while sharing each output load/store across rows.
- * @tparam Format Original value encoding; @tparam Rows One/two/four original value rows.
- * @param output Original FP32 numerator; @param values Complete original disjoint cache borrows.
- * @param weights Original separately derived finite weights, in increasing key-row order.
- * @throws std::invalid_argument For malformed geometry or aliasing before writes.
- */
+{ return AdmittedRows::dot<Format,Rows>(query,keys); }
+/** @brief Checked single-call weighted update; see AdmittedRows::accumulate. */
 template<Storage Format,std::size_t Rows>
 inline void accumulate(std::span<float>output,const std::array<std::span<const Unit<Format>>,Rows>&values,const std::array<float,Rows>&weights)
-{
-    requireSpan(output);
-    if(overlaps(output.data(),output.size_bytes(),values.data(),sizeof(values))||
-        overlaps(output.data(),output.size_bytes(),weights.data(),sizeof(weights)))
-        throw std::invalid_argument("CPU native attention numerator overlaps original invocation metadata");
-    std::array<const Unit<Format>*,Rows> rows;
-    for(std::size_t row=0;row<Rows;++row)
-    {
-        requireSpan(values[row]);
-        if(values[row].size()!=output.size()||
-            overlaps(output.data(),output.size_bytes(),values[row].data(),values[row].size_bytes()))
-            throw std::invalid_argument("CPU native attention requires disjoint complete value/numerator banks");
-        rows[row]=values[row].data();
-    }
-    accumulateRows<Format,Rows>(output.data(),rows,weights,int(output.size()));
-}
-/** @brief Exact int32 integer dots over rows an invocation admission already proved.
- * @tparam Rows Native one/two/four-row register program.
- * @param bound Typed reduction proof whose limit quantized @p query.
- * @param query First query code; @param keys First code of each key row.
- * @param width Admitted reduction width, at most bound.terms().
- * @return Exact original-row int32 dots, equal to the int64 sums.
- * @details Under the bound, sum(|q*k|) <= bound.worstMagnitude() <= INT32_MAX,
- * so every lane partial and the fold are exact. The query magnitude is folded
- * into the loop (one saturating abs/max per eight codes, shared by all rows);
- * a code beyond the bound is fatal, since the sum could have wrapped.
- */
-template<std::size_t Rows>
-inline std::array<std::int32_t,Rows> integerDotRows(const Q16ReductionBound&bound,const std::int16_t*query,
-    const std::array<const std::int16_t*,Rows>&keys,int width)noexcept
-{
-    static_assert(Rows==1||Rows==2||Rows==4);
-    const std::size_t count=std::size_t(width);
-    int32x4_t sums[Rows];for(auto&sum:sums)sum=vdupq_n_s32(0);
-    int16x8_t peak=vdupq_n_s16(0);
-    std::size_t coordinate=0;
-    for(;coordinate+8<=count;coordinate+=8)
-    {
-        const auto q=vld1q_s16(query+coordinate);
-        peak=vmaxq_s16(peak,vqabsq_s16(q));
-#pragma GCC unroll 4
-        for(std::size_t row=0;row<Rows;++row)
-        {
-            const auto key=vld1q_s16(keys[row]+coordinate);
-            sums[row]=vmlal_s16(sums[row],vget_low_s16(q),vget_low_s16(key));
-            sums[row]=vmlal_high_s16(sums[row],q,key);
-        }
-    }
-    // Every query code is admitted before any scalar arithmetic that relies on
-    // the bound: the fold and the tail run only on proven input. Vector lanes
-    // above are modular SIMD adds, so invalid input cannot have caused UB yet.
-    int magnitude=vmaxvq_s16(peak);
-    for(std::size_t tail=coordinate;tail<count;++tail)
-        magnitude=std::max(magnitude,std::abs(int(query[tail]))); // Widened: -32768 stays out of bound.
-    if(magnitude>bound.queryLimit())rejectAttentionData("Q16 query code outside its int32 reduction bound");
-    std::array<std::int32_t,Rows> result;
-    for(std::size_t row=0;row<Rows;++row)result[row]=vaddvq_s32(sums[row]);
-    for(;coordinate<count;++coordinate)
-        for(std::size_t row=0;row<Rows;++row)result[row]+=std::int32_t(query[coordinate])*keys[row][coordinate];
-    return result;
-}
-/** @brief Share original int16 query loads across rows with exact int32 accumulation.
- * @tparam Rows Native one/two/four-row register program.
- * @param bound Typed reduction proof whose limit quantized @p query.
- * @param query Original quantized query; @param keys Complete original native int16 key rows.
- * @return Exact original-row int32 dots, equal to the int64 sums.
- * @throws std::invalid_argument For malformed geometry or more products than the bound admits.
- */
+{ AdmittedRows::accumulate<Format,Rows>(output,values,weights); }
+/** @brief Checked single-call exact integer dot; see AdmittedRows::integerDot. */
 template<std::size_t Rows>
 inline std::array<std::int32_t,Rows> integerDot(const Q16ReductionBound&bound,std::span<const std::int16_t>query,
     const std::array<std::span<const std::int16_t>,Rows>&keys)
-{
-    requireSpan(query);
-    std::array<const std::int16_t*,Rows> rows;
-    for(std::size_t row=0;row<Rows;++row)
-    {requireSpan(keys[row]);if(keys[row].size()!=query.size())throw std::invalid_argument("CPU native integer attention row geometry mismatch");rows[row]=keys[row].data();}
-    if(query.size()>std::size_t(bound.terms()))
-        throw std::invalid_argument("CPU native integer attention reduction exceeds its proven int32 term count");
-    return integerDotRows<Rows>(bound,query.data(),rows,int(query.size()));
-}
+{ return AdmittedRows::integerDot<Rows>(bound,query,keys); }
 /** @brief Quantize one original FP32 query with the existing max/qmax, inverse, RNE program.
  * @param source Original complete query; @param destination Original disjoint int16 workspace.
  * @param limit Positive symmetric payload limit, at most 32767.
