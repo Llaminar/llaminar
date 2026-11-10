@@ -6485,6 +6485,7 @@ namespace llaminar2::primitives
         }
 
 // Process each position in parallel
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
         for (int pos = 0; pos < seq_len; ++pos)
         {

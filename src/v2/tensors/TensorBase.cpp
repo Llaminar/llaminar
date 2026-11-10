@@ -13,6 +13,7 @@
  */
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "TensorKernels.h"
 #include "SIMDHelpers.h"
 #include "../utils/CPUFeatures.h"
@@ -352,6 +353,7 @@ namespace llaminar2
         // Step 1: Decode entire tensor to FP32 (temporary buffer)
         std::vector<float> fp32_data(rows * cols);
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
         for (size_t row = 0; row < rows; ++row)
         {
@@ -374,6 +376,7 @@ namespace llaminar2
         }
 
         // Step 2: Compute per-column scales
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
         for (size_t j = 0; j < cols; ++j)
         {
@@ -390,6 +393,7 @@ namespace llaminar2
         // Step 3: Compute per-row scales (if requested)
         if (dst_row_scales != nullptr)
         {
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < rows; ++i)
             {
@@ -407,6 +411,7 @@ namespace llaminar2
         // Step 4: Quantize to INT8 using per-column scales (or per-row if requested)
         const bool use_row_scales = (dst_row_scales != nullptr);
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < rows; ++i)
         {
@@ -634,6 +639,7 @@ namespace llaminar2
                 const size_t blocks_per_row = (cols + src_block_size - 1) / src_block_size;
 
 // OpenMP parallelize over rows
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
                 for (size_t r = 0; r < rows; ++r)
                 {
@@ -675,6 +681,7 @@ namespace llaminar2
         std::vector<float> fp32_buffer(total_elements);
         to_fp32(fp32_buffer.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
         for (size_t b = 0; b < num_blocks; ++b)
         {
@@ -1429,6 +1436,7 @@ namespace llaminar2
         double norm_a = 0.0;
         double norm_b = 0.0;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for reduction(+ : dot, norm_a, norm_b) schedule(static)
         for (size_t i = 0; i < n; ++i)
         {
@@ -1473,6 +1481,7 @@ namespace llaminar2
 
         float max_diff = 0.0f;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for reduction(max : max_diff) schedule(static)
         for (size_t i = 0; i < n; ++i)
         {
@@ -1511,6 +1520,7 @@ namespace llaminar2
 
         double sum_diff = 0.0;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for reduction(+ : sum_diff) schedule(static)
         for (size_t i = 0; i < n; ++i)
         {
@@ -1546,6 +1556,7 @@ namespace llaminar2
         double diff_sq = 0.0;
         double ref_sq = 0.0;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for reduction(+ : diff_sq, ref_sq) schedule(static)
         for (size_t i = 0; i < n; ++i)
         {
@@ -1669,6 +1680,7 @@ namespace llaminar2
         double sum_diff = 0.0;
         float max_diff = 0.0f;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel
         {
             double local_dot = 0.0;

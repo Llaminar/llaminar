@@ -8,6 +8,7 @@
  */
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "../kernels/KernelFactory.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
@@ -302,6 +303,7 @@ namespace llaminar2
         }
 
         // Convert FP16 → FP32 using utility function with OpenMP parallelization for large tensors
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (count > 10000)
         for (size_t i = 0; i < count; ++i)
         {
@@ -337,6 +339,7 @@ namespace llaminar2
 
         uint16_t *dst = is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_fp16_data_.data();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel
         {
             std::vector<float> row_buffer(static_cast<size_t>(cols));
@@ -470,6 +473,7 @@ namespace llaminar2
         const size_t chunk_size = 4096; // Large enough to amortize thread overhead
         const size_t num_chunks = (count + chunk_size - 1) / chunk_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < num_chunks; ++i)
         {
@@ -486,6 +490,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -510,6 +515,7 @@ namespace llaminar2
 
         const size_t num_blocks = (total_elements + block_size - 1) / block_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
         {
@@ -686,6 +692,7 @@ namespace llaminar2
 
         const uint16_t *src_data = fp16_data();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel
         {
             // Per-thread buffer to avoid repeated allocations
@@ -830,6 +837,7 @@ namespace llaminar2
         Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
         const uint16_t *fp16_data = host_fp16_data_.data();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel
         {
             // Parallelize over rows for large M, or collapse(2) for small M
