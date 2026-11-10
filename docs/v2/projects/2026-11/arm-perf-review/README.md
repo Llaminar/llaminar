@@ -1202,3 +1202,27 @@ My "compile-only candidate, not published" framing was STALE. Corrections:
   needed. arm-sparks' state corrected: its .79 window = B11 attribution
   (NOW unblocked — the CUDA chain is settled) + the Dir-B trace (blocked on
   Main engine item #71).
+
+### Driver repair delivered (addon, 2026-11-10, ~17:56Z): combined tip = 252da4a53
+
+- **Repair SHA `252da4a53`** = origin/codex/arm-s4-nibble-witness
+  (force-with-lease from 717b2bfe6; ONE added file:
+  tests/v2/cmake/CPUNativeTileRegisterGate.sh — the driver is now a
+  CHECKED-IN TOOL). Tooling-only: reconciler exit status now checked —
+  malformed proof/cache/exception fails the cell as `reconcile-crashed`,
+  never PASS-with-empty-identity. 717b2's valid native artifacts untouched,
+  no recompile. Forced-failure check: corrupted proof + real cache →
+  `FAIL (reconcile-crashed rc=1)`; positive: full fresh 9-cell run with the
+  repaired driver → 9/9 PASS.
+- **Artifact paths sent to Main** (Mac archive:
+  evidence/register-gate-717b2bfe6-appleclang/ = a FRESH final run of the
+  repaired driver, replacing the older trial; .80:
+  build/rg-717b2bfe6/{build,receipt}/, rg-717b.log, focused-717b2.log,
+  f717-*.log).
+- COUNT CORRECTION: e8866ec04..717b2bfe6 = **8 commits** (5 re-pins +
+  InstalledWidth + functional fix-back + comment); with the driver commit
+  the candidate = 9 commits to 252da4a53. Production diff scan: clean.
+- OPEN for admission: the .80 GNU receipt PREDATES the driver repair (happy
+  path identical; whether a re-run with the repaired driver is required =
+  Main's call; a rerun is ~25 min if requested). Reviewer light note on the
+  driver-script commit requested (717b-precedent class).
