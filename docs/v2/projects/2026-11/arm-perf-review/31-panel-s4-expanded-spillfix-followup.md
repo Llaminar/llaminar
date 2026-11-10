@@ -110,3 +110,19 @@ Status: OPEN (2026-11-09; queued via R2 C4 per-encoding width evidence).
 - Disposition: Mac 9-cell canonical GREEN; .80 GNU-14 canonical census +
   full-byte + economy (measured) = the last qualification at 972c0081; rebase
   onto the final R2 tip (empty intersection, mechanical) -> INSTALLABLE.
+
+## INSTALL RECEIPT GREEN (2026-11-10, .80 GNU-14 9-cell @ 3027d7bb8)
+
+Rows1 = 0 on all 9 cells; grouped totals 1029/1176/1274 byte-equal to each
+tree's own budget; 0 mismatches / 0 missing; provenance = compile_commands
+reference only /work/trees/3027d7bb8 (worktree at that SHA). The R2
+correction receipt at 8fcc0fe0b = identical GREEN. DECISION (install path,
+option 2 stands): the installing commit's canonical census IS the receipt —
+NO additional I8MM runtime byte cells at 3027d7bb8 (the queued 4K no-reg
+engine run covers runtime confirmation). Handover sequence (base moved):
+Main publishes the rebased tip → mechanical stack replay (clean expected;
+no gemm/tournament conflicts per Main) → reviewer re-pin → Main FF.
+Tooling: container git unavailable → tree stamp read "unknown"; addon
+deployed a fallback to the trees/<sha> dirname; r2cmp.py on .80 hardcodes
+the gone /work/trees/r2 budget path — use each tree's own budget file or
+source119-80.sh ($TREE).
