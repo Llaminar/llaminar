@@ -181,3 +181,19 @@ exceptional-value and existing coverage findings.
   installed-width change; GNU-only != AppleClang qualification).
 - No grants. Half-perf checkpoint still needs the FP32-oracle/tree/completion
   + beta-state/API clarifications (relayed to the lane).
+
+## .80 disasm status — CORRECTED (2026-11-10, perf lane)
+
+- The relayed dumps = wrapper-only evidence (d1/d2 = ONE nonempty body =
+  _omp_fn.0 wrapper; dotRows = EMPTY headings; ZERO relocation records; the
+  'bl 0' = relocatable placeholder, not self-calls; 'no 256-lane structure'
+  UNSUPPORTED — source requires it). Verified wrapper counts = 8 FMUL + 4
+  FADD + 8 scalar FMADD (at offsets 1f0/1fc/208 = OUTPUT COMPLETION
+  alpha/bias/beta after BL, NOT the K loop).
+- .80 evidence folded as VERIFIED WRAPPER/DISPATCH ONLY. Actual hot-loop =
+  OUTSTANDING: need HalfRNE dotRows<4> bodies with `objdump -dr
+  --no-show-raw-insn` (relocations) or the complete object + exact compile
+  argv/source/object SHA identity; object tree = f9f190059 (older; bind to
+  777f-authenticated build). Local Grace TU evidence (FMLAL=0, scalar FMADD
+  per element, integer bit-arithmetic loaders) = the standing evidence for
+  the gap hypothesis. Perf lane sends corrected evidence note.
