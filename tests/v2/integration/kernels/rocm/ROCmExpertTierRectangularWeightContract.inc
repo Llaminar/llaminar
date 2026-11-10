@@ -37,7 +37,7 @@ TEST_F(ROCmExpertTierWeightKernelsTest, RectangularNativeMovementAllFormatsAndDi
         destinationCPU.payload_bytes=cpu.payload_bytes;destinationCPU.codebook_id=cpu.codebook_id;destinationCPU.is_superblock=cpu.is_superblock;destinationCPU.is_asymmetric=cpu.is_asymmetric;
         destinationCPU.encoding=cpu.encoding;destinationCPU.data_stride=cpu.data_stride;destinationCPU.interleaved_block_stride=cpu.interleaved_block_stride;
         destinationCPU.native_interleaved.resize_uninitialized(down.cpuStorageBytes());
-        std::span<uint8_t> finalCPU(destinationCPU.native_interleaved.data(),destinationCPU.native_interleaved.size());
+        auto finalCPU=destinationCPU.native_interleaved.unsealedGenerationBytes();
         std::fill(finalCPU.begin(),finalCPU.end(),0xa5);
         const auto promotionManifest=makeCpuToGpuExpertTierWeightStreamManifest(destinationCPU,82,0,7,ExpertTierWeightProjection::Down,2).forIntersection(backward);
         const auto up=promotionManifest.deviceLayout();
