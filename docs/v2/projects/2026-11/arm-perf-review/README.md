@@ -473,3 +473,38 @@ No two independent censuses inferred into a combined pass. Reclassified as
 superseded evidence: B9's c4536cf3c census (pre-S4 source) and the
 870bb545e AppleClang run. Bundle-1 = separate FF (own harness evidence;
 re-rebases onto the post-FF tip). No new runs before SETTLED.
+
+### Reviewer #165: B9 SOURCE ACK at f265d2950 (first grammar review)
+
+- Mechanical: parent 28ddbe253; c4536cf3c→f265 = 1/1 `=`; endpoints
+  byte-identical (+25/−1, exactly two tooling files); probe/envelope/
+  budgets/registrations match the donor.
+- Semantics SUPPORTED in CPUNativeTileRegisterEvidence.py: the two forms
+  (FORMS:187; widths 8/2 at :817-824); post-index uses the OLD base for the
+  transfer, reloads tracked whole-X pointer slots, advances the base after
+  (:1218, :1243-1244, :1261-1267); narrow W loads cannot become whole-
+  pointer reloads; partial reads of tracked pointer slots rejected
+  (:1286-1292); transferred-GPR/writeback-base overlap rejected BEFORE
+  transfer/state mutation with canonical X/W aliases (:1206-1210; covers
+  ldr pre/post + either ldp destination); structural failures fatal before
+  budget evaluation; no budget relaxation; the two named unsupported ldr
+  forms stay rejected (ldp x,x,mem,imm already admitted — do not
+  generalize). New test method :411-428 (5+5 cases) registered in Unit AND
+  ProductionTestPreflight.
+- NONBLOCKING strengthening recommendation: the new counters do not
+  distinguish correct post-increment from no increment; no actual stored-
+  stack-pointer reload through the new form; ldurh examples lack an
+  adjacent live pointer slot (2 vs 4 bytes indistinguishable). Recommend
+  offset-sensitive live-slot controls + an actual pointer-slot reload +
+  adjacent/overlapping narrow-read positives/negatives. DECISION: fold the
+  strengthening into the combined candidate as a SEPARATE 6th commit (B9
+  itself stays byte-identical to the ACKed f265d2950; the reviewer reviews
+  the 6th commit fresh in the combined re-pin — and since the test method
+  lives in the checker file, folding it now avoids ANOTHER checker_sha256
+  composition break later).
+- Q6_K remains S2 for Rows1 SDOT (incl. I8MM lone-row leaf); ASIMD/
+  shared-row/row-pair = S1; no installation changes; forced-S4 10/25 =
+  owner diagnostics, NOT installability; program_key still rejects forced
+  Strips!=0. Composition constraint reiterated: the final combined
+  source+checker/config needs its own canonical proof. No grants; Main owns
+  handover acceptance.
