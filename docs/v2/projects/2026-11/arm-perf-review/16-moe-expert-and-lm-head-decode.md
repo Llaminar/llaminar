@@ -49,3 +49,27 @@ LM head about 7 ms per row.
 
 - Per-stage CPU timing before and after, on 35B and 27B, MTP off and dynamic.
 - `Perf__CPUMoERouterVerifierRows`, `Perf__CPUFusedVerifier`.
+
+## Lane activated (2026-11-10, arm-addon2; plan outline APPROVED)
+
+- Code recon at the lane's base e8866ec04: the pooled fused launcher
+  (CPUNativeNEONProjectionBatch taskCount/runTask) exists and serves the
+  gate/up bundle; the multi-input expert-down launcher
+  (multiply_fused_expert_down → gemv_fused_multi_input_preq) and the GDN
+  4-member fused tensor path exist; a layer-batched grouped FFN transaction
+  (execute_moe_grouped_ffn_transaction_preq_decode_equivalent: ONE retained
+  team gate/up → exact SwiGLU-Q8 → down, expert-major rows, typed
+  MTPVerifier purpose) exists for grouped/verifier rows; the exact-overlay
+  table is empty/retired at this tip.
+- ATTRIBUTION DRIFT: the tracker's attribution commits (408ff90e5/264970e14)
+  are NOT ancestors of e8866ec04 (separate line) — the 274/176/394 µs
+  numbers must be re-measured at the current tip before Phase B claims.
+- APPROVED plan: Phase A measurement-only first (35B MTP off+dyn per-stage
+  timing + route/counter evidence at the then-current tip; window booked
+  after the combined receipts + Bundle-1 validation); Phase B candidates
+  B1 (route M=1 through the existing FFN transaction primitive) + B2
+  (shared-expert one-team transaction) + B3 (GDN pooling conditional on A) —
+  byte-neutral scheduling only, full written plan before implementation;
+  B4 (LM head) = evidence + a written top-k/shortlist sampler-contract
+  PROPOSAL, with the contract decision routed to the OPERATOR (semantics
+  change). Expected wins are hypotheses until A.
