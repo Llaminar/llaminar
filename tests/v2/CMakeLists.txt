@@ -39571,3 +39571,16 @@ if(TARGET v2_test_numa_topology_sysfs)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCallerNUMAOwnership)
     endif()
 endif()
+
+# Observe the original pre-cut tier inventory without changing solver policy.
+if(TARGET v2_unit_moe_overlay_residency_authority)
+    add_v2_test(V2_Integration_MoEPrecutTierCandidateWitness
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+            --gtest_filter=Test__MoEOverlayResidencyAuthority.PrecutTierWitnessRetainsIsolatedPositiveTailAndExhaustion
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Economy;Observability;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_PERF_STATS_FILTER=moe_overlay_residency.precut_tier_candidate_cut,moe_overlay_residency.projected_service_gain_ns")
+    if(TEST V2_Integration_MoEPrecutTierCandidateWitness)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEPrecutTierCandidateWitness)
+    endif()
+endif()

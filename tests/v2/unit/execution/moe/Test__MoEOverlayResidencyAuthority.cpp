@@ -11,6 +11,8 @@
  * that background planning cannot stall an already-active inference request.
  * Pipeline tests retain global model-layer identities while exercising compact
  * ownership, observed phase costs, frozen proposals and epoch publication.
+ * Pre-cut witnesses retain isolated candidate scores separately from the
+ * admitted transaction's coherent service estimate.
  */
 
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
@@ -4102,6 +4104,89 @@ namespace llaminar2::test
         ASSERT_NE(reserved, axis_admission->tags.end());
         EXPECT_EQ(reserved->second, "1")
             << "fairness may preempt economy for exactly one participant lane";
+    }
+
+    /**
+     * @brief Original solver exposes an isolated positive tail hidden by its tier cut.
+     *
+     * Four independently observed layers offer more positive tier exchanges
+     * than a two-tier-cycle subset admits. A larger bound exhausts that same
+     * candidate inventory; neither witness sums isolated forecasts or mutates
+     * the live placement. The production solver, not an authored counter, owns
+     * both observations.
+     */
+    TEST(Test__MoEOverlayResidencyAuthority,
+         PrecutTierWitnessRetainsIsolatedPositiveTailAndExhaustion)
+    {
+        for (const std::size_t cap : {3u, 9u})
+        {
+            SCOPED_TRACE(cap);
+            ScopedPerfStats perf;
+            constexpr int layer_count = 4;
+            auto histogram = fourParticipantHistogram(layer_count);
+            MoEOverlayResidencyAuthority authority({
+                .initial_plan = twoTierThreeCpuParticipantPlan(),
+                .model_metadata = eightExpertMetadata(layer_count),
+                .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+                .histogram = histogram.get(),
+                .phase_service_profile = twoTierServiceProfile(4, layer_count),
+                .migration_cost_profile = fourParticipantMigrationProfile(1, 1, layer_count),
+                .migration_economy_policy = MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 370,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                },
+                .participant_rebalance_policy = {.enabled = false},
+                .shadow_slots_per_endpoint_layer = 2,
+                .max_concurrent_cycles = cap,
+                .perf_device = "precut-tier-witness",
+            });
+            const auto window = observedPrefillLayers(1,
+                std::vector<std::vector<uint64_t>>(layer_count,
+                    {10, 9, 100, 90, 80, 70, 1, 1}));
+            const auto transaction = authority.proposeFromFrozenHistogramWindow(window);
+            ASSERT_TRUE(transaction.valid());
+            ASSERT_FALSE(transaction.empty());
+            EXPECT_EQ(authority.snapshot()->epoch, 1u);
+            const auto records = PerfStatsCollector::snapshot({"moe_overlay_residency"});
+            const auto *cut = findRecord(records, "precut_tier_candidate_cut");
+            ASSERT_NE(cut, nullptr);
+            EXPECT_EQ(cut->value, 1.0);
+            const auto count = [&](const char *name) { return std::stoull(cut->tags.at(name)); };
+            EXPECT_EQ(count("histogram_generation"), window->generation);
+            EXPECT_EQ(count("source_epoch"), 1u);
+            EXPECT_EQ(count("maximum_concurrent_cycles"), cap);
+            EXPECT_EQ(count("tier_cycle_budget"), cap - 1u);
+            EXPECT_GT(count("isolated_positive_tier_cycles"), 0u);
+            EXPECT_EQ(cut->tags.at("score_scope"), "isolated_cycle_against_observed_source_epoch");
+            EXPECT_EQ(cut->tags.at("joint_remainder_eligibility"), "not_evaluated");
+            EXPECT_EQ(count("candidate_tier_cycles"), count("selected_tier_cycles") +
+                count("shadow_rejected_before_cut") + count("cap_unvisited_tier_cycles"));
+            if (cap == 3u)
+            {
+                EXPECT_EQ(count("selected_tier_cycles"), 2u);
+                EXPECT_GT(count("isolated_positive_tier_cycles"),
+                          count("selected_isolated_positive_tier_cycles"));
+                EXPECT_GT(count("cap_unvisited_isolated_positive_tier_cycles"), 0u);
+                EXPECT_EQ(cut->tags.at("has_best_cap_unvisited_positive_cycle"), "true");
+                EXPECT_GT(count("best_cap_unvisited_isolated_projected_service_gain_ns"), 0u);
+                EXPECT_GT(count("best_cap_unvisited_isolated_projected_net_benefit_ns"), 0u);
+            }
+            else
+            {
+                EXPECT_EQ(count("cap_unvisited_tier_cycles"), 0u);
+                EXPECT_EQ(count("cap_unvisited_isolated_positive_tier_cycles"), 0u);
+                EXPECT_EQ(cut->tags.at("has_best_cap_unvisited_positive_cycle"), "false");
+                EXPECT_EQ(cut->tags.count("best_cap_unvisited_isolated_projected_service_gain_ns"), 0u);
+            }
+            // This existing record is the joint admitted-transaction estimate;
+            // the pre-cut family deliberately carries no sum of its scores.
+            const auto *joint = findRecord(records, "projected_service_gain_ns");
+            ASSERT_NE(joint, nullptr);
+            EXPECT_EQ(joint->tags.at("histogram_generation"), cut->tags.at("histogram_generation"));
+        }
     }
 
     /**

@@ -21,6 +21,8 @@
  * Each authority owns one exact global layer interval. Plans and movement
  * records keep global identities; price, forecast and hysteresis arrays store
  * only that interval's compact rows, rejecting evidence from another stage.
+ * Optional pre-cut evidence projects already-scored tier alternatives without
+ * treating isolated gains as a jointly feasible migration backlog.
  */
 
 #include "MoEOverlayResidencyAuthority.h"
@@ -4438,10 +4440,12 @@ namespace llaminar2
 
             participant_base_candidate =
                 build_tier_subset(selected_tier_cycles);
+            std::size_t attempted_tier_cycles = 0u;
             for (const std::size_t cycle_index : tier_cycle_order)
             {
                 if (selected_tier_cycles.size() >= tier_cycle_budget)
                     break;
+                ++attempted_tier_cycles;
                 auto trial_cycles = selected_tier_cycles;
                 trial_cycles.push_back(cycle_index);
                 auto trial_candidate = build_tier_subset(trial_cycles);
@@ -4467,6 +4471,69 @@ namespace llaminar2
             }
             participant_base_tier_cycles =
                 selected_tier_cycles.size();
+
+            // This is the original full tier axis, before participant planning
+            // and final cycle recomposition. The untouched tail was not tested
+            // jointly with selected work: its positive scores are ISOLATED
+            // observations against `previous`, never a summed speedup/backlog.
+            if (PerfStatsCollector::isRecordFamilyEnabled(
+                    "moe_overlay_residency", "precut_tier_candidate_cut"))
+            {
+                const auto isolated_positive = [](const BoundedTierCycleScore &score)
+                {
+                    return score.eligible && score.projected_service_gain_ns > 0u &&
+                           score.projected_net_benefit_ns > 0u;
+                };
+                const auto positive_count = static_cast<std::size_t>(std::count_if(
+                    tier_cycle_scores.begin(), tier_cycle_scores.end(), isolated_positive));
+                const auto selected_positive = static_cast<std::size_t>(std::count_if(
+                    selected_tier_cycles.begin(), selected_tier_cycles.end(),
+                    [&](std::size_t index) { return isolated_positive(tier_cycle_scores[index]); }));
+                std::size_t cap_unvisited_positive = 0u;
+                std::optional<std::size_t> best_unvisited;
+                for (std::size_t position = attempted_tier_cycles;
+                     position < tier_cycle_order.size(); ++position)
+                {
+                    const auto index = tier_cycle_order[position];
+                    if (!isolated_positive(tier_cycle_scores[index]))
+                        continue;
+                    ++cap_unvisited_positive;
+                    if (!best_unvisited)
+                        best_unvisited = index; // Existing net-benefit order.
+                }
+                PerfStatsCollector::Tags tags{
+                    {"histogram_generation", std::to_string(transaction.histogram_generation)},
+                    {"source_epoch", std::to_string(previous->epoch)},
+                    {"observed_window_tokens", std::to_string(observed_evidence.tokenCount())},
+                    {"candidate_tier_cycles", std::to_string(tier_cycle_order.size())},
+                    {"isolated_positive_tier_cycles", std::to_string(positive_count)},
+                    {"selected_tier_cycles", std::to_string(selected_tier_cycles.size())},
+                    {"selected_isolated_positive_tier_cycles", std::to_string(selected_positive)},
+                    {"cap_unvisited_tier_cycles", std::to_string(tier_cycle_order.size() - attempted_tier_cycles)},
+                    {"cap_unvisited_isolated_positive_tier_cycles", std::to_string(cap_unvisited_positive)},
+                    {"shadow_rejected_before_cut", std::to_string(attempted_tier_cycles - selected_tier_cycles.size())},
+                    {"tier_cycle_budget", std::to_string(tier_cycle_budget)},
+                    {"maximum_concurrent_cycles", std::to_string(config_.max_concurrent_cycles)},
+                    {"economy_enabled", config_.migration_economy_policy ? "true" : "false"},
+                    {"score_scope", "isolated_cycle_against_observed_source_epoch"},
+                    {"joint_remainder_eligibility", "not_evaluated"},
+                    {"has_best_cap_unvisited_positive_cycle", best_unvisited ? "true" : "false"},
+                };
+                if (best_unvisited)
+                {
+                    const auto &score = tier_cycle_scores[*best_unvisited];
+                    tags.emplace("best_cap_unvisited_cycle_index", std::to_string(*best_unvisited));
+                    tags.emplace("best_cap_unvisited_isolated_projected_service_gain_ns",
+                                 std::to_string(score.projected_service_gain_ns));
+                    tags.emplace("best_cap_unvisited_isolated_projected_net_benefit_ns",
+                                 std::to_string(score.projected_net_benefit_ns));
+                }
+                // The existing final projected_service_gain_ns record owns the
+                // coherent admitted-transaction score. Do not sum this vector.
+                PerfStatsCollector::addCounter("moe_overlay_residency",
+                    "precut_tier_candidate_cut", 1.0, "maintenance",
+                    config_.perf_device, std::move(tags));
+            }
         }
 
         MoEOverlayParticipantRebalancePolicy participant_search_policy =

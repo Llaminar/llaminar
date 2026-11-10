@@ -42,7 +42,8 @@ placement match. Runtime pause-loop cycle shares are not removable wall time.
 **Native Q8 candidates stay unpromoted:** MI50 **1.106–1.366×**, XTX
 **1.088–1.103×** component wins; installed-Auto gates pass, but model decode
 results overlap the control noise. Table-only rebuild takes **3.90s**.
-Next: CPU expert work and bounded movement economics toward 500P.
+Next: [exact cache batching and migration cuts](../2026-11/QFN_HYBRID_POST_AFFINITY_ATTRIBUTION_20261110.md).
+Fresh GPU trace:699ms root wait,45ms ngram policy; result copy near its measured transport ceiling.
 [Scope/results](../2026-11/QFN_ROCM_NATIVE_Q8_PREFILL_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
 [timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md),
