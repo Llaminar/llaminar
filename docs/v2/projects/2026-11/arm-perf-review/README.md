@@ -437,3 +437,10 @@ hand the GPU over on that outcome, not a wholly green padding cell). Further
 pushes expected (2 arena/transfer fixes, possibly tile/occupancy). Main will
 publish ONE settled exact SHA + overlap list for the final
 rebase/re-pin/bound gates. e5ee7f672 = current CUDA build/rerun target.
+
+- (addendum) The addon's Mac AppleClang 9-cell at 870bb545e completed one
+  minute before the hold arrived: GREEN (9× exit=0 tree=870bb545e, Rows1=0,
+  budgets 1415/2003/2171 byte-equal, no foreign sources). Recorded as
+  **superseded evidence, NOT a receipt** (binds a soon-dead SHA); JSONs
+  archived at arm-addon-notes/evidence/census-870bb545e-appleclang/. Value =
+  strong prior for the final census at the settled install SHA.
