@@ -8,6 +8,7 @@
  */
 #include "../../utils/PlanningHostServiceFixture.h"
 #include "planning/OrchestrationCandidateAdmission.h"
+#include "planning/PlanningForwardWeightWork.h"
 #include "fixtures/planning/RecordedNgramOrdering.h"
 #include "config/OrchestrationConfigParser.h"
 #include "loaders/ResolvedImmutableRowTablePlacement.h"
@@ -29,6 +30,8 @@ ClusterInventory publicationInventory()
     rank.cpu.numa_node = 0;
     rank.cpu_cores = rank.cpu_worker_threads = 8;
     rank.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    rank.cpu.numa_node = 0;
+    rank.numa_nodes = 1;
     rank.cpu.memory_bytes = rank.cpu.free_memory_bytes = rank.cpu_memory_bytes = 512ULL << 30;
     for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
         rank.gpus.push_back({.type = backend, .local_device_id = 0,
@@ -81,6 +84,33 @@ TEST(MoEPipelineNgramPublication, PublishesExactPlacementWithTheAdmittedRows)
             policy.retained_host_services=test::planningHostServiceBudgets(1);
             const auto admitted = AdmittedOrchestrationCandidate::admit(candidate,source,policy);
             ASSERT_TRUE(admitted.pipelineMemory());
+            for (const auto phase : {PlanningMainForwardPhase::Prefill, PlanningMainForwardPhase::Decode})
+            {
+                int terminal_mixers = 0, lookup_consumers = 0;
+                const auto work = compilePlanningForwardWeightWork(source.metadata(), admitted, phase);
+                ASSERT_EQ(work.size(), 2u);
+                for (const auto &participant : work)
+                    for (const auto &operation : participant.ordinary)
+                    {
+                        EXPECT_FALSE(std::holds_alternative<PlanningUnclassifiedWeight>(operation));
+                        std::visit([&](const auto &value) {
+                            if (value.weight.source_name.starts_with("output_hc_"))
+                            {
+                                ++terminal_mixers;
+                                EXPECT_EQ(participant.device, DeviceId::rocm(0));
+                                EXPECT_EQ(value.weight.invocation_site, PlanningWeightInvocationSite::Terminal);
+                            }
+                        }, operation);
+                        if (const auto *lookup = std::get_if<PlanningImmutableLookupWeight>(&operation))
+                        {
+                            ++lookup_consumers;
+                            EXPECT_EQ(lookup->consumer_layer, 1);
+                            EXPECT_EQ(participant.device, first_stage ? DeviceId::cuda(0) : DeviceId::rocm(0));
+                        }
+                    }
+                EXPECT_EQ(terminal_mixers, 3);
+                EXPECT_EQ(lookup_consumers, 1);
+            }
             const auto &pipeline = *admitted.pipelineMemory();
             const auto &sealed = pipeline.rankPlan().runtime;
             ASSERT_TRUE(sealed.ngram_table_placement);
