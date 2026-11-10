@@ -44,7 +44,9 @@
  * worker for the same prepared N panel, without changing either pair kernel.
  * GPU-aligned fused row pairs use the bounded ordered nibble kernel for all
  * eligible prepared nibble encodings. Decoder, original scale factors and
- * asymmetry remain tensor-owned; fixed K partitions and their FP32 fold do not
+ * asymmetry remain tensor-owned; pair dots merge independent exact integer
+ * half-block chains before the original compensation and FP contribution.
+ * Fixed K partitions and their FP32 fold do not
  * depend on the physical row or column tile.
  * Resolved WideRows three-row nibble tiles retain two sixteen-column segments
  * and the ordered fold directly; policy selection and two-row kernels stay separate.
@@ -2438,8 +2440,9 @@ namespace llaminar2::cpu::native_quantised
      * @brief Execute two GPU-aligned rows with shared decode and no partial plane.
      *
      * Two 32-column halves bound live state to four running reductions, four
-     * partition accumulators, and four integer dot accumulators. That fits the
-     * AVX-512 register file while each decoded weight vector feeds both rows.
+     * partition accumulators, and eight low/high integer dot accumulators.
+     * Each decoded weight vector feeds both rows. Integer halves merge before
+     * the original compensation/FP contribution, without moving any FP boundary.
      * Partition boundaries and the increasing left-fold exactly match the
      * heterogeneous projection contract.
      *
@@ -2522,7 +2525,15 @@ namespace llaminar2::cpu::native_quantised
                     __m512i int0_1 = _mm512_setzero_si512();
                     __m512i int1_0 = _mm512_setzero_si512();
                     __m512i int1_1 = _mm512_setzero_si512();
+                    __m512i high0_0 = _mm512_setzero_si512();
+                    __m512i high0_1 = _mm512_setzero_si512();
+                    __m512i high1_0 = _mm512_setzero_si512();
+                    __m512i high1_1 = _mm512_setzero_si512();
 
+                    // Low/high16 integer sums are independent dependency chains.
+                    // Even the signed-byte decoder bound is only16*255*128
+                    // per half, well within INT32. Merge the exact integers
+                    // BEFORE original compensation, FP conversion or scaling.
                     for (int group = 0; group < 4; ++group)
                     {
                         const __m512i raw0 = _mm512_load_si512(
@@ -2556,35 +2567,37 @@ namespace llaminar2::cpu::native_quantised
                                 mask_0F,
                                 q4_zero_offset);
 
-#define ORDERED_2ROW_DOT_HALF(ROW, A, B0, B1)                                \
-                        if constexpr (unsigned_identity)                      \
+#define ORDERED_2ROW_DOT_HALF(INT0, INT1, A, B0, B1)                           \
+                        if constexpr (unsigned_identity)                       \
                         {                                                      \
-                            int##ROW##_0 = _mm512_dpbusd_epi32(                \
-                                int##ROW##_0, B0, A);                         \
-                            int##ROW##_1 = _mm512_dpbusd_epi32(                \
-                                int##ROW##_1, B1, A);                         \
+                            INT0 = _mm512_dpbusd_epi32(INT0, B0, A);           \
+                            INT1 = _mm512_dpbusd_epi32(INT1, B1, A);           \
                         }                                                      \
                         else                                                   \
                         {                                                      \
-                            int##ROW##_0 = _mm512_dpbusd_epi32(                \
-                                int##ROW##_0, A, B0);                         \
-                            int##ROW##_1 = _mm512_dpbusd_epi32(                \
-                                int##ROW##_1, A, B1);                         \
+                            INT0 = _mm512_dpbusd_epi32(INT0, A, B0);           \
+                            INT1 = _mm512_dpbusd_epi32(INT1, A, B1);           \
                         }
 #define ORDERED_2ROW_DOT(ROW, BLOCK)                                           \
                         {                                                      \
                             const __m512i a_low = _mm512_set1_epi32(           \
-                                activation_word(BLOCK, group * 4));           \
-                            ORDERED_2ROW_DOT_HALF(ROW, a_low, low0, low1)      \
+                                activation_word(BLOCK, group * 4));            \
+                            ORDERED_2ROW_DOT_HALF(int##ROW##_0, int##ROW##_1,  \
+                                a_low, low0, low1)                             \
                             const __m512i a_high = _mm512_set1_epi32(          \
-                                activation_word(BLOCK, group * 4 + 16));      \
-                            ORDERED_2ROW_DOT_HALF(ROW, a_high, high0, high1)   \
+                                activation_word(BLOCK, group * 4 + 16));       \
+                            ORDERED_2ROW_DOT_HALF(high##ROW##_0, high##ROW##_1,\
+                                a_high, high0, high1)                          \
                         }
                         ORDERED_2ROW_DOT(0, a0)
                         ORDERED_2ROW_DOT(1, a1)
 #undef ORDERED_2ROW_DOT
 #undef ORDERED_2ROW_DOT_HALF
                     }
+                    int0_0 = _mm512_add_epi32(int0_0, high0_0);
+                    int0_1 = _mm512_add_epi32(int0_1, high0_1);
+                    int1_0 = _mm512_add_epi32(int1_0, high1_0);
+                    int1_1 = _mm512_add_epi32(int1_1, high1_1);
 
                     if constexpr (!unsigned_identity)
                     {
@@ -2606,8 +2619,13 @@ namespace llaminar2::cpu::native_quantised
 
                     const uint16_t *scales =
                         packed.chunkScales(chunk, kb) + zbase * 16;
-                    const __m512 scale0 = packed.loadScales512(scales);
-                    const __m512 scale1 = packed.loadScales512(scales + 16);
+                    // The original decoder-specialized M1 helper already
+                    // proves ordinary halves for linear/identity metadata.
+                    // Reuse it here so impossible IQ3_S/IQ4_XS factor masks
+                    // need not stay live across eight integer dot chains.
+                    // LUT keeps the original source-factor loader/equation.
+                    const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, scales);
+                    const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, scales + 16);
                     const float a0_scale =
                         nativeQuantisedFP16ScaleToFP32(a0.d);
                     const float a1_scale =

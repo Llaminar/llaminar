@@ -39679,3 +39679,23 @@ if(TARGET v2_unit_moe_overlay_residency_authority)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEIsolatedTierSwapJointAuthorityReplay)
     endif()
 endif()
+
+
+# Integer-only ordered nibble dependency split; original serial/M1 and AVX2 controls.
+if(TARGET v2_integration_cpu_native_quantised_fused_completion)
+    foreach(_split_dot_isa AVX2 AVX512)
+        if(_split_dot_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+            continue()
+        endif()
+        string(TOLOWER "${_split_dot_isa}" _split_dot_runtime_isa)
+        add_v2_test(V2_Integration_CPU_NativeQuantisedNibbleDotILP_${_split_dot_isa}
+            COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+                --gtest_filter=CPUNativeQuantisedFusedCompletion.OrderedNibbleSplitDotBoundaryLifecycle
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MoE;MTP;Prefill;${_split_dot_isa};ByteExact;Contract;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+            ENVIRONMENT "LLAMINAR_ISA_LEVEL=${_split_dot_runtime_isa}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
+        if(TEST V2_Integration_CPU_NativeQuantisedNibbleDotILP_${_split_dot_isa})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPU_NativeQuantisedNibbleDotILP_${_split_dot_isa})
+        endif()
+    endforeach()
+endif()

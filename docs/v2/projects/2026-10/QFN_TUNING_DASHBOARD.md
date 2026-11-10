@@ -7,9 +7,9 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Working9-slot/9-cycle policy: **335.999/40.798 P/D**; same-capacity cap5
-**330.527/39.668** (+1.66%/+2.85%). IDs/MTP match. Global defaults unchanged;
-500/40 remains open. [Wave results](../2026-11/QFN_HYBRID_NINE_SLOT_MIGRATION_20261110.md).
+Current nine-slot CPU-ILP slice: **339.306/40.566 P/D**, versus control
+335.999/40.798. All 768 IDs/MTP match; movement differs, so no causal model
+speedup claimed. Global defaults unchanged; 500/40 remains open. [Wave results](../2026-11/QFN_HYBRID_NINE_SLOT_MIGRATION_20261110.md).
 Cycle proposal **1.23× faster**, model gain unproven;14 focused gates pass.
 [Cycle results](../2026-11/QFN_ORDERED_MIGRATION_CYCLES_20261110.md).
 [Measured M448 dispatch](../2026-11/QFN_ROCM_M448_NATIVE_Q8_20261110.md),
@@ -36,16 +36,17 @@ CPU Auto: all21 byte-exact; mixed FFN improves **2.5–14%** in16 formats,
 five within **+2.5%**. QFN-shaped FFN saves **26–31%** in both row orders.
 Cache/work block sizes1–4 pass; model uses Auto. CPU-result readiness remains next.
 [All-format evidence](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md).
-**Latest CPU slice:** the eight-row candidate passes bytes/spills but loses
-in reversed timing order; production retains paired rows. [Decision](../2026-11/QFN_CPU_EIGHT_ROW_REGISTER_TILE_20261109.md).
+**Latest CPU slice:** exact pair-dot ILP passes bytes and spill inspection;
+QFN gate/up improves **4.5%**, persistent FFN **1.9–2.5%**. Five nibble formats
+qualified in both roles; full preflight next. [Results](../2026-11/QFN_CPU_PAIR_DOT_ILP_20261110.md).
 **GNU wait policy stays unchanged:** unset **299.560P/38.994D**; spin0
 199.393/29.381 and spin1000 203.445/32.726 regress. All 768 IDs/MTP/config/initial
 placement match. Runtime pause-loop cycle shares are not removable wall time.
 [OpenMP evidence](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
 **Native Q8:** M448 measured tiles installed on gfx906/gfx1100;
 M64 remains unchanged. Original whole four-cell candidate stays unpromoted.
-CPU ILP parked at emitted-body spill check; next: native compact-route arithmetic witness.
-Fresh trace:665ms root wait,20.7ms pooled lookup; result copy near its measured transport ceiling.
+Compact-route witness: MI50 exact; CUDA subnormal normalization differs.
+No transport change installed. [Boundary](../2026-11/QFN_NATIVE_ROUTE_COMPACTION_BOUNDARY_20261110.md).
 [Scope/results](../2026-11/QFN_ROCM_NATIVE_Q8_PREFILL_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
 [timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md),
@@ -73,7 +74,7 @@ logits; component savings do not establish model gain.
 
 | Next action | State / decision |
 |---|---|
-| Admission / SDK10.1 | **Scoped final gates green; full preflight deferred.** Host 53/53 (5.105s), repaired RCCL 9/9 (36.549s, all four original storage cases), HIP 19/19 on each ISA, NUMA 13/13 and full-visibility inventory 4/4. Actual P2P proof 11 policies/2,640 checks: native 0 failures/original 96. lto-build8 GREEN 37.282 s; configure14/build5 exit0 (1216.682/179.489s). Receipt-prefix and probe-logging follow-ups pass. [SDK evidence](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md). |
+| Admission / SDK10.1 | **Full Unit/preflight is next, before more tuning.** Prior focused host 53/53, RCCL 9/9, HIP 19/19 per ISA, NUMA 13/13 and inventory 4/4 pass. Fresh full-backend Integration build must qualify the complete current inventory; prior results do not replace it. [SDK evidence](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md). |
 | Six-GPU moving MTP | Prior CUDA2 continuation + MI50×4 follower fixed1/fixed3/dynamic slices pass: 57 host +16 native, 40 cancellation lifetimes, 2,416 byte comparisons, four prefix histories and eight migrations. All contexts retire. This earlier slice is not a complete current SDK/model certificate. [Focused qualification](../2026-11/QFN_RECURRENT_SIX_GPU_MTP_FOCUSED_QUALIFICATION_20261106.md). |
 | Native lifetime | [Captured component proof](../2026-11/QFN_READ_AHEAD_NATIVE_CAPTURE_QUALIFICATION.md): CUDA/ROCm each pass 40 lifetimes and 800 replays. [Early-current RAM/SSD proof](../2026-11/QFN_EARLY_CURRENT_CAUSAL_FOCUSED_20261105.md) and [ROCm TP2 fixed1/shared-owner proof](../2026-11/QFN_POOLED_CURRENT_READAHEAD_FOCUSED_20261106.md) pass. These establish scoped correctness and causal progress; combined-cache/dynamic-MTP Release overlap remains unqualified. Current hybrid benchmarks use ConsumerScheduled and warm all-hit requests. [Policy/overlap audit](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
 | Continuation / ngrams | Prior ROCm TP2 shared-owner RAM/fixed3 and SSD/fixed1 slices pass 2,416/1,208 byte comparisons, four prefix histories, public generation and retirement. Current hybrid uses ConsumerScheduled; combined-cache/dynamic-MTP Release overlap remains unqualified. [Shared-owner evidence](../2026-11/QFN_SHARED_OWNER_MTP_IDENTITY_FOCUSED_20261106.md), [policy/overlap](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |

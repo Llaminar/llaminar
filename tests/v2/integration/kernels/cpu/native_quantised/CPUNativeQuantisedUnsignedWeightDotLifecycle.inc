@@ -2,6 +2,8 @@
  * @file CPUNativeQuantisedUnsignedWeightDotLifecycle.inc
  * @brief Authored signed-activation boundaries preserve prepared-format row bytes.
  *
+ * The ordered pair additionally exercises independent low/high integer sums
+ * with opposing signed extrema before the unchanged FP contribution/fold.
  * Canonical source factories and the public serial kernel own grouped-row
  * oracles. Actual identity-nibble M1 additionally uses an independent scalar
  * original biased-integer witness, since its public serial entry also changes. Identity-nibble inputs also authenticate unsigned decoded ranges and
@@ -558,5 +560,111 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
         }
     }
 }
+/** @test Exact integer half-block merging preserves original serial bytes and retained scheduler ownership. */
+TEST(CPUNativeQuantisedFusedCompletion, OrderedNibbleSplitDotBoundaryLifecycle)
+{
+    using namespace cpu::native_quantised;
+    constexpr int n = 65, k = 768, max_rows = 9, stride = n + 7;
+    constexpr float guard = -12345.0f;
+    // A signed decoder can emit any INT8. The original biased program and
+    // both16-value halves are far below INT32 limits; direct identity dots
+    // are smaller still. No saturating instruction or FP operation is moved.
+    static_assert(32 * 255 * 128 < std::numeric_limits<int32_t>::max());
+    static_assert(16 * 255 * 128 == 522240);
+    static_assert(32 * 128 * 15 == 61440);
+    int nibble_sources = 0;
+    for (const auto &format : quantizedVerifierFormats())
+    {
+        auto source = format.create({size_t(n * 2), size_t(k)}, 9817);
+        CPUNativeQuantisedGemmKernel kernel(source.get(), n, 2 * n,
+            CPUProjectionNumericalPolicy::GPUAlignedExpert);
+        ASSERT_TRUE(kernel.isValid());
+        const auto &packed = kernel.packedWeights();
+        if (!packed.usesNibbleLUT()) continue;
+        ++nibble_sources;
+        SCOPED_TRACE(format.label);
+        ASSERT_EQ(packed.codebook_id, format.source_codebook_id);
+        ASSERT_EQ(packed.is_superblock, format.source_is_superblock);
+        const auto workspace = packed.native_interleaved;
+        std::vector<Q8_1Block> input(size_t(max_rows) * packed.blocks_per_row);
+        const size_t extent = size_t(max_rows) * stride + 17;
+        for (int bank = 0; bank < 2; ++bank)
+        {
+            UnsignedDotBankScope binding(packed, bank ? workspace.data() : nullptr);
+            for (int workers : {1, 3, 7})
+            {
+                FusedCompletionScope runtime(workers, std::nullopt);
+                int replay = 0;
+                for (int rows : {max_rows, 2, 1, 7})
+                {
+                    SCOPED_TRACE("bank=" + std::to_string(bank) + " workers=" +
+                        std::to_string(workers) + " rows=" + std::to_string(rows));
+                    for (size_t block = 0; block < input.size(); ++block)
+                    {
+                        auto &activation = input[block];
+                        activation.d = fp32_to_fp16(0.0078125f * (1 + block % 7));
+                        activation.sum_qs = 0;
+                        for (int lane = 0; lane < 32; ++lane)
+                        {
+                            // Opposite signed extrema in low/high halves, then
+                            // same-sign extrema, exercise cancellation and bounds.
+                            const bool high = lane >= 16;
+                            const bool positive = replay < 2 ? (high != bool((block + replay) & 1))
+                                                             : replay == 3;
+                            activation.qs[lane] = positive ? int8_t(127) : int8_t(-128);
+                            activation.sum_qs += activation.qs[lane];
+                        }
+                    }
+                    std::vector<float> reference(extent, guard);
+                    NativeQuantisedTestPartialStorage serial(packed, 1);
+                    for (int row = 0; row < max_rows; ++row)
+                        gemv_native_quantised_preq(packed,
+                            input.data() + size_t(row) * packed.blocks_per_row,
+                            reference.data() + size_t(row) * stride, serial.span());
+                    for (const auto purpose : {ProjectionRowsPurpose::Prefill, ProjectionRowsPurpose::MTPVerifier})
+                    {
+                        SCOPED_TRACE(projectionRowsPurposeName(purpose));
+                        std::array<std::vector<float>, 2> output, expected;
+                        std::array<FusedVerifierRowsDesc, 2> descriptors;
+                        for (int member = 0; member < 2; ++member)
+                        {
+                            const int live_rows = std::max(1, rows - member);
+                            output[member].assign(extent, guard);
+                            expected[member].assign(extent, guard);
+                            for (int row = 0; row < live_rows; ++row)
+                                std::memcpy(expected[member].data() + size_t(row) * stride,
+                                    reference.data() + size_t(row) * stride, n * sizeof(float));
+                            descriptors[member] = {.packed = &packed, .output = output[member].data(),
+                                .N = n, .ldc = stride, .rows = live_rows,
+                                .verifier_schedule = live_rows == 1 ? VerifierRowsPolicy::Auto : VerifierRowsPolicy::Pairwise,
+                                .purpose = purpose};
+                        }
+                        const auto plan = planNativeQuantisedFusedRows(descriptors, max_rows, workers, ISAPath::AUTO);
+                        EXPECT_EQ(plan.projections[0].k_tiles,
+                            MoEProjectionNumericalContract::orderedKPartitionsForWidth(k));
+                        EXPECT_EQ(plan.projections[0].k_blocks_per_tile, 2);
+                        if (rows >= 7)
+                        {
+                            // Both descriptors expose enough original N64 owners
+                            // at every tested width. AVX512 must execute the
+                            // changed ordered pair, not only a shared-bank leaf.
+                            ASSERT_EQ(plan.partial_route, NativeQuantisedFusedPartialRoute::OutputTileLocal);
+                            if (activeISALevel() >= ISALevel::AVX512)
+                                EXPECT_EQ(plan.projections[0].verifier_resolution.physical_row_tile, 2);
+                        }
+                        NativeQuantisedTestPartialStorage partials(plan.sharedPartialFloats());
+                        ASSERT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(input.data(),
+                            descriptors.data(), partials.span(), 2, max_rows, packed.blocks_per_row, ISAPath::AUTO));
+                        for (int member = 0; member < 2; ++member)
+                            EXPECT_EQ(std::memcmp(output[member].data(), expected[member].data(), extent * sizeof(float)), 0);
+                    }
+                    ++replay;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(nibble_sources, 5); // Original canonical Q4_0/Q4_1/Q4_K/IQ4_NL/IQ4_XS factories.
+}
+
 } // namespace
 } // namespace llaminar2::test
