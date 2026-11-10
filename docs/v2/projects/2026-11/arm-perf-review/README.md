@@ -844,3 +844,25 @@ e8866ec04), static code/registration only:
   full-project CMake registration (portability ≠ tests/v2/CMakeLists.txt) —
   the native proofs stand but are NOT execution of the new cell; #166/#167
   binding/final-set rules unchanged. Corrected successor requested.
+
+### #169 fix-back (addon, 2026-11-10): combined tip = ee7bf0596
+
+Stack: 5 ACKed patches unchanged → a16591eed → **ee7bf0596** (test-only
+fix-back; origin FF; .80 i31final updated; trees seeded, HEAD verified
+clean). Addresses both P2s:
+- I31-C1: admit() parses STRIPS in [0,4] (3 still rejected; advertised
+  grammar updated); runStrips() gains `case 0: return
+  run<Instruction,0>(batch)` — the real production selection
+  (execute<Instruction,0> → per-encoding panelStrips); positive self-test
+  control "installed width 0 admitted" (strips 0, asimd, Q4_0/IQ4_NL); the
+  registered cell IS the positive real-entry run; the I8MM M>=2 rejection
+  now reads "strips > 1" (0 always admissible).
+- I31-C2: default formats + the cell explicitly include Q4_0 and IQ4_NL
+  (the no-minimum centered/nonlinear NibbleLUT branch); IQ4_XS stays at its
+  S2 source-scale width; the cell exercises every S4-installed source.
+- Checks unchanged: Strips=0-vs-1 byte identity, per-invocation dirty,
+  guard words, immutable inputs, retained team with observed width;
+  metamorphic wording stated in the cell docs. Core-free scope honesty
+  confirmed. Mac: self-test 0 failed; real STRIPS=0 run over all 7 formats
+  passes byte checks + CSV strips=0; STRIPS=3 still rejected (updated
+  message). No FF until re-review + GNU receipt + focused set at ee7bf0596.
