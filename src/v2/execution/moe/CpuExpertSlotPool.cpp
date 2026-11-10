@@ -260,7 +260,7 @@ namespace llaminar2
             if (!type)
                 throw std::invalid_argument(
                     "CPU floating expert slot lacks a floating tensor type");
-            constexpr std::size_t allocation_alignment =
+            const std::size_t allocation_alignment =
                 NUMAAllocator::externalRangeAlignment();
             switch (*type)
             {
