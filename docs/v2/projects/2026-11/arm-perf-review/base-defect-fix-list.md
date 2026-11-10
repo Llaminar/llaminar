@@ -71,3 +71,20 @@ future 64K ARM; x86 unaffected (hwloc path) for B5, 4K-normal for B1/B2/B6.
 - NOTE: page-owner tests on Docker need --cap-add SYS_NICE + seccomp=
   unconfined (get_mempolicy EPERM otherwise) — separate from the page fix;
   record in test/CI docs.
+
+## B-series DONE on #43 — tip 9490b66bc (2026-11-10)
+- 6e049131b: the 3 64K test-expectation fixes (fabric page = hostPageBytes();
+  expert geometry = page-aligned slot bound; bound>=actual &&
+  bound-actual < one host page).
+- 4bf9ae83f B5: exact cpulist parse over every nodeN (both substring
+  directions + sparse/duplicate/malformed).
+- 524afd11e B3: DeviceRegistry = NodeTopology (CPU-bearing nodes only,
+  ascending) + Grace-shaped fixture; registry == NodeTopology on host.
+- 9490b66bc B4 (per G5): all planner/backend consumers already reject failed
+  detection; the ONE real ignore = RuntimeInitPhase DeviceManager::initialize
+  (took node0 as socket-local view) -> failed detection now publishes node -1,
+  method "undetected" (host-wide view); no top-level fail-fast.
+- All four in ProductionTestPreflight; Mac OK except known no-NUMA-sysfs
+  env class. Open: B8 (idea-20 residual), B9 (addon R2). Grace re-run of the
+  3 flipped tests at 9490b66bc = requested (would close B1-B7 there). Test
+  docs: page-owner tests in Docker need SYS_NICE + seccomp=unconfined.
