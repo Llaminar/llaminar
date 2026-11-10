@@ -175,3 +175,14 @@ in the plan. Any NibbleMap touch points must remain seam-based.
   when R2 arm + solo gated-cell rerun land; not claimed yet).
 - Orders: r2gate2 f69446e3c 777f7a52a → window-r2e f69446e3c 777f7a52a;
   GB10 CUDA gates at f69446e3c (.79) in parallel.
+
+## A1 COMPLETE — ALL GREEN (2026-11-10, f69446e3c/777f7a52a)
+
+- Byte identity: generated_token_ids sha256 IDENTICAL base==R2 ABBA across
+  ALL 4 cells (35B/27B x nomtp/mtp, 256 tokens each).
+- ECONOMY (decode tok/s, ABBA mean): 35B-nomtp 23.2 -> 25.3 (+8.9%);
+  35B-mtp 34.1 -> 34.8 (+2.0%); 27B-nomtp 5.30 -> 6.14 (+15.8%);
+  27B-mtp 5.58 -> 5.78 (+3.7%). Prefill ~neutral (<=1%). ZERO regressions.
+- R2 EVIDENCE COMPLETE: gate (0 new/0 gone; census 12/12, 9/9, 0 mismatches),
+  r2fa (base/env, idea22), A1 (green, byte-identical, decode wins).
+  remaining: #151 fix-back -> reviewer recheck -> WSL gate -> handover.
