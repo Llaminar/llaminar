@@ -20,16 +20,20 @@
  * rather than mislabelled.
  *
  * Publication: the Strips = 1 reference runs twice over two distinct dirty
- * patterns and must agree byte for byte, which proves it wrote every live
- * element. Before every timed invocation (outside the timed interval) the
+ * patterns, must agree byte for byte and must be finite (the fixture is), which
+ * proves it wrote every live element and cannot equal either dirt sentinel.
+ * Before every timed invocation (outside the timed interval) the
  * output is dirtied with a pattern that alternates between iterations, and
  * afterwards it must equal the reference, so an invocation that omits an
  * element or publishes nothing cannot pass on stale bytes. Guard words around
  * the output span, the weights and the activations are checked after each
- * cell. LLAMINAR_PANEL_SELF_TEST=1 runs negative controls of these checks and
- * of the input admission instead of timing.
+ * cell. LLAMINAR_PANEL_SELF_TEST=1 runs, instead of timing, admission controls
+ * (hostile inputs and an admissible workload) and publication controls through
+ * the real reference and timing wrappers (complete, omitted, no-op, stale,
+ * dirt-valued and nonfinite writers).
  *
- * Environment (all optional; every value is admitted before any allocation):
+ * Environment (all optional; every value is admitted before any allocation;
+ * numbers are canonical decimals, so list entries are unique by value):
  * - LLAMINAR_PANEL_STRIPS: 1, 2 or 4 (default 1); panels tile a 64-column chunk
  * - LLAMINAR_PANEL_ISA: asimd | dotprod | i8mm (default dotprod when compiled)
  * - LLAMINAR_PANEL_FORMATS: unique source labels (default Q4_K,Q6_K,IQ3_S,IQ4_XS,Q8_0)
@@ -39,7 +43,8 @@
  *
  * Output: one CSV line per cell:
  * format,n,k,m,threads,isa,strips,median_us,p95_us,min_us,iters
- * where threads is the observed width of the timing team.
+ * where threads is the observed width of the timing team and isa is the
+ * selected family (a lone I8MM row executes the SDOT leaf).
  */
 #include "kernels/cpu/gemm/CPUNativeNEONProjectionBatch.h"
 #include "utils/NativeQuantisedPreparedByteFixture.h"
@@ -50,6 +55,7 @@
 #include <bit>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -74,14 +80,18 @@ std::string env(const char *name, const char *fallback)
 }
 
 /**
- * @brief Parse a complete decimal integer inside [low, high].
- * @throws std::invalid_argument For empty text, trailing characters or a value out of range.
+ * @brief Parse a complete canonical decimal integer inside [low, high].
+ * @throws std::invalid_argument For empty or non-canonical text (leading zeros), trailing
+ * characters or a value out of range.
  */
 int integer(std::string_view text, int low, int high, const char *what)
 {
     int value = 0;
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (text.empty() || error != std::errc{} || end != text.data() + text.size() || value < low || value > high)
+    // Canonical decimal only: no leading zeros, so distinct text means a distinct value.
+    const bool canonical = !text.empty() && (text == "0" || text.front() != '0') &&
+        !(text.size() > 1 && text.front() == '-' && text[1] == '0');
+    if (!canonical || error != std::errc{} || end != text.data() + text.size() || value < low || value > high)
         throw std::invalid_argument(std::string(what) + " must be an integer in [" + std::to_string(low) + ", " +
             std::to_string(high) + "]: '" + std::string(text) + "'");
     return value;
@@ -174,6 +184,8 @@ Workload admit(const std::function<std::string(const char *, const char *)> &get
         if (preparedEncodingForSource(format(label)) == CPUNativeQuantisedEncoding::CompactMultiScale)
             throw std::invalid_argument("Compact multi-scale format " + label +
                 " keeps its own column walk; it has no panel candidate");
+    // Numbers are canonical decimals, so the fields' textual uniqueness is
+    // uniqueness of the parsed rows and N x K cells.
     for (const auto &text : fields(get("LLAMINAR_PANEL_SHAPES", "2048x4096,17408x5120,512x2048"), "LLAMINAR_PANEL_SHAPES"))
         w.shapes.push_back(shape(text));
     for (const auto &text : fields(get("LLAMINAR_PANEL_M", "1,2,4"), "LLAMINAR_PANEL_M"))
@@ -285,8 +297,12 @@ private:
 };
 
 /**
- * @brief Prove a reference wrote every live word: two runs over distinct dirt must agree.
- * @return The reference words, or empty when an element kept its dirt.
+ * @brief Prove a reference wrote every live word with a finite value.
+ * @return The reference words, or empty when the two runs over distinct dirt
+ * disagree, a guard changed, or any word is not finite.
+ * @details The fixture is finite, so its reference must be: a finite reference
+ * cannot equal either dirt sentinel, which makes "the output equals the
+ * reference" prove the invocation wrote every word.
  */
 std::vector<std::uint32_t> completeReference(GuardedOutput &output, const std::function<void()> &invoke)
 {
@@ -296,6 +312,8 @@ std::vector<std::uint32_t> completeReference(GuardedOutput &output, const std::f
     output.dirty(1);
     invoke();
     if (!output.equals(first) || !output.guardsIntact()) return {};
+    for (const auto word : first)
+        if (!std::isfinite(std::bit_cast<float>(word))) return {};
     return first;
 }
 
@@ -386,20 +404,59 @@ int selfTest()
         "I8MM row pairs with a forced panel");
 #endif
 
-    // Publication controls over 64 live words with a known complete writer.
+    rejects({{"LLAMINAR_PANEL_M", "1,01"}}, "rows repeated through a leading zero");
+    rejects({{"LLAMINAR_PANEL_SHAPES", "64x32,064x032"}}, "shape repeated through leading zeros");
+    rejects({{"LLAMINAR_PANEL_SHAPES", "64x32,64x32"}}, "repeated shape text");
+
+    // Positive control: an admissible workload is admitted exactly as written,
+    // so the rejections above are not an always-rejecting parser.
+    {
+        const std::vector<std::pair<std::string, std::string>> values = {{"LLAMINAR_PANEL_STRIPS", "2"},
+            {"LLAMINAR_PANEL_ISA", "asimd"}, {"LLAMINAR_PANEL_FORMATS", "Q8_0,Q4_K"},
+            {"LLAMINAR_PANEL_SHAPES", "64x32,128x64"}, {"LLAMINAR_PANEL_M", "1,3"},
+            {"LLAMINAR_PANEL_WARMUP", "0"}, {"LLAMINAR_PANEL_ITERS", "1"}};
+        const auto get = [&](const char *name, const char *fallback) -> std::string {
+            for (const auto &[key, value] : values)
+                if (key == name) return value;
+            return fallback;
+        };
+        try
+        {
+            const auto w = admit(get);
+            expect(w.strips == 2 && w.isa == "asimd" && w.formats == std::vector<std::string>{"Q8_0", "Q4_K"} &&
+                   w.shapes.size() == 2 && w.shapes[1].n == 128 && w.shapes[1].k == 64 &&
+                   w.rows == std::vector<int>{1, 3} && w.warmup == 0 && w.iters == 1,
+                "admissible workload admitted as written");
+        }
+        catch (const std::exception &) { expect(false, "admissible workload admitted"); }
+    }
+
+    // Publication controls run the real reference and timing wrappers over 64
+    // live words with callbacks that write completely, omit, or do nothing.
     constexpr std::size_t live = 64;
     GuardedOutput output(live);
     const auto write_all = [&] { for (std::size_t i = 0; i < live; ++i) output.live()[i] = float(i); };
     const auto reference = completeReference(output, write_all);
-    expect(reference.size() == live, "complete reference accepted");
+    expect(reference.size() == live, "complete finite reference accepted");
     const auto skip_one = [&] { for (std::size_t i = 0; i < live; ++i) if (i != 5) output.live()[i] = float(i); };
     expect(completeReference(output, skip_one).empty(), "omitted reference element rejected");
-    output.dirty(0);
-    expect(!output.equals(reference), "omitted result rejected");
-    write_all();
-    expect(output.equals(reference), "stale bytes would pass without dirtying");
-    output.dirty(1);
-    expect(!output.equals(reference), "stale result rejected after dirtying");
+    const auto dirt_writer = [&] { output.dirty(0); };
+    expect(completeReference(output, dirt_writer).empty(), "reference equal to a dirt sentinel rejected");
+    const auto nonfinite = [&] {
+        write_all();
+        output.live()[7] = std::numeric_limits<float>::infinity();
+    };
+    expect(completeReference(output, nonfinite).empty(), "stable nonfinite reference rejected");
+    const auto times = [&](const std::function<void()> &invoke, int warmup, int iters) {
+        return timeCell(output, reference, warmup, iters, invoke).published;
+    };
+    expect(times(write_all, 0, 3), "complete invocations published");
+    expect(!times(skip_one, 0, 1), "omitted element detected by timeCell");
+    expect(!times([] {}, 0, 1), "no-op invocation detected by timeCell");
+    write_all(); // Leave a correct result behind: a stale-bytes pass would need timeCell not to dirty.
+    expect(!times([] {}, 0, 1), "stale correct bytes detected by timeCell");
+    expect(!times([] {}, 1, 1), "no-op after warmup detected by timeCell");
+    expect(output.guardsIntact(), "guards intact after controls");
     output.poke(live, 0); // One word past the live span.
     expect(!output.guardsIntact(), "escaped write rejected");
     return failures;
