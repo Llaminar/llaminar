@@ -210,3 +210,16 @@ against the old caller before the patch. Same real commands rechecked after
 source ACK/green. #71 fix = 4096 REAL proof; 8192 = separate #74. Main
 retains exclusive .79 for this bounded follow-up only (no inference/
 profiling).
+
+### #74 native GREEN at 5b76a146c; Main executing the .79 proof (2026-11-10, ~23:15Z)
+
+Complete planning Unit + both focused preflights + 20 consecutive
+repetitions EACH (5-GTest row/classif + 1-GTest capacity) = native GREEN;
+reviewer #181 source ACK exact 5b. The old-caller regression reproduced
+the exact wrong invalid_argument on ALL CPU/CUDA/ROCm. Main ACTUALLY
+launched the bounded .79 incremental configure/build + the same 4096/8192
+plans at 5b in a new canonical driver window (artifacts
+/home/factory/idea25/plan74-main-5b76a146c; the old-35 actual app/core
+binaries + config/compileDB retained with matching hash mapping before the
+incremental; e886 controls untouched). Awaiting the TYPED REJECTION
+outcome — NOT claiming 8192 now fits.
