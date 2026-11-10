@@ -169,7 +169,11 @@ namespace llaminar2
                 std::visit([&](const auto &value) {
                     using Operation = std::decay_t<decltype(value)>;
                     const auto &weight = value.weight;
-                    const int count = weight.invocation_site == PlanningWeightInvocationSite::Terminal ? 1 : rows;
+                    const int count = weight.invocationRows(rows);
+                    if (weight.invocation_site == PlanningWeightInvocationSite::Terminal)
+                        result.qualifications.insert(std::string(phase == PlanningMainForwardPhase::Prefill ? "prefill" : "decode") +
+                            (weight.role == WeightRole::LMHead ? "_terminal_lm_head_rows=" : "_terminal_pre_head_rows=") +
+                            std::to_string(count)); // Report the exact count consumed by the pricing branches below.
                     double seconds = 0;
                     if constexpr (std::is_same_v<Operation, PlanningUnclassifiedWeight>)
                         throw std::invalid_argument("Unclassified request work: " + weight.source_name);

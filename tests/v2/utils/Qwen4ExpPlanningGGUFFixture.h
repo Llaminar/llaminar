@@ -28,7 +28,7 @@ public:
                 model.tensors.push_back({.name=std::move(name),.dimensions=std::move(shape),.type=type});
             };
             // Keep the legacy gain as a negative control: the schema terminal
-            // consumes the HC mixer instead, on one compact final-token row.
+            // consumes HC instead, before vocabulary-head row selection.
             add("output_norm.weight",{2560},GGUFTensorType::F32);
             add("output_hc_norm.weight",{10240},GGUFTensorType::F32);
             add("output_hc_down.weight",{320,10240});

@@ -30,8 +30,10 @@ namespace llaminar2
 
     /** @brief Semantic work family, shared by operand compilation and representative sampling. */
     enum class PlanningOrdinaryWeightKind { Projection, Router, Embedding, NonProjection, Unclassified, ImmutableLookup };
-    /** @brief Graph ownership and row-selection boundary, independent of source storage. */
+    /** @brief Graph ownership boundary, independent of source storage or row selection. */
     enum class PlanningWeightInvocationSite { Layer, Entry, Terminal };
+    /** @brief Actual graph row use: final normalization/mixers precede vocabulary-head compaction. */
+    enum class PlanningWeightRowPolicy { AllInvocationRows, CompactFinalRow };
     /** @return The one main-forward classification of a semantic role; unknown roles stay explicit. */
     PlanningOrdinaryWeightKind planningOrdinaryWeightKind(WeightRole role) noexcept;
 
@@ -45,7 +47,17 @@ namespace llaminar2
         ModelPreparedWeightRepresentation representation;
         WeightShardGeometry geometry;
         FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native; ///< Immutable observed arithmetic family.
-        PlanningWeightInvocationSite invocation_site = PlanningWeightInvocationSite::Layer; ///< Schema-owned execution boundary; terminal work consumes one real row.
+        PlanningWeightInvocationSite invocation_site = PlanningWeightInvocationSite::Layer; ///< Schema-owned execution boundary, not a row-count hint.
+        PlanningWeightRowPolicy row_policy = PlanningWeightRowPolicy::AllInvocationRows; ///< Graph-defined row selection, independent of terminal ownership.
+
+        /**
+         * @brief Resolve the exact rows charged by the request-cost consumer.
+         * @param invocation_rows Positive active rows in the main forward invocation.
+         * @return All active rows, or the one terminal vocabulary row after graph selection.
+         * @throws std::invalid_argument for nonpositive rows or an unknown row policy.
+         * @throws std::logic_error for compact selection outside a terminal boundary.
+         */
+        [[nodiscard]] int invocationRows(int invocation_rows) const;
 
         /** @return Actual runtime scalar/codebook label, not an assumed source format. */
         std::string_view executionFormat() const noexcept

@@ -918,8 +918,13 @@ TEST(PlanningRequestCostModel, FlashNextWorkHasTypedTerminalAndImmutableLookupCo
                     {
                         EXPECT_EQ(weight.invocation_site, PlanningWeightInvocationSite::Terminal);
                         EXPECT_EQ(weight.layer, -1);
+                        const int rows = phase == PlanningMainForwardPhase::Prefill ? 64 : 1;
+                        EXPECT_EQ(weight.invocationRows(rows), rows)
+                            << "HC mixers execute before vocabulary-head row selection";
                         ++terminal_hc;
                     }
+                    if (weight.role == WeightRole::LMHead)
+                        EXPECT_EQ(weight.invocationRows(phase == PlanningMainForwardPhase::Prefill ? 64 : 1), 1);
                     EXPECT_NE(weight.source_name, "output_norm.weight")
                         << "The Flash Next terminal mixer replaces legacy output normalization";
                 }, operation);
@@ -941,6 +946,9 @@ TEST(PlanningRequestCostModel, FlashNextWorkHasTypedTerminalAndImmutableLookupCo
         EXPECT_TRUE(std::isfinite(prediction.decodeSecondsPerToken()));
         EXPECT_GT(prediction.decodeSecondsPerToken(), 0);
         EXPECT_NE(prediction.evidence().find("immutable row gathers"), std::string::npos);
+        EXPECT_NE(prediction.evidence().find("prefill_terminal_pre_head_rows=64"), std::string::npos);
+        EXPECT_NE(prediction.evidence().find("decode_terminal_pre_head_rows=1"), std::string::npos);
+        EXPECT_NE(prediction.evidence().find("prefill_terminal_lm_head_rows=1"), std::string::npos);
         auto invalid = source.metadata().memoryProfile();
         invalid.flash_next->ple_heads = 0;
         EXPECT_THROW(compilePlanningForwardWeightWork(PlanningModelMetadata(invalid, 48), candidate,
@@ -965,6 +973,9 @@ TEST(PlanningRequestCostModel, SingleDeviceHasNoLinksAndLiveContextCostsMoreAcro
                 const auto short_context = costs.evaluate(candidate, {64, 16});
                 const auto long_context = costs.evaluate(candidate, {2048, 16});
                 const auto tail = costs.evaluate(candidate, {65, 16});
+                EXPECT_NE(short_context.evidence().find("prefill_terminal_pre_head_rows=64"), std::string::npos);
+                EXPECT_NE(short_context.evidence().find("decode_terminal_pre_head_rows=1"), std::string::npos);
+                EXPECT_NE(short_context.evidence().find("prefill_terminal_lm_head_rows=1"), std::string::npos);
                 EXPECT_GT(long_context.decodeSecondsPerToken(), short_context.decodeSecondsPerToken());
                 EXPECT_GT(long_context.prefillSeconds(), tail.prefillSeconds());
                 EXPECT_GT(tail.prefillSeconds(), short_context.prefillSeconds());
