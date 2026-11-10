@@ -65,3 +65,16 @@ and byte-identical output. The repo already has the model for this:
 
 - Runs on the Mac and on GB10; 1..20 workers; X925/A725/mixed where applicable.
 - The harness is a prerequisite for evaluating ideas 4, 6, 7, 8, 9, 12.
+
+## #145 review HOLD (2026-11-10) — 01 revision needed
+Full findings relayed to the lane: 01-3 P1s (provenance binding or non-
+certifying label; full comparable identity incl. success/policies/identity-
+fields with explicit declared changes; shared schema+finite validation at
+record AND diff + diff-CLI negative controls) + 01-1 P2s (requested-vs-actual
+width + no physical-core-normalized claim without witness; effective-byte-
+rate labeling; safe env parsing [ERANGE/overflow/dup labels/cap accounting];
+REGISTER the focused DecodeBandwidthContract in ProductionTestPreflight +
+fail-closed/identity controls) + contract precision (finite>0 only, extent
+divisibility, memcmp=last output/same-production equivalence, name the upper-
+median statistic) + the 1-ULP negative control must become a real test + the
+log provided. Reviewer moved to #146 (rev3); half-cell separate.
