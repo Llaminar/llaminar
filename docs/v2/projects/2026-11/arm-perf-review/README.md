@@ -299,3 +299,21 @@ After i8mm merge (same tile / post-merge):
 - CORRECTIVE RECEIPTS queued on .80 (stamped, fresh dirs, ~25 min each):
   **3027d7bb8 → 8fcc0fe0b → c4536cf3c**; success = rc 0, all 9 lines
   `exit=0 tree=<sha>`, Rows1=0, budgets 1029/1176/1274.
+
+## Base moved again (2026-11-10): #43 replayed onto 2948b1e49 — FREEZE until publish
+
+- Operator-requested rebase. Main replayed #43 (171 commits) onto base
+  2948b1e49; local candidate **a710eba02, NOT pushed**. Full ARM Integration
+  compile underway; NO full regate / 6-arch rebuild (routine-rebase rule).
+- Resolutions preserve: new-base caller-NUMA ownership (all allowed CPUs,
+  /proc/thread-self, unknown=-1), portable OpenMP placement + wait policy,
+  both preflight registration blocks.
+- FREEZE: all lanes hold at c007a59a2 until Main publishes the rebased SHA.
+  Pinned gates finish unchanged (CUDA rerun at c007; censuses at
+  3027d7bb8/8fcc0fe0b/c4536cf3c = content receipts, unaffected). Idea-14 A +
+  reviewer checkpoint stay anchored at c007 (routine-rebase rule).
+- FF-time consequence: the idea-31 stack (95d462930/3027d7bb8/e5248cba8/
+  042a9e9da) and Bundle-1's 897727484 sit on 8fcc0fe0b → both redo their
+  mechanical rebases onto the published tip before push/FF (Bundle-1
+  pre-committed to redo-on-new-tip; idea-31 replay + reviewer re-pin per
+  protocol). Bundle-1's PUSH is on hold until then.
