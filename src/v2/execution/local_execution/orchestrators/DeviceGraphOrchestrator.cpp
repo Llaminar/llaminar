@@ -19,6 +19,7 @@
  */
 
 #include "execution/qwen4exp/PooledImmutableParticipantExecutionPolicy.h"
+#include "../../../utils/OpenMPUtils.h"
 #include "execution/qwen4exp/PooledImmutableLocalHotTransportGeometry.h"
 #include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
@@ -61941,6 +61942,7 @@ namespace llaminar2
         std::atomic<int> applied{0};
         const int n = static_cast<int>(moe_stages.size());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < n; ++i)
         {

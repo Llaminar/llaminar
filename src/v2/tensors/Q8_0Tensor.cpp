@@ -7,6 +7,7 @@
  */
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorClasses.h"
 #include "VnniPackContext.h"
@@ -224,6 +225,7 @@ namespace llaminar2
             size_t K = shape_[1];
             size_t blocks_per_row = (K + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (total_elements > 10000)
             for (size_t r = 0; r < shape_[0]; ++r)
             {
@@ -449,6 +451,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -463,6 +466,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -479,6 +483,7 @@ namespace llaminar2
 
         const size_t num_blocks = (total_elements + block_size - 1) / block_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
         {

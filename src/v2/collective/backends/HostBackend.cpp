@@ -10,6 +10,7 @@
  */
 
 #include "HostBackend.h"
+#include "../../utils/OpenMPUtils.h"
 #include "../../tensors/FP16Utils.h"
 #include "../../utils/BFloat16.h"
 #include "../../utils/Logger.h"
@@ -976,6 +977,7 @@ namespace llaminar2
             switch (op)
             {
             case CollectiveOp::ALLREDUCE_SUM:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for simd
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -984,6 +986,7 @@ namespace llaminar2
                 break;
 
             case CollectiveOp::ALLREDUCE_MAX:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for simd
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -992,6 +995,7 @@ namespace llaminar2
                 break;
 
             case CollectiveOp::ALLREDUCE_MIN:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for simd
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1001,6 +1005,7 @@ namespace llaminar2
 
             default:
                 LOG_WARN("HostBackend::reduceOnHost: Unsupported op, defaulting to SUM");
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for simd
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1019,6 +1024,7 @@ namespace llaminar2
             switch (op)
             {
             case CollectiveOp::ALLREDUCE_SUM:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for simd
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1027,6 +1033,7 @@ namespace llaminar2
                 break;
 
             case CollectiveOp::ALLREDUCE_MAX:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for simd
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1035,6 +1042,7 @@ namespace llaminar2
                 break;
 
             case CollectiveOp::ALLREDUCE_MIN:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for simd
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1065,6 +1073,7 @@ namespace llaminar2
             switch (op)
             {
             case CollectiveOp::ALLREDUCE_SUM:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1074,6 +1083,7 @@ namespace llaminar2
                 break;
 
             case CollectiveOp::ALLREDUCE_MAX:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1084,6 +1094,7 @@ namespace llaminar2
                 break;
 
             case CollectiveOp::ALLREDUCE_MIN:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1122,6 +1133,7 @@ namespace llaminar2
             switch (op)
             {
             case CollectiveOp::ALLREDUCE_SUM:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1131,6 +1143,7 @@ namespace llaminar2
                 break;
 
             case CollectiveOp::ALLREDUCE_MAX:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1141,6 +1154,7 @@ namespace llaminar2
                 break;
 
             case CollectiveOp::ALLREDUCE_MIN:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1165,6 +1179,7 @@ namespace llaminar2
             switch (op)
             {
             case CollectiveOp::ALLREDUCE_SUM:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for simd
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1174,6 +1189,7 @@ namespace llaminar2
                 break;
 
             case CollectiveOp::ALLREDUCE_MAX:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for simd
                 for (size_t i = 0; i < count; ++i)
                 {
@@ -1182,6 +1198,7 @@ namespace llaminar2
                 break;
 
             case CollectiveOp::ALLREDUCE_MIN:
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for simd
                 for (size_t i = 0; i < count; ++i)
                 {

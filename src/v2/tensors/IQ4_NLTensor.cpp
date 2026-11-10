@@ -8,6 +8,7 @@
  */
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
@@ -322,6 +323,7 @@ namespace llaminar2
         }
 
 // PRODUCTION PATH: Row-level parallelization for improved cache locality
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (rows > 4)
         for (size_t row = 0; row < rows; ++row)
         {
@@ -357,6 +359,7 @@ namespace llaminar2
 
         // Decode to FP32 first, then convert to BF16
         // This is efficient since FP32->BF16 is just a truncation with rounding
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (rows > 4)
         for (size_t row = 0; row < rows; ++row)
         {
@@ -446,6 +449,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         decode_to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -462,6 +466,7 @@ namespace llaminar2
 
         const size_t num_blocks = (total_elements + block_size - 1) / block_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
         {
@@ -663,6 +668,7 @@ namespace llaminar2
         // For now, fall back to standard decode
         LOG_DEBUG("[IQ4_NLTensor] Microkernel not yet implemented, using standard path");
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (rows > 4)
         for (int row = 0; row < rows; ++row)
         {

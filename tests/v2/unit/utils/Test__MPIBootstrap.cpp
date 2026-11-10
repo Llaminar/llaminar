@@ -258,6 +258,13 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
               << " ns/invocation over " << kMeasuredNotes << " invocations"
               << std::endl;
     EXPECT_LT(ns_per_note, 100.0);
+
+    // The evidence configuration ends here: both RAII guards restored the
+    // caller's environment values, and the configuration authorities reload
+    // from the restored environment so no export selection outlives the test.
+    mutableDebugEnv().reload();
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
+    PerfStatsCollector::reset();
 }
 
 /** Credentials and rank-local hardware policy must not become cluster-wide settings. */
