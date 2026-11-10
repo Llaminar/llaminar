@@ -184,3 +184,15 @@ binary/core hashes + 4-split model stats captured before/after. The
 owner draft was REJECTED (invalid driver CLI + hardcoded OMP20); Main's
 scripts retained in artifacts. No outcomes claimed until terminal
 artifacts exist.
+
+### #71 OUTCOMES (Main, 2026-11-10, ~23:05Z) — 4096 PASS, 8192 BLOCKED, no workaround
+
+- -c4096 PLAN PASS (JSON written; the original "Unclassified" gone);
+  AUTO-selected CPU single (1 admitted, 0 capacity-rejected) — explicitly
+  NOT GPU runtime/trace proof; evidence reports actual pre-head rows 256 /
+  head 1 in prefill, both 1 in decode. -c8192 FAILS with the exact
+  independent "Higher-priority PMA before ngram" error — NO workaround
+  applied. Canonical driver window COMPLETE/PASS, 0 findings/new records;
+  baseline binary/core hashes + 4-split stats unchanged. Main
+  investigating the 8192 diagnostic (ownership/qualification) before
+  completion/handback. No inference/profiling ran.
