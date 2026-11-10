@@ -215,3 +215,19 @@ Evidence: `~/llaminar-spark-results/K14-CUDA-SPILL-MIGRATION-a62696317`.
 - SEQUENCE: ideas FF (5d4e3716a → 39c24d8b4) → CUDA rebase onto 39c24d8b4 →
   push → GB10 gates (parity/byte, prefill/attention timing, tracked CUDA
   incl. RoPEGraphCaptureNoH2D, spill re-check, Qwen3.8 trace).
+
+## GB10 CUDA gate @ f69446e3c (2026-11-10, uma4, GCD sm_121, 64 cells)
+- 51 GREEN incl. ALL tracked: V2_Integration_CUDARoPEGraphCaptureNoH2D PASSED
+  (ideas RoPE binding ON-DEVICE ✓ — GPU-gate note closed), CUDATinyProjection
+  {AllFloatingFormats,SharedOperands,SharedWork}+2xPerf, CUDAIQ2S
+  {FusedMoEOriginalEquation,OriginalEquation} (paired), CUDAExactPrefill
+  PrecedesBK256Heuristic (BK256), single-row dispatch (timer-exception? ->
+  same FA root cause for PrefillBucketMInvariantAllFormats).
+- 1 REAL TIP DEFECT (new single root cause): ScopedCUDAKernelTimer 'requires
+  the exact non-null kernel stream' x11 (= FA/parity/prefill/verifier cells
+  entering FlashAttention + the prefill bucket M-invariant cell) — the FA
+  launch uses a NULL/default stream (maxim 10); 100% reproducible on GB10;
+  OWNER = Main (propagate the exact stream + focused regression).
+- 12th: GPUSpillCompilation_CUDA proof JSON not carried into the integration
+  build (expected-absent; the sm_121 re-check = Release fatal-guard BUILD_DONE
+  zero spills; compile evidence accepted; Main's call re the cell).
