@@ -7,11 +7,12 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Latest ROCm 10.1 maintenance placement: **314.868 P /40.035 after-prefill D**,
-versus core-place control **305.221/38.528** (+3.16%/+3.91%, one comparison).
-All 768 IDs/MTP/initial placement match. Five focused registrations pass,
-including the original-worker RED/GREEN affinity regression. Goal remains open.
-[Placement fix and limits](../2026-11/QFN_CPU_OPENMP_TEAM_PLACEMENT_20261110.md).
+Latest ROCm 10.1 cache/planner slice: **314.818 P /39.988 after-prefill D**,
+flat versus **314.868/40.035**. All768 IDs/MTP/initial placement match;
+25 focused host/CUDA/MI50/XTX registrations pass. Goal remains open.
+MI50 queue update **32.058→4.857ms**; exact49-layer planning **1433→3.122ms**.
+Measured promotions rise16→24; component wins are not model speedup factors.
+[Results and limits](../2026-11/QFN_CACHE_AND_PLACEMENT_ECONOMY_20261110.md).
 Historical remote-GPU rates are numerical controls, **not a placement speedup
 baseline**. Standalone benchmark rank→PID publication remains open.
 [SDK status](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md).
@@ -42,8 +43,8 @@ placement match. Runtime pause-loop cycle shares are not removable wall time.
 **Native Q8 candidates stay unpromoted:** MI50 **1.106–1.366×**, XTX
 **1.088–1.103×** component wins; installed-Auto gates pass, but model decode
 results overlap the control noise. Table-only rebuild takes **3.90s**.
-Next: [exact cache batching and migration cuts](../2026-11/QFN_HYBRID_POST_AFFINITY_ATTRIBUTION_20261110.md).
-Fresh GPU trace:699ms root wait,45ms ngram policy; result copy near its measured transport ceiling.
+Next: bounded same-observation migration continuation; not yet qualified.
+Fresh trace:665ms root wait,20.7ms pooled lookup; result copy near its measured transport ceiling.
 [Scope/results](../2026-11/QFN_ROCM_NATIVE_Q8_PREFILL_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
 [timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md),

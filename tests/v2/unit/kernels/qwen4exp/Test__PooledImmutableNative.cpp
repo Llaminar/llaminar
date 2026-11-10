@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#include <tuple>
 #include <stdexcept>
 #include <vector>
 namespace llaminar2::test {
@@ -41,6 +42,180 @@ using pooled_scalar_replay::declared;
 using pooled_scalar_replay::Owner;
 using pooled_scalar_replay::Pool;
 }
+namespace {
+/** @brief Compare semantic coordinator state and counters, excluding padding and scratch allocation addresses. */
+void expectQueueBatchPolicyEqual(Pool& candidate,Pool& original)
+{
+    const auto a=candidate.view(),b=original.view();
+    const auto& x=*a.frame;const auto& y=*b.frame;
+    EXPECT_EQ(std::tie(x.interval.table,x.interval.admission,x.interval.sequence,x.source.table,x.source.generation,x.source.sequence,
+        x.ordinal,x.command_ordinal,x.source_storage_generation,x.initial_clock,x.phase,x.status,x.original_ids,x.unique_rows,
+        x.outstanding,x.free_planned,x.victim_planned,x.purpose,x.observed,x.queues_applied,x.free_exhausted,x.cancelled_completion),
+        std::tie(y.interval.table,y.interval.admission,y.interval.sequence,y.source.table,y.source.generation,y.source.sequence,
+        y.ordinal,y.command_ordinal,y.source_storage_generation,y.initial_clock,y.phase,y.status,y.original_ids,y.unique_rows,
+        y.outstanding,y.free_planned,y.victim_planned,y.purpose,y.observed,y.queues_applied,y.free_exhausted,y.cancelled_completion));
+    for(unsigned list=0;list<3;++list)EXPECT_EQ(x.eligible_cursor[list],y.eligible_cursor[list]);
+    ASSERT_EQ(bool(a.policy),bool(b.policy));
+    if(a.policy){
+        EXPECT_EQ(std::tie(a.policy->logical_clock,a.policy->directory_root,a.policy->node_free,a.policy->protected_count,
+            a.policy->flags,a.policy->aging_accesses,a.policy->lane_width,a.policy->protected_limit),
+            std::tie(b.policy->logical_clock,b.policy->directory_root,b.policy->node_free,b.policy->protected_count,
+            b.policy->flags,b.policy->aging_accesses,b.policy->lane_width,b.policy->protected_limit));
+        for(unsigned list=0;list<3;++list){EXPECT_EQ(a.policy->head[list],b.policy->head[list]);EXPECT_EQ(a.policy->tail[list],b.policy->tail[list]);}
+    }
+    for(std::uint32_t i=0;i<a.parameters.entries();++i){const auto& e=a.entries[i];const auto& f=b.entries[i];
+        EXPECT_EQ(std::tie(e.locator.row,e.locator.generation,e.locator.owner,e.locator.slot,e.touched,e.observed_frame,
+            e.previous,e.next,e.stream,e.present),std::tie(f.locator.row,f.locator.generation,f.locator.owner,f.locator.slot,
+            f.touched,f.observed_frame,f.previous,f.next,f.stream,f.present));
+    }
+    for(std::uint32_t i=0;i+1<a.parameters.entries();++i){
+        EXPECT_EQ(a.nodes[i].child[0],b.nodes[i].child[0]);EXPECT_EQ(a.nodes[i].child[1],b.nodes[i].child[1]);
+        EXPECT_EQ(a.nodes[i].split_bit,b.nodes[i].split_bit);
+    }
+    for(std::uint64_t i=0;i<std::uint64_t{4}*a.parameters.laneWidth();++i){
+        EXPECT_EQ(a.frequency_counts[i],b.frequency_counts[i]);EXPECT_EQ(a.frequency_epochs[i],b.frequency_epochs[i]);
+    }
+    std::array<std::uint32_t,2> hits{},misses{};
+    for(std::uint32_t i=0;i<x.unique_rows;++i){const auto& e=a.unique[i];const auto& f=b.unique[i];
+        EXPECT_EQ(std::tie(e.row,e.entry,e.first_position,e.decision_index,e.allocation_owner,e.phase,e.queue_started),
+            std::tie(f.row,f.entry,f.first_position,f.decision_index,f.allocation_owner,f.phase,f.queue_started));
+        EXPECT_EQ(std::tie(e.pin.requested_row,e.pin.kind,e.pin.reserved,e.pin.ordinal.value),
+            std::tie(f.pin.requested_row,f.pin.kind,f.pin.reserved,f.pin.ordinal.value));
+        EXPECT_EQ(std::tie(e.decision.row,e.decision.unique,e.decision.kind,e.decision.victim.row,
+            e.decision.victim.generation,e.decision.victim.owner,e.decision.victim.slot,e.decision.ordinal.value),
+            std::tie(f.decision.row,f.decision.unique,f.decision.kind,f.decision.victim.row,
+            f.decision.victim.generation,f.decision.victim.owner,f.decision.victim.slot,f.decision.ordinal.value));
+        const auto& g=e.grant;const auto& h=f.grant;
+        EXPECT_EQ(std::tie(g.interval.table,g.interval.admission,g.interval.sequence,g.row,g.generation,g.destination_token,
+            g.unique,g.owner,g.slot,g.kind),std::tie(h.interval.table,h.interval.admission,h.interval.sequence,h.row,
+            h.generation,h.destination_token,h.unique,h.owner,h.slot,h.kind));
+        ++(e.phase==p::UniquePhase::Read?hits[0]:misses[0]);++(f.phase==p::UniquePhase::Read?hits[1]:misses[1]);
+    }
+    for(std::uint32_t i=0;i<a.parameters.participants();++i){const auto& e=a.owner_plans[i];const auto& f=b.owner_plans[i];
+        EXPECT_EQ(std::tie(e.lease.interval.table,e.lease.interval.admission,e.lease.interval.sequence,e.lease.owner,e.lease.free_slots,
+            e.free_offset,e.free_count,e.free_received,e.victim_offset,e.victim_count,e.victim_received,e.plan_write),
+            std::tie(f.lease.interval.table,f.lease.interval.admission,f.lease.interval.sequence,f.lease.owner,f.lease.free_slots,
+            f.free_offset,f.free_count,f.free_received,f.victim_offset,f.victim_count,f.victim_received,f.plan_write));
+    }
+    EXPECT_EQ(hits[0],hits[1]);EXPECT_EQ(misses[0],misses[1]);
+    for(std::uint32_t i=0;i<x.original_ids;++i)EXPECT_EQ(a.original_to_unique[i],b.original_to_unique[i]);
+    EXPECT_EQ(candidate.source_sequence,original.source_sequence);
+}
+/**
+ * @brief Exercise complete actual source/owner lifecycles against the original scalar queue body.
+ * @param slots Original per-owner capacities, including C0.
+ * @param seed Original initial demand rows.
+ * @param original Recorded large/partial/repeated original-position stream.
+ * @param warm Whether an independent original promotion frame precedes the tested frame.
+ * @param eligible Expected actual guard after the first victim-receipt frontier.
+ * @param policy Original shared arithmetic/protection policy.
+ */
+void queueBatchReplay(std::span<const std::uint32_t> slots,std::span<const std::uint64_t> seed,
+    std::span<const std::uint64_t> original,bool warm,bool eligible,a::Policy policy={65536,1,2})
+{
+    Pool candidate(slots,8192,policy),reference(slots,8192,policy);reference.original_queue_order=true;
+    for(auto* pool:{&candidate,&reference}){
+        pool->complete(seed);
+        if(warm)pool->complete(seed);
+    }
+    expectQueueBatchPolicyEqual(candidate,reference);
+    for(unsigned repeat=0;repeat<3;++repeat){
+        // The first original call proves the requested eligibility. Later calls can promote probation rows.
+        candidate.complete(original,repeat+2);reference.complete(original,repeat+2);
+        ASSERT_TRUE(reference.original_queue_batch_eligible.has_value());
+        if(!repeat)EXPECT_EQ(*reference.original_queue_batch_eligible,eligible);
+        expectQueueBatchPolicyEqual(candidate,reference);
+        // Shrink and empty requests preserve dirty tails, source sequence and subsequent repeated policy.
+        if(!original.empty()){
+            candidate.complete(original.first(1),repeat+2);reference.complete(original.first(1),repeat+2);
+            expectQueueBatchPolicyEqual(candidate,reference);
+        }
+        candidate.complete({},repeat+2);reference.complete({},repeat+2);
+        expectQueueBatchPolicyEqual(candidate,reference);
+    }
+}
+}
+TEST(PooledImmutableNative, ProtectedHitQueueBatchOriginalScalarPolicyReplay)
+{
+    const std::array slots{8u,0u,8u};const std::array<std::uint64_t,4> seed{31,32,33,34};
+    std::vector<std::uint64_t> cyclic(7168),reverse(1024),subset(513);
+    for(std::size_t i=0;i<cyclic.size();++i)cyclic[i]=seed[i%4];
+    for(std::size_t i=0;i<reverse.size();++i)reverse[i]=seed[3-i%4];
+    for(std::size_t i=0;i<subset.size();++i)subset[i]=i%3?31:33;
+    queueBatchReplay(slots,seed,cyclic,true,true);
+    queueBatchReplay(slots,seed,reverse,true,true,{17,1,2});
+    queueBatchReplay(slots,seed,subset,true,true);
+    std::vector<std::uint64_t> contiguous(7168);
+    for(std::size_t i=0;i<contiguous.size();++i)contiguous[i]=seed[i/1792];
+    // Unequal positive owner capacities plus C0: the eligible reverse run scan
+    // must keep the same final times, full cursor and later partial histories.
+    queueBatchReplay(std::array{2u,0u,6u},seed,contiguous,true,true);
+    queueBatchReplay(slots,seed,std::array<std::uint64_t,7>{34,31,32,34,32,31,34},true,true);
+    queueBatchReplay(std::array{2u},std::array<std::uint64_t,1>{31},std::array<std::uint64_t,5>{31,31,31,31,31},true,true);
+    queueBatchReplay(slots,seed,{},true,false);
+}
+TEST(PooledImmutableNative, ProtectedHitQueueBatchKeepsProbationPressureAndMixedOriginalOrder)
+{
+    const std::array slots{8u,0u,8u};const std::array<std::uint64_t,4> seed{31,32,33,34};
+    const std::array<std::uint64_t,9> cyclic{31,32,33,34,31,34,33,32,31};
+    queueBatchReplay(slots,seed,cyclic,false,false);
+    queueBatchReplay(std::array{4u},seed,cyclic,true,false); // Protected pressure/demotions prohibit batching.
+    queueBatchReplay(slots,seed,std::array<std::uint64_t,5>{31,99,31,99,32},true,false);
+    queueBatchReplay(std::array{0u},std::span<const std::uint64_t>{},cyclic,false,false);
+}
+TEST(PooledImmutableNative, ProtectedHitQueueBatchRejectsClockCorruptionBeforeListWrites)
+{
+    const std::array<std::uint64_t,2> seed{31,32};
+    for(const bool overflow:{false,true}){
+        Pool pool(std::array{8u});pool.complete(seed);pool.complete(seed);pool.begin(seed);pool.receivedFree();
+        const auto v=pool.view();std::vector<p::DirectoryEntry> before(v.entries,v.entries+v.parameters.entries());
+        EXPECT_THROW(pool.receivedVictims({},false,[&]{
+            if(overflow)v.frame->initial_clock=UINT64_MAX-1;
+            else ++v.policy->logical_clock;
+        }),std::logic_error);
+        for(std::uint32_t i=0;i<v.parameters.entries();++i){const auto& e=v.entries[i];const auto& f=before[i];
+            EXPECT_EQ(std::tie(e.touched,e.previous,e.next,e.stream),std::tie(f.touched,f.previous,f.next,f.stream));
+        }
+        EXPECT_EQ(v.frame->status,a::Status::Invariant);
+    }
+    Pool pool(std::array{8u});pool.view().policy->logical_clock=UINT64_MAX-1;
+    EXPECT_THROW(pool.begin(seed),std::logic_error); // Existing original admission rejects overflow too.
+}
+
+/** @test The batched join preserves scalar tail rejection and poisons malformed policy state. */
+TEST(PooledImmutableNative, ProtectedHitQueueBatchRejectsMalformedResidualTailLikeOriginal)
+{
+    const std::array<std::uint64_t,2> seed{31,32};
+    enum class TailFault {OutOfRange,SelfTail,NextLink,Stream,FutureTime};
+    for(const auto fault:{TailFault::OutOfRange,TailFault::SelfTail,TailFault::NextLink,
+                         TailFault::Stream,TailFault::FutureTime}){
+        SCOPED_TRACE(static_cast<unsigned>(fault));
+        for(const bool original:{false,true}){
+            SCOPED_TRACE(original);
+            Pool pool(std::array{8u});pool.original_queue_order=original;
+            pool.complete(seed);pool.complete(seed);
+            pool.begin(std::span<const std::uint64_t>(seed).first(1));pool.receivedFree();
+            const auto v=pool.view();
+            EXPECT_THROW(pool.receivedVictims({},false,[&]{
+                const auto tail=v.policy->tail[2];
+                ASSERT_LT(tail,v.parameters.entries());
+                switch(fault){
+                case TailFault::OutOfRange:v.policy->tail[2]=v.parameters.entries();break;
+                case TailFault::SelfTail:v.policy->tail[2]=v.unique[0].entry;break;
+                case TailFault::NextLink:v.entries[tail].next=tail;break;
+                case TailFault::Stream:v.entries[tail].stream=a::Stream::NewProbation;break;
+                case TailFault::FutureTime:v.entries[tail].touched=v.frame->initial_clock+v.frame->original_ids+1;break;
+                }
+            }),std::logic_error);
+            EXPECT_EQ(v.frame->status,a::Status::Invariant);
+            EXPECT_NE(v.policy->flags&a::OwnerFailed,0u);
+            // Failure is sticky; a later request cannot hide a failed join.
+            EXPECT_FALSE(p::CoordinatorOperations(v).begin(9,seed.data(),seed.size()));
+            EXPECT_EQ(v.frame->status,a::Status::Invariant);
+        }
+    }
+}
+
 TEST(PooledImmutableNative, ActualDecodedNativePhasesReplayFreeVictimSourceAndRepeatedReset)
 {
     Pool pool(std::array{2u,0u,2u});

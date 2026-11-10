@@ -1233,9 +1233,11 @@ namespace llaminar2
             std::span<const std::size_t> after_indices)
         {
             std::vector<std::int32_t> before(objective.numExperts(), -1);
-            for (const auto &owner : transaction.previous->placementOwnerMap().owners())
-                if (owner.layer_idx == layer)
-                    before.at(static_cast<std::size_t>(owner.expert_id)) = objective.targetIndex(owner);
+            // The immutable original map already owns canonical layer/expert
+            // order. Read the exact layer range, retaining cohort targets and
+            // the original checked expert-ID writes, not a parallel owner index.
+            for (const auto &owner : transaction.previous->placementOwnerMap().placementsForLayer(layer))
+                before.at(static_cast<std::size_t>(owner.expert_id)) = objective.targetIndex(owner);
             auto after = before;
             const auto apply = [&](std::span<const std::size_t> indices,
                                    std::vector<std::int32_t> &owners)

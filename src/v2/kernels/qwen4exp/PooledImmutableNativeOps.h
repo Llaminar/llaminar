@@ -704,6 +704,21 @@ struct CoordinatorCoalescingAccess
     QFN_ADAPTIVE_HD static bool finish(CoordinatorOperations& op){return op.finishOriginal();}
     /** @brief Seal controls after actual independent setup producers complete. */
     QFN_ADAPTIVE_HD static bool seal(CoordinatorOperations& op){return op.initializeControls();}
+    /**
+     * @brief Replay the actual original scalar recency body after the same complete victim receipt parser.
+     * @param op Independent host replay borrower; never a downloaded native policy.
+     * @param receipts Original actual owner completion frontier.
+     * @param count Exact original participant count.
+     * @param batchEligible Optional host replay observation of the real guard after receipt reconciliation.
+     * @return Original completion and scalar queue result for policy equivalence tests.
+     */
+    static bool completeVictimsOriginalQueueOrder(CoordinatorOperations& op,
+        const VictimAllocationReceipt* receipts,std::uint32_t count,bool* batchEligible=nullptr)
+    {
+        if(!op.complete(receipts,count,true))return false;
+        if(batchEligible)*batchEligible=op.protectedHitQueueBatchEligible();
+        return op.applyQueuesOriginalOrder();
+    }
     /** @brief Consume only the exact stable native run banks after their complete ordered producer. */
     QFN_ADAPTIVE_HD static bool planFree(CoordinatorOperations& op,const AvailabilityLease* leases,std::uint32_t count,OriginalObservationRuns runs)
     {return op.planFreeImpl(leases,count,&runs);}

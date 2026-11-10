@@ -268,7 +268,7 @@ public:
     DeviceType backend()const noexcept override{return QFN_NATIVE_BACKEND;}
     /** @return Version, exact identity algorithm, thread geometry and deterministic coalescing policy are immutable capture identity. */
     std::uint64_t codeIdentity()const noexcept override
-    {return (n::Version<<48)|(static_cast<std::uint64_t>(QFN_NATIVE_BACKEND)<<40)|(std::uint64_t{6}<<32)|(std::uint64_t{PlanFreeLanes}<<25)|(std::uint64_t{Threads}<<16)|SmallRows;}
+    {return (n::Version<<48)|(static_cast<std::uint64_t>(QFN_NATIVE_BACKEND)<<40)|(std::uint64_t{7}<<32)|(std::uint64_t{PlanFreeLanes}<<25)|(std::uint64_t{Threads}<<16)|SmallRows;}
 protected:
     /** @brief Initialize one checked owner once on its exact setup stream. */
     void initializeOwner(const n::OwnerArgs& a,void* exact)const override

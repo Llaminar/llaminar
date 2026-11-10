@@ -270,3 +270,34 @@ TEST(CPUJointPlacementCandidateContract,
               initial->placementOwnerMap().placementFor(0, 0)->owner_participant);
     EXPECT_EQ(authority.snapshot(), initial);
 }
+
+/** The existing source-bound CPU cohort owner is retained by each layer range. */
+TEST(CPUJointPlacementCandidateContract, CanonicalLayerRangeMatchesCohortFullScan)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test;
+    for (const int members : {2, 4, 8})
+    {
+        JointPlacementOriginal original(members, 2, 6, 3, 32, true);
+        const auto map = original.preparation->cpuJointOwnerMap();
+        ASSERT_TRUE(map);
+        for (int replay = 0; replay < 3; ++replay)
+            for (const int layer : {31, 32, 33, 34, 35})
+            {
+                std::vector<MoEExpertOwner> expected;
+                for (const auto &owner : map->owners())
+                    if (owner.layer_idx == layer) expected.push_back(owner);
+                const auto actual = map->placementsForLayer(layer);
+                EXPECT_EQ(std::vector<MoEExpertOwner>(actual.begin(), actual.end()), expected);
+                for (const auto &owner : actual)
+                {
+                    EXPECT_EQ(&owner, map->placementFor(layer, owner.expert_id));
+                    if (owner.shard_cohort)
+                    {
+                        EXPECT_EQ(map->fragmentCountForExpert(layer, owner.expert_id), std::size_t(members));
+                        EXPECT_THROW((void)map->ownerFor(layer, owner.expert_id), std::logic_error);
+                    }
+                }
+            }
+    }
+}

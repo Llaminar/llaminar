@@ -120,6 +120,8 @@ struct Pool {
     std::vector<std::unique_ptr<Owner>> owners;
     std::uint64_t source_sequence=0;
     FrequencyObservationMode frequency_mode=FrequencyObservationMode::StableRuns; ///< Original stable-run default; scalar/native witnesses select one explicit mode.
+    bool original_queue_order=false; ///< Explicit independent oracle uses the unchanged production scalar body.
+    std::optional<bool> original_queue_batch_eligible; ///< Actual guard after the original receipt parser, before scalar mutation.
     std::optional<std::uint32_t> direct_pin_owner;
     std::uint64_t observed_direct_pin_bytes=0,observed_direct_pin_offset=0;
     /**
@@ -201,6 +203,16 @@ struct Pool {
                 }
                 require(p::CoordinatorCoalescingAccess::finishPlanFree(op));
                 n::directedPlans<false>(args);return;
+            }
+        }
+        if constexpr(Action==n::CoordinatorAction::CompleteVictims){
+            if(original_queue_order){
+                auto op=p::CoordinatorOperations(view());
+                bool eligible=false;
+                require(p::CoordinatorCoalescingAccess::completeVictimsOriginalQueueOrder(op,
+                    static_cast<const p::VictimAllocationReceipt*>(args.input.frontier),args.plan.policy.participants(),&eligible));
+                original_queue_batch_eligible=eligible;
+                return;
             }
         }
         require(n::coordinator<Action>(args));

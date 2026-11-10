@@ -839,8 +839,86 @@ private:
         v_.frame->phase = victims?LookupPhase::VictimCompleted:LookupPhase::FreeCompleted;
         return true;
     }
-    /** @brief Apply exact original-position recency once, only to actual acquired owner lifetimes. */
+    /**
+     * @brief Admit batching only when every original hit is already protected and no demotion can occur.
+     * @return True for the completed normal all-hit wave; other supported states retain original ordering.
+     * @note Pins mark these entries with this frame ordinal before availability. No directory, owner,
+     * grant or occupancy state is inferred from list membership. The complete actual frontier is already checked.
+     */
+    QFN_ADAPTIVE_HD bool protectedHitQueueBatchEligible() const
+    {
+        const auto& f=*v_.frame;
+        if(!capacity() || f.phase!=LookupPhase::VictimCompleted || f.status!=Status::Success ||
+           f.purpose!=LookupPurpose::CurrentDemand || !f.observed || f.queues_applied ||
+           f.cancelled_completion || f.outstanding || !f.original_ids || !f.unique_rows ||
+           v_.policy->protected_count<f.unique_rows ||
+           v_.policy->protected_count>v_.parameters.protectedLimit() ||
+           f.eligible_cursor[2]!=v_.policy->head[2])return false;
+        for(std::uint32_t i=0;i<f.unique_rows;++i){
+            const auto& r=v_.unique[i];
+            if(r.phase!=UniquePhase::Read || r.entry>=capacity())return false;
+            const auto& e=v_.entries[r.entry];
+            if(e.stream!=Stream::Protected || !e.present || e.observed_frame!=f.ordinal ||
+               e.touched>f.initial_clock)return false;
+        }
+        return true;
+    }
+    /**
+     * @brief Apply protected hits once in increasing final-occurrence order using only original metadata.
+     * @return True after exact list/cursor/timestamp publication, false on a sticky invariant failure.
+     * @note Before any write, every live entry has touched<=initial_clock. A reverse first visit writes
+     * its FINAL time in (initial_clock,initial_clock+original_ids], which is also the sole seen marker.
+     * Later reverse visits cannot overwrite it. No extra marker, allocation or policy authority exists.
+     * Unlinked hits prepend to a local chain; joining it after untouched members reconstructs scalar LRU.
+     */
+    QFN_ADAPTIVE_HD bool applyProtectedHitQueueBatch()
+    {
+        auto& f=*v_.frame;auto& policy=*v_.policy;
+        if(UINT64_MAX-f.initial_clock<f.original_ids ||
+           policy.logical_clock!=f.initial_clock+f.original_ids)return fail(Status::Invariant);
+        const auto protectedCount=policy.protected_count;
+        std::uint32_t first=None,last=None,visited=0;
+        for(auto pos=f.original_ids;pos;){
+            const auto finalPosition=--pos;
+            const auto unique=v_.original_to_unique[finalPosition];
+            if(unique>=f.unique_rows)return fail(Status::Invariant);
+            // Adjacent repeats share this exact final time. Scan their original
+            // metadata once without reloading the same entry's seen marker.
+            while(pos && v_.original_to_unique[pos-1]==unique)--pos;
+            const auto at=v_.unique[unique].entry;
+            auto& e=v_.entries[at];
+            if(e.touched>f.initial_clock)continue;
+            if(!unlink(at))return false;
+            e.touched=f.initial_clock+std::uint64_t{finalPosition}+1;
+            e.stream=Stream::Protected;e.next=first;
+            if(first==None)last=at;
+            else v_.entries[first].previous=at;
+            first=at;++visited;
+        }
+        if(visited!=f.unique_rows || first==None || last==None ||
+           policy.protected_count!=protectedCount-visited)return fail(Status::Invariant);
+        // The detached chain replaces repeated scalar appends, not their
+        // residual-list boundary validation. Reject before dereferencing tail.
+        if(!validateAppendBoundary(first,Stream::Protected))return false;
+        const auto tail=policy.tail[2];
+        v_.entries[first].previous=tail;
+        if(tail==None)policy.head[2]=first;
+        else v_.entries[tail].next=first;
+        policy.tail[2]=last;policy.protected_count=protectedCount;
+        // The original head cursor stops at the first untouched member. If all members were
+        // touched, scalar unlink/append follows the final head (or None for the sole member).
+        if(visited==protectedCount)f.eligible_cursor[2]=protectedCount>1?first:None;
+        f.queues_applied=true;
+        return true;
+    }
+    /** @brief Apply the guarded batch or the unchanged original recency policy for all other states. */
     QFN_ADAPTIVE_HD bool applyQueues()
+    {
+        if(protectedHitQueueBatchEligible())return applyProtectedHitQueueBatch();
+        return applyQueuesOriginalOrder();
+    }
+    /** @brief Original scalar operation retained verbatim as generic policy and independent replay oracle. */
+    QFN_ADAPTIVE_HD bool applyQueuesOriginalOrder()
     {
         auto &f = *v_.frame;
         if (f.purpose==LookupPurpose::FutureLookupOnly || f.queues_applied || !f.observed) return true;
@@ -1072,6 +1150,25 @@ private:
         e.stream = Stream::None;
         return true;
     }
+    /**
+     * @brief Validate the original scalar append boundary for a member or detached chain.
+     * @param at First appended entry, whose timestamp owns the boundary ordering.
+     * @param stream Exact destination policy list.
+     * @return True for an empty or well-formed ordered tail; false with sticky Invariant otherwise.
+     * @note A detached chain already marks its members with the destination stream.
+     * Explicit self-tail rejection retains the scalar detached-member disjointness check.
+     */
+    QFN_ADAPTIVE_HD bool validateAppendBoundary(std::uint32_t at,Stream stream)
+    {
+        const auto list=static_cast<unsigned>(stream);
+        if(list>=3 || at>=capacity())return fail(Status::Invariant);
+        const auto& policy=*v_.policy;
+        const auto tail=policy.tail[list];
+        if(tail==None ? policy.head[list]!=None :
+            (tail>=capacity() || tail==at || v_.entries[tail].next!=None ||
+             v_.entries[tail].stream!=stream || less(at,tail)))return fail(Status::Invariant);
+        return true;
+    }
     /** @brief Append one complete list member and maintain its exact full queue order. */
     QFN_ADAPTIVE_HD bool append(std::uint32_t at, Stream stream)
     {
@@ -1079,12 +1176,10 @@ private:
         if (list >= 3 || at >= capacity()) return fail(Status::Invariant);
         auto &e = v_.entries[at];
         auto &o = *v_.policy;
-        const auto tail = o.tail[list];
-        if (e.stream != Stream::None || e.previous != None || e.next != None ||
-            (tail == None ? o.head[list] != None :
-                (tail >= capacity() || v_.entries[tail].next != None ||
-                 v_.entries[tail].stream != stream || less(at, tail))))
+        if (e.stream != Stream::None || e.previous != None || e.next != None)
             return fail(Status::Invariant);
+        if (!validateAppendBoundary(at,stream))return false;
+        const auto tail = o.tail[list];
         e.previous = tail;
         e.next = None;
         e.stream = stream;

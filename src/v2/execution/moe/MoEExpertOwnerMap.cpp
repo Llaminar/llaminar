@@ -929,6 +929,15 @@ namespace llaminar2
         return &*owner;
     }
 
+    std::span<const MoEExpertOwner> MoEExpertOwnerMap::placementsForLayer(int layer_idx) const noexcept
+    {
+        const auto first = std::lower_bound(owners_.begin(), owners_.end(), layer_idx,
+            [](const MoEExpertOwner &owner, int layer) { return owner.layer_idx < layer; });
+        const auto last = std::upper_bound(first, owners_.end(), layer_idx,
+            [](int layer, const MoEExpertOwner &owner) { return layer < owner.layer_idx; });
+        return std::span<const MoEExpertOwner>(first, last);
+    }
+
     const MoEExpertOwner* MoEExpertOwnerMap::ownerFor(int layer_idx,int expert_id) const
     {
         const auto* placement=placementFor(layer_idx,expert_id);

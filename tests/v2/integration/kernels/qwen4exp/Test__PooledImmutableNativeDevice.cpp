@@ -122,6 +122,8 @@ private:
 enum class RecordedTrace {PlanCancellation,SuccessfulSource};
 /** @brief Contract certification and opt-in transaction timing remain distinct diagnostic uses. */
 enum class NativeReplayIntent {ContractReplay,TransactionTiming,FailedEpochReplay};
+/** @brief Explicit input-history authority; fixed free/victim witnesses are never inferred from sequence alone. */
+enum class NativeReplayHistory {OriginalFreeVictim,AuthoredPolicy};
 /** @brief Raw event observation becomes valid only after the original scalar/terminal checks pass. */
 struct NativeTransactionEventSample {
     float elapsed_ms=0;
@@ -144,10 +146,13 @@ public:
      * @param policyProof Retain the independent serial-position policy oracle for terminal comparisons.
      * @param aging Exact immutable arithmetic policy period, identical in native and oracle declarations.
      * @param intent Explicit contract replay or separately selected opt-in transaction timing.
+     * @param history Original fixed-history witness or independent scalar-authenticated arbitrary policy history.
      */
-    NativeReplay(DeviceId device,PreparedNativeLookupFixture& session,std::uint32_t maximum,std::uint32_t slots,RecordedTrace mode=RecordedTrace::PlanCancellation,n::OriginalIdWidth width=n::OriginalIdWidth::UInt64,bool declarationOnly=false,bool policyProof=false,std::uint64_t aging=65536,NativeReplayIntent intent=NativeReplayIntent::ContractReplay):device(device),worker(*session.permit(device).worker()),
-        backend(getBackendFor(device)),stream(ExplicitGPUStream(worker.defaultStream()).get()),maximum(maximum),slots(slots),mode(mode),originalWidth(width),intent(intent)
+    NativeReplay(DeviceId device,PreparedNativeLookupFixture& session,std::uint32_t maximum,std::uint32_t slots,RecordedTrace mode=RecordedTrace::PlanCancellation,n::OriginalIdWidth width=n::OriginalIdWidth::UInt64,bool declarationOnly=false,bool policyProof=false,std::uint64_t aging=65536,NativeReplayIntent intent=NativeReplayIntent::ContractReplay,NativeReplayHistory history=NativeReplayHistory::OriginalFreeVictim):device(device),worker(*session.permit(device).worker()),
+        backend(getBackendFor(device)),stream(ExplicitGPUStream(worker.defaultStream()).get()),maximum(maximum),slots(slots),mode(mode),originalWidth(width),intent(intent),history(history)
     {
+        requireNative(history!=NativeReplayHistory::AuthoredPolicy || policyProof,
+            "Authored policy history requires the independent original scalar oracle");
         // Ownership/admission stays on the original control thread. Only native
         // storage preparation and recording marshal onto the exact worker.
         if(!declarationOnly)
@@ -172,8 +177,9 @@ public:
         for(const auto& plan:{physical.cacheBOM(0,gpu),physical.mandatoryBOM(0,gpu),geometry.policyBOM(gpu),geometry.mandatoryBOM(gpu),ownerPlan.mandatoryBOM(gpu),coordinatorPlan.mandatoryBOM(gpu)})
             for(const auto& resource:plan.resources())bom.add(resource);
         if(mode==RecordedTrace::SuccessfulSource){
-            ioOffsets.payload=((ioOffsets.records+slots*std::max({sizeof(p::OwnerCommand),sizeof(n::Fill),sizeof(p::AllocationDecision)})+63)/64)*64;
-            ioOffsets.bytes=((ioOffsets.payload+slots*90+63)/64)*64;
+            const auto replies=ownerPlan.parameters().native.reply_capacity;
+            ioOffsets.payload=((ioOffsets.records+std::size_t{replies}*std::max({sizeof(p::OwnerCommand),sizeof(n::Fill),sizeof(p::AllocationDecision)})+63)/64)*64;
+            ioOffsets.bytes=((ioOffsets.payload+std::size_t{replies}*ownerPlan.parameters().row_bytes+63)/64)*64;
         }
         const auto idBytes=width==n::OriginalIdWidth::UInt32?4u:8u;
         const auto inputBytes=std::size_t{maximum}*idBytes+4+128+ioOffsets.bytes+(mode==RecordedTrace::SuccessfulSource?std::size_t{maximum}*90:0);
@@ -197,6 +203,7 @@ public:
                 "Policy oracle requires successful source replay or explicit zero-capacity timing control");
             scalarPolicy=std::make_unique<pooled_scalar_replay::Pool>(physical,maximum,q::adaptive_lookup::Policy{aging,1,2});
             scalarPolicy->frequency_mode=pooled_scalar_replay::FrequencyObservationMode::ScalarPositions;
+            scalarPolicy->original_queue_order=true; // Actual original queue body, independent of native batching.
         }
         if(intent==NativeReplayIntent::FailedEpochReplay){
             requireNative(policyProof && slots==4 && aging==17,"Fatal epoch replay has incompatible immutable geometry");
@@ -282,17 +289,18 @@ public:
         if(header_bytes){
             input(spans,q::PooledNativeOperand::Frontier,oroot.native,BufferId::QFN_POOLED_OWNER_NATIVE,owner->plan().parameters().native.header,*header_bytes);}
         if(mode==RecordedTrace::SuccessfulSource){const auto& plan=owner->plan().parameters();
-            if(action==n::OwnerAction::Pin){input(spans,q::PooledNativeOperand::Records,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.records,slots*sizeof(p::OwnerCommand));
+            const auto replies=plan.native.reply_capacity;
+            if(action==n::OwnerAction::Pin){input(spans,q::PooledNativeOperand::Records,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.records,std::size_t{replies}*sizeof(p::OwnerCommand));
                 input(spans,q::PooledNativeOperand::RecordBytes,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.record_bytes,8);}
             if(action==n::OwnerAction::AcceptFree || action==n::OwnerAction::AcceptVictim){
-                input(spans,q::PooledNativeOperand::Records,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.records,slots*sizeof(p::AllocationDecision));
+                input(spans,q::PooledNativeOperand::Records,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.records,std::size_t{replies}*sizeof(p::AllocationDecision));
                 input(spans,q::PooledNativeOperand::Frontier,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.header,action==n::OwnerAction::AcceptFree?sizeof(n::FreePlanHeader):sizeof(n::VictimPlanHeader));}
             if(action==n::OwnerAction::SealSource || action==n::OwnerAction::ApplySourceDelivery)
                 input(spans,q::PooledNativeOperand::Frontier,trace,BufferId::QFN_NGRAM_LOOKUP_STATE,64,sizeof(n::SourceFrontier));
             if(action==n::OwnerAction::ApplySourceDelivery){
-                input(spans,q::PooledNativeOperand::Records,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.records,slots*sizeof(n::Fill));
+                input(spans,q::PooledNativeOperand::Records,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.records,std::size_t{replies}*sizeof(n::Fill));
                 input(spans,q::PooledNativeOperand::RecordBytes,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.record_bytes,8);
-                input(spans,q::PooledNativeOperand::Payload,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.payload,slots*plan.row_bytes);
+                input(spans,q::PooledNativeOperand::Payload,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.payload,std::size_t{replies}*plan.row_bytes);
                 input(spans,q::PooledNativeOperand::PayloadBytes,io,BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE,ioOffsets.payload_bytes,8);}
         }
         auto operands=q::PooledImmutableOwnerOperands(action,owner->plan(),std::move(spans));
@@ -311,13 +319,15 @@ public:
                 action==n::CoordinatorAction::PlanFree?sizeof(n::Availability):action==n::CoordinatorAction::CompleteFree?sizeof(p::FreeAllocationReceipt):
                 action==n::CoordinatorAction::CompleteVictims?sizeof(p::VictimAllocationReceipt):sizeof(p::ReadyHeader));
         if(action==n::CoordinatorAction::Cancel){input(spans,q::PooledNativeOperand::Source,trace,BufferId::QFN_NGRAM_LOOKUP_STATE,64,sizeof(n::SourceFrontier));
-            if(slots){const auto& plan=owner->plan().parameters();
-                input(spans,q::PooledNativeOperand::Records,owner->roots().frame,BufferId::QFN_POOLED_OWNER_FRAME,plan.frame.release_receipts,slots*sizeof(p::ReleaseReceipt));
+            const auto replies=coordinator->plan().parameters().native.reply_capacity;
+            if(replies){const auto& plan=owner->plan().parameters();
+                input(spans,q::PooledNativeOperand::Records,owner->roots().frame,BufferId::QFN_POOLED_OWNER_FRAME,plan.frame.release_receipts,std::size_t{replies}*sizeof(p::ReleaseReceipt));
                 input(spans,q::PooledNativeOperand::RecordBytes,owner->roots().native,BufferId::QFN_POOLED_OWNER_NATIVE,plan.native.progress+offsetof(n::OwnerProgress,release_bytes),8);}}
         if(action==n::CoordinatorAction::SealSource || action==n::CoordinatorAction::Publish)
             input(spans,q::PooledNativeOperand::Source,trace,BufferId::QFN_NGRAM_LOOKUP_STATE,64,sizeof(n::SourceFrontier));
         if(action==n::CoordinatorAction::AcquirePins || action==n::CoordinatorAction::AcquireFree || action==n::CoordinatorAction::AcquireVictims){const auto& plan=owner->plan().parameters();
-            input(spans,q::PooledNativeOperand::Records,owner->roots().native,BufferId::QFN_POOLED_OWNER_NATIVE,plan.native.replies,slots*sizeof(p::Grant));
+            input(spans,q::PooledNativeOperand::Records,owner->roots().native,BufferId::QFN_POOLED_OWNER_NATIVE,plan.native.replies,
+                std::size_t{coordinator->plan().parameters().native.reply_capacity}*sizeof(p::Grant));
             input(spans,q::PooledNativeOperand::RecordBytes,owner->roots().native,BufferId::QFN_POOLED_OWNER_NATIVE,plan.native.progress+offsetof(n::OwnerProgress,reply_bytes),8);}
         auto operands=q::PooledImmutableCoordinatorOperands(action,coordinator->plan(),rows,std::move(spans));
         stages.push_back(std::make_unique<PooledImmutableNativePhaseStage>(arena,code,PooledImmutableNativePhaseStage::Coordinator{action,coordinator,std::move(operands)}));
@@ -408,6 +418,12 @@ public:
      */
     void replay(std::uint64_t sequence,std::span<const std::uint64_t> original,NativeTransactionEventSample* sample=nullptr){
         if(sample)sample->valid=false;
+        const bool originalHistory=mode==RecordedTrace::SuccessfulSource && history==NativeReplayHistory::OriginalFreeVictim;
+        if(originalHistory && sequence==1)requireNative(original.size()==2 && original[0]==101 && original[1]==102,
+            "Original free/victim witness lost its exact first input");
+        if(originalHistory && sequence==2)requireNative(original.size()>=3 && original[0]==700 && original[1]==701 &&
+            std::all_of(original.begin()+2,original.end(),[](auto row){return row==900;}),
+            "Original free/victim witness lost its exact second input");
         if(intent==NativeReplayIntent::TransactionTiming){
             requireNative(original.size()<=maximum,"Timing input count exceeds its admitted original bound");
             const auto sourceRows=coordinator->plan().parameters().policy.sourceRows();
@@ -451,8 +467,9 @@ public:
         const auto actual=read<p::CoordinatorUnique>(frame,plan.frame.unique,unique.size());
         for(std::size_t i=0;i<unique.size();++i)EXPECT_EQ(actual[i].row,unique[i]);
         const auto permutation=read<std::uint32_t>(frame,plan.frame.original_to_unique,original.size());EXPECT_EQ(permutation,expected);
-        EXPECT_EQ(bool(owner->roots().cache),slots!=0);EXPECT_EQ(owner->plan().parameters().native.bytes,128u+64u*slots);EXPECT_EQ(coordinator->captureIdentity(),identity);
         const auto& ownerPlan=owner->plan().parameters();
+        EXPECT_EQ(ownerPlan.owner.capacity(),slots);EXPECT_EQ(bool(owner->roots().cache),ownerPlan.owner.capacity()!=0);
+        EXPECT_EQ(owner->roots().native->size_bytes(),ownerPlan.native.bytes);EXPECT_EQ(coordinator->captureIdentity(),identity);
         const auto ownerFrame=read<p::OwnerFrame>(static_cast<const std::byte*>(owner->roots().frame->gpu_data_ptr()),ownerPlan.frame.control,1).front();
         EXPECT_EQ(ownerFrame.phase,p::OwnerPhase::Idle);EXPECT_EQ(ownerFrame.status,mode==RecordedTrace::PlanCancellation?q::adaptive_lookup::Status::Cancelled:q::adaptive_lookup::Status::Success);
         EXPECT_EQ(ownerFrame.held_pins,0u);EXPECT_EQ(ownerFrame.reservations,0u);
@@ -466,30 +483,34 @@ public:
             }else{EXPECT_EQ(actualOwner.filled,sequence==1?2u:4u);EXPECT_EQ(actualOwner.next_slot_generation,sequence==1?2u:5u);}}
         EXPECT_EQ(memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableTableStorage,PhysicalMemoryMaterializationKind::NewAllocation),owner->plan().parameters().cache.bytes+coordinator->plan().parameters().cache.bytes+(source?source->size_bytes():0));
         if(mode==RecordedTrace::SuccessfulSource){
+            const auto expectedProduced=scalarPolicy?scalarPolicy->view().frame->free_planned+scalarPolicy->view().frame->victim_planned:
+                sequence==1?2u:sequence==2?3u:0u;
+            requireNative(expectedProduced<=ownerPlan.native.reply_capacity,"Scalar source frontier exceeds original reply capacity");
+            // IO is poisoned once, not per replay. Retain the actual scalar-authored high-water prefix;
+            // previous larger source replies may remain in its inactive tail during later all-hit frames.
+            payloadWrittenRows=std::max(payloadWrittenRows,expectedProduced);
             for(std::size_t i=0;i<original.size();++i)std::copy_n(static_cast<const std::byte*>(source->raw_data())+original[i]*90,90,expectedOutput.data()+i*90);
             const auto actualOutput=read<std::byte>(static_cast<const std::byte*>(output->gpu_data_ptr()),0,output->size_bytes());EXPECT_EQ(actualOutput,expectedOutput);
-            const auto nativePayload=read<std::byte>(static_cast<const std::byte*>(io->gpu_data_ptr()),ioOffsets.payload,slots*90);
-            for(std::size_t i=(sequence==1?2:3)*90;i<nativePayload.size();++i)EXPECT_EQ(nativePayload[i],std::byte{0xa5});
-            const auto slotsState=read<q::adaptive_lookup::Slot32>(static_cast<const std::byte*>(owner->roots().cache->gpu_data_ptr()),ownerPlan.cache.slots,slots);
-            const auto cachePayload=read<std::byte>(static_cast<const std::byte*>(owner->roots().cache->gpu_data_ptr()),ownerPlan.cache.payload,slots*ownerPlan.slot_stride);
-            for(std::size_t slot=0;slot<slots;++slot){
+            const auto nativePayload=read<std::byte>(static_cast<const std::byte*>(io->gpu_data_ptr()),ioOffsets.payload,std::size_t{ownerPlan.native.reply_capacity}*ownerPlan.row_bytes);
+            for(std::size_t i=std::size_t{payloadWrittenRows}*ownerPlan.row_bytes;i<nativePayload.size();++i)EXPECT_EQ(nativePayload[i],std::byte{0xa5});
+            const auto slotsState=read<q::adaptive_lookup::Slot32>(static_cast<const std::byte*>(owner->roots().cache->gpu_data_ptr()),ownerPlan.cache.slots,ownerPlan.owner.capacity());
+            const auto cachePayload=read<std::byte>(static_cast<const std::byte*>(owner->roots().cache->gpu_data_ptr()),ownerPlan.cache.payload,std::size_t{ownerPlan.owner.capacity()}*ownerPlan.slot_stride);
+            for(std::size_t slot=0;slot<ownerPlan.owner.capacity();++slot){
                 for(std::size_t i=90;i<ownerPlan.slot_stride;++i)EXPECT_EQ(cachePayload[slot*ownerPlan.slot_stride+i],std::byte{0xa5});
                 if(q::adaptive_lookup::PhysicalSlot<q::adaptive_lookup::Slot32>::state(slotsState[slot])==q::adaptive_lookup::SlotState::Ready)
                     EXPECT_EQ(std::memcmp(cachePayload.data()+slot*ownerPlan.slot_stride,static_cast<const std::byte*>(source->raw_data())+slotsState[slot].row*90,90),0);
             }
-            if(sequence>=2){for(const auto& slot:slotsState)if(slot.row==900 && q::adaptive_lookup::PhysicalSlot<q::adaptive_lookup::Slot32>::state(slot)==q::adaptive_lookup::SlotState::Ready){
-                if(sequence==2)hotGeneration=slot.generation;else EXPECT_EQ(slot.generation,hotGeneration);}}
-            if(sequence==2){EXPECT_EQ(state.free_planned,2u);EXPECT_EQ(state.victim_planned,1u);
+            if(originalHistory && sequence>=2){for(const auto& slot:slotsState)if(slot.row==900 && q::adaptive_lookup::PhysicalSlot<q::adaptive_lookup::Slot32>::state(slot)==q::adaptive_lookup::SlotState::Ready){
+                if(!hotGeneration)hotGeneration=slot.generation;else EXPECT_EQ(slot.generation,hotGeneration);}}
+            if(originalHistory && sequence==2){EXPECT_EQ(state.free_planned,2u);EXPECT_EQ(state.victim_planned,1u);
                 const auto grants=read<p::Grant>(static_cast<const std::byte*>(owner->roots().frame->gpu_data_ptr()),ownerPlan.frame.replies,3);
                 const auto accepted=read<p::AllocationDecision>(static_cast<const std::byte*>(owner->roots().frame->gpu_data_ptr()),ownerPlan.frame.accepted_plan,3);
                 const std::array<std::uint64_t,3> rows{700,701,900};
                 for(unsigned i=0;i<3;++i){EXPECT_EQ(grants[i].row,rows[i]);EXPECT_EQ(grants[i].generation,i+3);EXPECT_EQ(grants[i].destination_token,i+1);EXPECT_EQ(accepted[i].row,rows[i]);
                     EXPECT_EQ(accepted[i].kind,i<2?p::CommandKind::ReserveFree:p::CommandKind::ReserveVictim);}
             }
-            if(sequence>=3 && !scalarPolicy){EXPECT_EQ(state.free_planned,0u);EXPECT_EQ(state.victim_planned,0u);}
+            if(originalHistory && sequence>=3 && !scalarPolicy){EXPECT_EQ(state.free_planned,0u);EXPECT_EQ(state.victim_planned,0u);}
             const auto sourceFrontier=read<n::SourceFrontier>(static_cast<const std::byte*>(trace->gpu_data_ptr()),64,1).front();
-            const auto expectedProduced=scalarPolicy?scalarPolicy->view().frame->free_planned+scalarPolicy->view().frame->victim_planned:
-                sequence==1?2u:sequence==2?3u:0u;
             EXPECT_EQ(sourceFrontier.disposition,expectedProduced?n::SourceDisposition::Consumed:n::SourceDisposition::Unpublished);
             const auto records=read<std::uint64_t>(static_cast<const std::byte*>(io->gpu_data_ptr()),ioOffsets.record_bytes,1).front();
             const auto payloadBytes=read<std::uint64_t>(static_cast<const std::byte*>(io->gpu_data_ptr()),ioOffsets.payload_bytes,1).front();
@@ -661,7 +682,7 @@ public:
         const auto counts=read<std::uint16_t>(cache,plan.cache.counts,cells);
         EXPECT_TRUE(std::equal(epochs.begin(),epochs.end(),expected.frequency_epochs));
         EXPECT_TRUE(std::equal(counts.begin(),counts.end(),expected.frequency_counts));
-        EXPECT_LT(plan.policy.laneWidth(),7u); // Seven distinct recorded rows force collisions in every lane.
+        if(slots==4)EXPECT_LT(plan.policy.laneWidth(),7u); // Original seven-row pressure trace forces collisions.
         if(actual.aging_accesses==17 && actual.logical_clock>17){
             EXPECT_TRUE(std::any_of(epochs.begin(),epochs.end(),[](auto epoch){return epoch>0;}));
         }
@@ -684,6 +705,11 @@ public:
             EXPECT_EQ(nodes[i].split_bit,expected.nodes[i].split_bit);
         }
         const auto state=read<p::LookupFrame>(frame,plan.frame.control,1).front();
+        EXPECT_EQ(state.initial_clock,expected.frame->initial_clock);
+        EXPECT_EQ(state.original_ids,expected.frame->original_ids);EXPECT_EQ(state.unique_rows,expected.frame->unique_rows);
+        EXPECT_EQ(state.outstanding,expected.frame->outstanding);EXPECT_EQ(state.phase,expected.frame->phase);
+        EXPECT_EQ(state.status,expected.frame->status);EXPECT_EQ(state.queues_applied,expected.frame->queues_applied);
+        for(unsigned list=0;list<3;++list)EXPECT_EQ(state.eligible_cursor[list],expected.frame->eligible_cursor[list]);
         EXPECT_EQ(state.free_planned,expected.frame->free_planned);
         EXPECT_EQ(state.victim_planned,expected.frame->victim_planned);
         const auto decisions=std::size_t{state.free_planned}+state.victim_planned;
@@ -727,6 +753,8 @@ public:
     RecordedTrace mode;
     n::OriginalIdWidth originalWidth;
     NativeReplayIntent intent;
+    NativeReplayHistory history;
+    std::uint32_t payloadWrittenRows=0; ///< Diagnostic scalar-derived dirty-IO frontier, outside event clocks.
     BufferArena arena;
     std::shared_ptr<const q::IPooledImmutableNativeKernels> code;
     std::unique_ptr<IDeviceContext> context;
@@ -855,7 +883,7 @@ void successfulNativeReplay(DeviceId device,bool policyProof=false){
             });
             EXPECT_EQ(writers,1);
             EXPECT_EQ((replay.code->codeIdentity()>>25)&0x7fU,4u);
-            EXPECT_EQ((replay.code->codeIdentity()>>32)&0xffU,6u);
+            EXPECT_EQ((replay.code->codeIdentity()>>32)&0xffU,7u);
         }
         for(const auto& node:nodes){requireNative(node.valid(),"Native successful kernel resource inventory incomplete");
             const std::array coordinatorNames{"coordinator","Original","radix","coalesceSmall","seedKeys","markGroups","scanGroups","materializeGroups","materializeUnique"};
@@ -888,7 +916,7 @@ void failedEpochNativeReplay(DeviceId device){
     session->requirePayloadRetired();session->retire();
 }
 /** @brief Distinct request histories retain their authored arithmetic policy and source scope. */
-enum class TransactionTimingHistory {WarmRepeat,WarmInterleaved,ChangingPressure,ZeroCapacity};
+enum class TransactionTimingHistory {WarmRepeat,WarmInterleaved,WarmProtected16,ChangingPressure,ZeroCapacity};
 /** @brief One exact opt-in timing cell; no code identity or production dispatch is selected here. */
 struct TransactionTimingCase {
     std::uint32_t live_ids;
@@ -896,7 +924,7 @@ struct TransactionTimingCase {
     /** @return Exact physical query bound; empty work still retains its declared control graph. */
     std::uint32_t maximum()const{return live_ids?live_ids:16;}
     /** @return Original physical owner capacity; C0 is an explicit no-source cancellation control. */
-    std::uint32_t slots()const{return history==TransactionTimingHistory::ZeroCapacity?0:4;}
+    std::uint32_t slots()const{return history==TransactionTimingHistory::ZeroCapacity?0:history==TransactionTimingHistory::WarmProtected16?32:4;}
     /** @return Authored policy: pressure controls age every original observation to admit actual changing cold rows. */
     std::uint64_t aging()const{return history==TransactionTimingHistory::ChangingPressure?1:65536;}
     /** @return Existing complete source/owner transaction used by this cell. */
@@ -906,6 +934,7 @@ struct TransactionTimingCase {
         switch(history){
         case TransactionTimingHistory::WarmRepeat:return live_ids?"warm_repeat":"empty_positive_capacity";
         case TransactionTimingHistory::WarmInterleaved:return "warm_interleaved";
+        case TransactionTimingHistory::WarmProtected16:return "warm_protected16";
         case TransactionTimingHistory::ChangingPressure:return "changing_hot_cold_pressure_aging1";
         case TransactionTimingHistory::ZeroCapacity:return live_ids?"zero_capacity_no_source_plan_cancel":"empty_zero_capacity_plan_cancel";
         }
@@ -931,6 +960,11 @@ std::vector<std::uint64_t> timingWarmRows(std::uint32_t count){
  */
 std::vector<std::uint64_t> timingRows(const TransactionTimingCase& cell,std::uint32_t ordinal){
     if(cell.history==TransactionTimingHistory::WarmRepeat)return timingWarmRows(cell.live_ids);
+    if(cell.history==TransactionTimingHistory::WarmProtected16){
+        std::vector<std::uint64_t> rows(cell.live_ids);
+        for(std::size_t i=0;i<rows.size();++i)rows[i]=101+i%16;
+        return rows;
+    }
     if(cell.history==TransactionTimingHistory::WarmInterleaved){
         constexpr std::array<std::uint64_t,3> hot{700,701,900};
         std::vector<std::uint64_t> rows(cell.live_ids);
@@ -959,7 +993,7 @@ nlohmann::json timingInputRuns(std::span<const std::uint64_t> rows){
 /**
  * @brief Collect opt-in complete transaction intervals through the actual production native owner.
  * @param device Explicit CUDA or ROCm participant; unavailable hardware fails rather than skips.
- * @param selected Optional isolated WarmInterleaved/N7168 cell; absent preserves the complete 26-cell trajectory.
+ * @param selected Optional isolated interleaved/protected16 N7168 cell; absent preserves the original 26-cell trajectory.
  * @note Generic timing reports its actual bundle identity and accepts coherent original-scheduling/current-common-arithmetic
  *       and candidate builds. The separate four-lane geometry regression remains identity-specific.
  */
@@ -970,8 +1004,9 @@ void transactionTiming31(DeviceId device,std::optional<TransactionTimingCase> se
     if(!hasCPUBackend())initCPUBackend(-1);
     std::vector<TransactionTimingCase> cells;
     if(selected){
-        requireNative(selected->live_ids==7168 && selected->history==TransactionTimingHistory::WarmInterleaved,
-            "Isolated native profiling requires the authored WarmInterleaved/N7168 cell");
+        requireNative(selected->live_ids==7168 &&
+            (selected->history==TransactionTimingHistory::WarmInterleaved || selected->history==TransactionTimingHistory::WarmProtected16),
+            "Isolated native timing requires an authored interleaved/protected16 N7168 cell");
         cells.push_back(*selected);
     }else{
         for(const auto n:{16u,32u,48u,64u,1024u,7168u}){
@@ -991,14 +1026,14 @@ void transactionTiming31(DeviceId device,std::optional<TransactionTimingCase> se
     PhysicalMemoryPlanBuilder plan;
     for(const auto cell:cells){
         NativeReplay declaration(device,*session,cell.maximum(),cell.slots(),cell.trace(),n::OriginalIdWidth::UInt64,
-            true,true,cell.aging(),NativeReplayIntent::TransactionTiming);
+            true,true,cell.aging(),NativeReplayIntent::TransactionTiming,NativeReplayHistory::AuthoredPolicy);
         for(const auto& resource:declaration.declaration().resources())plan.add(resource);
     }
     session->admit(plan.build());
     for(const auto cell:cells){
         {
             NativeReplay replay(device,*session,cell.maximum(),cell.slots(),cell.trace(),n::OriginalIdWidth::UInt64,
-                false,true,cell.aging(),NativeReplayIntent::TransactionTiming);
+                false,true,cell.aging(),NativeReplayIntent::TransactionTiming,NativeReplayHistory::AuthoredPolicy);
             worker.submitAndWait([&]{
                 std::vector<GPUGraphKernelNodeInfo> kernels;
                 std::string detail;
@@ -1018,7 +1053,10 @@ void transactionTiming31(DeviceId device,std::optional<TransactionTimingCase> se
                 }
                 const nlohmann::json metadata{{"schema","qfn.native_transaction_timing.v1"},{"case",cell.name()},
                     {"device",device.toString()},{"target_live_ids",cell.live_ids},{"maximum_original",cell.maximum()},
-                    {"owner_slots",cell.slots()},{"aging_accesses",cell.aging()},{"warmups",warmups},{"measurements",samples},
+                    {"owner_slots",cell.slots()},
+                    {"owner_reply_capacity",replay.owner->plan().parameters().native.reply_capacity},
+                    {"coordinator_reply_capacity",replay.coordinator->plan().parameters().native.reply_capacity},
+                    {"aging_accesses",cell.aging()},{"warmups",warmups},{"measurements",samples},
                     {"conditioning_requests",conditioning},{"matrix_cells",cells.size()},
                     {"initial_state","fresh original owner/coordinator metadata; no policy upload or reset"},
                     {"source_lifetime","one original prepared session admitted for the complete timing matrix"},
@@ -1027,7 +1065,7 @@ void transactionTiming31(DeviceId device,std::optional<TransactionTimingCase> se
                     {"actual_capture_identity",replay.coordinator->captureIdentity()},{"kernel_manifest",manifest},
                     {"source_scope",cell.slots()?"admitted diagnostic IQ4_NL rows, not RAM/SSD transport":"no-source C0 planned-cancellation protocol"},
                     {"timer_scope","complete retained native transaction event interval; not isolated PlanFree"},
-                    {"scalar_reference","original serial-position observations; terminal checks outside event interval"},
+                    {"scalar_reference","original serial-position frequency and original queue body; checks outside event interval"},
                     {"full_path_launch_economy_qualified",false}};
                 std::cout<<"POOLED_NATIVE_TRANSACTION_METADATA "<<metadata.dump()<<'\n';
                 std::uint64_t sequence=0;
@@ -1039,6 +1077,11 @@ void transactionTiming31(DeviceId device,std::optional<TransactionTimingCase> se
                         requireNative(event.unique_rows==3 && event.initial_hit_rows==3 && event.source_rows==0,
                             "Warm-interleaved timing requires all three actual retained hot rows and no source fetch");
                     }
+                    if(cell.history==TransactionTimingHistory::WarmProtected16 && sequence>conditioning){
+                        requireNative(event.unique_rows==16 && event.initial_hit_rows==16 && event.source_rows==0 &&
+                            replay.scalarPolicy->original_queue_batch_eligible.value_or(false),
+                            "Warm-protected16 timing requires actual retained hits and original scalar queue guard eligibility");
+                    }
                     const auto admission=cell.slots() && sequence>=3?2u:1u;
                     const nlohmann::json record{{"schema","qfn.native_transaction_timing.v1"},{"case",cell.name()},
                         {"device",device.toString()},{"target_live_ids",cell.live_ids},{"owner_slots",cell.slots()},
@@ -1049,13 +1092,19 @@ void transactionTiming31(DeviceId device,std::optional<TransactionTimingCase> se
                         {"initial_hit_unique_rows",event.initial_hit_rows},{"completed_unique_rows",event.unique_rows},
                         {"free_planned_rows",event.free_rows},{"victim_planned_rows",event.victim_rows},
                         {"source_rows",event.source_rows},{"source_native_bytes",event.source_native_bytes},
-                        {"scalar_and_terminal_checks_passed",true},{"timer_scope","complete retained native transaction"}};
+                        {"scalar_and_terminal_checks_passed",true},
+                        {"scalar_queue_batch_eligible",replay.scalarPolicy->original_queue_batch_eligible.value_or(false)},
+                        {"timer_scope","complete retained native transaction"}};
                     std::cout<<"POOLED_NATIVE_TRANSACTION_SAMPLE "<<record.dump()<<'\n';
                     return event.elapsed_ms;
                 };
-                observe("conditioning",0,std::array<std::uint64_t,2>{101,102});
-                const auto seed=timingWarmRows(cell.maximum());
-                observe("conditioning",1,seed);
+                if(cell.history==TransactionTimingHistory::WarmProtected16){
+                    std::array<std::uint64_t,16> seed{};for(std::size_t i=0;i<seed.size();++i)seed[i]=101+i;
+                    observe("conditioning",0,seed);observe("conditioning",1,seed);
+                }else{
+                    observe("conditioning",0,std::array<std::uint64_t,2>{101,102});
+                    const auto seed=timingWarmRows(cell.maximum());observe("conditioning",1,seed);
+                }
                 for(unsigned index=0;index<warmups;++index){
                     const auto rows=timingRows(cell,index);
                     observe("warmup",index,rows);
@@ -1079,9 +1128,55 @@ void transactionTiming31(DeviceId device,std::optional<TransactionTimingCase> se
     session->retire();
 }
 
+/**
+ * @brief Replay protected-hit batching against the actual original scalar queue body with full policy/bytes.
+ * @param device Exact original prepared native owner; no host policy is uploaded to select a GPU branch.
+ * @note The captured production transaction retains the same owner/source lifecycle through large/small/empty reuse.
+ */
+void protectedHitQueueBatchNativeReplay(DeviceId device)
+{
+    auto* backend=getBackendFor(device);requireNative(backend && backend->deviceCount()>device.ordinal,"Explicit pooled queue backend unavailable");
+    if(!hasCPUBackend())initCPUBackend(-1);
+    auto session=PreparedNativeLookupFixture::prepare(std::array{device});
+    auto& worker=*session->permit(device).worker();
+    NativeReplay declaration(device,*session,7168,32,RecordedTrace::SuccessfulSource,
+        n::OriginalIdWidth::UInt64,true,true,65536,NativeReplayIntent::ContractReplay,NativeReplayHistory::AuthoredPolicy);
+    PhysicalMemoryPlanBuilder bom;for(const auto& resource:declaration.declaration().resources())bom.add(resource);
+    session->admit(bom.build());
+    {
+        NativeReplay replay(device,*session,7168,32,RecordedTrace::SuccessfulSource,
+            n::OriginalIdWidth::UInt64,false,true,65536,NativeReplayIntent::ContractReplay,NativeReplayHistory::AuthoredPolicy);
+        EXPECT_EQ(replay.owner->plan().parameters().owner.capacity(),32u);
+        EXPECT_EQ(replay.owner->plan().parameters().native.reply_capacity,16u);
+        EXPECT_EQ(replay.coordinator->plan().parameters().native.reply_capacity,16u);
+        worker.submitAndWait([&]{
+            std::array<std::uint64_t,16> seed{};for(std::size_t i=0;i<seed.size();++i)seed[i]=101+i;
+            replay.replay(1,seed);replay.replay(2,seed); // Initial probation then original protected promotion.
+            std::vector<std::uint64_t> original(7168);
+            for(std::size_t i=0;i<original.size();++i)original[i]=seed[i%seed.size()];
+            replay.replay(3,original);
+            ASSERT_TRUE(replay.scalarPolicy->original_queue_batch_eligible.value_or(false));
+            std::reverse(original.begin(),original.end());
+            replay.replay(4,std::span<const std::uint64_t>(original).first(1024));
+            ASSERT_TRUE(replay.scalarPolicy->original_queue_batch_eligible.value_or(false));
+            replay.replay(5,std::array<std::uint64_t,1>{101});
+            ASSERT_TRUE(replay.scalarPolicy->original_queue_batch_eligible.value_or(false));
+            replay.replay(6,{});EXPECT_FALSE(replay.scalarPolicy->original_queue_batch_eligible.value_or(true));
+            for(auto& row:original)if(row==seed.back())row=900; // Replace a key: keep the original 16-unique bound.
+            // Mixed missing/probation frame must keep original ordered mutation.
+            replay.replay(7,original);EXPECT_FALSE(replay.scalarPolicy->original_queue_batch_eligible.value_or(true));
+            replay.replay(8,seed); // Protected pressure from the new row is validated by the original oracle too.
+        });
+    }
+    session->requirePayloadRetired();session->retire();
+}
 }
 #ifdef HAVE_CUDA
+TEST(PooledImmutableNativeDevice,CUDAProtectedHitQueueBatchCapturedReplay){protectedHitQueueBatchNativeReplay(DeviceId::cuda(0));}
 TEST(PooledImmutableNativeDevice,DISABLED_CUDAActualIdentityTransactionTiming31){transactionTiming31(DeviceId::cuda(0));}
+TEST(PooledImmutableNativeDevice,DISABLED_CUDAWarmProtected16_7168TransactionTiming31){
+    transactionTiming31(DeviceId::cuda(0),TransactionTimingCase{7168,TransactionTimingHistory::WarmProtected16});
+}
 TEST(PooledImmutableNativeDevice,CUDAPlanFreeFailedEpochCapturedReplay){failedEpochNativeReplay(DeviceId::cuda(0));}
 TEST(PooledImmutableNativeDevice,CUDAFourFrequencyLanePolicyCapturedReplay){successfulNativeReplay(DeviceId::cuda(0),true);}
 TEST(PooledImmutableNativeDevice,CUDAUInt32DispatchBoundaryReplay){narrowBoundaryReplay(DeviceId::cuda(0));}
@@ -1089,7 +1184,11 @@ TEST(PooledImmutableNativeDevice,CUDACapturedSuccessfulSourceReplay){successfulN
 TEST(PooledImmutableNativeDevice,CUDACapturedPlanCancelLargeSmallEmptyReplay){nativeReplay(DeviceId::cuda(0));}
 #endif
 #ifdef HAVE_ROCM
+TEST(PooledImmutableNativeDevice,ROCmProtectedHitQueueBatchCapturedReplay){protectedHitQueueBatchNativeReplay(DeviceId::rocm(0));}
 TEST(PooledImmutableNativeDevice,DISABLED_ROCmActualIdentityTransactionTiming31){transactionTiming31(DeviceId::rocm(0));}
+TEST(PooledImmutableNativeDevice,DISABLED_ROCmWarmProtected16_7168TransactionTiming31){
+    transactionTiming31(DeviceId::rocm(0),TransactionTimingCase{7168,TransactionTimingHistory::WarmProtected16});
+}
 TEST(PooledImmutableNativeDevice,DISABLED_ROCmWarmInterleaved7168TransactionTiming31){
     transactionTiming31(DeviceId::rocm(0),TransactionTimingCase{7168,TransactionTimingHistory::WarmInterleaved});
 }

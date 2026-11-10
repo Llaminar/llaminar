@@ -5,8 +5,8 @@
  * Static policies fill setup-resolved quotas in strict integer-priority order.
  * Dynamic policies may consume exact decode, prefill, and grouped-verifier
  * demand together with a complete service profile. That path solves a fixed-
- * quota bipartite min-cost flow using integer arithmetic, so every distributed
- * participant derives the same placement without floating-point or declaration-
+ * quota objective using exact two-tier differences or general min-cost flow,
+ * so every distributed participant derives the same placement without floating-point or declaration-
  * order ambiguity. Compact arrays are indexed relative to the authenticated
  * stage origin; weights, histograms and published placements retain global IDs.
  */
@@ -682,7 +682,8 @@ namespace llaminar2
         /**
          * @brief Solve the exact phase-weighted fixed-quota assignment.
          *
-         * This is a deterministic successive-shortest-path solver over the
+         * Two tiers use exact fixed-quota cost-difference selection. More
+         * than two tiers use a deterministic successive-shortest-path solver over the
          * bipartite expert-to-tier graph. Primary cost is exact integer
          * nanoseconds, secondary cost is the number of incumbent moves, and
          * the final expert-id term assigns lower ids to more-preferred tiers.
@@ -728,6 +729,64 @@ namespace llaminar2
             {
                 priority_rank[static_cast<std::size_t>(
                     priority_order[static_cast<std::size_t>(rank)])] = rank;
+            }
+
+            // Construct the SAME checked lexicographic edge cost for both
+            // algorithms. In particular, even a zero-quota tier must validate
+            // every expert's phase evidence and service arithmetic.
+            const auto assignment_cost = [&](int expert, int tier)
+            {
+                const auto tie_value = static_cast<__int128>(expert) *
+                    static_cast<__int128>(tier_count - 1 -
+                        priority_rank[static_cast<std::size_t>(tier)]);
+                if (tie_value > static_cast<__int128>(
+                                    std::numeric_limits<int64_t>::max()))
+                    throw std::overflow_error(
+                        "MoE deterministic expert-id assignment tie overflowed");
+                return ExactAssignmentCost{
+                    .service_time_ns = phaseWeightedServiceTime(
+                        histogram, profile, tier, layer, expert),
+                    .moved_experts = previous &&
+                        previous->routed_expert_tier[static_cast<std::size_t>(expert)] != tier ? 1 : 0,
+                    .expert_id_tie = static_cast<int64_t>(tie_value),
+                };
+            };
+
+            if (tier_count == 2)
+            {
+                struct ExpertDifference
+                {
+                    int expert;
+                    ExactAssignmentCost cost;
+                };
+                std::vector<ExpertDifference> differences;
+                differences.reserve(static_cast<std::size_t>(metadata.num_experts));
+                for (int expert = 0; expert < metadata.num_experts; ++expert)
+                {
+                    const auto first = assignment_cost(expert, 0);
+                    const auto second = assignment_cost(expert, 1);
+                    differences.push_back({expert, addExactCost(first, negateExactCost(second))});
+                }
+                // Starting with every expert in tier 1 leaves a constant
+                // objective. Exactly quota[0] switches are required; the
+                // smallest exact differences therefore give the global
+                // optimum. The original incumbent and expert-id objectives
+                // remain subordinate to service time, without scalar packing.
+                std::sort(differences.begin(), differences.end(),
+                    [](const ExpertDifference &lhs, const ExpertDifference &rhs)
+                    {
+                        if (lhs.cost < rhs.cost) return true;
+                        if (rhs.cost < lhs.cost) return false;
+                        return lhs.expert < rhs.expert;
+                    });
+                RoutedExpertLayerPlacement placement;
+                placement.layer = layer;
+                placement.routed_expert_tier.assign(
+                    static_cast<std::size_t>(metadata.num_experts), 1);
+                for (int chosen = 0; chosen < quotas[0]; ++chosen)
+                    placement.routed_expert_tier[static_cast<std::size_t>(
+                        differences[static_cast<std::size_t>(chosen)].expert)] = 0;
+                return placement;
             }
 
             struct ResidualEdge
@@ -778,40 +837,8 @@ namespace llaminar2
                 add_edge(source, expert_begin + expert, 1, zero);
                 for (int tier = 0; tier < tier_count; ++tier)
                 {
-                    const auto tie_value =
-                        static_cast<__int128>(expert) *
-                        static_cast<__int128>(
-                            tier_count - 1 -
-                            priority_rank[static_cast<std::size_t>(tier)]);
-                    if (tie_value >
-                        static_cast<__int128>(
-                            std::numeric_limits<int64_t>::max()))
-                    {
-                        throw std::overflow_error(
-                            "MoE deterministic expert-id assignment tie overflowed");
-                    }
-                    add_edge(
-                        expert_begin + expert,
-                        tier_begin + tier,
-                        1,
-                        {
-                            .service_time_ns = phaseWeightedServiceTime(
-                                histogram,
-                                profile,
-                                tier,
-                                layer,
-                                expert),
-                            .moved_experts =
-                                previous &&
-                                        previous->routed_expert_tier[
-                                            static_cast<std::size_t>(expert)] !=
-                                            tier
-                                    ? 1
-                                    : 0,
-                            .expert_id_tie =
-                                static_cast<int64_t>(tie_value),
-                        },
-                        tier);
+                    add_edge(expert_begin + expert, tier_begin + tier, 1,
+                             assignment_cost(expert, tier), tier);
                 }
             }
             for (int tier = 0; tier < tier_count; ++tier)

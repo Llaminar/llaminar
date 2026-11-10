@@ -226,6 +226,17 @@ namespace llaminar2
         const MoEExpertOwner* placementFor(int layer_idx,int expert_id) const;
 
         /**
+         * @brief Borrow one layer's complete canonical placement relation.
+         * @param layer_idx Model-global layer, including sparse or absent IDs.
+         * @return Ordered original rows, including whole owners and cohorts;
+         *         empty for an absent layer. The immutable map owns the lifetime.
+         * @note Every builder canonicalizes `(layer, expert)` once before
+         *       publication. Two binary searches retain this invariant without
+         *       constructing a second index or scanning other model layers.
+         */
+        [[nodiscard]] std::span<const MoEExpertOwner> placementsForLayer(int layer_idx) const noexcept;
+
+        /**
          * @param layer_idx Original model-global layer.
          * @param expert_id Original expert ID.
          * @return Exact physical fragment count; zero if absent, one for a whole owner.

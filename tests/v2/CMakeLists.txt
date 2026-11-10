@@ -19095,7 +19095,7 @@ add_executable(v2_perf_prepared_expert_swap_search
     performance/moe/Perf__PreparedExpertSwapSearch.cpp)
 target_include_directories(v2_perf_prepared_expert_swap_search PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_features(v2_perf_prepared_expert_swap_search PRIVATE cxx_std_20)
-target_link_libraries(v2_perf_prepared_expert_swap_search PRIVATE GTest::gtest GTest::gtest_main)
+target_link_libraries(v2_perf_prepared_expert_swap_search PRIVATE llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Perf_PreparedExpertSwapSearch
     COMMAND $<TARGET_FILE:v2_perf_prepared_expert_swap_search>
     LABELS "V2;Performance;MoE;CPU;ExpertOverlay;Economy"
@@ -37854,6 +37854,13 @@ if(TARGET v2_test_qwen4exp_primitives)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledImmutableFourFrequencyLaneReplay)
+    add_v2_test(V2_Integration_PooledImmutableProtectedHitQueueBatchReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableNative.ProtectedHitQueueBatch*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledImmutableProtectedHitQueueBatchReplay)
 endif()
 # Explicit native gates execute captured production phase callers; no source/transport eligibility is implied.
 if((HAVE_CUDA OR HAVE_ROCM) AND TARGET v2_test_qwen4exp_device_primitives)
@@ -37905,6 +37912,12 @@ foreach(QFN_POOLED_SUCCESS_BACKEND IN ITEMS CUDA ROCm)
             LABELS "V2;Integration;ProductionTestPreflight;${QFN_POOLED_SUCCESS_BACKEND};Ngram;Ownership;TraceReplay;Capture;Component;ByteExact;Regression"
             MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${QFN_POOLED_SUCCESS_LOCK} TIMEOUT 30 ENVIRONMENT ${QFN_POOLED_SUCCESS_ENV})
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${QFN_POOLED_SUCCESS_BACKEND}_PooledImmutableFourFrequencyLaneCapturedReplay)
+        add_v2_test(V2_Integration_${QFN_POOLED_SUCCESS_BACKEND}_PooledImmutableProtectedHitQueueBatchReplay
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=PooledImmutableNativeDevice.${QFN_POOLED_SUCCESS_BACKEND}ProtectedHitQueueBatchCapturedReplay
+            LABELS "V2;Integration;ProductionTestPreflight;${QFN_POOLED_SUCCESS_BACKEND};Ngram;Ownership;TraceReplay;Capture;Component;ByteExact;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${QFN_POOLED_SUCCESS_LOCK} TIMEOUT 30 ENVIRONMENT ${QFN_POOLED_SUCCESS_ENV})
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${QFN_POOLED_SUCCESS_BACKEND}_PooledImmutableProtectedHitQueueBatchReplay)
         add_v2_test(V2_Integration_${QFN_POOLED_SUCCESS_BACKEND}_PooledImmutablePlanFreeFailedEpochReplay
             COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                 --gtest_filter=PooledImmutableNativeDevice.${QFN_POOLED_SUCCESS_BACKEND}PlanFreeFailedEpochCapturedReplay
@@ -39582,5 +39595,39 @@ if(TARGET v2_unit_moe_overlay_residency_authority)
         ENVIRONMENT "LLAMINAR_PERF_STATS_FILTER=moe_overlay_residency.precut_tier_candidate_cut,moe_overlay_residency.projected_service_gain_ns")
     if(TEST V2_Integration_MoEPrecutTierCandidateWitness)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEPrecutTierCandidateWitness)
+    endif()
+endif()
+
+# Exact two-tier assignment replays the retained general solver and brute-force optima.
+if(TARGET v2_unit_moe_routed_expert_placement_planner)
+    add_v2_test(V2_Integration_MoEExactTwoTierAssignmentReplay
+        COMMAND $<TARGET_FILE:v2_unit_moe_routed_expert_placement_planner>
+            --gtest_filter=Test__MoERoutedExpertPlacementPlanner.ExactTwoTier*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Planning;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    if(TEST V2_Integration_MoEExactTwoTierAssignmentReplay)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEExactTwoTierAssignmentReplay)
+    endif()
+endif()
+
+# Original immutable owner ranges preserve both whole and joint CPU placements.
+if(TARGET v2_unit_moe_expert_owner_map)
+    add_v2_test(V2_Integration_MoECanonicalOwnerLayerRange
+        COMMAND $<TARGET_FILE:v2_unit_moe_expert_owner_map>
+            --gtest_filter=Test__MoEExpertOwnerMap.CanonicalLayerRange*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Ownership;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    if(TEST V2_Integration_MoECanonicalOwnerLayerRange)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoECanonicalOwnerLayerRange)
+    endif()
+endif()
+if(TARGET v2_unit_moe_overlay_residency_authority)
+    add_v2_test(V2_Integration_MoECanonicalCohortLayerRange
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+            --gtest_filter=CPUJointPlacementCandidateContract.CanonicalLayerRange*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Ownership;LocalTP;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    if(TEST V2_Integration_MoECanonicalCohortLayerRange)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoECanonicalCohortLayerRange)
     endif()
 endif()
