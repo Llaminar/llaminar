@@ -334,3 +334,19 @@ After i8mm merge (same tile / post-merge):
   added-line identity = the proof).
 - B9: census receipt at c4536cf3c is content-bound → travels with an
   identical replay (range-diff 1/1 `=` + reviewer re-pin).
+
+### PUBLISHED (2026-11-10, ~11:10Z): #43 tip = 28ddbe253 (172 commits onto 2948b1e49)
+
+- Operator direction: always push, don't wait for compile → published with
+  the full ARM compile STILL RUNNING (not certified); 14/14 target-selection
+  checks pass. Freeze LIFTED for mechanical rebase/reviewer re-pin; pinned
+  gates finish unchanged (B9 census proceeds at c4536cf3c as queued).
+- Both stacks replay onto 28ddbe253 BEFORE FF handover: idea-31 stack
+  (95d462930/3027d7bb8/e5248cba8/042a9e9da — clean replay expected, no
+  gemm/tournament conflicts) and Bundle-1's 11 commits (CMake resolves
+  semantically around 28ddbe253's own ARM-gated x86-only registrations;
+  added-line identity = the proof). Bundle-1's push additionally waits for
+  the .80 bound-run result.
+- I8MM runtime byte cells (focused set: PreparedProjection Unit/Integration,
+  PanelTailsMatchSerial, I8MMOperandGrouping, I8MMTailsMatchSDOT,
+  PanelTournamentContract) run ONLY at the eventual rebased handover tip.
