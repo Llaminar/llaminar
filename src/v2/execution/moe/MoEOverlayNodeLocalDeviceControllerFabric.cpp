@@ -8,6 +8,7 @@
  * only writers of controller lifecycle and policy records.
  */
 
+#include "utils/HostPageSize.h"
 #include "MoEOverlayNodeLocalDeviceControllerFabric.h"
 #include "MoEOverlaySharedBackingStartup.h"
 
@@ -899,7 +900,7 @@ namespace llaminar2
             config_.num_layers,
             config_.num_experts,
             config_.command_capacity,
-            4096u,
+            hostPageBytes(),
             config_.payload_bytes_per_layer,
             config_.minimum_window_activations,
             config_.maximum_cycles_per_wave,

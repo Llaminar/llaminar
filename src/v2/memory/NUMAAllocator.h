@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "utils/HostPageSize.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -98,13 +99,14 @@ namespace llaminar2
         /**
          * @brief Required alignment for externally owned NUMA-bound ranges.
          *
-         * The implementation applies policy to whole 4-KiB pages and rounds
-         * the byte extent upward to the same boundary.  Callers must therefore
-         * allocate both a page-aligned address and page-rounded capacity.
+         * The implementation applies policy to whole host base pages (4 KiB,
+         * 16 KiB or 64 KiB on AArch64) and rounds the byte extent upward to the
+         * same boundary. Callers must therefore allocate both a page-aligned
+         * address and page-rounded capacity.
          */
-        [[nodiscard]] static constexpr size_t externalRangeAlignment() noexcept
+        [[nodiscard]] static size_t externalRangeAlignment()
         {
-            return 4096;
+            return hostPageBytes();
         }
 
         /**
