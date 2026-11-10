@@ -895,3 +895,20 @@ clean). Addresses both P2s:
 - Scope: static source ACK; not compilation/execution/receipt
   authentication/FF permission. #169 done → the FF gate = GNU driver
   receipt + focused set at ee7bf0596 (in flight) → Main.
+
+### Combined tip advanced (addon correction, 2026-11-10): 717b2bfe6
+
+- CORRECTION accepted: the addon's earlier "origin FF" claim was wrong (the
+  fix-back push had not happened; the reviewer's stale-ref observation was
+  right). origin/codex/arm-s4-nibble-witness NOW carries **717b2bfe6**;
+  before this push it carried a16591eed.
+- Prose folded NOW (nonblocking, comment-only): the tournament file header's
+  default-format line lists all seven sources, matching line 196.
+- NEW combined tip: **717b2bfe6** (7 commits: 5 ACKed + a16591eed +
+  ee7bf0596 + 717b2bfe6 prose-only). .80: i31final updated;
+  trees/717b2bfe6 seeded.
+- Receipt validity: a register-gate receipt at ee7bf0596 remains fully
+  valid (the tournament file is NOT a register-gate input; probe/budget/
+  checker identical); if arm-sparks hadn't started, retarget to
+  trees/717b2bfe6. Awaiting arm-sparks' answer on which SHA its run is
+  against. Reviewer light-confirmation of the comment-only delta requested.
