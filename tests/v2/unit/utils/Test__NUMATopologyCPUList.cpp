@@ -104,3 +104,17 @@ TEST(NUMATopologyCPUList, RegistryCPUEndpointsFollowNodeTopology)
         expected.push_back(node.node_id);
     EXPECT_EQ(registered, expected);
 }
+
+/** @test Failed detection never publishes a usable node; success always does. */
+TEST(NUMATopologyCPUList, UndetectedAffinityIsNeverNodeZero)
+{
+    EXPECT_EQ(llaminar2::NUMAInfo{}.local_numa_node, -1);
+    const auto info = NUMATopology::detectLocalNUMANode();
+    if (info.detection_succeeded)
+        EXPECT_GE(info.local_numa_node, 0);
+    else
+    {
+        EXPECT_EQ(info.local_numa_node, -1);
+        EXPECT_EQ(info.detection_method, "unknown");
+    }
+}
