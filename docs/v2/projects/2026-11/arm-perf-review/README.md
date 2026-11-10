@@ -350,3 +350,19 @@ After i8mm merge (same tile / post-merge):
 - I8MM runtime byte cells (focused set: PreparedProjection Unit/Integration,
   PanelTailsMatchSerial, I8MMOperandGrouping, I8MMTailsMatchSDOT,
   PanelTournamentContract) run ONLY at the eventual rebased handover tip.
+
+### Stacks rebased onto 28ddbe253 (2026-11-10, addon lane; all-mechanical, range-diff `=` every commit)
+
+- **Idea-31 + selector** = `codex/arm-panel-tournament-policy` @ **df15aca96**:
+  4950e6101 (=95d462930) → **870bb545e** (=3027d7bb8, install commit) →
+  8e23691d8 (=e5248cba8) → **df15aca96** (=042a9e9da).
+- **B9** = `codex/arm-witness-post-index` @ **f265d2950** (= c4536cf3c).
+- Ancestry: 28ddbe253 does NOT contain 8fcc0fe0b — Main re-landed R2 as
+  **cd0f95150** (all 11 commits present); neither stack carries old R2
+  commits. Mac quick checks: PreparedProjection DotProd 15/15 @ df15aca96;
+  tournament self-test 0 failed; witness shards OK @ f265d2950.
+- .80 ready (refs i31final/b9final/base28d; trees seeded; **561 G free** —
+  the 473 G deletion evidently done): focused I8MM byte-cell set at
+  df15aca96 (GO) → B9 census at c4536cf3c (queued). Install receipt at
+  870bb545e = content-bound to the GREEN 3027d7bb8 receipt; re-run only if
+  the reviewer requires. Reviewer re-pins requested for both stacks.
