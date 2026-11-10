@@ -239,3 +239,20 @@ not a defect); the 4096 CPU plan is planning evidence, NOT GPU
 trace/inference evidence. Source/doc checkpoint follows; #72
 (GroupedSealedPlan stub) queued next, #73 (FusedFinalAdd policy triage)
 after; addon #175 + A1 #180 independent holds unchanged.
+
+### Dir-B trace — EXPLICIT SCOPE ACK (coordinator, 2026-11-10, ~23:38Z)
+
+Approved: CPU-single per-bucket structure trace at -c 4096 / 5b76a146c
+(host-side CPU timings: forward_graph/prefill_graph_launch per-bucket +
+per-stage host wall via PerfStats CSV/JSON; NO GPU runtime, NO 8192, NO
+NCU/NSYS/CUPTI; production OMP 20T places=cores close; ONE prefill-
+dominated pass: benchmark --config <plan> -n 8 --temperature 0 --seed 42
+--no-mtp --iterations 1 with the ~2154-token filler; model = on-disk .79
+4-split set — no fetch; runner docker uma4; seal
+K14-IDEA25-Q38-TRACE-STRUCT-CPU4096-<date> with the CPU label). Prereq
+ownership: coordinator + arm-sparks (self-booked window on Main's
+handback); Main's plan-only handback + this ACK = inference authorization
+for this bounded run only. CONDITION: launch after arm-sparks classifies
+the a/b fast-rc1 failure text (config/authoring → its fix; authorization
+boundary → STOP + report). This = the operator-approved idea-25 Dir-B
+perf-structure evidence (on-demand helper, not a gate).
