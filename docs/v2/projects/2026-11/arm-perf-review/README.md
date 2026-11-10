@@ -697,3 +697,17 @@ omitted the actual sixth stream argument → production declaration included
 + explicit same-stream I/O. **LMHead workspace + KV input admission fixes
 ALSO PASS** → the 2 known arena/transfer cases appear fixed. Continuing:
 sm121 tile inventory + idea21b probe. NOT SETTLED yet.
+
+### GPU slot slice 2 (2026-11-10, ~14:40Z) — tip 371f5ab35 (175 commits)
+
+- TILE INVENTORY (b) FIXED AT SOURCE: the missing dense prefill tile was
+  exactly tile5 — NOT sm_121 resource ineligibility; the fixed inventory
+  geometries hit short-K/marginal-wave heuristic demotions at GB10's SM
+  count. Fix: an all-format long-K geometry scaled to >=1.5 waves, all tile
+  assertions + captured byte oracles retained. Native GB10 focused bucket-M
+  prefill PASS (16s); both invocation regressions repeatedly passing.
+- IDEA-21b (c) REPRODUCED EXACTLY: codebook4 C32 = 62 regs / 8 CTAs;
+  codebook13 C32 = 56/9; NO SPILLS. Main investigating 12.x occupancy
+  WITHOUT budget loosening (real kernel improvement first — consistent with
+  the standing rule's escape-hatch discipline). Finishing durable summary.
+NOT SETTLED yet.
