@@ -1125,3 +1125,14 @@ from the retained g-*.census.log files on .80 (arm-sparks to cat).
   (c) SHA = **825fe8deb** (not 0185f69b3). Final strengthening SHAs:
   3ed993968 (a) / f3faa540c (b) / 825fe8deb (c). Content byte-identical to
   the validated composition; analysis shard 64/64 green after the edit.
+- MECHANISM PINNED (arm-sparks verbatim evidence, 17:34Z): the census Debug
+  CONFIGURE_FAILED lines = **cache-mismatch, NOT ENOSPC** —
+  census-gnu-obj/b-Debug-NEON.cfg.log (+8 siblings): "The source
+  /work/trees/8fcc0fe0b/... does not match the source /work/trees/46c9ffc58/
+  ... used to generate cache" (the FIXED out-dir was first configured for
+  46c9ffc58; every later tree failed). ZERO ENOSPC in any retained
+  .err/.cfg.log (Debug-*.err = 0 bytes; CMake errored to the .cfg.log); the
+  disk-full era affected the int-* builds, NOT the census cells. Item 2
+  closes: single mechanism (silent fixed-out-dir cache mismatch), fixed by
+  the per-cell fresh dirs + stamps; reordering Debug first = cosmetic, no
+  change recommended.
