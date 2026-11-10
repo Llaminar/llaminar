@@ -335,7 +335,7 @@ TEST(Test__NUMAAllocator, DedicatedMappingsSurviveAlternatingNodeChurn)
     if (!allocator.isNUMAAvailable())
         GTEST_SKIP() << "NUMA policy APIs are unavailable";
 
-    constexpr size_t page_size =
+    const size_t page_size =
         NUMAAllocator::externalRangeAlignment();
     constexpr size_t pages_per_round = 384;
     const int rounds = allocator.numNUMANodes() > 1 ? 32 : 4;
@@ -366,7 +366,7 @@ TEST(Test__NUMAAllocator, HugePageAdvisedMappingsRetainExactFirstTouchNode)
     if (!allocator.isNUMAAvailable())
         GTEST_SKIP() << "NUMA policy APIs are unavailable";
 
-    constexpr size_t page_size =
+    const size_t page_size =
         NUMAAllocator::externalRangeAlignment();
     constexpr size_t mapping_bytes = 4u * 1024u * 1024u;
     const int rounds = allocator.numNUMANodes() > 1 ? 16 : 4;

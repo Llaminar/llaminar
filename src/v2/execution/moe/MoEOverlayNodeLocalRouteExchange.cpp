@@ -9,6 +9,7 @@
  * this file contains no inference-time polling, copying, or synchronization.
  */
 
+#include "utils/HostPageSize.h"
 #include "MoEOverlayNodeLocalRouteExchange.h"
 
 #include "transfer/TransferEngine.h"
@@ -27,7 +28,6 @@ namespace llaminar2
     namespace
     {
         constexpr std::size_t kCacheLineBytes = 64u;
-        constexpr std::size_t kPageBytes = 4096u;
 
         /** @return `value` rounded up to `alignment`, rejecting overflow. */
         std::size_t checkedAlignUp(
@@ -245,7 +245,7 @@ namespace llaminar2
             if (endpoint.participant_id == root_participant)
                 continue;
 
-            cursor = checkedAlignUp(cursor, kPageBytes);
+            cursor = checkedAlignUp(cursor, hostPageBytes());
             LaneLayout layout;
             layout.producer_device = endpoint.device;
             layout.producer_participant = endpoint.participant_id;
@@ -257,7 +257,7 @@ namespace llaminar2
             layout.slot_epochs_offset = cursor;
             cursor = checkedAdd(
                 cursor, slot_epoch_bytes, "slot-epoch layout");
-            cursor = checkedAlignUp(cursor, kPageBytes);
+            cursor = checkedAlignUp(cursor, hostPageBytes());
             layout.payload_offset = cursor;
             cursor = checkedAdd(cursor, payload_bytes, "payload layout");
             layout.root_staging_offset = checkedMultiply(
@@ -273,7 +273,7 @@ namespace llaminar2
          * overwrite that bank only after every peer has acknowledged the prior
          * epoch on device.
          */
-        cursor = checkedAlignUp(cursor, kPageBytes);
+        cursor = checkedAlignUp(cursor, hostPageBytes());
         const std::size_t dense_control_offset = cursor;
         cursor = checkedAdd(
             cursor,
@@ -287,7 +287,7 @@ namespace llaminar2
             "dense publication peer acknowledgements");
         cursor = checkedAdd(
             cursor, dense_peers_bytes, "dense publication peer layout");
-        cursor = checkedAlignUp(cursor, kPageBytes);
+        cursor = checkedAlignUp(cursor, hostPageBytes());
         const std::size_t dense_payload_offset = cursor;
         const std::size_t dense_element_capacity = checkedMultiply(
             static_cast<std::size_t>(max_rows),
@@ -299,7 +299,7 @@ namespace llaminar2
             "dense publication payload bytes");
         cursor = checkedAdd(
             cursor, dense_payload_bytes, "dense publication payload layout");
-        const std::size_t mapping_bytes = checkedAlignUp(cursor, kPageBytes);
+        const std::size_t mapping_bytes = checkedAlignUp(cursor, hostPageBytes());
 
         /*
          * TransferEngine is the sole mapped-memory authority.  In a

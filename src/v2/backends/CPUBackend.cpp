@@ -12,6 +12,7 @@
 #include "CPUBackend.h"
 #include "HostMemoryCapacity.h"
 #include "../utils/Logger.h"
+#include "../utils/HostPageSize.h"
 
 #include <cerrno>
 #include <cstring> // memcpy, memset
@@ -158,7 +159,9 @@ namespace llaminar2
         // 64-byte alignment is enough for cache line / AVX-512 alignment.
         // NUMA placement is installed with mbind() before first-touch so the
         // pointer remains compatible with std::free().
-        const size_t alignment = local_numa_node_ >= 0 ? static_cast<size_t>(4096) : static_cast<size_t>(64);
+        // mbind applies policy to whole host base pages, so a bound
+        // allocation starts and ends on the host page size (4-64 KiB).
+        const size_t alignment = local_numa_node_ >= 0 ? hostPageBytes() : static_cast<size_t>(64);
         size_t aligned_bytes = (bytes + alignment - 1) & ~(alignment - 1);
 
         ptr = std::aligned_alloc(alignment, aligned_bytes);
@@ -201,7 +204,7 @@ namespace llaminar2
         if (bytes >= 128 * 1024) // Only parallel init for >= 128KB
         {
             char *data = static_cast<char *>(ptr);
-            const size_t page_size = 4096;
+            const size_t page_size = hostPageBytes();
 #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < bytes; i += page_size)
             {
