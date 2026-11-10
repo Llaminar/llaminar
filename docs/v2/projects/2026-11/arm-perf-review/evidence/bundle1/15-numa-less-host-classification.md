@@ -263,3 +263,32 @@ Classifiers, archived in the tracker at `docs/v2/projects/2026-11/arm-perf-revie
 - **To add (revision 2, authoritative):** `15/classify_v2.py` (`ac0a624f…`),
   `15/classification-v2.csv` (`35c21aff…`, one row per (run, test) with `x86_same_name`, `tags`,
   `primary`), and the shared block splitter `15/extract.py`.
+
+## Reviewer #144 source-bounds addendum (2026-11-10) — wording fixes REQUIRED
+
+- classify_v2.py:48-61 scans the ENTIRE CTest output (incl. passing/expected-
+  negative siblings) then promotes first match to primary+cause -> the
+  PRIMARY DIAGNOSTIC TAGS are disjoint tags, NOT established causes. EITHER
+  bind evidence to the actual failed case OR label output HEURISTIC
+  diagnostic classification and keep causes unresolved; stop 'by primary
+  cause'; same for 'passes unmasked => seccomp-only' and 'timeout passes
+  alone => VM cause'.
+- 39c->7d1/a27 'CPU-only content-equivalent' claim is NOT true:
+  ContributionContract.h +50/-7; PackedWeights.h +5/-2;
+  UnsignedWeightDotLifecycle.inc +333/-2; AVX2/Gemv + registrations change.
+  -> scope correspondence to exact unchanged files; no whole-CPU/test
+  qualification transfer.
+- 'No I8MM-specific failures' stronger than matched failed-name set (extra
+  unresolved *neon_i8mm failure): state exact name-set observation + scoped
+  dedicated-test passes; causes/qualification open.
+- G1/G2: 'CAN affect neighbours' (static reachable hazard), NOT an observed
+  corrupting run. G3: API defect proven; not automatically the planner's
+  path. G4: byte-range nonoverlap != runtime-page first-touch ownership;
+  'correct on 64K' too broad. G5: NUMATopology:82-87 publishes node0 +
+  detection_succeeded=false + method=fallback; ClusterInventoryGatherer:261-
+  263 + RuntimeInitPhase:59-60 REJECT failed detection -> narrow to
+  misleading/synthetic failure metadata; NOT proof those paths accept node0.
+  G6: 'EVERY sub-page projection' too broad (65532 FP32 -> 65536 both);
+  'CAN under-admit sub-page projections' accurate; PMA rejection separate
+  from estimator defect. G7: ALSO falsely ACCEPTS CPU1 in '10-19' (not only
+  misses CPU9 in '0-71'); generic affinity failure doesn't identify detector.
