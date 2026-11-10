@@ -644,3 +644,26 @@ substitute. Spec only — no driver approval/execution/merge grant.
 - HYGIENE RULE (both GB10 hosts): prune superseded gate build dirs once
   their gates seal — keep the last sealed tip's dir + all logs. Accumulation
   across tips starved .80 (473 G static-core) and .79 (70 G) the same day.
+
+### Receipt driver v2 — #167-conformant (addon, 2026-11-10)
+
+`register-gate.sh <tree> <out> <expected-identity> [cmake args]` (also on
+.80 build/); completeness/binding coordinator only, verdicts from the
+existing build/verify authorities. Per cell (Debug/Release/Integration ×
+3 ISA): persistent per-cell portability configure (regenerated on input
+change; failed configure fails the cell; Integration empty-flag guard
+enforced by v2_validate_portability_integration_flags) → build BOTH proof
+targets → inventory = exactly 14 aliases (native/envelope/checker,
+Unit+Integration), run with --no-tests=error, all must Pass → per-cell
+receipt/<cell>/ with the full #167 artifact set (register
+proof.json/.o/.dis/.i + deps; envelope proof.json/.s/target.txt; compile
+DBs; commands/exit codes/logs; inventory) → reconcile (identity/ISA/build-
+type/budget+checker hashes vs tree). Receipt dir RECREATED each run (no old-
+file harvesting); failure = failure report, never a receipt. Checker shards
+conservatively PER CELL pending the reuse-clause answer. Mac trials
+(AppleClang-21 @ c4536cf3c; tooling trials): fresh 9/9 + reuse 9/9 (~9 min);
+negatives = identity mismatch (reconcile), unregistered alias (inventory
+13/14), lowered budget (cell-attributed PROOF_BUILD_FAILED) — all rc 1.
+Archived: evidence/register-gate-trial2-c4536cf3c-appleclang/ (125 MB).
+Post-SETTLED usage: .80 GNU-14 + Mac AppleClang-21 at the combined tip.
+Holding until SETTLED.
