@@ -21,6 +21,9 @@
 #include <charconv>
 #include <limits>
 #include <string_view>
+#include <cctype>
+#include <stdexcept>
+#include <system_error>
 
 // Conditional includes for optional dependencies
 #ifdef HAVE_HWLOC
@@ -185,6 +188,52 @@ namespace llaminar2
 #else
         return -1; // hwloc not available
 #endif
+    }
+
+    std::vector<int> NUMATopology::parseCPUListExact(const std::string &list)
+    {
+        std::vector<int> cpus;
+        const auto parse_id = [](const std::string &text) {
+            if (text.empty() || !std::all_of(text.begin(), text.end(),
+                                             [](unsigned char ch) { return std::isdigit(ch); }))
+                throw std::invalid_argument("Malformed CPU id in cpulist: '" + text + "'");
+            return std::stoi(text);
+        };
+        std::string trimmed = list;
+        trimmed.erase(0, trimmed.find_first_not_of(" \t\n"));
+        trimmed.erase(trimmed.find_last_not_of(" \t\n") + 1);
+        if (trimmed.empty())
+            return cpus;
+        std::istringstream stream(trimmed);
+        std::string token;
+        while (std::getline(stream, token, ','))
+        {
+            const auto dash = token.find('-');
+            const int first = parse_id(dash == std::string::npos ? token : token.substr(0, dash));
+            const int last = dash == std::string::npos ? first : parse_id(token.substr(dash + 1));
+            if (last < first)
+                throw std::invalid_argument("Reversed range in cpulist: '" + token + "'");
+            for (int cpu = first; cpu <= last; ++cpu)
+                cpus.push_back(cpu);
+        }
+        std::sort(cpus.begin(), cpus.end());
+        return cpus;
+    }
+
+    int NUMATopology::nodeOwningCPU(
+        int cpu, const std::vector<std::pair<int, std::string>> &node_cpulists)
+    {
+        int owner = -1;
+        for (const auto &[node, list] : node_cpulists)
+        {
+            const auto cpus = parseCPUListExact(list);
+            if (!std::binary_search(cpus.begin(), cpus.end(), cpu))
+                continue;
+            if (owner >= 0)
+                throw std::invalid_argument("Two NUMA nodes list CPU " + std::to_string(cpu));
+            owner = node;
+        }
+        return owner;
     }
 
     int NUMATopology::detectViaProcfs()
