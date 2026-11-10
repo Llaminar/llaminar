@@ -8787,6 +8787,14 @@ add_v2_test(V2_Integration_NUMATopologyCPUListMembership
     COMMAND $<TARGET_FILE:v2_test_numa_cpulist>
     LABELS "V2;Integration;ProductionTestPreflight;NUMA;DeviceFree;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+# Mutable Q16_1 storage extents use the checked native-extent authority; the
+# unchecked rows x blocks x block_bytes product wrapped to a tiny buffer.
+add_executable(v2_test_q16_1_tensor_extent unit/tensors/Test__Q16_1TensorExtent.cpp)
+target_link_libraries(v2_test_q16_1_tensor_extent llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_Q16TensorExtentOverflow
+    COMMAND $<TARGET_FILE:v2_test_q16_1_tensor_extent>
+    LABELS "V2;Integration;ProductionTestPreflight;Q16;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_test(NAME V2_Integration_HostPageLiteralPolicy
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_host_page_literals.py
             --repo-root ${CMAKE_SOURCE_DIR}/../..)
@@ -41052,7 +41060,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertGemmRegistry
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEPipelineStageGraphFamily)
 
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HostPageSizeOwners V2_Integration_HostPageLiteralPolicy
-    V2_Integration_NUMATopologyCPUListMembership)
+    V2_Integration_NUMATopologyCPUListMembership V2_Integration_Q16TensorExtentOverflow)
 
 # nvcc --split-compile partitions a module nondeterministically, so register
 # allocation and the fatal spill verdict changed between identical compiles.
