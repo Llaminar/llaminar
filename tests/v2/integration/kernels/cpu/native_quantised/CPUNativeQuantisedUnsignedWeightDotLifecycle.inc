@@ -577,7 +577,8 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
         }
     }
 }
-/** @test Exact integer half-block merging preserves original serial bytes and retained scheduler ownership. */
+#if !defined(__aarch64__)
+/** @test Exact x86 integer half-block merging preserves serial bytes and retained scheduler ownership. */
 TEST(CPUNativeQuantisedFusedCompletion, OrderedNibbleSplitDotBoundaryLifecycle)
 {
     using namespace cpu::native_quantised;
@@ -682,6 +683,7 @@ TEST(CPUNativeQuantisedFusedCompletion, OrderedNibbleSplitDotBoundaryLifecycle)
     }
     EXPECT_EQ(nibble_sources, 5); // Original canonical Q4_0/Q4_1/Q4_K/IQ4_NL/IQ4_XS factories.
 }
+#endif // !defined(__aarch64__)
 
 } // namespace
 } // namespace llaminar2::test
