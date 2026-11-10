@@ -733,10 +733,18 @@ namespace
      * column and reused across all valid rows. K work is processed partition by
      * partition in one CTA; no global partial buffer or cross-CTA reduction is
      * required, and the final FP32 tree is exactly the public serial-M1 tree.
+     * The narrow IQ4/IQ2S 12.x kernels retain ten resident CTAs per SM; this
+     * compiler scheduling bound limits live registers without changing storage
+     * or the integer/FP contribution order.
      */
     template <uint8_t CodebookId, int ColumnsPerBlock>
     __global__ __launch_bounds__(
         GroupedImmaGeometry<ColumnsPerBlock>::projection_threads,
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        (ColumnsPerBlock == 32 &&
+         (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut ||
+          CodebookId == 13)) ? 10 :
+#endif
         GroupedImmaGeometry<ColumnsPerBlock>::
             projection_minimum_blocks_per_sm)
     void groupedImmaProjectionKernel(

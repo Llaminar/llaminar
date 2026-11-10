@@ -1,9 +1,10 @@
 # Native ARM CPU inference: implementation, numerical proof and tuning plan
 
-Created: 2026-11-04; frontier updated 2026-11-08.
-Base: `feat/qfn-ngram-continuation` at `b65ee52fd`. Working branch
-`codex/qfn-ngram-continuation-arm64` (draft PR #32), force-pushed after every
-commit; `arm-validation/<sha9>` branches pin each commit for the Spark hosts.
+Created: 2026-11-04; frontier updated 2026-11-10.
+Base: `feat/qfn-ngram-continuation` at `2948b1e49`. Working branch
+`codex/qfn-ngram-continuation-arm64`, published as `feat/arm64-native-kernels`
+in PR #43. Push each commit immediately; record pending validation separately.
+Qualification identifies exact SHAs, without additional pin branches or tags.
 
 **Status: implementation complete for the ARM CPU scope; post-merge performance work is tracked separately on the `codex/arm-perf-review` branch.**
 The objective remains native CPU inference with the robustness of the Intel
@@ -11,7 +12,35 @@ path, finished by a Release `Perf__` scaling round. Detailed historical
 evidence (K-series snapshots, seals, falsification controls) lives in
 [the evidence record](ARM_CPU_KERNEL_IMPLEMENTATION_EVIDENCE.md).
 
-### Current frontier — 2026-11-08
+### Maintenance frontier — 2026-11-10
+
+- The rebase onto `2948b1e49` is published. Full CPU-only ARM NEON Integration
+  compilation passed at `e5ee7f672`, after compiler OOM-killed parity objects
+  were resumed without changing build settings. Focused MPI/OpenMP/NUMA checks
+  passed; this was not a full Unit/preflight rerun.
+- GB10's legacy CUDA stream-call failures passed their rerun at `e5ee7f672`.
+  `18b455d62` then fixed the ops fixture's five/six-argument residual C ABI
+  mismatch, LM-head workspace binding and KV-input preparation. The complete
+  ops and padding files and both focused preflight invocation aliases pass.
+- `371f5ab35` extends the all-format captured prefill geometry inventory with
+  an SM-count-scaled long-K/full-wave case. Tile 5 is now exercised without
+  forcing dispatch, weakening eligibility or dropping a byte comparison.
+- Grouped-IMMA 12.x narrow IQ4/IQ2S projections now declare a ten-CTA compiler
+  scheduling bound. Native resource, all-format captured byte and staged
+  metadata gates pass without loosening limits; the source-scale IQ4 path joins
+  the strong 12.x resource check. The changed TU compiles spill-free for
+  80/86/89/90/120/121, with identical shipped instruction bytes after accounting
+  for nvcc's source-digest symbol salts. See the dated evidence record.
+- Profiler attachment emitted new NVRM reference-state warnings; further
+  NCU/NSYS attachment was stopped. Subsequent non-attached baseline and candidate
+  workloads completed inside clean driver-diagnostic windows. Attached results
+  are not a clean qualification receipt; diagnostic Integration event samples
+  do not establish a Release end-to-end speedup.
+- Idea-31/B9 handovers remain separate from CUDA iteration. Their final
+  composed source/checker/configuration requires canonical bound register and
+  compiler-envelope proofs, not composition of predecessor censuses.
+
+### CPU qualification snapshot — 2026-11-08
 
 Installed and verified:
 

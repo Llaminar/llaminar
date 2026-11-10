@@ -2260,3 +2260,71 @@ dense MTP economics, GDN grouped verifier, FA2 policy regret, region/barrier
 count, LM head, placement by core class, in-model overlay collection, GB10 CUDA
 register pressure (separate branch), NUMA-less hosts and a native macOS engine
 port. No generic prefill/decode retraining was performed.
+
+## GB10 CUDA maintenance evidence — 2026-11-10
+
+This section supersedes the earlier separate-branch disposition for the CUDA
+register-pressure work, not the historical CPU qualification results above.
+
+- `e5ee7f672`: the rectangular expert-tier CUDA/ROCm fixtures use the writable
+  unsealed publication span. GB10's stream-fixed cases pass at this revision.
+- `18b455d62`: the ops fixture now includes the production residual declaration
+  instead of a five-argument C redeclaration of the six-argument ABI. The crash
+  was reproduced before the fix. Explicit stream-ordered uploads, launches and
+  readbacks cover FP32/BF16/FP16. LM-head workspace binding and KV append input
+  preparation also pass. Both complete test files and the two new focused
+  `ProductionTestPreflight` invocation-contract aliases passed on GB10.
+- `371f5ab35`: the all-format captured prefill bucket-M invariant gate passes
+  with its added long-K/full-wave geometry. All six automatic tile obligations
+  remain; the formerly missing tile 5 is exercised without forced dispatch.
+
+### Narrow grouped IMMA scheduling bound
+
+The 12.x 32-column IQ4/IQ2S projection compiler bound admits at least ten CTAs
+per SM. No register array, shared-storage layout, arithmetic operation, stream,
+launch grid or public execution mode changes. The resource regression retains
+its 48-register ceiling and ten-active-CTA floor, and now applies that same
+strong contract to source-scale IQ4 on 12.x as well.
+
+| Execution codebook, 32 columns | Previous registers | Candidate registers | Candidate local bytes |
+|---|---:|---:|---:|
+| IQ4 nonlinear (4) | 62 | 48 | 0 |
+| IQ2_S (13) | 56 | 40 | 0 |
+| Source-scale IQ4_XS (24) | 56 | 45 | 0 |
+
+The changed translation unit passes the fatal spill guard for
+80/86/89/90/120/121. Shipped 80/86/89/90 instruction and encoding lines are
+identical, preserving function/template identity while normalizing only
+nvcc's source-digest salt in internal symbol names. This is instruction-byte
+identity, not identity of complete object files or debug metadata.
+The kernel source SHA-256 is
+`65e4940c33928afc84a34e5bc6d8e807d95d8932f80460f5cf10e17b38f9014f`.
+
+Native `CUDAMoEPrefillCompilerResourcesAllCodebooks`,
+`CUDAMoEPairedGateUpRegisterLifetimeAllFormats` and
+`CUDA_MoEPrefillStagedMetadataByteInvariant` gates pass. They exercise actual
+production dispatch and captured full-buffer serial-row byte comparisons.
+
+### Timing and driver-safety limits
+
+A matched synthetic production-shaped Integration/O3 trainer diagnostic
+(h2048/r512/e256/top8, IQ2_S gate/up, IQ4_XS down, M512, power-law routing)
+produced 24 candidate records per side with zero bit mismatches. For
+`imma_paired_g32__d32`, the 15-sample median changed from 3336.51 to 3315.53 us;
+its down projection changed from 56 registers/9 active CTAs to 45/10. The
+approximately 0.6% timing difference is within the observed noise and is not a
+Release performance or end-to-end speedup claim.
+
+NCU emitted a baseline report, but its owned driver window caught new NVRM
+`refcntRequestReference_IMPL` warnings. Further NCU/NSYS attachment was stopped;
+that report is not a clean qualification receipt. Subsequent non-attached
+baseline and candidate workload windows both passed driver diagnostics.
+The initial profiler attempt failed before launch because its session root did
+not exist; its incomplete driver-window record is retained separately.
+
+Raw commands, objects, disassembly, resource logs, CSV samples and driver
+reports remain on `.79` under `/home/factory/idea25/slot-probes/`, with the
+attached report under `slot-profiles/` and driver-window files alongside those
+directories. `candidate2-runtime.log` records the passing native checks and
+clean non-attached driver window. These diagnostics do not certify the full
+CUDA gate, a Release model benchmark or the pending Qwen3.8 trace.
