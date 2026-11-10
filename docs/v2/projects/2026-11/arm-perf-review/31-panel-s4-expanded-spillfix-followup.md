@@ -48,3 +48,25 @@ Status: OPEN (2026-11-09; queued via R2 C4 per-encoding width evidence).
   the post-index form (owner = register-gate tooling/addon + reviewer; do
   NOT change in the perf slice).
 - Classifier + installed witness untouched; .80 canonical gate separate.
+
+## Idea-31 candidate AppleClang secondary PASS (2026-11-10, b4dd753c8)
+
+- M1 Max AppleClang-21.0.0 portability Release; cand + parent NEON/NEON_DOTPROD.
+- Bytes 0-new/0-gone: ctest cand 292/292 DOTPROD + 291/291 NEON (parent 291/291);
+  0 skips; only new = V2_Integration_CPUNativeNEONNibblePanelReplay. Entire
+  prepared-projection binary: cand DOTPROD 15/15 + NEON 9/9 (new =
+  DotProdNibbleS4RecordedInputReplay). In-tree v2 byte sweep all green
+  (PanelWidthsMatchTheStripProgram + EverySourceAndEncoding/Compact +
+  EveryHalfAndOpaqueWord + ActivationSums + tail-padding + new replay).
+- Register witness: installed canonical passes; cand vs parent
+  INSTRUCTION-IDENTICAL (128/128 DOTPROD, 64/64 NEON). Non-certifying forced
+  census (same analyzer e6350f86): 48 programs all classifiable; candidate
+  S4 = NibbleLUT Centered BN **0 (parent 9)** / GA 0(0); NonLinear BN 0
+  (parent 4) / GA 0(0) -> ZERO on AppleClang + FIXES BN 9/4. Controls
+  unchanged (cand = parent): Unsigned+min BN7/GA0; SourceScale BN4/GA0;
+  Q5_K BN4 (gate-5 verified = 4); Q6_K 25/25 (known AppleClang spill,
+  CLASSIFIABLE on AppleClang unlike GNU); ExpandedInt8/IQ3S 0; all S1/S2 0.
+  44/48 forced programs identical; exactly the 4 candidate programs changed.
+- VERDICT: AppleClang parity holds (spill-free both compilers). Limits:
+  non-certifying census; the INSTALL needs the canonical witness extension +
+  the .80 economy gate (already measured); no Mac timing.
