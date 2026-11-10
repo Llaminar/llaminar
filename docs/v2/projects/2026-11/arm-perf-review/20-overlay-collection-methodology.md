@@ -1,6 +1,6 @@
 # Idea 20 — Overlay collection methodology (microbench wins that lose in-model)
 
-Status: **Open** (design/verification methodology; arises from idea 12's
+Status: **ADDRESSED** — coverage methodology finalized via Bundle-1; B5/B7 fixed; B8 deferred to the next overlay-table change. (2026-11-10 status flip)
 verdict).
 
 ## Context

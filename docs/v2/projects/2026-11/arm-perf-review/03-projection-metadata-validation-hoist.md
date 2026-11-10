@@ -1,6 +1,6 @@
 # Idea 3 — Move projection metadata validation out of the K loop
 
-Status: **Open** (at reviewed head the inner-loop throw is still present).
+Status: **ADDRESSED** — merged via R1 (5d4e3716a): publication seal, Q16 bound, fatal accessor, tile-register witness. (2026-11-10 status flip)
 
 ## Context
 

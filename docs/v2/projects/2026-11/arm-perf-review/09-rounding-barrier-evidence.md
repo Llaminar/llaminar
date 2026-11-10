@@ -1,6 +1,6 @@
 # Idea 9 — Non-volatile rounding barrier evidence
 
-Status: **Open** (experiment candidate; evidence required — no MCA/PMU
+Status: **REJECTED on merit** (Bundle-1 decision 2026-11-10 — no MCA/PMU justification; barrier evidence not actionable).
 comparison exists at the reviewed head).
 
 ## Context

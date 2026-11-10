@@ -1,6 +1,6 @@
 # Idea 11 — Attention validation hoist + integer-dot range proof
 
-Status: **Open**. Two related attention items, both about where validation
+Status: **ADDRESSED** — merged via R2 C2c (FA invocation admission) + addon scope. (2026-11-10 status flip)
 lives rather than the arithmetic itself.
 
 ## 11a. Per-call validation in NEON attention math

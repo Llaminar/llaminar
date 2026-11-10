@@ -1,6 +1,6 @@
 # Idea 6 — I8MM (SMMLA) row-pair dot-product
 
-Status: **Open**. Not implemented; only feature observation exists
+Status: **ADDRESSED** — merged (SMMLA row-pairs on shared-row tiles, lone-row SDOT leaf; runtime HWCAP admission; engine MTP +1.3/+1.7%). (2026-11-10 status flip)
 (`ARMCPUFeatures.h`: `IntegerMatMul`, HWCAP2_I8MM). M1's absence is not a
 global deferral for GB10, where both core types are Armv9.2 with I8MM.
 

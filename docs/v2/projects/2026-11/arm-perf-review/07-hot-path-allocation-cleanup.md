@@ -1,6 +1,6 @@
 # Idea 7 — Hot-path allocation / cache cleanup (shared CPU code)
 
-Status: **Open**. These are shared x86+ARM paths, not ARM-specific. They show
+Status: **ADDRESSED** — merged with ideas-7+25 (RoPE workspace, owner identity, inv_freq memo, RMSNorm 8192 fail-fast, host timers). (2026-11-10 status flip)
 up in the ARM hot path once the engine runs and are best as separate small PRs.
 Some already have a fatal/typed cleanup pattern to follow (`rejectNumeric`,
 idea 10).

@@ -1,6 +1,6 @@
 # Idea 27 — Fused NativeVNNI evidence cells fail on ARM (Pairwise/WideRows gap)
 
-Status: **Addressed** (2026-11-08 — closed per implementer). Fixed on PR #43 in
+Status: **ADDRESSED** (already recorded 2026-11-08 — confirmed).
 two commits: `37bd75ffa` lineage (evidence cell uses the native WideRows
 schedule on ARM) and `afe62c5ef` (real cause: ARM's fused launcher recorded
 nothing — three call sites published a 12-tag record including the bundle

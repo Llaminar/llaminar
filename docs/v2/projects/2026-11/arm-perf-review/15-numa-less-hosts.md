@@ -1,6 +1,6 @@
 # Idea 15 — NUMA-less and cache-unpublished Linux ARM hosts
 
-Status: **Partial**. `a572c3c9c` attributes system memory to a NUMA-less
+Status: **ADDRESSED** — NUMA-less classification rev4.1 via Bundle-1; B-series closed on real 64K. (2026-11-10 status flip)
 single-package host (`assignNonNUMAHostMemory`, regression
 `V2_Integration_NonNUMAHostMemoryAttribution`). Full serving support is
 scoped in the ARM plan (work package J, "NUMA-less and cache-unpublished

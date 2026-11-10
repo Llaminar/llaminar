@@ -1,6 +1,6 @@
 # Idea 4 — Wider decode column panel + activation reuse
 
-Status: **Open** (inner kernel unchanged since `ebe8da586`; the workshare
+Status: **ADDRESSED** — merged via R2 C4 (8fcc0fe0b): per-encoding panel widths + the installed-tournament contract. (2026-11-10 status flip)
 improvements in `33690f9b1`/`408ff90e5` address the outer task structure, not
 the tile K traversal).
 

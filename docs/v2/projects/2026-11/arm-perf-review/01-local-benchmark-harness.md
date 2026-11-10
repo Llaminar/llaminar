@@ -1,6 +1,6 @@
 # Idea 1 — Local kernel-benchmark A/B harness
 
-Status: **Partial**. The `Perf__` kernel suite exists and is portable; the gaps
+Status: **ADDRESSED** — perf_baseline.py + DecodeBandwidth landed via Bundle-1 (01-1 + 01-3); residual gaps recorded. (2026-11-10 status flip)
 below are worth closing before the larger kernel changes land.
 
 ## Context
