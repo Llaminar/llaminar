@@ -340,7 +340,7 @@ template<std::size_t Rows>void nonfiniteIsFatalBeforeWrites(std::span<float>nume
  * program. The numerator is shared with the death-test child, and a
  * write-before-reject negative control proves the witness sees child writes.
  */
-/** @test The private integer row program rejects a width beyond its bound's term count, and any negative width. */
+/** @test The private integer row program aborts (SIGABRT, not terminate) on a width beyond its bound's term count or below zero. */
 TEST_F(NEONAttentionMath, PrivateIntegerRowsRejectUnprovenWidths)
 {
     GTEST_FLAG_SET(death_test_style,"threadsafe");
@@ -348,10 +348,12 @@ TEST_F(NEONAttentionMath, PrivateIntegerRowsRejectUnprovenWidths)
     std::vector<std::int16_t> query(16,1),key(16,1);
     EXPECT_EQ(native::AdmittedRowsTestAccess::integerDotRows(bound,query.data(),key.data(),8),8);
     EXPECT_EQ(native::AdmittedRowsTestAccess::integerDotRows(bound,query.data(),key.data(),0),0);
-    EXPECT_DEATH((void)native::AdmittedRowsTestAccess::integerDotRows(bound,query.data(),key.data(),9),
-        "reduction width outside its int32 term bound");
-    EXPECT_DEATH((void)native::AdmittedRowsTestAccess::integerDotRows(bound,query.data(),key.data(),-1),
-        "reduction width outside its int32 term bound");
+    // Explicit abort from the diagnostic: an escaped exception or terminate exits 77.
+    for(const int width:{9,-1})
+        EXPECT_EXIT(({
+                std::set_terminate([]{std::fputs("escaped exception or terminate\n",stderr);std::_Exit(77);});
+                (void)native::AdmittedRowsTestAccess::integerDotRows(bound,query.data(),key.data(),width);
+            }),::testing::KilledBySignal(SIGABRT),"reduction width outside its int32 term bound") << "width=" << width;
 }
 
 TEST_F(NEONAttentionMath, NonfiniteWeightIsFatalBeforeAnySharedNumeratorWrite)

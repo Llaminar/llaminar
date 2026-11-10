@@ -8004,7 +8004,7 @@ add_v2_test(V2_Unit_CPUFlashAttentionKernelT
 # their complete actual banks before the first request or slice runs.
 add_v2_test(V2_Integration_CPUFlashAttentionInvocationAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
-            --gtest_filter=Test__CPUFlashAttention_TP_GQA.InvocationAdmissionRejectsBeforeAnyWrite:Test__CPUFlashAttention_TP_GQA.WholeInvocationAdmissionPrecedesEveryWrite
+            --gtest_filter=Test__CPUFlashAttention_TP_GQA.InvocationAdmissionRejectsBeforeAnyWrite:Test__CPUFlashAttention_TP_GQA.WholeInvocationAdmissionPrecedesEveryWrite:Test__CPUFlashAttention_TP_GQA.Q16LayoutAdmissionPrecedesEveryWrite
     LABELS "V2;Integration;ProductionTestPreflight;CPU;Attention;FlashAttention;Geometry;Regression"
     NO_MODELS
     MPI_PROCS 1
