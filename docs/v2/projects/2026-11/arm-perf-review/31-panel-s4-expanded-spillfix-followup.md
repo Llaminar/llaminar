@@ -81,3 +81,17 @@ Status: OPEN (2026-11-09; queued via R2 C4 per-encoding width evidence).
   block in registers' = intended compiler outcome (-> 'allows it to remain');
   176-installed witness != forced-S4 coverage; owner evidence unauthenticated;
   ACK = candidate delta on 777 only; flip/rebases = own exact-pin checks.
+
+## Idea-31 flip — Mac AppleClang-21 canonical census GREEN (2026-11-10, 972c0081)
+- 9 cells (Integration/Release/Debug identical): NEON 64/16 Rows1/0 spills +
+  1415=1415; NEON_DOTPROD 128/32/0 + 2003=2003; NEON_I8MM 176/32/0 +
+  2171=2171; budgets byte-equal; no rows>=2 key changed. The audited Rows1 =
+  the INSTALLED ones at the flip → includes the S4 NibbleLUT centered/
+  nonlinear programs both policies.
+- Mac byte sweep: PreparedProjection DotProd 15/15 (incl.
+  DotProdNibbleS4RecordedInputReplay + PanelWidths + TailPadding), NEON-only
+  9/9, ProjectionBatch DotProd 10/10. I8MM byte/oracle cells (incl. the fixed
+  codebook-5 lookup) = .80 window (GB10).
+- Merge note: idea-31 branch on 777f7a52a; its 2 commits = empty intersection
+  with 777f..8fcc0fe0b → rebase onto the final R2 tip = mechanical (at
+  handover). INSTALLABLE = .80 GNU-14 canonical census + the rebase.
