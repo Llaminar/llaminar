@@ -798,3 +798,25 @@ focused set (+InstalledWidth) → Main FF.
   evidence; #166/#167 govern complete current binding and the final set; a
   source re-pin is not receipt authentication or FF permission — Main owns
   acceptance/grants.
+
+### Reviewer #168 SOURCE ACK — Main's CUDA slice 28dd..e8866ec04 (no blocking finding)
+
+Verified the four linear commits (e5ee7f672 → 18b455d62 → 371f5ab35 →
+e8866ec04), static code/registration only:
+- Fixtures obtain the owned freshly-resized unsealed-generation span (no
+  seal bypass, no production-byte change); residual tests use the
+  production six-arg declarations + the fixture's CUDA ordinal + an
+  explicit nonblocking stream, ordered upload→launch→download→completion;
+  LMHead binds the declared persistent workspace; KV prep via TransferEngine
+  on the actual append stream.
+- The tile5 long-K geometry (K=2304, N=128*max(14,ceil(3*SM/8))+1,
+  M511/513 buckets) = the intended full-wave AUTO tile5 opportunity; no
+  forced tile, no eligibility weakening, no removed obligations/comparisons;
+  capture poisoning + double launch retained.
+- PRODUCTION CHANGE = ONLY the __launch_bounds__ minimum on
+  __CUDA_ARCH__>=1200, Columns32, codebooks 4/13/24; resource tests retain
+  <=48regs/>=10CTAs for 4/13 and extend to 24 on major>=12 (query addresses
+  the actual specialization).
+- Both new invocation aliases explicitly in ProductionTestPreflight.
+- Limits: source correspondence only; owner runtime reports stay owner
+  evidence; no FF/merge grant. #169 (combined re-pin) now unblocked.
