@@ -569,3 +569,23 @@ the canonical BOUND build/verify evidence per required cell; tree stamps /
 GREEN summaries / patch equality alone cannot satisfy it. Combined
 idea-31+B9 qualification still needs its own combined evidence (receipts do
 not compose). No authentication/branch-protection/merge grants in the ruling.
+
+### Addon adoption of the standing rule + receipt-path replacement (2026-11-10)
+
+- RECLASSIFICATION: census-matrix.sh output (incl. the 3027/8fcc/c4536/
+  870bb545e runs) = DIAGNOSTIC evidence, not qualifying receipts, per the
+  standing rule. Qualifying evidence = the canonical bound proof from a
+  configured gate build for EVERY required cell: the
+  `v2_cpu_native_tile_register_proof` target (proof.json, budgets applied,
+  binding verified) + the `V2_*_CPUNativeNEONTileRegisters` and
+  `TileRegisterEvidence*` ctests.
+- Combined-candidate composition (pending reviewer confirmation at re-pin):
+  18 required cells = **9 configured builds per compiler** (3 build types ×
+  NEON / NEON_DOTPROD / NEON_I8MM) × GNU-14 (.80) + AppleClang-21 (Mac),
+  via the core-free portability project.
+- The addon is writing a FAIL-CLOSED driver (fresh per-cell configure at the
+  exact tip → proof target → TileRegister ctests → per-cell proof.json →
+  nonzero exit on any failure/missing) to replace census-matrix.sh as the
+  receipt path; census-matrix.sh stays diagnostic. Ratchet: any grouped-key
+  lowering by the combined candidate = explicit downward-ratchet commit
+  through review.
