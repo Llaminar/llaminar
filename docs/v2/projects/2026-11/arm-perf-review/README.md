@@ -543,3 +543,17 @@ historical evidence, no active reservation.
   GitHub MERGEABLE/CLEAN. Still NOT CUDA qualification / NOT SETTLED for
   handovers (.79 rerun + GPU slot outstanding). The earlier
   "published-while-compiling" caveat is closed for the CPU-only side.
+
+### 01 BOUND RUN COMPLETE — graded BOUND (2026-11-10, .80 @ 5d606a108)
+
+- Results: build/results/{bound-5d606a108.json, bound-bw-result.json}.
+  Kind=kernel-metrics; build identity: Release, NEON ISA envelope (default,
+  pre-ISA-pin configure — acceptable: the bound run validates harness
+  content), g++-14 14.2.0, -O3, SHARED_CORE=ON, CUDA/ROCm OFF;
+  observations=1 (Ladder: Q4_K/Q5_K/Q6_K/IQ3_S × threads 20/10/1 × max
+  64MiB; 2 tests PASSED).
+- Provenance note: tree = /work/trees/b5d606a108 (the 5d name was claimed
+  by a stale prunable entry; identical tree + clean .git).
+- Bundle-1 acceptance input SATISFIED → push sequence: Main's SETTLED
+  declaration → final re-rebase onto the settled tip → force-with-lease
+  push (a4ebff3dd') → Main FF.
