@@ -5,7 +5,7 @@ Reviewed against: `codex/qfn-ngram-continuation-arm64` @ `be6658c38`
 (rebase onto `feat/qfn-ngram-continuation` @ `2f01249c9` complete; 28 ARM
 commits replayed).
 
-**Current anchors (2026-11-09):** arm branch PR #43 head = **`5d4e3716a`**
+**Current anchors (2026-11-10):** arm branch PR #43 head = **`8fcc0fe0b`** (169 commits; R2 MERGED via FF — 29351a57e -> 8fcc0fe0b; reviewed tip exact)
 (126 commits @ base `46c35f15b`; rename `NativeVNNI`->`NativeQuantised` in
 `a0fd16d04`; R1 fast-forwarded in: 425002104 -> 5d4e3716a; no rebase,
 reviewed tip exact; PR body updated). R2 + CUDA spill commits stack on
@@ -238,3 +238,15 @@ After i8mm merge (same tile / post-merge):
 - WSL (x86): x86 CPU-only gates/i8mm control/N3. Mac (M1): AppleClang/portability
   + Bundle-1 measurement. DGX station (Grace/GB300, 64K): perf-implementation
   lane + the only 64K host (B-fix validation window).
+
+## R2 MERGED (2026-11-10, Main) — #43 FF 29351a57e -> 8fcc0fe0b (169 commits)
+- Review tip exact (FF, no rebase); PR body updated. R2 = C2c admission +
+  C3 Ops seam + C4 per-encoding widths + tournament harness (the full fix-back
+  chain #151/#153/#155/#157 + owner gates: .80 43/43 first-FA-exec, engine
+  byte-identical + decode +7.9%/+2.3%, WSL x86 14/14 + admission 3/3+6/6).
+- Lanes re-anchor to 8fcc0fe0b: idea-31 (972c0081e) + policy selector
+  (6ebe1aefb) rebase onto 8fcc0fe0b after the .80 GNU census green; B9 = addon
+  tooling commit; GB10 CUDA stream investigation continues on the new tip.
+- YTD merged chain: base -> R1 -> ideas-7+25 -> CUDA stack -> B-series (B1-B7
+  + B10) -> R2. Remaining handovers: idea-31 (post-census rebase) + Bundle-1
+  (FF-time rebase target 8fcc0fe0b).
