@@ -1379,3 +1379,21 @@ ANSWER to arm-sparks's question: YES — the ngram/defaults pre-failures =
 base-pending-#71 (Main's fix), NOT lane regressions (names known from the
 415/9-era observations before the cell existed; zero other new names).
 Merge-readiness package routes to the reviewer with that attribution.
+
+### Tip + attribution updates (Main, 2026-11-10, ~21:23Z)
+
+- Pushed tip = **a847db3286b60d7db9f59b58b23653453d944b7d** (179 above
+  2948; MERGEABLE/CLEAN) — not 0d6f09919 (production code unchanged
+  0d6→a847; a847 repairs the ngram FIXTURES' NUMA observations + adds PP
+  terminal/lookup ownership tests).
+- ATTRIBUTION REFINEMENT (Main, precise): the 415/9-era ngram failures =
+  **INVALID TEST INPUTS** (CPU0/GPU3 or unknown-NUMA records, rejected
+  BEFORE request-work classification) — **not environment failures and not
+  code-path effects of the new classifier**. a847 FIXES the fixtures.
+  (Second station-baseline-class correction: the half-perf b512 run's
+  ngram/defaults names are this fixture-defect class — now FIXED
+  upstream; the reviewer attributes them away from the lane.)
+- Unit + expanded preflight + 20x rerun underway. **Real-model plan-only
+  window DELEGATED to arm-sparks at exact 0d6** (canonical driver
+  begin/finish; e886 preserved control) — the Qwen3.8-UD planning proof.
+- Addon still held; re-pin onto the eventual final Main tip mandatory.
