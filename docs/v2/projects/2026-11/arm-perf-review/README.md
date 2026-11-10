@@ -317,3 +317,20 @@ After i8mm merge (same tile / post-merge):
   mechanical rebases onto the published tip before push/FF (Bundle-1
   pre-committed to redo-on-new-tip; idea-31 replay + reviewer re-pin per
   protocol). Bundle-1's PUSH is on hold until then.
+
+### Rebase overlap detail (Main, publish pending)
+
+- Resolutions touched: tests/v2/CMakeLists.txt (both late base registrations
+  + backend-omission accounting preserved), Test__MPIBootstrap.cpp (both
+  independent tests), MPIBootstrap.cpp (portable placement + bounded wait),
+  NodeTopology/NUMATopology headers/bodies (all-CPU exact caller ownership;
+  unknown stays "unknown"). NO gemm/tournament production conflicts →
+  idea-31 stack replay = clean.
+- New-base fix 28ddbe253: gates the x86-only OrderedNibbleSplitDot-
+  BoundaryLifecycle body + AVX2/AVX512 preflight registrations off ARM
+  (borrowed banks/scheduler) — sits near Bundle-1's CMake insertion point;
+  its replay resolves semantically (three coexisting elements: new base
+  ARM-gated registrations + DecodeBandwidth 39 lines + tournament anchor;
+  added-line identity = the proof).
+- B9: census receipt at c4536cf3c is content-bound → travels with an
+  identical replay (range-diff 1/1 `=` + reviewer re-pin).
