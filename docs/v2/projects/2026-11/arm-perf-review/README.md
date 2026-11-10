@@ -1045,3 +1045,26 @@ FF-GATE STATUS: COMPLETE —
    (7 commits). Queued next: half-perf Linux validation at the FIX-BACK tip
    1ea08211 (not adb1c98e9 — the fix-back is what would merge) + idea-16
    Phase A window.
+
+### Reviewer #172 SOURCE ACK — half-perf fix-back 1ea08211 (HP-1..HP-5 closed at source)
+
+Two-file delta (+102/−21) verified; direct adb1c98e9 parent; the adb HOLD
+retained. HP-1 native typed_data() comparisons with
+positive→mutate→reject→restore→positive controls; HP-2 four public-entry
+controls genuinely discriminate rounded alpha-product/bias completion, fused
+beta completion (0xa8800000) and absent-bias −0 vs +0 (real half operands
+incl. 0x1000=2^-11); the nonzero-beta control calls the SAME Replay::intervals()
+as timing (warmup2/sample3/postcheck; resets outside timed calls);
+HP-3 physical_A_hash selects actual storage, rounded-half digest separately
+named, profiler declaration/unknown + caller-only rounding explicit, Git
+value = snapshot not provenance; HP-4 exact SingleConfiguredCell filter +
+repeat1 + count1 checked before construction/publication, mixed selection
+rejected; HP-5 c(admit(x)) finishes validation before first fixture init,
+N+1/extents/policy covered, boundary rejects + valid admissions present.
+Retained set confirmed. Production/CMake unchanged. Registration: smoke +
+Integration/preflight (no Unit timing alias).
+Nonblocking #173: method Doxygen for Fixture/Replay ctors + nontrivial
+helpers — scoped follow-up, does not reopen the five blockers.
+Static source ACK only; Linux build/replay/preflight + GDN geometry/trace +
+final bound evidence + economy = owner/Main obligations. Source-review gate
+CLOSED for the half-perf cell.
