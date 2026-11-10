@@ -589,3 +589,10 @@ not compose). No authentication/branch-protection/merge grants in the ruling.
   receipt path; census-matrix.sh stays diagnostic. Ratchet: any grouped-key
   lowering by the combined candidate = explicit downward-ratchet commit
   through review.
+- PRECISION (reviewer, #166 follow-up): the five TileRegisterEvidence
+  Analysis/Binding0-3 shards test the CHECKER (incl. stand-in tools) — they
+  are NOT the bound native register witness. Per covered cell, the native
+  owner is `v2_cpu_native_tile_register_proof` with verification aliases
+  `V2_Unit_CPUNativeNEONTileRegisters` + `V2_Integration_CPUNativeNEONTileRegisters`;
+  the required checker shards COMPLEMENT each cell's native build/verify
+  evidence. A proper build directory alone changes nothing about this.
