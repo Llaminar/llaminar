@@ -459,3 +459,17 @@ rebase/re-pin/bound gates. e5ee7f672 = current CUDA build/rerun target.
   push-before-acceptance). After Main's SETTLED + publish: one more
   mechanical re-rebase onto the settled tip, then push a4ebff3dd' on the
   green bound result → Main FF.
+
+### Receipt-composition constraint (reviewer #165 finding, relayed by Main)
+
+idea-31/selector and B9 source deltas are disjoint, but their RECEIPTS
+cannot compose: B9 changes `checker_sha256` (pre-B9 3027-class proof fails
+under the new checker) while B9's c4536 census ran on PRE-S4 source.
+POST-SETTLED therefore: the addon prepares ONE COMBINED candidate (both
+stacks on the settled tip, either order) → reviewer re-pin → final receipt
+set runs ONCE against that actual checker + S4 source + configured targets:
+GNU census (.80) + AppleClang 9-cell (Mac) + focused byte-cell set (.80).
+No two independent censuses inferred into a combined pass. Reclassified as
+superseded evidence: B9's c4536cf3c census (pre-S4 source) and the
+870bb545e AppleClang run. Bundle-1 = separate FF (own harness evidence;
+re-rebases onto the post-FF tip). No new runs before SETTLED.
