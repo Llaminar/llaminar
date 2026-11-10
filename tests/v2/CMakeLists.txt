@@ -39631,3 +39631,27 @@ if(TARGET v2_unit_moe_overlay_residency_authority)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoECanonicalCohortLayerRange)
     endif()
 endif()
+
+# Original controller replay: current-epoch rescore, active-progress budget and retirement.
+if(TARGET v2_unit_moe_overlay_residency_maintenance_service)
+    add_v2_test(V2_Integration_MoEActiveProgressContinuationReplay
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_maintenance_service>
+            --gtest_filter=Test__MoEOverlayResidencyMaintenanceService.ActiveProgressContinuationReplay*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Lifecycle;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    if(TEST V2_Integration_MoEActiveProgressContinuationReplay)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEActiveProgressContinuationReplay)
+    endif()
+endif()
+if(TARGET v2_integration_moe_overlay_residency_consensus_mpi)
+    add_v2_test(V2_Integration_MoEContinuationOriginalPublisherReplay_MPI
+        COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+            --gtest_filter=Test__MoEOverlayMPIResidencyConsensus.ActiveProgressContinuationSameGenerationLaterEpochReplay
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MPI;MoE;Lifecycle;Replay;Regression"
+        MPI_PROCS 2 NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    if(TEST V2_Integration_MoEContinuationOriginalPublisherReplay_MPI)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEContinuationOriginalPublisherReplay_MPI)
+    endif()
+endif()

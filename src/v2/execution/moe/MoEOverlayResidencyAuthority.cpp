@@ -1588,6 +1588,13 @@ namespace llaminar2
                 *this = std::move(next);
             }
 
+            /** @return Whether this exact owned immutable input remains forecast-authoritative. */
+            [[nodiscard]] bool observes(const std::shared_ptr<const DecodeExpertHistogramWindow> &window) const noexcept
+            {
+                return observed_.get() == window.get() &&
+                    !observed_.owner_before(window) && !window.owner_before(observed_);
+            }
+
             /** @return Borrowed prediction for candidate ranking, never publication. */
             [[nodiscard]] const DecodeExpertHistogramWindow &candidateCounts() const noexcept
             {
@@ -3948,9 +3955,56 @@ namespace llaminar2
         return std::move(result.transaction);
     }
 
+    MoEOverlayResidencyAuthority::CommittedObservation
+    MoEOverlayResidencyAuthority::retainCommittedObservation(
+        const MoEOverlayResidencyTransaction &committed) const
+    {
+        requireHostDynamicPublicationAuthority("Host ExpertOverlay committed observation");
+        const auto current = snapshot();
+        const CommittedObservation observation(committed.histogram_window, committed.candidate);
+        std::lock_guard<std::mutex> lock(economy_mutex_);
+        if (!migrationEnabled() || !committed.valid() || committed.empty() ||
+            committed.purpose != MoEOverlayResidencyTransactionPurpose::PlacementChange ||
+            !committed.economy.enabled || committed.economy.projected_service_gain_ns == 0u ||
+            committed.economy.projected_net_benefit_ns == 0u ||
+            !observation.matches(current) || !economy_state_ || !economy_state_->forecast ||
+            !economy_state_->forecast->observes(committed.histogram_window))
+            throw std::logic_error("ExpertOverlay continuation requires the original certified committed observation");
+        return observation;
+    }
+
+    bool MoEOverlayResidencyAuthority::isCurrentCommittedObservation(
+        const CommittedObservation &observation) const
+    {
+        return observation.matches(snapshot());
+    }
+
+    std::optional<MoEOverlayResidencyTransaction>
+    MoEOverlayResidencyAuthority::reproposeFromCommittedObservation(
+        const CommittedObservation &observation)
+    {
+        requireHostDynamicPublicationAuthority("Host ExpertOverlay observation continuation");
+        if (!migrationEnabled() || !optimizationDemandActive() ||
+            hasActiveBackgroundWave() || pendingRetirementCount() != 0u || pendingAbortCount() != 0u)
+            throw std::logic_error("ExpertOverlay continuation requires retired original wave resources");
+        auto derived = buildFromFrozenHistogramWindow(observation.window_, &observation);
+        const auto &transaction = derived.transaction;
+        if (transaction.empty() || !transaction.economy.enabled ||
+            transaction.economy.projected_service_gain_ns == 0u ||
+            transaction.economy.projected_net_benefit_ns == 0u)
+        {
+            // A terminal continuation is not a new demand window: in
+            // particular it must not grow/reset the mutable next bank.
+            recordNoMovement(false);
+            return std::nullopt;
+        }
+        return std::move(derived.transaction);
+    }
+
     MoEOverlayResidencyAuthority::FrozenHistogramDerivation
     MoEOverlayResidencyAuthority::buildFromFrozenHistogramWindow(
-        std::shared_ptr<const DecodeExpertHistogramWindow> window)
+        std::shared_ptr<const DecodeExpertHistogramWindow> window,
+        const CommittedObservation *continuation)
     {
         const auto current = snapshot();
         const bool joint = current && current->ownershipKind() ==
@@ -3991,6 +4045,9 @@ namespace llaminar2
          * makes profile publication and proposal arithmetic indivisible.
          */
         std::unique_lock<std::mutex> economy_lock(economy_mutex_);
+        if (continuation && (!continuation->matches(previous) || !economy_state_ ||
+            !economy_state_->forecast || !economy_state_->forecast->observes(transaction.histogram_window)))
+            throw std::logic_error("ExpertOverlay continuation observation or committed epoch is stale");
         const DecodeExpertHistogramWindow *planning_window =
             transaction.histogram_window.get();
         if (config_.migration_economy_policy)

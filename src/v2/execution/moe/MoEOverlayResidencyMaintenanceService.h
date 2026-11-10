@@ -9,6 +9,9 @@
  * the inference path waits for this worker.
  * Proposal construction is admitted only after the authority reports complete
  * quiescence, so no expensive plan can starve an existing collective's progress.
+ * A committed observation may fund further current-epoch decisions only after
+ * new completed inference progress; fresh Ready demand has priority and idle
+ * polling never accumulates continuation credits.
  */
 
 #pragma once
@@ -222,7 +225,7 @@ namespace llaminar2
         uint64_t deferred_attempts = 0;   ///< Backpressured stage attempts.
         uint64_t waves_started = 0;       ///< Async migration waves begun.
         uint64_t committed_waves = 0;     ///< Candidate epochs published.
-        uint64_t dynamic_no_movement = 0; ///< Dynamic windows needing no move.
+        uint64_t dynamic_no_movement = 0; ///< Observations/continuations with no eligible move.
         uint64_t static_no_movement = 0;  ///< Explicit static immobility checks.
         uint64_t proposals_published = 0; ///< Coordinator send completions.
         uint64_t proposals_received = 0; ///< Authenticated peer plans.
@@ -418,7 +421,8 @@ namespace llaminar2
          * @brief Publish a demand boundary reconciled through one generation.
          *
          * The worker calls this only after `progressHistogramWindow()` reports
-         * no complete window. A concurrent notification advances
+         * no complete window. An eligible continuation keeps ReconcilingDemand
+         * instead of falsely advertising Waiting. A concurrent notification advances
          * `notifications_` without changing this generation, so public status
          * remains non-quiescent until a later poll observes that notification.
          *
@@ -438,6 +442,19 @@ namespace llaminar2
          */
         [[nodiscard]] MoEOverlayHistogramWindowResult
         progressAuthoritativeHistogramWindow();
+
+        /** @return Whether unconsumed actual inference progress can admit one continuation. */
+        [[nodiscard]] bool continuationHasNewProgress() const noexcept;
+
+        /**
+         * @brief Select fresh Ready evidence first, otherwise one progress-funded continuation.
+         * @param window Original completed histogram poll; no independent probe is issued.
+         * @return Existing current-epoch transaction, or no admitted attempt.
+         * @note Called only after original wave/reclaim Idle. Consumes all current
+         *       progress for one attempt; deferred retries keep that exact attempt.
+         */
+        [[nodiscard]] std::optional<MoEOverlayResidencyTransaction>
+        deriveNextProposal(const MoEOverlayHistogramWindowResult &window);
 
         /**
          * @brief Admit, retry or discard one ReadyToStage transaction.
@@ -490,6 +507,10 @@ namespace llaminar2
         MoEOverlayResidencyTransaction retained_transaction_;
         MoEOverlayRetainedTransactionState retained_transaction_state_ =
             MoEOverlayRetainedTransactionState::Empty;
+        /** One original observation, weak current identity; never a previous bank/read lease. */
+        std::optional<MoEOverlayResidencyAuthority::CommittedObservation> continuation_;
+        /** All logical progress observed at the last continuation admission; no idle credits. */
+        std::uint64_t continuation_progress_tokens_ = 0u;
         bool static_check_complete_ = false;
         /** Coordinator-owned proposal retained until its MPI sends complete. */
         std::shared_ptr<const MoEOverlayDistributedResidencyProposal>

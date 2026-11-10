@@ -9,7 +9,9 @@
  * This file defines the single publication authority and its transactional
  * transport boundary.  It is deliberately device-free so the lifecycle can be
  * proved exhaustively in unit tests; production transports bind the protocol to
- * prepared-weight services and exact backend transfer streams.
+ * prepared-weight services and exact backend transfer streams. Committed
+ * observations retain immutable demand and weak epoch identity, never old
+ * reader/bank ownership, for current-epoch economy re-evaluation.
  */
 
 #pragma once
@@ -33,6 +35,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace llaminar2
@@ -1014,6 +1017,39 @@ namespace llaminar2
         struct EconomyState;
 
     public:
+        /**
+         * @brief One certified committed observation, without a bank or reader lease.
+         *
+         * Only the original authority can issue this witness after publication.
+         * The window shares its existing PMA-owned immutable demand; the weak
+         * identity cannot retain the old/current expert bank or placement state.
+         */
+        class CommittedObservation final
+        {
+        public:
+            /** @return Whether a later wave belongs to this exact original observation. */
+            [[nodiscard]] bool observes(const std::shared_ptr<const DecodeExpertHistogramWindow> &window) const noexcept
+            {
+                return window_.get() == window.get() &&
+                    !window_.owner_before(window) && !window.owner_before(window_);
+            }
+        private:
+            friend class MoEOverlayResidencyAuthority;
+            /** @brief Bind already-authenticated immutable source and committed identity. */
+            CommittedObservation(std::shared_ptr<const DecodeExpertHistogramWindow> window,
+                                 const std::shared_ptr<const MoEOverlayResidencySnapshot> &committed)
+                : window_(std::move(window)), committed_(committed) {}
+            /** @return Exact current snapshot/control-block equality, without retaining it. */
+            [[nodiscard]] bool matches(const std::shared_ptr<const MoEOverlayResidencySnapshot> &current) const noexcept
+            {
+                const auto committed = committed_.lock();
+                return committed && committed.get() == current.get() &&
+                    !committed.owner_before(current) && !current.owner_before(committed);
+            }
+            std::shared_ptr<const DecodeExpertHistogramWindow> window_;
+            std::weak_ptr<const MoEOverlayResidencySnapshot> committed_;
+        };
+
         /** @brief Semantic reader class retained by one epoch lease. */
         enum class TicketLeasePurpose : std::uint8_t
         {
@@ -1454,6 +1490,31 @@ namespace llaminar2
             std::shared_ptr<const DecodeExpertHistogramWindow> window);
 
         /**
+         * @brief Issue a source-only witness for a just-published certified move.
+         * @param committed Original nonempty live transaction now exactly current.
+         * @return Immutable observation and weak current identity, never a lease.
+         * @throws std::logic_error For foreign/stale/unpriced/restoration input.
+         */
+        [[nodiscard]] CommittedObservation retainCommittedObservation(
+            const MoEOverlayResidencyTransaction &committed) const;
+
+        /** @brief Check the weak epoch witness before a progress-funded attempt.
+         * @param observation Original authority-issued committed witness.
+         * @return Whether its weak exact identity is still this authority's current epoch. */
+        [[nodiscard]] bool isCurrentCommittedObservation(const CommittedObservation &observation) const;
+
+        /**
+         * @brief Reprice one committed observation on current ownership, without ingestion.
+         * @param observation Original certified current witness, after physical retirement.
+         * @return Fresh strictly improving transaction, or no further eligible movement.
+         * @throws std::logic_error For stale/foreign source or unsupported lifecycle.
+         * @note Reuses the original solver/objective, but never advances histogram
+         *       cadence, re-smooths a generation, or reuses old isolated scores.
+         */
+        [[nodiscard]] std::optional<MoEOverlayResidencyTransaction>
+        reproposeFromCommittedObservation(const CommittedObservation &observation);
+
+        /**
          * @brief Export the exact executable part of a root-owned proposal.
          * @param transaction Valid live placement transaction from this authority.
          * @return Dense pointer-free candidate suitable for authenticated publication.
@@ -1672,11 +1733,13 @@ namespace llaminar2
         /**
          * @brief Shared source-bound histogram candidate derivation, without runtime admission.
          * @param window Original validated recorded logical routing observations.
+         * @param continuation Optional committed witness; validates same source/current identity under the economy lock.
          * @return Existing heuristic's transaction with its original economy lock retained.
          * @throws std::logic_error For unsupported fixed-target axes or missing economy prices.
          */
         FrozenHistogramDerivation buildFromFrozenHistogramWindow(
-            std::shared_ptr<const DecodeExpertHistogramWindow> window);
+            std::shared_ptr<const DecodeExpertHistogramWindow> window,
+            const CommittedObservation *continuation = nullptr);
 
         /**
          * @brief Validate and materialize one immutable residency epoch.

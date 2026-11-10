@@ -31,6 +31,7 @@
 #include "execution/moe/CpuExpertSlotPool.h"
 #include "utils/MPIContext.h"
 #include "../../utils/ObservedExpertDemandFixture.h"
+#include "../../utils/ActiveProgressContinuationReplayFixture.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>
@@ -4019,6 +4020,95 @@ namespace llaminar2::test
         EXPECT_TRUE(local.fingerprints.empty());
         EXPECT_EQ(local.retirements, 0);
     }
+    /** Same observed generation can publish distinct later epochs only through retired original lanes. */
+    TEST(Test__MoEOverlayMPIResidencyConsensus, ActiveProgressContinuationSameGenerationLaterEpochReplay)
+    {
+        auto context = worldContext();
+        if (!requireTwoRanks(*context)) GTEST_SKIP() << "Continuation publisher replay requires two ranks";
+        constexpr int coordinator = 1;
+        auto histogram = continuation_replay::histogram(context->rank(), true);
+        auto authority = continuation_replay::authority(*histogram, 2, coordinator);
+        MoEOverlayMPIResidencyProposalPublisher publisher({.mpi_context = context,
+            .coordinator_world_rank = coordinator, .num_layers = 1, .num_experts = 8,
+            .perf_device = "continuation-original-publisher-replay",
+            .transaction_demand = histogram->config().transaction_demand});
+        ImmediateLocalResidencyTransport local;
+        auto consensus = std::make_shared<MoEOverlayMPIResidencyConsensus>(
+            MoEOverlayMPIResidencyConsensus::Config{.mpi_context = context,
+                .perf_device = "continuation-original-consensus-replay"});
+        MoEOverlayDistributedResidencyTransport transport({.local_transport = &local,
+            .consensus = consensus, .perf_device = "continuation-original-wave-replay"});
+        std::optional<MoEOverlayResidencyAuthority::CommittedObservation> observation;
+        uint64_t first_generation = 0;
+        for (int round = 0; round < 3; ++round)
+        {
+            MoEOverlayResidencyTransaction transaction;
+            std::string error;
+            if (publisher.isCoordinator())
+            {
+                if (round == 0) transaction = authority->proposeFromHistogram();
+                else
+                {
+                    auto next = authority->reproposeFromCommittedObservation(*observation);
+                    ASSERT_TRUE(next);
+                    transaction = std::move(*next);
+                }
+                const auto proposal = makeMoEOverlayDistributedResidencyProposal(
+                    authority->exportAuthoritativeResidencyPlan(transaction), transaction);
+                ASSERT_TRUE(publisher.beginPublish(proposal, &error)) << error;
+                EXPECT_FALSE(publisher.beginPublish(proposal, &error))
+                    << "The original packet/ack lane must finish before reuse";
+            }
+            else if (round != 0)
+                ASSERT_TRUE(publisher.armReceive(&error)) << error;
+
+            bool adopted = false;
+            for (;;)
+            {
+                std::shared_ptr<const MoEOverlayDistributedResidencyProposal> received;
+                const auto progress = publisher.poll(&received, &error);
+                ASSERT_NE(progress, MoEOverlayResidencyWaveProgress::Failed) << error;
+                if (received)
+                {
+                    ASSERT_FALSE(publisher.isCoordinator());
+                    transaction = authority->adoptAuthoritativeResidencyPlan(received->plan);
+                    ASSERT_EQ(fingerprintMoEOverlayResidencyExecutionPlan(transaction), received->execution_fingerprint);
+                    EXPECT_FALSE(publisher.armReceive(&error));
+                    ASSERT_TRUE(publisher.acceptReceivedProposal(transaction.histogram_generation, &error)) << error;
+                    EXPECT_FALSE(publisher.armReceive(&error)) << "A posted ack still owns its storage";
+                    adopted = true;
+                    continue;
+                }
+                if (progress == MoEOverlayResidencyWaveProgress::Ready) break;
+                std::this_thread::yield();
+            }
+            EXPECT_EQ(publisher.state(), MoEOverlayMPIResidencyProposalPublisherState::Idle);
+            EXPECT_TRUE(publisher.isCoordinator() || adopted);
+            ASSERT_TRUE(transaction.valid());
+            ASSERT_FALSE(transaction.empty());
+            EXPECT_EQ(transaction.expected_epoch, uint64_t(1 + round));
+            if (round == 0) first_generation = transaction.histogram_generation;
+            EXPECT_EQ(transaction.histogram_generation, first_generation);
+            auto old_reader = authority->tryAcquireTicketSnapshot();
+            ASSERT_TRUE(old_reader);
+            ASSERT_EQ(authority->beginApply(transaction, transport).status, MoEOverlayResidencyApplyStatus::Started);
+            ASSERT_EQ(finishAuthorityWave(*authority).status, MoEOverlayResidencyApplyStatus::Published);
+            if (publisher.isCoordinator()) observation = authority->retainCommittedObservation(transaction);
+            EXPECT_EQ(authority->snapshot()->epoch, uint64_t(2 + round));
+            EXPECT_GT(authority->pendingRetirementCount(), 0u);
+            old_reader.reset();
+            ASSERT_TRUE(drainAuthorityRetirements(*authority, &error)) << error;
+            EXPECT_EQ(local.retirements, round + 1);
+            // This is a test boundary on the existing execution membership;
+            // production still uses its nonblocking reader/consensus edges.
+            context->barrier();
+        }
+        EXPECT_EQ(publisher.stats().blocking_inference_waits, 0u);
+        if (publisher.isCoordinator()) EXPECT_EQ(publisher.stats().publications_completed, 3u);
+        else EXPECT_EQ(publisher.stats().acknowledgements_completed, 3u);
+        publisher.stopAndDrain();
+    }
+
 } // namespace llaminar2::test
 
 #include "LiveEconomyEvidenceMPIContract.inc"

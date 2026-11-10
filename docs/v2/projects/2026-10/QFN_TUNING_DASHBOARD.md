@@ -7,12 +7,12 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Latest ROCm 10.1 cache/planner slice: **314.818 P /39.988 after-prefill D**,
-flat versus **314.868/40.035**. All768 IDs/MTP/initial placement match;
-25 focused host/CUDA/MI50/XTX registrations pass. Goal remains open.
-MI50 queue update **32.058→4.857ms**; exact49-layer planning **1433→3.122ms**.
-Measured promotions rise16→24; component wins are not model speedup factors.
-[Results and limits](../2026-11/QFN_CACHE_AND_PLACEMENT_ECONOMY_20261110.md).
+Migration continuation: **327.546–331.486 P /39.679–39.893 after-prefill D**,
+versus314.818/39.988: **+4.0–5.3% P**, −0.24–0.77% D. Both runs match all768
+IDs/MTP/config;11 focused registrations and20 repeats/new replay pass.
+Memory/retirement pass. Goal remains open. [Results/limits](../2026-11/QFN_ACTIVE_PROGRESS_MIGRATION_20261110.md).
+Earlier queue32.058→4.857ms and49-layer planner1433→3.122ms component wins:
+[cache/planner](../2026-11/QFN_CACHE_AND_PLACEMENT_ECONOMY_20261110.md).
 Historical remote-GPU rates are numerical controls, **not a placement speedup
 baseline**. Standalone benchmark rank→PID publication remains open.
 [SDK status](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md).
@@ -43,7 +43,7 @@ placement match. Runtime pause-loop cycle shares are not removable wall time.
 **Native Q8 candidates stay unpromoted:** MI50 **1.106–1.366×**, XTX
 **1.088–1.103×** component wins; installed-Auto gates pass, but model decode
 results overlap the control noise. Table-only rebuild takes **3.90s**.
-Next: bounded same-observation migration continuation; not yet qualified.
+Next: isolate M448 prefill dispatch and reduce repeated tier-cycle pricing.
 Fresh trace:665ms root wait,20.7ms pooled lookup; result copy near its measured transport ceiling.
 [Scope/results](../2026-11/QFN_ROCM_NATIVE_Q8_PREFILL_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),

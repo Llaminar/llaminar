@@ -524,8 +524,50 @@ namespace llaminar2
             observed_progress_generation,
             std::memory_order_release);
         state_.store(
-            MoEOverlayMaintenanceState::Waiting,
+            continuationHasNewProgress() ? MoEOverlayMaintenanceState::ReconcilingDemand
+                                         : MoEOverlayMaintenanceState::Waiting,
             std::memory_order_release);
+    }
+
+    bool MoEOverlayResidencyMaintenanceService::continuationHasNewProgress() const noexcept
+    {
+        return continuation_.has_value() && inference_progress_tokens_.load(std::memory_order_acquire) >
+            continuation_progress_tokens_;
+    }
+
+    std::optional<MoEOverlayResidencyTransaction>
+    MoEOverlayResidencyMaintenanceService::deriveNextProposal(const MoEOverlayHistogramWindowResult &window)
+    {
+        if (window.progress == MoEOverlayHistogramWindowProgress::Ready)
+        {
+            // Release obsolete demand BEFORE the forecast replaces its own
+            // reference. No second PMA demand allocation is retained by us.
+            continuation_.reset();
+            if (!window.window || !window.window->valid())
+                throw std::logic_error("ExpertOverlay maintenance requires a valid original Ready observation");
+            state_.store(MoEOverlayMaintenanceState::PlanningProposal, std::memory_order_release);
+            return config_.authority->proposeFromFrozenHistogramWindow(window.window);
+        }
+        if (window.progress != MoEOverlayHistogramWindowProgress::Waiting || !continuationHasNewProgress())
+            return std::nullopt;
+        if (!config_.authority->isCurrentCommittedObservation(*continuation_))
+        {
+            continuation_.reset();
+            return std::nullopt;
+        }
+        // One new positive logical-progress delta funds ONE attempt. Consume
+        // all of it before planning; never drain banked credits while idle.
+        continuation_progress_tokens_ = inference_progress_tokens_.load(std::memory_order_acquire);
+        state_.store(MoEOverlayMaintenanceState::PlanningProposal, std::memory_order_release);
+        auto transaction = config_.authority->reproposeFromCommittedObservation(*continuation_);
+        if (!transaction)
+        {
+            continuation_.reset();
+            dynamic_no_movement_.fetch_add(1, std::memory_order_relaxed);
+            recordPerfCounter("maintenance_dynamic_no_movement");
+            state_.store(MoEOverlayMaintenanceState::ReconcilingDemand, std::memory_order_release);
+        }
+        return transaction;
     }
 
     MoEOverlayHistogramWindowResult
@@ -708,6 +750,8 @@ namespace llaminar2
         bool allow_new_proposal)
     {
         poll_iterations_.fetch_add(1, std::memory_order_relaxed);
+        if (!allow_new_proposal)
+            continuation_.reset();
 
         if (config_.economy_certification &&
             !economy_certification_observed_)
@@ -914,54 +958,29 @@ namespace llaminar2
         }
 
         const bool dynamic = config_.authority->migrationEnabled();
-        std::shared_ptr<const DecodeExpertHistogramWindow> local_window;
         if (dynamic)
         {
-            const auto window_result =
-                progressAuthoritativeHistogramWindow();
-            if (window_result.progress ==
-                MoEOverlayHistogramWindowProgress::Waiting)
+            const auto window_result = progressAuthoritativeHistogramWindow();
+            if (window_result.progress == MoEOverlayHistogramWindowProgress::Pending)
             {
-                return;
-            }
-            if (window_result.progress ==
-                MoEOverlayHistogramWindowProgress::Reconciled)
-            {
-                return;
-            }
-            if (window_result.progress ==
-                MoEOverlayHistogramWindowProgress::Pending)
-            {
-                state_.store(
-                    MoEOverlayMaintenanceState::DrainingEvidence,
-                    std::memory_order_release);
+                state_.store(MoEOverlayMaintenanceState::DrainingEvidence, std::memory_order_release);
                 recordPerfCounter("maintenance_histogram_drain_polls");
                 return;
             }
-            local_window = window_result.window;
-            if (!local_window || !local_window->valid())
+            auto transaction = deriveNextProposal(window_result);
+            if (!transaction) return;
+            retained_transaction_ = std::move(*transaction);
+        }
+        else
+        {
+            if (static_check_complete_)
             {
-                fail(
-                    "ExpertOverlay maintenance prepared an invalid local histogram window");
+                state_.store(MoEOverlayMaintenanceState::Waiting, std::memory_order_release);
                 return;
             }
+            state_.store(MoEOverlayMaintenanceState::PlanningProposal, std::memory_order_release);
+            retained_transaction_ = config_.authority->proposeFromHistogram();
         }
-        if (!dynamic && static_check_complete_)
-        {
-            state_.store(
-                MoEOverlayMaintenanceState::Waiting,
-                std::memory_order_release);
-            return;
-        }
-
-        state_.store(
-            MoEOverlayMaintenanceState::PlanningProposal,
-            std::memory_order_release);
-        retained_transaction_ = dynamic
-                                    ? config_.authority
-                                          ->proposeFromFrozenHistogramWindow(
-                                              std::move(local_window))
-                                    : config_.authority->proposeFromHistogram();
         retained_transaction_state_ =
             MoEOverlayRetainedTransactionState::ReadyToStage;
         proposals_.fetch_add(1, std::memory_order_relaxed);
@@ -977,45 +996,15 @@ namespace llaminar2
         {
             const auto window_result =
                 progressAuthoritativeHistogramWindow();
-            if (window_result.progress ==
-                MoEOverlayHistogramWindowProgress::Waiting)
+            if (window_result.progress == MoEOverlayHistogramWindowProgress::Pending)
             {
-                return;
-            }
-            if (window_result.progress ==
-                MoEOverlayHistogramWindowProgress::Reconciled)
-            {
-                return;
-            }
-            if (window_result.progress ==
-                MoEOverlayHistogramWindowProgress::Pending)
-            {
-                state_.store(
-                    MoEOverlayMaintenanceState::DrainingEvidence,
-                    std::memory_order_release);
+                state_.store(MoEOverlayMaintenanceState::DrainingEvidence, std::memory_order_release);
                 recordPerfCounter("maintenance_histogram_drain_polls");
                 return;
             }
-
-            if (!window_result.window || !window_result.window->valid())
-            {
-                fail(
-                    "ExpertOverlay coordinator froze an invalid histogram window");
-                return;
-            }
-
-            /*
-             * The continuation root is the sole distributed policy authority.
-             * It performs smoothing, placement, skew, wave bounding, and
-             * economy once, then publishes the selected executable candidate.
-             * Peers never repeat this decision from rank-local measurements.
-             */
-            state_.store(
-                MoEOverlayMaintenanceState::PlanningProposal,
-                std::memory_order_release);
-            auto transaction =
-                config_.authority->proposeFromFrozenHistogramWindow(
-                    std::move(window_result.window));
+            auto selected = deriveNextProposal(window_result);
+            if (!selected) return;
+            auto transaction = std::move(*selected);
             auto proposal =
                 std::make_shared<MoEOverlayDistributedResidencyProposal>(
                     makeMoEOverlayDistributedResidencyProposal(
@@ -1371,6 +1360,20 @@ namespace llaminar2
                 std::memory_order_release);
             return;
         case MoEOverlayResidencyApplyStatus::Published:
+            if ((!config_.proposal_publisher || config_.proposal_publisher->isCoordinator()) &&
+                !shutdown_requested_.load(std::memory_order_acquire) && healthy() &&
+                retained_transaction_.purpose == MoEOverlayResidencyTransactionPurpose::PlacementChange &&
+                !retained_transaction_.empty() && retained_transaction_.economy.enabled &&
+                retained_transaction_.economy.projected_service_gain_ns > 0u &&
+                retained_transaction_.economy.projected_net_benefit_ns > 0u)
+            {
+                const bool same_observation = continuation_ &&
+                    continuation_->observes(retained_transaction_.histogram_window);
+                continuation_ = config_.authority->retainCommittedObservation(retained_transaction_);
+                if (!same_observation)
+                    continuation_progress_tokens_ = inference_progress_tokens_.load(std::memory_order_acquire);
+            }
+            else continuation_.reset();
             retained_transaction_ = {};
             retained_transaction_state_ =
                 MoEOverlayRetainedTransactionState::Empty;
@@ -1437,6 +1440,7 @@ namespace llaminar2
             std::lock_guard<std::mutex> lock(failure_mutex_);
             failure_message_ = message;
         }
+        continuation_.reset();
         fatal_failures_.fetch_add(1, std::memory_order_relaxed);
         state_.store(
             MoEOverlayMaintenanceState::Failed,
