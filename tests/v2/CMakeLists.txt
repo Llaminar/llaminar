@@ -5292,6 +5292,14 @@ set_tests_properties(V2_Unit_PerfBaselineIdentity PROPERTIES
     LABELS "V2;Unit;Benchmark;Tooling;Regression"
     TIMEOUT 30
 )
+add_test(NAME V2_Integration_PerfBaselineProvenance
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_perf_baseline.py
+)
+set_tests_properties(V2_Integration_PerfBaselineProvenance PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;Benchmark;Tooling;Regression"
+    TIMEOUT 30
+)
 add_test(NAME V2_Integration_MTPBenchmarkPolicyEvidence
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_mtp_iteration_benchmark_matrix.py
@@ -19059,8 +19067,8 @@ add_v2_test(V2_Perf_CPUNativeQuantised_DecodeBandwidth
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 600)
 add_v2_test(V2_Integration_CPUNativeQuantisedDecodeBandwidthContract
     COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_decode_bandwidth>
-            --gtest_filter=Perf__CPUNativeQuantisedDecodeBandwidth.ContractTinyLadder
-    LABELS "V2;Integration;CPU;NativeQuantised;AllFormats;ByteExact;Contract;Bandwidth"
+            --gtest_filter=Perf__CPUNativeQuantisedDecodeBandwidth.ContractTinyLadder:Perf__CPUNativeQuantisedDecodeBandwidth.NegativeControlRejectsPerturbedAndStaleOutput:Perf__CPUNativeQuantisedDecodeBandwidth.EnvironmentParsingFailsClosed
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;ByteExact;Contract;Bandwidth;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
     ENVIRONMENT "OMP_NUM_THREADS=2")
 
