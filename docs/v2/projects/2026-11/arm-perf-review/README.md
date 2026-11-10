@@ -951,3 +951,18 @@ combined-candidate receipts) → Main.
   Integration/ProductionTestPreflight only; smoke is Performance (the
   RELEASED plan says smoke not Unit) — the released plan governs over the
   draft's registration line. No tests run by the reviewer.
+
+### GNU-14 register-gate receipt GREEN at 717b2bfe6 (2026-11-10, ~16:23Z)
+
+**gate=PASS, 9/9 cells PASS** (GNU-14: Integration/Release/Debug ×
+NEON/NEON_DOTPROD/NEON_I8MM; programs 64/128/176, sites 1029/1176/1274;
+per-cell object SHAs recorded). Receipt: .80
+/home/factory/llaminar-i8mm/build/rg-717b2bfe6/{build,receipt}/ +
+rg-717b.log. Owner evidence pending reviewer authentication at the FF
+request. FOCUSED SET: correctly NOT runnable in the gate build (the
+register-gate configure builds only the proof targets — portability
+project, no test binaries; first attempt showed 5×Not Run = expected
+behavior, not a defect); running NOW from a proper Integration build at
+717b2bfe6 (SHARED_CORE=ON, df15 pattern; the 6 cells incl. the NEW
+InstalledWidth). FF gate after: focused set green → Main takes the
+combined branch.
