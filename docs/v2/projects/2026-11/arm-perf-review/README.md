@@ -557,3 +557,15 @@ historical evidence, no active reservation.
 - Bundle-1 acceptance input SATISFIED → push sequence: Main's SETTLED
   declaration → final re-rebase onto the settled tip → force-with-lease
   push (a4ebff3dd') → Main FF.
+
+### Standing rule adopted (reviewer ruling #166, operator-delegated): C as a HARD installed-set gate
+
+Committed VERBATIM to **register-gate-standing-rule.md**. Two corrections to
+the coordinator's draft: budget improvements = explicit committed downward
+ratchet (never auto-rewritten acceptance tests); an unqualified installed
+state cannot ride along in an otherwise unrelated merge. Key operational
+point: the standalone census subcommand is DIAGNOSTIC — the hard gate =
+the canonical BOUND build/verify evidence per required cell; tree stamps /
+GREEN summaries / patch equality alone cannot satisfy it. Combined
+idea-31+B9 qualification still needs its own combined evidence (receipts do
+not compose). No authentication/branch-protection/merge grants in the ruling.
