@@ -115,3 +115,35 @@ depth whose verifier cost per accepted token exceeds a decode step.
 Policy-only (no kernel byte changes); grouped rows stay byte-identical
 (MTP batch invariance); base feedback to Main (01a1a8bf); reviewer at a
 clean checkpoint; merge-ready handover to Main.
+
+## Plan v1 APPROVED (2026-11-10, station perf lane; plan-first)
+
+Anchor `c007a59a2` (SHA-authenticated); isolated branch
+`feat/dense-mtp-controller-economics`; policy-only; no live work yet.
+APPROVED: **Plan A** — offline root-cause (configure/reset→publication→
+recordStep→summary lifecycle chronology from RETAINED traces; owning
+controller/replay tests incl. boundary matrix; bookkeeping-overhead timing
+kept separate from model economics; wall-nanoseconds reported, PMU
+explicitly unavailable). No profile/threshold change at this checkpoint.
+**Plan B** (fresh paired GB10 economy: Release MTP-off vs production
+dynamic, rotated A/B, raw reps + p95, mode verification via terminal
+PerfStats — never cell labels [historical cells were mislabeled], exact
+source/binary hashes, anchor-refresh rule, prefill/generation split, full
+transaction cost without double-counting, bounded fixed-depth controls only
+if negative) = coordinator-booked after the idea-31 + B9 censuses and the
+Bundle-1 bound run. **Plan C** strictly conditional on demonstrated current
+loss; typed design review if no existing profile/ABI can represent the
+policy.
+
+**DIAGNOSTIC CORRECTION to the finding above:** a terminal
+`window_not_ready` + request-wide 43.4% do NOT establish "depth 10 at 43%
+acceptance" or a permanently blocked window — `recordStep` clears consumed
+windows after evaluation and overwrites `last_decision` on later incomplete
+windows; the runner reports the LAST reason beside request-wide acceptance
+whose denominator is ALL draft steps. The C-era capture is a diagnostic
+limitation until the A audit says otherwise. Also: Portable zero-accept
+demotion 0.30 = fraction of zero-accept TRANSACTIONS (not 1 − token
+acceptance); the CPU controller records counters, not clocks;
+`MTPDepthCostProfile.h` is ROCm/QFN-MoE-scoped (no CPU-dense authority);
+canonical replay = `v2_test_mtp_depth_trace_replay` (cannot produce
+counterfactual acceptance streams or end-to-end speedups).
