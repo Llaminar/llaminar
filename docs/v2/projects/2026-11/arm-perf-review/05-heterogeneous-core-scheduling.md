@@ -188,3 +188,21 @@ another schedule heuristic.
   qualified); worker blocked on ninja/ccache provisioning (operator-side).
   GW: build (Integration, CPU-only) + Unit + model-free Preflight +
   cpuinfo (I8MM/SMMLA? SVE2?) + optional local-GGUF smoke.
+
+## Fleet-heterogeneity correction + remaining item (Main, 2026-11-10)
+
+Main corrected the coordinator's "GB10/Grace fleet homogeneous" claim:
+**.79 records fast{5..9,15..19} / slow{0..4,10..14}** (X925 + A725 class
+split), with capacity-ordered fast-first placement ALREADY INSTALLED at
+662da0d99 (bindOpenMPWorkersFastestFirst; used by the cluster path and
+every self-launched OMP_PLACES=cores/close rank). So idea 05's premise is
+live on this fleet, and its core scheduling question is largely addressed
+by the installed placement.
+
+REMAINING ITEM (small, measurement rider): fleet measurement of the
+INSTALLED fast-first placement on the heterogeneous split — does the slow-
+core tail gate any pooled workshare region at decode (per-member timing
+across the fast/slow classes on the MoE/gate/up/down + GDN regions)? This
+rides the already-booked idea-16 Phase A and idea-26 A2 windows (per-stage/
+per-member timing) at zero extra cost. Beyond that: Mac-only class-aware
+scheduling remains optional/unplanned. NOT a big implementation item.
