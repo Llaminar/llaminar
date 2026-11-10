@@ -9473,7 +9473,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
                   "runner_->primaryDeviceId().is_gpu()"),
               std::string::npos);
     EXPECT_NE(compact_prefill_planning_initializer.find(
-                  "decode_transaction_planning_position_=committed_tokens"),
+                  "slot_handoff_.decode_transaction_planning_position_=committed_tokens"),
               std::string::npos)
         << "Successful GPU prefill must initialize planning from the scheduler-known prompt length.";
     EXPECT_NE(prefill_planning_initializer_body.find(
@@ -9483,7 +9483,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
               std::string::npos)
         << "Ordinary seeded GPU decode and MTP share the same logical-position contract.";
     EXPECT_NE(compact_decode_position_advance.find(
-                  "++(*decode_transaction_planning_position_)"),
+                  "++(*slot_handoff_.decode_transaction_planning_position_)"),
               std::string::npos)
         << "Every committed one-token GPU forward must advance the scheduler position.";
     EXPECT_EQ(compact_decode_position_advance.find("runner_->get_position()"),
@@ -9493,12 +9493,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
                   "gpu_decode_transaction_position_forward_advances"),
               std::string::npos);
     EXPECT_NE(compact_mtp_commit_position_publish.find(
-                  "*decode_transaction_planning_position_!=transaction_base_tokens"),
+                  "*slot_handoff_.decode_transaction_planning_position_!=transaction_base_tokens"),
               std::string::npos)
         << "An MTP commit must prove that its validated base still matches the "
            "scheduler transaction before publishing the next position.";
     EXPECT_NE(compact_mtp_commit_position_publish.find(
-                  "decode_transaction_planning_position_="
+                  "slot_handoff_.decode_transaction_planning_position_="
                   "transaction_base_tokens+committed_rows"),
               std::string::npos)
         << "Validated MTP rows must advance the scheduler-owned transaction coordinate.";
@@ -9534,7 +9534,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
     EXPECT_LT(gpu_planning_guard, cpu_position_read)
         << "GPU planning must return or fail closed before the CPU-only backend position read.";
     EXPECT_NE(compact_planner_helper.find(
-                  "decode_transaction_planning_position_.has_value()"),
+                  "slot_handoff_.decode_transaction_planning_position_.has_value()"),
               std::string::npos);
     EXPECT_NE(compact_planner_helper.find("runner_->get_position()"),
               std::string::npos)

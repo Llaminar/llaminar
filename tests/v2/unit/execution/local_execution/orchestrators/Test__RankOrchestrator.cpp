@@ -5714,9 +5714,9 @@ TEST_F(Test__RankOrchestrator,
     const std::string continuation = runner_source.substr(
         continuation_begin, continuation_end - continuation_begin);
     for (const char *lease_owner : {
-             "ready_mtp_condition_.reset();",
-             "pending_mtp_condition_resident_state_.reset();",
-             "prelaunched_mtp_first_sidecar_resident_state_.reset();",
+             "slot_handoff_.ready_mtp_condition_.reset();",
+             "slot_handoff_.pending_mtp_condition_resident_state_.reset();",
+             "slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();",
          })
     {
         EXPECT_NE(continuation.find(lease_owner), std::string::npos)

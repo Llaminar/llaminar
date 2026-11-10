@@ -1905,6 +1905,31 @@ namespace llaminar2
         };
 
         /**
+         * @brief Typed per-slot handoff bank for the capacity-one serving lane.
+         *
+         * The runner is the sole lifecycle owner: this bank is the slot-owned
+         * handoff state that replaces the former runner-global scalars. One
+         * record covers the single resident slot. `admission_epoch` identifies
+         * the admission that opened it, stamped by the runner at the public
+         * request-admission edge from its own monotonic per-slot generation
+         * counter. `retired` marks a bank whose request was retired at an
+         * exact retirement boundary. A retired bank must never hold payload,
+         * and consuming payload under a retired identity is a fatal request
+         * diagnostic, never a silent discard. Same-request speculative-sidecar
+         * invalidation (exact mailbox mismatch) and late external cancellation
+         * stay distinct, non-fatal paths. At capacity one the record is
+         * singular and replaced at every admission, so the epoch is retention
+         * bookkeeping for the qualified capacity increase rather than a
+         * runtime-visible selector today.
+         */
+        struct ServingSlotHandoff
+        {
+            /** @brief Monotonic per-slot admission generation that opened this bank. */
+            std::uint64_t admission_epoch{0};
+            /** @brief True once an exact retirement boundary consumed this bank. */
+            bool retired{true};
+
+            /**
          * @brief Whether current terminal logits already own the next decode edge.
          *
          * A missing @ref ready_mtp_condition_ means the token still needs to be
@@ -1912,8 +1937,8 @@ namespace llaminar2
          * condition means sampling already happened under the explicitly typed
          * authority above and must never be repeated.
          */
-        bool prefill_logits_ready_{false};
-        std::optional<ReadyMTPCondition> ready_mtp_condition_;
+            bool prefill_logits_ready_{false};
+            std::optional<ReadyMTPCondition> ready_mtp_condition_;
         /**
          * @brief Already-emitted correction token that still needs a main verifier row.
          *
@@ -1968,6 +1993,32 @@ namespace llaminar2
          * hidden state, and publication metadata remain device-owned.
          */
         std::optional<int> decode_transaction_planning_position_;
+
+            /** @return Whether any handoff payload is present in this bank. */
+            [[nodiscard]] bool hasPayload() const noexcept
+            {
+                return prefill_logits_ready_ || ready_mtp_condition_.has_value() ||
+                       pending_mtp_condition_token_.has_value() ||
+                       pending_mtp_condition_params_.has_value() ||
+                       pending_mtp_condition_resident_state_.has_value() ||
+                       prelaunched_mtp_first_sidecar_resident_state_.has_value() ||
+                       prelaunched_mtp_first_sidecar_params_.has_value() ||
+                       decode_transaction_planning_position_.has_value();
+            }
+
+            /** @brief Open a fresh bank for a newly admitted request generation. */
+            void openFor(std::uint64_t generation) noexcept
+            {
+                *this = ServingSlotHandoff{};
+                admission_epoch = generation;
+                retired = false;
+            }
+        };
+
+        /** Slot-owned handoff bank for the single resident request. */
+        ServingSlotHandoff slot_handoff_;
+        /** Monotonic per-slot admission generation owned by this runner. */
+        std::uint64_t serving_slot_generation_{0};
         /** One immutable CPU/composed response admission; never a progress counter. */
         std::optional<DeviceGenerationAdmissionRequest> host_sparse_query_admission_;
         /**
