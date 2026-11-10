@@ -65,8 +65,24 @@ Context 8192 still rejects with `Higher-priority PMA plan must fit before ngram
 storage selection`. This is independent: the row selector may return a
 nonfitting mandatory diagnostic plan, but ordinary candidate admission passes it
 to optional table selection before the canonical capacity certificate. Followup
-#74 will certify the unchanged mandatory base first, preserving typed capacity
-rejection without reopening rows/quotas or modifying placement/accounting.
+`5b76a146c` (#74) certifies the unchanged mandatory base first, preserving typed
+capacity rejection without reopening rows/quotas or modifying placement/accounting.
+Its focused positive-budget CPU/CUDA/ROCm regression reproduces the old exact
+`invalid_argument`; the corrected native planning Unit and both focused preflight
+aliases pass, including 20 consecutive repetitions of each. Bounded source ACK
+#181 covers that ordering/category change.
+
+Main's second real-model window at `5b76a146c` passes configure/build and 4096
+planning again. At 8192, the expected terminal result is now `No automatic
+candidate fits the complete physical admission`, with canonical mandatory demand
+126,324,719,040 bytes versus observed available 123,457,634,304 bytes. The request
+is **not admitted**; the optional table selector is no longer called on an
+invalid base. This is not a claim that the model fits at 8192. The driver window
+again completes with zero records/findings. Artifacts are retained separately at
+`/home/factory/idea25/plan74-main-5b76a146c/`. Both windows retain actual application/
+core bytes plus configuration/compile databases, with explicit hash-checked
+original-to-retained mappings before any later build update. `.79` was explicitly
+handed back after terminal inspection.
 
 The host-owned canonical driver window completes with zero records/findings;
 all phase exits are retained separately (4096=0, 8192=1, driver=0). Baseline
@@ -76,6 +92,17 @@ identity; no new full-payload hash certificate is claimed. Artifacts are on
 `.79` at `/home/factory/idea25/plan71-main-35a827a2a/`, with commands, logs,
 configuration, compile database, binary hashes and driver journal. No inference,
 attached profiling or final installed-state/register-gate qualification follows.
+
+## Grouped sealed-plan fixture maintenance — 2026-11-10
+
+The registered `V2_Unit_CPUNativeQuantisedGroupedSealedPlan` script reproduces ten
+errors among twelve tests because its synthetic `SimpleNamespace` observation
+omits the real observation's `physical_launch_evidence` field. Explicit empty
+optional evidence repairs the fixture without a production `getattr` fallback,
+invented tournament evidence or relaxed validator. The canonical native ARM
+container rerun passes the complete registered script. The initial host-Mac
+attempt could not import NumPy; that environment failure is separate from the
+actual reproduced fixture defect. No kernel/economy qualification is implied.
 
 ## 2026-11-06 immutable4e56 successor audit
 
