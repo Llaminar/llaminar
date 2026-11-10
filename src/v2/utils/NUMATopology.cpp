@@ -14,6 +14,9 @@
 #include <sstream>
 #include <filesystem>
 #include <algorithm>
+#include <cctype>
+#include <stdexcept>
+#include <system_error>
 
 // Conditional includes for optional dependencies
 #ifdef HAVE_HWLOC
@@ -171,6 +174,52 @@ namespace llaminar2
 #endif
     }
 
+    std::vector<int> NUMATopology::parseCPUListExact(const std::string &list)
+    {
+        std::vector<int> cpus;
+        const auto parse_id = [](const std::string &text) {
+            if (text.empty() || !std::all_of(text.begin(), text.end(),
+                                             [](unsigned char ch) { return std::isdigit(ch); }))
+                throw std::invalid_argument("Malformed CPU id in cpulist: '" + text + "'");
+            return std::stoi(text);
+        };
+        std::string trimmed = list;
+        trimmed.erase(0, trimmed.find_first_not_of(" \t\n"));
+        trimmed.erase(trimmed.find_last_not_of(" \t\n") + 1);
+        if (trimmed.empty())
+            return cpus;
+        std::istringstream stream(trimmed);
+        std::string token;
+        while (std::getline(stream, token, ','))
+        {
+            const auto dash = token.find('-');
+            const int first = parse_id(dash == std::string::npos ? token : token.substr(0, dash));
+            const int last = dash == std::string::npos ? first : parse_id(token.substr(dash + 1));
+            if (last < first)
+                throw std::invalid_argument("Reversed range in cpulist: '" + token + "'");
+            for (int cpu = first; cpu <= last; ++cpu)
+                cpus.push_back(cpu);
+        }
+        std::sort(cpus.begin(), cpus.end());
+        return cpus;
+    }
+
+    int NUMATopology::nodeOwningCPU(
+        int cpu, const std::vector<std::pair<int, std::string>> &node_cpulists)
+    {
+        int owner = -1;
+        for (const auto &[node, list] : node_cpulists)
+        {
+            const auto cpus = parseCPUListExact(list);
+            if (!std::binary_search(cpus.begin(), cpus.end(), cpu))
+                continue;
+            if (owner >= 0)
+                throw std::invalid_argument("Two NUMA nodes list CPU " + std::to_string(cpu));
+            owner = node;
+        }
+        return owner;
+    }
+
     int NUMATopology::detectViaProcfs()
     {
         // Read /proc/self/status and look for Cpus_allowed_list
@@ -194,44 +243,42 @@ namespace llaminar2
                 // Trim whitespace
                 cpu_list.erase(0, cpu_list.find_first_not_of(" \t"));
 
-                // Parse first CPU in range
-                size_t dash = cpu_list.find('-');
-                int first_cpu = -1;
+                // The first allowed CPU locates the process's node.
+                std::vector<int> allowed;
                 try
                 {
-                    if (dash != std::string::npos)
-                    {
-                        first_cpu = std::stoi(cpu_list.substr(0, dash));
-                    }
-                    else
-                    {
-                        first_cpu = std::stoi(cpu_list);
-                    }
+                    allowed = NUMATopology::parseCPUListExact(cpu_list);
                 }
-                catch (...)
+                catch (const std::invalid_argument &)
                 {
                     return -1;
                 }
+                if (allowed.empty())
+                    return -1;
 
-                // Infer NUMA node from first CPU
-                // Read /sys/devices/system/cpu/cpu{N}/node{M}/cpulist
-                for (int node = 0; node < 8; ++node) // Try up to 8 NUMA nodes
+                // Enumerate every node directory; node ids are not bounded or dense.
+                std::vector<std::pair<int, std::string>> node_cpulists;
+                std::error_code error;
+                for (const auto &entry : std::filesystem::directory_iterator(
+                         "/sys/devices/system/node", error))
                 {
-                    std::string cpulist_path = "/sys/devices/system/node/node" +
-                                               std::to_string(node) + "/cpulist";
-                    std::ifstream cpulist(cpulist_path);
-                    if (!cpulist.is_open())
+                    const std::string name = entry.path().filename().string();
+                    if (name.size() <= 4 || name.compare(0, 4, "node") != 0 ||
+                        !std::all_of(name.begin() + 4, name.end(),
+                                     [](unsigned char ch) { return std::isdigit(ch); }))
                         continue;
-
+                    std::ifstream cpulist(entry.path() / "cpulist");
                     std::string node_cpus;
-                    std::getline(cpulist, node_cpus);
-
-                    // Check if first_cpu is in this node's CPU list
-                    // Simple check: does the string contain our CPU number?
-                    if (node_cpus.find(std::to_string(first_cpu)) != std::string::npos)
-                    {
-                        return node;
-                    }
+                    if (cpulist.is_open() && std::getline(cpulist, node_cpus))
+                        node_cpulists.emplace_back(std::stoi(name.substr(4)), node_cpus);
+                }
+                try
+                {
+                    return NUMATopology::nodeOwningCPU(allowed.front(), node_cpulists);
+                }
+                catch (const std::invalid_argument &)
+                {
+                    return -1;
                 }
             }
         }
