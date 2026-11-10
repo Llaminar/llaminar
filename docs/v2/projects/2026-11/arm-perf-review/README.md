@@ -274,3 +274,28 @@ After i8mm merge (same tile / post-merge):
 - Side observation (non-blocking, census tooling): `g-*.census.log` shows
   `Debug * CONFIGURE_FAILED` lines before the 9 results — a first-attempt
   Debug configure that was retried; addon lane to investigate.
+
+## Evidence correction — census-gnu-obj reuse defect (2026-11-10, addon lane)
+
+- DEFECT: `source119-80.sh` wrote the GNU 9-cell census to the FIXED dir
+  `build/census-gnu-obj`, first configured for trees/46c9ffc58. Any other
+  TREE → CMake cache mismatch → ALL 9 configures failed; the log grep only
+  surfaced Debug lines; `census-matrix.sh` didn't clean old outputs or exit
+  nonzero; the summary step then read STALE JSONs (11-09 21:36-21:38, from
+  the f3b28a120 run).
+- CORRECTED CLAIMS: the "GNU 9-cell Rows1=0 / budgets byte-equal" parts of
+  g-f9f190059, g-777f7a52a and **g-8fcc0fe0b are STALE (f3b28a120 values)**;
+  the R2-handover row claiming that matrix at 8fcc0fe0b is wrong as stated.
+- STILL VALID: TileRegister ctest 12/12 at int-8fcc0fe0b (incl. the
+  canonical build-time witness V2_Integration_CPUNativeNEONTileRegisters,
+  GNU-14 Integration NEON_I8MM, at 8fcc0fe0b); the FRESH per-encoding
+  census `census-r2gnu` at 063fc292a (green; `git diff 063fc292a 8fcc0fe0b`
+  empty over gemm/primitives/witness/budget/portability/cmake); ALL Mac
+  AppleClang censuses (fresh dirs).
+- TOOLING FIX (deployed to .80 build/, Mac-verified): census-matrix.sh now
+  removes per-cell build dirs + old JSON/err before configuring, stamps the
+  tree SHA into every JSON, and EXITS NONZERO if any cell fails (forced
+  failure → rc 1, zero JSONs left). source119-80.sh writes per-tree dirs.
+- CORRECTIVE RECEIPTS queued on .80 (stamped, fresh dirs, ~25 min each):
+  **3027d7bb8 → 8fcc0fe0b → c4536cf3c**; success = rc 0, all 9 lines
+  `exit=0 tree=<sha>`, Rows1=0, budgets 1029/1176/1274.
