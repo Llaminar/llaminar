@@ -207,6 +207,10 @@ namespace llaminar2
              * @param tensor_rows Number of physical rows in either Q16 tensor.
              * @param logical_rows Number of oldest-to-newest rows to consume.
              * @return True only when every translated block lies in the tensor.
+             * @details Covers blockIndex()'s whole envelope: a position-major
+             * row holds every K/V head's blocks (kv_heads x blocks_per_head),
+             * a head-major row is exactly one head's blocks, and the rows
+             * reachable through the logical view exist.
              */
             [[nodiscard]] constexpr bool valid(
                 std::size_t tensor_rows,
@@ -218,6 +222,11 @@ namespace llaminar2
                 {
                     return false;
                 }
+                const bool row_holds_heads = head_major
+                    ? blocks_per_tensor_row == blocks_per_head
+                    : blocks_per_head <= blocks_per_tensor_row / static_cast<std::size_t>(kv_heads);
+                if (!row_holds_heads)
+                    return false;
 
                 const std::size_t expected_rows = head_major
                                                       ? physical_rows_per_head *
@@ -1200,7 +1209,9 @@ namespace llaminar2
                 {
                     const auto *key_q16 = dynamic_cast<const Q16_1Tensor *>(key);
                     const auto *value_q16 = dynamic_cast<const Q16_1Tensor *>(value);
-                    const auto admission = key_q16 && value_q16
+                    const auto admission = key_q16 && value_q16 &&
+                            q16KVLayout(key_q16, value_q16, n_kv_heads, head_dim, kv_lens[request],
+                                kv_logical_views[request])
                         ? q16Request(request_q, key_q16, value_q16, request_output, query_rows, n_heads,
                               n_kv_heads, head_dim, head_start, gqa_n_rep, slice)
                         : std::nullopt;
@@ -1584,11 +1595,19 @@ namespace llaminar2
              * transposing it here would allocate and copy in the verifier hot
              * path.
              */
+            // The row programs form heads x rows in int: reject an unrepresentable
+            // product before any expression below computes it.
+            const std::int64_t verifier_head_rows = std::int64_t(n_heads) * verifier_rows;
+            if (verifier_head_rows > std::numeric_limits<int>::max())
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Verifier heads x rows overflow the row programs' int indices");
+                return false;
+            }
             const auto &q_shape = Q_base->shape();
             const bool head_major_q =
                 Q_base->native_type() == TensorType::Q16_1 &&
                 q_shape.size() >= 2 &&
-                q_shape[0] == static_cast<size_t>(n_heads * verifier_rows) &&
+                q_shape[0] == static_cast<size_t>(verifier_head_rows) &&
                 q_shape[1] == static_cast<size_t>(head_dim);
 
             const int base_position_offset = kv_len - verifier_rows;
@@ -1788,6 +1807,41 @@ namespace llaminar2
         static std::size_t fp32BankBytes(const ITensor *tensor)
         {
             return tensor->native_type() == TensorType::FP32 ? tensor->size_bytes() : tensor->numel() * sizeof(float);
+        }
+
+        /**
+         * @brief Admit a Q16 K/V pair's format and logical layout for one invocation.
+         * @return The layout every block index of the invocation goes through, or
+         * empty when the pair disagrees (block size, rows, row width), a row does
+         * not hold the addressed head blocks, or the logical view needs rows the
+         * tensors lack.
+         * @details Head-major storage is [kv_head][row][head blocks]; position-major
+         * is [row][kv_heads x head blocks]. The detection matches the kernels.
+         */
+        static std::optional<detail::Q16KVLogicalLayout> q16KVLayout(const Q16_1Tensor *K_q16,
+            const Q16_1Tensor *V_q16, int n_kv_heads, int head_dim, int kv_len,
+            const attention::AttentionKVLogicalView &view)
+        {
+            if (!K_q16 || !V_q16 || n_kv_heads <= 0 || head_dim <= 0 || kv_len <= 0 ||
+                K_q16->q16_block_size() != V_q16->q16_block_size() || K_q16->rows() != V_q16->rows() ||
+                K_q16->blocks_per_row() != V_q16->blocks_per_row())
+                return std::nullopt;
+            const std::size_t block_elems = q16_block_size_elements(K_q16->q16_block_size());
+            const std::size_t blocks_per_row = K_q16->blocks_per_row();
+            const std::size_t blocks_per_head = (static_cast<std::size_t>(head_dim) + block_elems - 1) / block_elems;
+            const bool head_major = blocks_per_row == blocks_per_head && n_kv_heads > 1;
+            const detail::Q16KVLogicalLayout layout{
+                .blocks_per_tensor_row = blocks_per_row,
+                .blocks_per_head = blocks_per_head,
+                .physical_rows_per_head = head_major ? K_q16->rows() / static_cast<std::size_t>(n_kv_heads)
+                                                     : K_q16->rows(),
+                .kv_heads = n_kv_heads,
+                .head_major = head_major,
+                .logical_view = view,
+            };
+            if (!layout.valid(K_q16->rows(), kv_len))
+                return std::nullopt;
+            return layout;
         }
 
         /**
@@ -5613,40 +5667,20 @@ namespace llaminar2
             const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-            // Q16_1 block layout
+            // Q16_1 block layout: one admission shared with the request-batch preflight.
+            const auto admitted_layout = q16KVLayout(K_q16, V_q16, n_kv_heads, head_dim, kv_len, kv_logical_view);
+            if (!admitted_layout)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid Q16 prefill K/V layout or logical ring view");
+                return false;
+            }
+            const detail::Q16KVLogicalLayout q16_layout = *admitted_layout;
             const Q16BlockSize blk_size = K_q16->q16_block_size();
             const size_t block_bytes = q16_block_size_bytes(blk_size);
             const size_t block_elems = q16_block_size_elements(blk_size);
             const size_t blocks_per_kv_row = K_q16->blocks_per_row();
             constexpr size_t QS_OFFSET = sizeof(float) + sizeof(int32_t); // = 8 bytes
-
-            const size_t blocks_per_head_detect =
-                (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
-            const bool is_head_major =
-                (blocks_per_kv_row == blocks_per_head_detect && n_kv_heads > 1);
-            const size_t rows_per_head = is_head_major
-                                             ? (K_q16->rows() / static_cast<size_t>(n_kv_heads))
-                                             : 0;
-
-            const detail::Q16KVLogicalLayout q16_layout{
-                .blocks_per_tensor_row = blocks_per_kv_row,
-                .blocks_per_head = blocks_per_head_detect,
-                .physical_rows_per_head = is_head_major
-                                              ? rows_per_head
-                                              : K_q16->rows(),
-                .kv_heads = n_kv_heads,
-                .head_major = is_head_major,
-                .logical_view = kv_logical_view,
-            };
-            if (K_q16->q16_block_size() != V_q16->q16_block_size() ||
-                K_q16->rows() != V_q16->rows() ||
-                K_q16->blocks_per_row() != V_q16->blocks_per_row() ||
-                !q16_layout.valid(K_q16->rows(), kv_len))
-            {
-                LOG_ERROR("[CPUFlashAttentionKernelT] Invalid Q16 prefill K/V layout or logical ring view");
-                return false;
-            }
-
+            const bool is_head_major = q16_layout.head_major;
             const uint8_t *k_raw = static_cast<const uint8_t *>(K_q16->raw_data());
             const uint8_t *v_raw = static_cast<const uint8_t *>(V_q16->raw_data());
             if (!k_raw || !v_raw)
@@ -5676,7 +5710,7 @@ namespace llaminar2
 
             // Physical cache tiling is independent of canonical arithmetic.
             const std::size_t q16_head_row_bytes =
-                blocks_per_head_detect * block_bytes;
+                q16_layout.blocks_per_head * block_bytes;
             const int kv_tile = detail::selectCPUFlashKVTile(
                 cpu::fa2_policy::CPUFA2KVStoragePair::Q16_1,
                 head_dim,
