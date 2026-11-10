@@ -1247,3 +1247,46 @@ not catch the source-tree mismatch (Main caught it via header hashes) — a
 driver-strengthening candidate (verify the configured source tree against
 the expected identity, e.g. via compile_commands paths + header hash) is
 now evident. The earlier owner "tree stamp = a16591eed" claim was wrong.
+
+### Reviewer #174 COMPLETE — coordinator HOLD at 252da4a53 (three P2 defect classes; #175 tracks fixes)
+
+The narrow defect (Python reconciler exit) IS source-fixed (lines 106–128;
+nonzero reconciliation fatal). Broader coordinator defects prevent the
+driver ACK:
+- **RG-1 [P2] error policy:** only nounset at startup; errexit appears only
+  AFTER the first reconciliation → the first cell ignores failed receipt
+  retirement/copies; failed removal can leave an old artifact; failed
+  overwrite/truncated copy can leave it present while the new
+  proof/cache reconcile → cell stays PASS. run() in a negated conditional:
+  set-e alone doesn't make its writes reliable; it returns the tool rc even
+  if metadata publication failed; the inventory rc is unchecked. FIX:
+  explicitly propagate cleanup/metadata/inventory/retention/publication
+  errors; never publish success for merely existing artifacts; ONE stable
+  error policy (no first-cell-dependent set-e transition).
+- **RG-2 [P2] argument detach:** trailing unrestricted CMake args can
+  detach configuration from the certified cell (an appended -B configures
+  elsewhere while the driver builds/tests its original B → old cells all
+  pass; an overriding -S selects a different source tree; reconciliation
+  checks only compiler identity/ISA/type + tool/policy hashes, NOT the
+  declared source/build root). FIX: protect coordinator-owned
+  source/build/generator/cell settings; validate the ACTUAL generated
+  configuration before building.
+- **RG-3 [P2] no final coherent set/retention binding:** at final gate=PASS
+  only the initial budget/checker hashes are reconciled; nothing proves an
+  earlier cell still binds the final candidate/tool/configuration or that
+  the archived bytes are those its verifier accepted (a dependency/SDK tool
+  changing between cells → observations from incompatible epochs). #167:
+  protected authenticated accepted artifacts/current common inputs OR final
+  canonical revalidation. ARCHIVE CAVEAT: prefixed copies are not directly
+  runnable receipts (the register verifier needs the original object_file
+  basename + executed paths; the envelope copy renames proof.s/
+  target.txt) — keep original bindings intact; authenticate any archive
+  mapping; do NOT rewrite proof JSON to make relocation pass.
+- ALSO: add a checked-in fast/device-free regression around the ACTUAL
+  coordinator's failure/publication paths with explicit
+  ProductionTestPreflight coverage (a forced exception in only the embedded
+  Python block does not cover the shell/epoch paths); align ordinary
+  invocation with the repository's active-Ninja pinning + unrestricted
+  build/test parallelism (separate from register policy).
+- Main seq115 = attributed context only. #175 tracks the fixes. Narrow ACK:
+  the preserved 717 machinery + the Python-exit closure ONLY.
