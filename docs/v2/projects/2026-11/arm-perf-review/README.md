@@ -227,3 +227,14 @@ After i8mm merge (same tile / post-merge):
   (idea-31 S=4 slices, FP16/FMLAL, follow-ups) -> DGX perf lane; Spark-first
   verification; gates/reviewer/evidence unchanged. Keep the pipeline fed so the
   fast implementer can move immediately when a checkpoint releases.
+
+## Host inventory (operator reminder 2026-11-10)
+
+- TWO DGX Spark GB10 hosts (arm-sparks owns both): **.79** = GPU/CUDA side
+  (GB10 CUDA runtime gates, sm_121 spill compile, Qwen3.8-UD trace) and
+  **.80** = CPU/tree side (R2 sequence, censuses, disasm, Release/economy,
+  B-fix no-4KiB-regression runs). RUN IN PARALLEL where independent — do not
+  serialize unrelated work across the two.
+- WSL (x86): x86 CPU-only gates/i8mm control/N3. Mac (M1): AppleClang/portability
+  + Bundle-1 measurement. DGX station (Grace/GB300, 64K): perf-implementation
+  lane + the only 64K host (B-fix validation window).
