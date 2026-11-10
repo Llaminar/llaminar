@@ -1011,3 +1011,14 @@ HP-4 enforced timing-only fresh-process selection; HP-5 whole-case admission
 before first allocation) + Doxygen standard. Hook-disabled Mac commit; Linux
 validation remains merge-gating. Routed to the reviewer for #172 re-review;
 .80 window follows the combined-candidate receipts.
+- ADDON OWNER-VERIFICATION of the GNU receipt at 717b2bfe6 (16:58Z):
+  QUALIFIES — binding verified (tree stamp = origin ref; expected_identity
+  GNU-14; budget/checker hashes 6a34b344…/f180104a… IDENTICAL across hosts
+  to the Mac proofs; 9/9 × 14/14 aliases; Rows1=0; grouped sites at the
+  committed ceilings; provenance clean — compile_commands reference only
+  /work/trees/717b2bfe6; full binding in proof JSONs). The failed rg-ee7bf
+  attempt (started before the tree was fully seeded) superseded by the run
+  at the final tip; failure report retained per the rule. → GNU side of the
+  FF gate GREEN (owner-verified). The reviewer's comment-only ack for
+  717b2bfe6 was already given (15:48Z). Remaining FF item: the focused set
+  (status requested from arm-sparks — .80 seen idle at 16:52Z).
