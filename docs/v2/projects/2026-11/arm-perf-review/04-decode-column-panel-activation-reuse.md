@@ -198,3 +198,13 @@ in the plan. Any NibbleMap touch points must remain seam-based.
 - GB10 CUDA gate seal: K14-GB10-CUDA-F69446E3C-20261110 (51/64; tracked cells
   incl. RoPEGraphCaptureNoH2D GREEN; FA null-stream = single real defect,
   attribution + base control in flight).
+
+## R2 x86 GREEN (2026-11-10, WSL; queue emptied 06:59Z)
+- R2 FINAL 8fcc0fe0b vs 29351a57e: 0 new/0 gone; addon cells 14/14; C2c
+  verbose 3/3 + 6/6 OK (0 skips); census +2 (admission registrations; none
+  gone/label-changed; 3 ARM-only noted); Release both rc=0. 01 FINAL
+  5d606a108 vs ce9ddb326: 0 new/0 gone + 4/4 extras. Base ce9ddb326 vs
+  f69446e3c: 0 new/1 gone = MoEOwnedSharedBackingNativeStartup NOW PASSES
+  (5.0s vs 0.44s fail) = WSL 'env' failure FIXED by the ARM-tip NUMA commits
+  (real improvement). Base 29351a57e x86 gate: GREEN. R2 = ALL GATES COMPLETE
+  -> handover doc to Main (lane). WSL disclosure: late reporting, no infra.
