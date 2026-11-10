@@ -65,6 +65,15 @@ namespace llaminar2
         static NodeTopology detect();
 
         /**
+         * @brief Enumerate CPU-bearing NUMA nodes under one sysfs node root.
+         * @param node_root Directory holding nodeN entries, normally
+         *        /sys/devices/system/node.
+         * @return Nodes with at least one CPU, in ascending node id. CPU-less
+         *         memory nodes (GPU/CXL memory on Grace) are not CPU endpoints.
+         */
+        static std::vector<NUMANode> detectNUMANodesAt(const std::string &node_root);
+
+        /**
          * @brief Replace raw firmware package ids with dense socket indices.
          * @param nodes Detected NUMA nodes whose socket_id holds the raw sysfs
          *        physical_package_id; on return socket_id is the rank of that id
