@@ -166,3 +166,15 @@ codex/arm-idea26-openmp-wakeup @ **0ce033b6c** (parent 1d9141934; 53 files,
 VALIDATION: portability 295/295 green (Mac); Linux targets syntax-validated
 under stubs (runtime at the canonical gates). A2 outputs held pending the
 re-review ACK.
+
+### Review #179 successor IN PROGRESS — 0ce NOT ACKable as written (reviewer, ~23:47Z)
+
+Immediate concrete defect: the engine passes scope.forks() into
+publishOpenMPTeamForkSummary, but the publisher still computes
+openMPTeamForkSnapshot()-entry_forks → mixes owner count with process-total
+epoch, yielding unrelated historical/concurrent counts (fresh isolated 3
+forks → 0, not 3). ALSO: the default-off call now eagerly constructs
+forwardGraphPerfContext BEFORE the publisher gate (side-effect/timing leak
+in the off path). Reviewer completing the remaining policy/test audit
+before ONE consolidated finding set. 295 portability/stubs = NOT
+engine-publication qualification.
