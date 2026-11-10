@@ -42652,6 +42652,26 @@ if(TARGET v2_integration_moe_overlay_residency_consensus_mpi)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_MoERemoteProjectionBoundedTelemetry_MPI)
 endif()
+if(HAVE_CUDA AND TARGET v2_integration_cuda_ops_parity)
+    add_v2_test(V2_Integration_CUDAResidualAddInvocationContract
+        COMMAND $<TARGET_FILE:v2_integration_cuda_ops_parity>
+            --gtest_filter=Test__CUDAOpsParity.ResidualAdd_*
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;ResidualAdd;ExplicitStream;Contract;Regression"
+        MPI_PROCS 1 NO_MODELS REQUIRES_BACKEND CUDA)
+    if(TEST V2_Integration_CUDAResidualAddInvocationContract)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAResidualAddInvocationContract)
+    endif()
+endif()
+if(HAVE_CUDA AND TARGET v2_integration_cuda_attention_padding_parity)
+    add_v2_test(V2_Integration_CUDAAttentionPaddingInvocationContract
+        COMMAND $<TARGET_FILE:v2_integration_cuda_attention_padding_parity>
+            --gtest_filter=Test__CUDAAttentionPaddingParity.LMHeadPaddedBucketUsesLastRealRowOnGPU:Test__CUDAAttentionPaddingParity.DecodeContinuationUsesRealKVLengthOnGPU
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;Attention;Workspace;Transfer;Contract;Regression"
+        MPI_PROCS 1 NO_MODELS REQUIRES_BACKEND CUDA)
+    if(TEST V2_Integration_CUDAAttentionPaddingInvocationContract)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAAttentionPaddingInvocationContract)
+    endif()
+endif()
 
 # Report, never hide, every registration omitted (after all includes) because their compiled backend
 # family is absent from this build (for example a CPU-only build).
