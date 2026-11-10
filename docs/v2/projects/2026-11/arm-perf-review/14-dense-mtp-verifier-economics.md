@@ -187,3 +187,12 @@ candidate-path agreement ≠ baseline validation by this executable (exact
 flags to be recorded); [I14-A-2] the owner build wrapper is not a c007 file
 — 14/14 tracked SHAs blob-verified, wrapper/binary hashes = owner evidence.
 Details in evidence/idea14-A-owner-selfcheck.md.
+
+### B-wave booking confirmed (operator, 2026-11-10): first post-SETTLED .80 window
+
+Operator confirmed the coordinator defaults: Plan B (fresh paired GB10
+Release economy, rotated A/B, mode-verified, full transaction cost) runs in
+the FIRST post-SETTLED .80 window, anchored at Main's settled tip; bounded
+fixed-depth controls stay only-if-negative. Post-SETTLED execution order
+confirmed: combined idea-31+B9 FF → Bundle-1 FF → Qwen3.8-UD trace → GPU
+windows (ideas 19/14/18) → half-perf cell → native FMLAL leaf.
