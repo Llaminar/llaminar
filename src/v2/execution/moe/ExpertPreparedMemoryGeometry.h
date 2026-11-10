@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include "utils/HostPageSize.h"
 #include "ExpertWeightFormat.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "loaders/GPUVramPreflight.h"
@@ -137,7 +138,10 @@ namespace llaminar2
                     "CPU expert projection memory requires positive geometry and a valid format");
             }
 
-            constexpr std::size_t page_alignment = 4096u;
+            // CPU expert slots are page-aligned to the host base page
+            // (NUMAAllocator::externalRangeAlignment); admission must use the
+            // same size, or 16/64 KiB-page hosts under-admit every projection.
+            const std::size_t page_alignment = hostPageBytes();
             if (format.isFloating())
             {
                 const std::size_t elements = checkedMultiply(
