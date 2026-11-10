@@ -780,3 +780,21 @@ Pending: reviewer #169 re-pin (incl. fresh a16591eed review; NOTE — the 6th
 commit is the InstalledWidth cell, not the #165 B9 checker-strengthening
 controls; routing that question to the reviewer) → arm-sparks GNU driver +
 focused set (+InstalledWidth) → Main FF.
+
+### Reviewer ruling on the 6th commit (2026-11-10): B9 strengthening DEFERRED
+
+- #165's offset-sensitive/pointer-slot/narrow-footprint strengthening was
+  explicitly NONBLOCKING and remains so → acceptable to DEFER for this
+  delivery. **Deferred follow-up on the books** (B9 test strengthening:
+  offset-sensitive live-slot controls, actual pointer-slot reload,
+  adjacent/overlapping narrow-read positives/negatives — to ride with a
+  later B9-adjacent change or a dedicated commit).
+- The InstalledWidth cell covers a DIFFERENT idea-31 contract — it is NOT a
+  substitute for the B9 controls.
+- #169 queues the exact a16591eed-over-e8866ec04 re-pin behind #168 (Main's
+  3-CUDA-commit slice, in progress).
+- WORDING DISCIPLINE (reviewer correction): the Mac 9/9 ×14 and the GNU
+  launch are OWNER reports, not reviewer-authenticated "qualifying"
+  evidence; #166/#167 govern complete current binding and the final set; a
+  source re-pin is not receipt authentication or FF permission — Main owns
+  acceptance/grants.
