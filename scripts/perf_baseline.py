@@ -676,8 +676,12 @@ def _median(values: Sequence[float]) -> float:
     Range split: while ``high <= max/2`` the sum ``low + high`` cannot overflow
     and ``(low + high) / 2`` is correctly rounded (halving is exact for normal
     results; in the subnormal range the sum is exact and halving rounds once,
-    ties to even). Only at the large end is ``low/2 + high/2`` used, where both
-    halves are exact normal values. No branch adds an error term that could
+    ties to even). Only at the large end (``high > max/2``) is
+    ``low/2 + high/2`` used: ``high/2`` is exact there, and ``low/2`` is exact
+    unless ``low`` is subnormal, in which case it may round to 0. That loss is
+    harmless: such a ``low`` is far below half an ulp of ``high/2``, so the
+    correctly rounded midpoint is ``high/2`` either way, and otherwise the sum
+    of two exact halves rounds once. No branch adds an error term that could
     invent spread for constant or near-constant samples.
     """
 

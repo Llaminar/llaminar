@@ -447,7 +447,8 @@ class PerfBaselineTest(unittest.TestCase):
     def test_even_median_is_correctly_rounded_across_the_range(self) -> None:
         d, top = 5e-324, sys.float_info.max
         cases = {(d, d): d, (3 * d, 4 * d): 4 * d, (d, 2 * d): 2 * d, (7 * d, 7 * d): 7 * d,
-                 (1.0, 2.0): 1.5, (top, top): top, (top / 2, top): top * 0.75, (1e308, 1e308): 1e308}
+                 (1.0, 2.0): 1.5, (top, top): top, (top / 2, top): top * 0.75, (1e308, 1e308): 1e308,
+                 (d, top): top / 2}  # large branch with a subnormal low: d/2 rounds to 0, result still exact
         for (low, high), expected in cases.items():
             with self.subTest(low=low, high=high):
                 self.assertEqual(self._median_of(low, high), expected)
