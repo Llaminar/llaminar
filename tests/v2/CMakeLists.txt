@@ -19067,7 +19067,7 @@ add_v2_test(V2_Perf_CPUNativeQuantised_DecodeBandwidth
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 600)
 add_v2_test(V2_Integration_CPUNativeQuantisedDecodeBandwidthContract
     COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_decode_bandwidth>
-            --gtest_filter=Perf__CPUNativeQuantisedDecodeBandwidth.ContractTinyLadder:Perf__CPUNativeQuantisedDecodeBandwidth.NegativeControlRejectsPerturbedAndStaleOutput:Perf__CPUNativeQuantisedDecodeBandwidth.EnvironmentParsingFailsClosed
+            --gtest_filter=Perf__CPUNativeQuantisedDecodeBandwidth.ContractTinyLadder:Perf__CPUNativeQuantisedDecodeBandwidth.NegativeControlRejectsPerturbedAndStaleOutput:Perf__CPUNativeQuantisedDecodeBandwidth.EnvironmentParsingFailsClosed:Perf__CPUNativeQuantisedDecodeBandwidth.RepeatedRunsShareIdentityAndDifferOnlyInObservations
     LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;ByteExact;Contract;Bandwidth;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
     ENVIRONMENT "OMP_NUM_THREADS=2")

@@ -26,10 +26,11 @@
  * - **Timing statistic.** Each point's time is the *upper median*:
  *   `sorted(samples)[n / 2]` (the middle sample for odd n, the upper of the
  *   two middle samples for even n).
- * - **Authentication.** Every timed invocation starts from a NaN-sentinel
- *   output (written before the timer starts) and its complete output is
- *   compared byte for byte, after the timer stops, with serial one-worker rows
- *   of the same production entry point. This proves the timed launches equal
+ * - **Authentication.** The serial one-worker reference is pre-filled with one
+ *   NaN payload and must be completely finite afterwards (proof that every
+ *   column was published). Every timed invocation starts from a different NaN
+ *   payload (written before the timer starts), and its complete output is
+ *   compared byte for byte, after the timer stops, with that reference. This proves the timed launches equal
  *   the serial production arithmetic; it is not an independent reference
  *   implementation. Sentinel writes and comparisons are outside the timed
  *   interval but do warm the output row.
@@ -44,7 +45,10 @@
  * - `LLAMINAR_CPU_DECODE_BW_WARMUP`: [1, 10000] (default 3).
  * - `LLAMINAR_CPU_DECODE_BW_ITERS`: [1, 100000] (default 15).
  * - `LLAMINAR_CPU_DECODE_BW_JSON`: write a `kernel-metrics` document for
- *   `scripts/perf_baseline.py`.
+ *   `scripts/perf_baseline.py`. Its `harness` and `parameters` (geometry and
+ *   requests only) are the identity; per-run timings are under `observations`.
+ *
+ * Integers must be canonical decimals ("01", "+5" and " 5" are rejected).
  *
  * Every requested format must contribute at least one ladder step; a ceiling
  * below a format's smallest step is fatal rather than silently omitted.
@@ -55,6 +59,7 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -101,12 +106,13 @@ long long parseBounded(const char *raw, const std::string &name, long long defau
 {
     if (!raw || !*raw)
         return default_value;
-    if (!(std::isdigit(static_cast<unsigned char>(raw[0])) || raw[0] == '-'))
-        throw std::invalid_argument(name + "='" + raw + "' must start with a digit or '-'");
     errno = 0;
     char *end = nullptr;
     const long long value = std::strtoll(raw, &end, 10);
-    if (errno == ERANGE || end == raw || *end != '\0' || value < minimum || value > maximum)
+    // Canonical decimal only: "01", "+5", " 5" and "1e3" are rejected, so equal
+    // values always have equal spellings.
+    if (errno == ERANGE || end == raw || *end != '\0' || std::to_string(value) != raw ||
+        value < minimum || value > maximum)
         throw std::invalid_argument(name + "='" + raw + "' must be an integer in [" + std::to_string(minimum) +
                                     ", " + std::to_string(maximum) + "]");
     return value;
@@ -150,6 +156,8 @@ std::vector<int> requestedWidths(const char *raw, int maximum_threads)
             widths.push_back(static_cast<int>(
                 parseBounded(entry.c_str(), "LLAMINAR_CPU_DECODE_BW_THREADS entry", 1, 1, maximum_threads)));
     std::sort(widths.begin(), widths.end());
+    if (std::adjacent_find(widths.begin(), widths.end()) != widths.end())
+        throw std::invalid_argument("LLAMINAR_CPU_DECODE_BW_THREADS contains a duplicate width value");
     return widths;
 }
 
@@ -204,6 +212,34 @@ std::vector<Q8_1Block> makeActivationRow(int k, int k_blocks)
     std::vector<Q8_1Block> quantized(static_cast<size_t>(k_blocks));
     quantize_activations_to_q8_1(fp32.data(), quantized.data(), 1, k, k_blocks);
     return quantized;
+}
+
+/** @brief NaN payload pre-filled into the serial reference before it is computed. */
+float referenceSentinel()
+{
+    return std::bit_cast<float>(std::uint32_t{0x7fc0dea1u});
+}
+
+/** @brief A different NaN payload pre-filled into every timed output. */
+float timedSentinel()
+{
+    return std::bit_cast<float>(std::uint32_t{0x7fc0be11u});
+}
+
+/**
+ * @brief Prove the serial reference was completely published before its bytes are trusted.
+ *
+ * The synthetic weights and activations produce finite outputs, so every
+ * reference element must be finite; an element still holding the NaN sentinel
+ * (or any non-finite value) means the reference call did not write it.
+ * @throws std::runtime_error When any reference element is not finite.
+ */
+void requirePublishedReference(const std::vector<float> &reference, const std::string &context)
+{
+    for (size_t column = 0; column < reference.size(); ++column)
+        if (!std::isfinite(reference[column]))
+            throw std::runtime_error(context + ": serial reference column " + std::to_string(column) +
+                                     " was not published");
 }
 
 /**
@@ -277,7 +313,6 @@ std::vector<std::pair<int, int>> shapeLadder(double bytes_per_element, std::uint
 std::vector<EffectiveRatePoint> measureLadder(const LadderSpec &spec)
 {
     std::vector<EffectiveRatePoint> points;
-    const float sentinel = std::numeric_limits<float>::quiet_NaN();
     for (const QuantizedVerifierFormatCase *format : spec.formats)
     {
         double bytes_per_element = 0.0;
@@ -305,17 +340,19 @@ std::vector<EffectiveRatePoint> measureLadder(const LadderSpec &spec)
             const std::uint64_t k_blocks = static_cast<std::uint64_t>(packed.blocks_per_row);
             const std::uint64_t weight_bytes = n_chunks * k_blocks * footprint.weight_bytes_per_n_chunk_k_block;
             const auto activations = makeActivationRow(k, packed.blocks_per_row);
-            std::vector<float> serial(static_cast<size_t>(n), sentinel);
+            std::vector<float> serial(static_cast<size_t>(n), referenceSentinel());
             {
                 omp_set_num_threads(1);
                 NativeQuantisedTestPartialStorage partials(packed, 1);
                 gemv_native_quantised_preq(packed, activations.data(), serial.data(), partials.span(),
                                            ISAPath::AUTO, DecodeSchedulePolicy::Auto);
             }
+            requirePublishedReference(serial, std::string(format->label) + " N=" + std::to_string(n) +
+                                                  " K=" + std::to_string(k));
             for (const int requested : spec.requested_threads)
             {
                 omp_set_num_threads(requested);
-                std::vector<float> output(static_cast<size_t>(n), sentinel);
+                std::vector<float> output(static_cast<size_t>(n), timedSentinel());
                 NativeQuantisedTestPartialStorage partials(packed, 1);
                 const auto launch = [&]() {
                     gemv_native_quantised_preq(packed, activations.data(), output.data(), partials.span(),
@@ -334,7 +371,7 @@ std::vector<EffectiveRatePoint> measureLadder(const LadderSpec &spec)
                 std::vector<double> microseconds;
                 for (int iteration = 0; iteration < spec.iterations; ++iteration)
                 {
-                    std::fill(output.begin(), output.end(), sentinel);
+                    std::fill(output.begin(), output.end(), timedSentinel());
                     const auto begin = std::chrono::steady_clock::now();
                     launch();
                     const auto end = std::chrono::steady_clock::now();
@@ -360,7 +397,8 @@ std::vector<EffectiveRatePoint> measureLadder(const LadderSpec &spec)
 /** @brief Build the `kernel-metrics` document for `scripts/perf_baseline.py`. */
 nlohmann::json kernelMetricsDocument(const std::vector<EffectiveRatePoint> &points, const LadderSpec &spec)
 {
-    nlohmann::json metrics = nlohmann::json::object(), steps = nlohmann::json::array(), formats = nlohmann::json::array();
+    nlohmann::json metrics = nlohmann::json::object(), steps = nlohmann::json::array(),
+                   timings = nlohmann::json::array(), formats = nlohmann::json::array();
     for (const auto &point : points)
     {
         const std::string key = point.format + ".n" + std::to_string(point.n) + "k" + std::to_string(point.k) +
@@ -369,9 +407,11 @@ nlohmann::json kernelMetricsDocument(const std::vector<EffectiveRatePoint> &poin
             throw std::logic_error("duplicate metric key " + key);
         metrics[key] = {{"value", point.rate_gbps}, {"unit", "GB/s"}, {"better", "higher"},
                         {"samples", point.rate_samples_gbps}};
+        // Identity: deterministic geometry and request only. Timings are observations.
         steps.push_back({{"format", point.format}, {"n", point.n}, {"k", point.k},
                          {"requested_threads", point.requested_threads}, {"weight_bytes", point.weight_bytes},
-                         {"effective_bytes", point.effective_bytes}, {"upper_median_us", point.upper_median_us}});
+                         {"effective_bytes", point.effective_bytes}});
+        timings.push_back({{"metric", key}, {"upper_median_us", point.upper_median_us}});
     }
     for (const auto *format : spec.formats)
         formats.push_back(format->label);
@@ -383,7 +423,8 @@ nlohmann::json kernelMetricsDocument(const std::vector<EffectiveRatePoint> &poin
                             {"iterations", spec.iterations}, {"cpu0_published_caches", publishedCpu0Caches()},
                             {"build_isa", compiledNativeQuantisedBuildISAName()},
                             {"runtime_isa_tag", isaLevelName(activeISALevel())}, {"steps", steps}}},
-            {"metrics", metrics}};
+            {"metrics", metrics},
+            {"observations", {{"timings", timings}}}};
 }
 
 /** @brief Print the human table. */
@@ -494,20 +535,55 @@ TEST(Perf__CPUNativeQuantisedDecodeBandwidth, NegativeControlRejectsPerturbedAnd
     ASSERT_TRUE(kernel.isValid());
     const auto &packed = kernel.packedWeights();
     const auto activations = makeActivationRow(256, packed.blocks_per_row);
-    const float sentinel = std::numeric_limits<float>::quiet_NaN();
-    std::vector<float> serial(128, sentinel), output(128, sentinel);
+    std::vector<float> serial(128, referenceSentinel()), output(128, timedSentinel());
     NativeQuantisedTestPartialStorage partials(packed, 1);
     omp_set_num_threads(1);
     gemv_native_quantised_preq(packed, activations.data(), serial.data(), partials.span(), ISAPath::AUTO,
                                DecodeSchedulePolicy::Auto);
     gemv_native_quantised_preq(packed, activations.data(), output.data(), partials.span(), ISAPath::AUTO,
                                DecodeSchedulePolicy::Auto);
+    EXPECT_NO_THROW(requirePublishedReference(serial, "complete reference"));
     EXPECT_NO_THROW(authenticate(output, serial, "unmodified"));
+    // One-ULP perturbation of a real production output.
     auto perturbed = output;
     perturbed[64] = std::nextafter(perturbed[64], std::numeric_limits<float>::infinity());
     EXPECT_THROW(authenticate(perturbed, serial, "one-ULP"), std::runtime_error);
-    const std::vector<float> stale(128, sentinel);
-    EXPECT_THROW(authenticate(stale, serial, "stale sentinel"), std::runtime_error);
+    // Entirely unwritten timed output.
+    EXPECT_THROW(authenticate(std::vector<float>(128, timedSentinel()), serial, "stale"), std::runtime_error);
+    // Partially unwritten timed output: one column left at the timed sentinel.
+    auto partial_output = output;
+    partial_output[127] = timedSentinel();
+    EXPECT_THROW(authenticate(partial_output, serial, "partial timed"), std::runtime_error);
+    // Partially unwritten reference: one column left at the reference sentinel is
+    // rejected before its bytes are used, even when the timed output omits the same column.
+    auto partial_reference = serial;
+    partial_reference[3] = referenceSentinel();
+    EXPECT_THROW(requirePublishedReference(partial_reference, "partial reference"), std::runtime_error);
+    // Distinct payloads: an omitted column never compares equal across the two buffers.
+    auto both_omitted = output;
+    both_omitted[3] = timedSentinel();
+    EXPECT_THROW(authenticate(both_omitted, partial_reference, "both omitted"), std::runtime_error);
+}
+
+/**
+ * @brief Producer control: two independent real ladders of one spec carry identical
+ * identity (`harness`, `parameters`) and metric keys; only metrics and observations may differ.
+ */
+TEST(Perf__CPUNativeQuantisedDecodeBandwidth, RepeatedRunsShareIdentityAndDifferOnlyInObservations)
+{
+    omp_set_dynamic(0);
+    const LadderSpec spec{.formats = formatsFor("Q4_K"), .requested_threads = {1},
+                          .max_weight_bytes = 16u * 1024u, .warmup = 1, .iterations = 3};
+    const auto first = kernelMetricsDocument(measureLadder(spec), spec);
+    const auto second = kernelMetricsDocument(measureLadder(spec), spec);
+    EXPECT_EQ(first.at("harness"), second.at("harness"));
+    EXPECT_EQ(first.at("parameters"), second.at("parameters"));
+    ASSERT_EQ(first.at("metrics").size(), second.at("metrics").size());
+    for (const auto &[name, metric] : first.at("metrics").items())
+        EXPECT_TRUE(second.at("metrics").contains(name)) << name;
+    EXPECT_FALSE(first.at("parameters").dump().find("upper_median_us") != std::string::npos)
+        << "timings must not be part of the identity";
+    EXPECT_TRUE(first.at("observations").contains("timings"));
 }
 
 /** @brief Environment parsing rejects overflow, out-of-range, malformed and duplicate input. */
@@ -522,6 +598,10 @@ TEST(Perf__CPUNativeQuantisedDecodeBandwidth, EnvironmentParsingFailsClosed)
     EXPECT_THROW(formatsFor("Q4_K,"), std::invalid_argument);
     EXPECT_THROW(formatsFor("NOPE"), std::invalid_argument);
     EXPECT_THROW(requestedWidths("1,1", 4), std::invalid_argument);
+    EXPECT_THROW(requestedWidths("1,01", 4), std::invalid_argument);
+    EXPECT_THROW(requestedWidths("2,002", 4), std::invalid_argument);
+    EXPECT_THROW(parseBounded("01", "X", 1, 1, 10), std::invalid_argument);
+    EXPECT_THROW(parseBounded("+5", "X", 1, 1, 10), std::invalid_argument);
     EXPECT_THROW(requestedWidths("5", 4), std::invalid_argument);
     EXPECT_EQ(requestedWidths("4,1", 4), (std::vector<int>{1, 4}));
     const LadderSpec too_small{.formats = formatsFor("Q8_0"), .requested_threads = {1},
