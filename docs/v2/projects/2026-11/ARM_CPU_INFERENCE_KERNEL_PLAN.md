@@ -15,12 +15,15 @@ evidence (K-series snapshots, seals, falsification controls) lives in
 ### Maintenance frontier — 2026-11-10
 
 - Engine #71: `58dcdaff5` classifies Flash Next source roles through the shared
-  typed work authority, with schema-owned compact terminal work and a native-row
-  lookup consumer at the PLE decoder layer. PMA admission is unchanged.
-  `0d6f09919` completes the sparse source/service fixture; its focused native
-  preflight passes. The broader planning Unit run exposes nine stale NUMA-owner
-  fixtures (415/424 pass); corrections and PP ownership coverage are pending.
-  Actual Qwen3.8-UD planning proof is reserved separately at `0d6f09919`; context
+  typed work authority and gives native-row lookup its PLE decoder-layer owner.
+  PMA admission is unchanged. `0d6f09919` completes the sparse source/service
+  fixture. `a847db328` corrects nine stale NUMA-owner observations and adds PP
+  locality checks; planning Unit passes 424/424 and focused preflight passes
+  20 consecutive repetitions. Review #177 then rejects the initial terminal-HC
+  compact-row assumption: HC/norm run before vocabulary-head row selection.
+  The corrective successor separates row policy from ownership and adds actual
+  pricing-count assertions. Its native validation and actual Qwen3.8-UD planning
+  proof remain pending; the earlier model window is held before launch. Context
   8192's PMA failure remains independent until rechecked. No model-performance
   or final register-gate qualification follows from this diagnostic.
 
