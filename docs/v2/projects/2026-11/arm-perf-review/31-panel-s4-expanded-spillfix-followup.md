@@ -126,3 +126,15 @@ Tooling: container git unavailable → tree stamp read "unknown"; addon
 deployed a fallback to the trees/<sha> dirname; r2cmp.py on .80 hardcodes
 the gone /work/trees/r2 budget path — use each tree's own budget file or
 source119-80.sh ($TREE).
+
+### CORRECTION (Main's directive supersedes the line above)
+
+The I8MM runtime byte cells DO run — but ONLY at the eventual exact handover
+tip of the REBASED idea-31 stack (never at an intermediate SHA). Focused
+ctest set at that tip: PreparedProjection (Unit/Integration),
+PanelTailsMatchSerial, I8MMOperandGrouping, I8MMTailsMatchSDOT,
+PanelTournamentContract. Sequence: pins hold (idea-31+selector 042a9e9da;
+B9 c4536cf3c) until Main publishes the rebased #43 tip → addon rebases both
+mechanically (range-diff `=`) → reviewer re-pin at the new SHAs → the
+focused set at the exact handover tip → Main FF. Main recorded the direct
+8fcc receipt as REPLACING the withdrawn row; no #43 source fix needed.
