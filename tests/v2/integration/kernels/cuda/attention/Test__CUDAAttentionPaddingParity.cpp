@@ -407,18 +407,24 @@ namespace
         if (err != cudaSuccess)
             return fail(std::string("cudaMemset(output) failed: ") + cudaGetErrorString(err));
 
+        // Order the legacy-stream setup copies before the kernel stream.
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+            return fail(std::string("setup synchronize failed: ") + cudaGetErrorString(err));
         llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> kernel(cuda_ordinal);
+        ScopedGPUStream kernel_stream(DeviceId::cuda(cuda_ordinal));
+        kernel.setGPUStream(kernel_stream.get());
         const bool kernel_ok = kernel.compute(
             device_query, device_key, device_value, d_output,
             seq_len, n_heads, n_kv_heads, head_dim,
             causal, -1,
             nullptr, nullptr, nullptr, nullptr,
             false, &mpi_ctx, cuda_ordinal);
-        err = cudaDeviceSynchronize();
+        err = cudaStreamSynchronize(static_cast<cudaStream_t>(kernel_stream.get()));
         if (!kernel_ok)
             return fail("CUDA attention kernel returned false");
         if (err != cudaSuccess)
-            return fail(std::string("cudaDeviceSynchronize failed: ") + cudaGetErrorString(err));
+            return fail(std::string("kernel stream synchronize failed: ") + cudaGetErrorString(err));
 
         err = cudaMemcpy(result.output.data(), d_output, output_bytes, cudaMemcpyDeviceToHost);
         if (err != cudaSuccess)
