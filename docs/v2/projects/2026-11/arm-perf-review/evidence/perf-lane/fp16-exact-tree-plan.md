@@ -1,199 +1,136 @@
 # Plan first: native NEON FP16 projection, exact 256-lane contract
-
-2026-11-09 — PERFORMANCE lane, SPARKS/X925 target. DRAFT; no production code
-authorized/changed. Source analysis and fresh GCC14 TU compilation use
-detached 39c24d8b4. Final implementation base re-confirmed after R2/C4 and
-the main-lane guards: 777f7a52a (on f69446e3c). arm-perf confirms FP16
-arithmetic unchanged by that WIP, pending final diff verification.
+(MASTER — 2026-11-10 evidence-archive revision; v2.1 contract/holds retained;
+scope-qualified .80 receipt added. Design approved by arm-perf; no production
+code authorized. Base 777f7a52a; diff 39c->777f for the FP16 chain = EMPTY;
+final-base gate PASSED. Implementation + scratch candidates HELD until .80
+hot-loop/closure evidence + reviewer v2.1 release + canonical .80 census +
+explicit first-slice confirmation.)
 
 ## Findings / scope
-No vfmlal/fmlalq source occurrence exists under src/v2 at this checkout.
-Fresh production TUs compiled sequentially with existing-container GCC14.2,
-one physical CPU, no GPU/network. Flags from build_v2_dgx/build.ninja
-(Integration -O3 -g + NEON_I8MM); second diagnostic = -mtune=generic
--march=armv9-a+sve2+i8mm+bf16. Neither emits FMLAL/FMLAL2 in
-CPURMSNormKernelT.cpp, CPUSoftmaxKernelT.cpp or KernelFactory.cpp.
-Only actual half x half candidate = explicit FP16RNE floating projection
-(GDN selective alpha/beta policies), instantiated by KernelFactory.cpp from
-cpu/gemm/FloatingPointGemmKernel.h. Exact-tree dispatcher: Scalar/AVX2/AVX512,
-NO NEON case; active NEON enters default scalar program. Two FP16RNE
-dotRows<4> bodies (FP32 A rounded via binary16; physical-half A) each emit
-one scalar FMADD, no vector FMLA, no FCVT/FCVTL: half conversion = integer
-bit arithmetic. This is a missing native vector implementation, not just
-missed compiler fusion. Fresh armv9 compilation does not resolve it.
+- No vfmlal/fmlalq under src/v2 at this checkout; fresh GCC14.2 TU compile
+  (production Integration -O3 -g NEON_I8MM flags; armv9 diagnostic variant)
+  emits FMLAL/FMLAL2=0 in RMSNorm/Softmax/KernelFactory TUs.
+- Only half x half candidate = explicit FP16RNE floating projection (GDN
+  selective alpha/beta), instantiations in KernelFactory.cpp from
+  FloatingPointGemmKernel.h. Exact-tree dispatcher = Scalar/AVX2/AVX512 only
+  (NO NEON case); active NEON -> default scalar program. Two FP16RNE
+  dotRows<4> bodies (FP32-A HalfRNE; physical-half A) each emit one scalar
+  FMADD, no vector FMLA/FCVT; half conversion = integer bit arithmetic.
+  Missing native vector implementation, NOT missed compiler fusion.
+- Closed non-candidates: attention dot (mixed FP32 query x half key; FP32
+  prob x half V); T5 RMSNorm (FP32-original t5SquaredSums; normalize rejects
+  non-FP32 T5; FP16 uses FP64 squaredSums); softmax (FP32 poly after half
+  decode).
 
-Closed non-candidates:
-- Attention dot: FP32 query x half key; value accumulate: FP32 prob x half V.
-  FMLAL would require narrowing an originally FP32 operand (bytes).
-- T5 RMSNorm: t5SquaredSums takes OriginalRows<Storage::FP32,Count>; normalize
-  rejects non-FP32 T5FP32; FP16 RMSNorm uses FP64 squaredSums (retain).
-- Softmax: FP32 polynomial intermediates after half storage decode.
+## Gate-1 SPARKS receipt (2026-11-10) — scope-qualified
+- .80 = VERIFIED WRAPPER/DISPATCH ONLY; hot-loop dotRows<4> bodies +
+  relocations + 777f-bound identity = OUTSTANDING. All 4 relay payloads
+  SHA-verified (d1 bd644e4a.., d2 7a3c17ff.., d3 71e59fc0.., fp16 ef4f1387..).
+  Producer: .80, rel-f9f190059-neon_i8mm, KernelFactory.cpp.o, g++-14 14.2.0
+  Release NEON_I8MM; exact argv/source/object receipt + final-binary identity
+  NOT supplied; f9f190059 not local, not diff-authenticated vs 777f.
+- CORRECTION: d1/d2 = OpenMP wrapper only (8 scalar FMUL + 4 FADD + 8 FMADD =
+  completion after BL; NOT K-loop); dotRows = empty headings; no relocations
+  (bl 0 = placeholder, not self-calls/absence); d3 = dispatch/publication (no
+  FP math). Do NOT import '0 FMA'/'serial partials/no 256-lane'/'per-K'.
+  Local source/object analysis still establishes missing native exact-tree.
+  Requested via arm-perf: hot-leaf/closure extraction + identity binding
+  (prefer rel-777f7a52a from r2gate2's Release build; else checked
+  39c/777f/f9f arithmetic diff receipt).
 
-## Existing exact contract — no changed arithmetic
-Canonical: FloatingExpertNumericalContract.h (dotRows, reducePartials);
-DeviceFP32NumericalContract.h (fusedMultiplyAdd, add, persistRounded);
-FloatingPointGemmKernel.h (roundFloatingOperandHalfRNE, executeHalfOperands,
-run_gpu_aligned_expert_fp32_matmul_isa, completeSkinnyMatmulValue).
-For each output and row:
-1. Init exactly256 logical FP32 lane accumulators to +0.
-2. Logical lane l consumes K indices l, l+256, l+512, ... in order; update =
-   one FP32 FMA with explicit rounding/dependency edge.
-3. Reduce stride128,64,32,16,8,4,2,1: partial[l] = rounded_add(partial[l],
-   partial[l+stride]); no alternative horizontal-add order.
-4. Preserve alpha/beta/bias completion, read-before-write rules, row
-   selection/offset, HalfRNE-specific completion verbatim.
-Current scalar already implements this exact contract. New NEON must equal
-BOTH an independently constructed contract-ordered oracle AND the current
-scalar. No order change for SIMD.
+## Existing exact contract
+- FloatingExpertNumericalContract.h (dotRows, reducePartials);
+  DeviceFP32NumericalContract.h (fusedMultiplyAdd, add, persistRounded);
+  FloatingPointGemmKernel.h (roundFloatingOperandHalfRNE,
+  executeHalfOperands, run_gpu_aligned_expert_fp32_matmul_isa,
+  completeSkinnyMatmulValue).
+- Per output+row: 256 logical FP32 lane accumulators +0; lane l consumes
+  l,l+256,... via FP32 FMA; reduce strides 128..1 rounded adds; HalfRNE
+  completion = rounded alpha*dot, bias add separately when present, FMA
+  (beta,C0,value) only when beta!=0 (else no C read); only entrypoint's
+  supported offsets/selection; grouped half = alpha1/beta0/offset0/dense
+  first-M -> REJECT other completion/offset/selection (see half-perf v2.1).
+  Current scalar implements this contract; new NEON must equal BOTH an
+  independent contract-ordered oracle AND current scalar (no order change
+  for SIMD).
 
-## Variant domain (not permission to narrow)
-HalfRNE=false, HalfStorage=false: original unrestricted FP32 -> native
-FP32 x widened-FP16 FMA (NOT FMLAL).
-HalfRNE=true, HalfStorage=false: original FP32 rounded binary16 RNE, then
-widened -> FMLAL candidate after exactly matching that rounding.
-HalfRNE=true, HalfStorage=true: original stored binary16 -> FMLAL candidate;
-no extra rounding.
-HalfRNE=false, HalfStorage=true: original stored binary16 -> half-product
-candidate if instantiated; preserve its distinct epilogue.
-Other floating weight types stay first-class; do not reinterpret BF16/FP32
-as FP16. Explicit-half policy NOT broadened to quantized sources, attention
-or RMSNorm.
+## Variant domain
+HalfRNE/HalfStorage (T/F): (T,F) FP32 rounded bin16 -> FMLAL candidate after
+exact rounding; (T,T) stored bin16 -> FMLAL candidate; (F,T) stored bin16 ->
+half-product candidate (distinct epilogue); (F,F) unrestricted FP32 -> NOT
+FMLAL (native FP32 x widened-FP16 FMA). Other weight types first-class; no
+BF16/FP32 reinterpretation; no broaden to quantized/attention/RMSNorm.
 
-## Identity proof and limits
-For finite original binary16 a,b: <=11 significand bits each; exact product
-<=22 bits, fits binary32 precision24; smallest nonzero product 2^-48 is
-normal FP32. Thus exact_widen(a)*exact_widen(b) has the SAME exact real
-product as a half-widening multiply. With the SAME lane accumulator, one
-round-to-nearest FP32 fused add produces identical result bits. Fixed
-per-lane K order + fixed pairwise add tree preserve identity inductively
-(NO associative reduction claim).
-Limits: does NOT authenticate NaN/signaling/payload propagation, Inf x 0,
-signed zero, FPCR rounding/flush or half-subnormal treatment. Must match
-the admitted runtime contract and oracle. Do NOT: change FPCR globally,
-introduce unproved finite-only restriction, canonicalize NaNs, or scalar
-retry if the intrinsic differs. Any supported-domain byte mismatch rejects
-the candidate until corrected or the documented admission contract proves
-the input unsupported.
-Activation conversion must match roundFloatingOperandHalfRNE (subnormal
-ties + NaN). neon_fp16::narrow NOT interchangeable (truncates subnormals
-for FP16Utils); explicit HalfRNE = full RNE. HW FCVTN permissible ONLY
-after proving rounding/FPCR/exception words; else implement the existing
-RNE bit program in SIMD once per consumed activation fragment. Preserve
-source-half words without a second conversion.
+## Identity proof + limits
+Finite bin16 a,b: <=11 significand bits; product <=22 bits exact in FP32
+(min 2^-48 normal); same per-lane fused op + 256-lane tree => finite-domain
+induction (no associative claim). Limits: NaN/payload, Inf x 0, signed zero,
+FPCR rounding/flush, half-subnormal treatment must match runtime contract +
+oracle; no global FPCR change, no finite-only shrink, no canonicalization, no
+scalar retry. Conversion must match roundFloatingOperandHalfRNE (subnormal
+ties + NaN); neon_fp16::narrow NOT interchangeable (truncates subnormals);
+HW FCVTN only after proving rounding/FPCR/exception words; else the RNE bit
+program in SIMD once per fragment. (Reviewer: post-conversion domain open —
+finite FP32 like 65520 -> half INF; geometry admission :4660-4673 doesn't
+exclude NaN/Inf; full exceptional/payload/conversion + LTO isolation gates =
+REAL. TAIL invariant: inactive K lanes get NO arithmetic update (no dummy
+fma(+0,+0,-0) changing -0 -> +0); preserve untouched lanes/rows + beta==0
+nonconsumption; signed-zero + partial-stripe discriminating controls.)
 
 ## Proposed native schedule (subject to .80 measurement approval)
-- Explicit NEON exact-tree implementation (not a special call in the scalar
-  default). Preserve shared row selection, team ownership, completion.
-- Bounded tile of logical lanes (candidate 16 lanes = 4 FP32 vectors/row);
-  visit tile's K indices with stride256 so every accumulator has the
-  original sequence. Up to 4 rows = 16 accumulator registers; weight-half
-  fragments shared; activation fragments short-lived; no whole-K panels.
-- FMLAL/FMLAL2 low/high only where A AND B are both half; mixed native =
-  widened B + FP32 FMA.
-- Materialize each completed logical lane exactly once into the fixed-256
-  reduction storage, then the unchanged explicit binary tree with NEON adds.
-  This intentional contract partial bank is distinct from a compiler spill;
-  bounded per-invocation/per-worker storage per existing authority. No heap
-  allocation/repacking/host shadow.
-- Measure lane tiles 8/16 separately if register evidence requires;
-  physical tiling must not change the logical tree. K<256 / K%256 tails
-  bounded; no out-of-range loads; +0 inactive lanes.
-- FMLAL NOT authorized by the current NEON_I8MM envelope. Keep public
-  baseline unchanged. Minimal function/TU-local FP16FML target needs native
-  ASIMDFHM authentication (+ complete emitted instruction envelope) via
-  ARMCPUCapabilities; existing FP16Arithmetic only authenticates
-  FPHP+ASIMDHP (insufficient alone). Darwin optional feature discovery needs
-  a separately verified OS key before claiming support.
-- A fully qualified ordinary NEON widen+FP32-FMA implementation remains an
-  independently certified implementation where its envelope applies;
-  variant selection is explicit first-class dispatch, never fallback after
-  a failed FMLAL launch or correctness check. Runtime-default selection =
-  separately gated. No broad armv9 project envelope or M1 baseline change.
+Explicit NEON exact-tree impl (not a special-case in scalar default);
+16-lane tile (4 FP32 vectors/row), stride-256 K visits, <=4 rows = 16 acc
+regs; FMLAL/FMLAL2 only half x half; mixed = widened B + FP32 FMA;
+materialize each lane once -> fixed-256 bank -> unchanged binary tree NEON
+adds (bounded per-invocation storage; no heap/repack/host shadow); tiles
+8/16 measured separately; K<256/K%256 tails bounded, +0 inactive lanes;
+FMLAL NOT authorized by the NEON_I8MM envelope -> minimal function/TU-local
+FP16FML target with native ASIMDFHM authentication via ARMCPUCapabilities
+(FP16Arithmetic FPHP+ASIMDHP insufficient; Darwin separate OS key);
+qualified widen+FMA = separately certified impl; explicit dispatch, never
+fallback; no broad armv9 envelope/M1 change. (Reviewer: complete admission
+design OPEN — name exact FPCR profile + stability/admission owner on EVERY
+worker incl. retained teams; FPSR flags/traps contract role.)
 
-## Evidence / acceptance gates
-1. Await arm-sparks .80 shipped-object disasm + identity; verify the finding
-   there. Use the existing Perf__ production-shaped half projection harness
-   (owner discovered; currently NONE exists -> test-only extension of
-   Perf__CPUFloatingMoEExpert with explicit FP16RNE instantiation, pending
-   R2 confirmation), not a private proxy. .80 scope: GCC14, exact
-   envelope/route, M/N/K, threads, persistent input/request policy; candidate
-   cycling + fresh-process medians. Current host results are not SPARKS
-   evidence.
-2. Before production edits: approve contract/variant design + scratch
-   target-local candidate. Require repeated latency win beyond noise
-   INCLUDING conversion, tree reduction and completion — not intrinsic-only
-   peak throughput. Reject uneconomical.
-3. Byte oracle: M1..supported grouped; row tiles 1/2/3/4; K 1/3/4/7/8/15/16/
-   255/256/257/511/512/513 + real GDN sizes; N tails; row offsets/selection;
-   alpha/beta/bias; stored-half + FP32-RNE sources; cancellation, signed
-   zero, half subnormals/normals/ties/overflow boundaries, all supported
-   exceptional inputs. Each grouped row vs independent serial M1 + fixed-tree
-   reference (no tolerance).
-4. Instruction census per emitted variant/envelope: FMLAL/FMLAL2 in half
-   leaf; ordinary FMA in mixed; no prohibited instructions in baseline
-   closure; admission negative controls; complete compiler/flags/source/
-   object identity.
-5. Register witness: no compiler FP/SIMD spills inside accumulation;
-   distinguish typed256-lane partial storage from stack traffic, ABI saves,
-   explicit reduction I/O. Cover each row count + lane tile.
-6. Reuse V2_Unit_CPUHalfOperands + V2_Integration_CPUHalfOperands_<ISA> +
-   production floating-expert format/tree gate. Add focused recorded-input
-   production replay (reset, dirty, partial, repeated replay) in
-   ProductionTestPreflight. Extend Unit policy/rounding tests + every
-   positive worker budget without weakening canonical gate names.
-7. After a production slice: complete configured Unit + ProductionTestPreflight,
-   then .80 Release correctness/economy + applicable GDN E2E/PerfStats route
-   evidence. Preserve optimized dispatch; no deterministic substitution.
+## Gates
+1. .80 wrapper received/SHA-verified; AWAIT actual dotRows instruction/
+   relocation closure + compiler/source/object binding (never substitute
+   wrapper completion counts for a leaf census). Owner discovery: no
+   exact-half CPU perf mode (Perf__CPUFloatingMoEExpert + CPUFloatingVerifier
+   = FP32 activations; RecordedGDNProjection = GPU adapter; R2 = none) ->
+   NEW separately owned production-shaped half perf file/registration
+   (scratch-half-perf-cell-draft.md; reviewer v2.1 HOLD). Initial .80 scope:
+   GCC14, exact envelope/route, M/N/K, threads, persistent policy, candidate
+   cycling + fresh-process medians.
+2. Approve contract/variant design + scratch target-local candidate BEFORE
+   production edits; require repeated latency win beyond noise incl.
+   conversion + tree + completion; reject uneconomical.
+3. Byte oracle: M1..supported grouped; row tiles 1-4; K 1/3/4/7/8/15/16/255/
+   256/257/511/512/513 + GDN sizes; N tails; entry-supported offsets/
+   selection/alpha/beta/bias; stored-half + FP32-RNE; cancellation, signed
+   zero, subnormal/normal/ties/overflow + exceptions; grouped rows vs
+   independent serial M1 + fixed-tree/completion. Half representability NEVER
+   certifies a native FP32 oracle. ORDER fixture K257 (p0=2^24,p1=1,p256=
+   -2^24): canonical 1 vs increasing-K 0. Conversion fixtures separate.
+   Nonzero-beta timing: same C0 restored before every measured invocation.
+4. Instruction census per emitted variant/envelope (FMLAL in half leaf, FMA
+   in mixed, no prohibited in baseline, admission negative controls, complete
+   identity).
+5. Register witness extension: no FP/SIMD spills in accumulation; typed256-
+   lane bank vs stack/ABI/reduction I/O; per row count + lane tile.
+6. Reuse V2_Unit/Integration_CPUHalfOperands + production floating-expert
+   gates; add focused recorded-input production replay (reset/dirty/partial/
+   repeated) in ProductionTestPreflight; extend Unit policy/rounding +
+   positive worker budgets (no canonical-name weakening).
+7. Full Unit + ProductionTestPreflight after a slice; .80 Release
+   correctness/economy + GDN E2E/PerfStats route; no deterministic
+   substitution.
 
 ## Provenance / hold
-Evidence: artifacts/fp16-emission/ (compile manifest, *_production.asm,
-*_armv9.asm, projection-inner-*.json, projection-symbols.txt). Whole-TU
-counts = census only, not hot-loop estimates. No production code, CMake,
-capability API or test registration changed. Implementation HELD pending
-final base + .80 evidence + explicit plan approval. Estimate roughly 3-5
-focused engineer-days for a fully gated first family, subject to
-exceptional-value and existing coverage findings.
-
-## Reviewer #143 verdict (2026-11-09) — ACK with OPEN admission items
-
-- ACK: finite-half identity lemma sound (<=22 product bits, exact in FP32;
-  same per-lane fused op + 256-lane tree => finite-domain induction), applied
-  to operands AFTER HalfRNE conversion. 4 boolean cases correct; FP32 A
-  cannot be narrowed; keep WeightType discriminator + two completion
-  branches. Source (:1462-1477) confirms scalar-default on ARM; FP arithmetic
-  files unchanged 39c->777f (source correspondence).
-- OPEN (must be folded before any FMLAL promotion, NOT assumptions):
-  1. POST-CONVERSION domain: finite FP32 input such as 65520 -> HALF INFINITY;
-     the finite lemma does NOT cover it. Geometry admission :4660-4673 does
-     not exclude NaNs/infinities -> full exceptional/payload/conversion gates
-     + compiler/LTO isolation tests = REAL outstanding obligations.
-  2. Complete FMLAL admission design: name the exact supported FPCR profile +
-     stability/admission owner on EVERY executing worker (incl. retained
-     teams); state whether FPSR flags/traps are part of the contract.
-  3. TAIL INVARIANT: inactive K lanes receive NO arithmetic update (not
-     merely zero-filled loads). Mixed FP32xhalf: negative underflow can leave
-     a lane at -0; dummy fma(+0,+0,-0) -> +0 under nearest rounding. Preserve
-     untouched logical lanes/rows and beta==0 nonconsumption. Add independent
-     signed-zero / partial-stripe discriminating controls.
-- Idea31 v2: STATIC PLAN ACK (scope :195-202 confirmed; invariants + gates
-  right; per-block correction must STAY inside its block program, not a
-  post-K accumulated correction; both-compiler closures before any shared
-  installed-width change; GNU-only != AppleClang qualification).
-- No grants. Half-perf checkpoint still needs the FP32-oracle/tree/completion
-  + beta-state/API clarifications (relayed to the lane).
-
-## .80 disasm status — CORRECTED (2026-11-10, perf lane)
-
-- The relayed dumps = wrapper-only evidence (d1/d2 = ONE nonempty body =
-  _omp_fn.0 wrapper; dotRows = EMPTY headings; ZERO relocation records; the
-  'bl 0' = relocatable placeholder, not self-calls; 'no 256-lane structure'
-  UNSUPPORTED — source requires it). Verified wrapper counts = 8 FMUL + 4
-  FADD + 8 scalar FMADD (at offsets 1f0/1fc/208 = OUTPUT COMPLETION
-  alpha/bias/beta after BL, NOT the K loop).
-- .80 evidence folded as VERIFIED WRAPPER/DISPATCH ONLY. Actual hot-loop =
-  OUTSTANDING: need HalfRNE dotRows<4> bodies with `objdump -dr
-  --no-show-raw-insn` (relocations) or the complete object + exact compile
-  argv/source/object SHA identity; object tree = f9f190059 (older; bind to
-  777f-authenticated build). Local Grace TU evidence (FMLAL=0, scalar FMADD
-  per element, integer bit-arithmetic loaders) = the standing evidence for
-  the gap hypothesis. Perf lane sends corrected evidence note.
+Evidence: artifacts/fp16-emission/ (manifest + production/armv9 asm +
+projection-inner JSON + symbols); relay audit scratch-fp16-sparks-relay-audit.md.
+No production/CMake/capability/test changes. Design approved; HOLD until:
+reviewer v2.1 release, canonical .80 census, explicit first-slice
+confirmation. Next possible slice = the independently owned test-only
+perf cell/smoke; native half rounding/schedule/admission = later separate
+slice after .80 baseline. Full gated family ~3-5 focused engineer-days.
