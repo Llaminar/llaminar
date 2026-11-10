@@ -17,8 +17,10 @@ The focused native baseline regression reproduces all nine missing Flash Next
 semantic-role classifications, not only that first encountered tensor.
 
 `58dcdaff5` uses the existing source-role authority for HC/indexer/PLE projections
-and scalar parameters. Schema-declared terminal inputs consume one compact final
-row. The original immutable table instead becomes a typed native-row gather on
+and scalar parameters. Its original assumption that terminal HC inputs consume
+one compact final row was subsequently rejected by source review (#177): the
+actual graph executes HC/normalization before vocabulary-head row selection.
+The original immutable table instead becomes a typed native-row gather on
 its declared decoder-layer consumer; neither a whole-table GEMM nor allocation
 capacity is charged as live lookup traffic. Unknown roles remain fatal, and PMA
 placement/admission is unchanged. Lookup pricing explicitly remains a source-byte
@@ -30,13 +32,24 @@ through admission. This repairs the first test attempt's incomplete inputs; it
 does not bypass production service admission. Native GNU14 NEON Integration
 build and `V2_Integration_PlanningFlashNextWeightWorkContract` pass (two GTests,
 including synthetic CPU/CUDA/ROCm observations; no accelerator/payload loaded).
-The broader `V2_Unit_MemoryPlanner` run passes 415/424 cases; nine ngram fixtures
-still declare foreign or unknown CPU/GPU NUMA ownership and fail before request
-classification. Fixture ownership corrections and PP consumer coverage are next;
-this is not a complete Unit/preflight pass.
+The broader `V2_Unit_MemoryPlanner` run initially passed 415/424 cases; nine ngram
+fixtures declared foreign or unknown CPU/GPU NUMA ownership and failed before
+request classification. `a847db328` repairs those observations without weakening
+ownership checks and adds PP terminal/lookup stage-locality coverage. The native
+planning Unit family passes all 424 cases; the expanded three-GTest preflight
+passes 20 consecutive repetitions. These tests did not yet discriminate the
+incorrect terminal HC row-count assumption.
 
-The actual `.79` planning proof is separately reserved at `0d6f09919`, with the
-same 4096/8192 commands and canonical non-attached driver-diagnostic window.
+The #177 corrective successor separates typed invocation-row policy from stage
+ownership. HC and final normalization retain all active forward rows; only the
+vocabulary projection compacts to one row. Request pricing consumes the checked
+row API and reports the actual prefill/decode terminal counts it uses; focused
+assertions discriminate multirow prefill from one-row decode, including PP and
+legacy output normalization. Corrected-source validation remains pending.
+
+The actual `.79` planning proof is held before launch at the superseded
+`0d6f09919` until the corrected estimator pin is supplied, with the same
+4096/8192 commands and canonical non-attached driver-diagnostic window.
 The 8192 `Higher-priority PMA plan must fit before ngram storage selection`
 failure remains an independent unverified admission issue, not an assumed
 consequence of weight classification. No inference or attached profiling is
