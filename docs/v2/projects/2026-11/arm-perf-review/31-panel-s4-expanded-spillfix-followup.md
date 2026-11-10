@@ -95,3 +95,18 @@ Status: OPEN (2026-11-09; queued via R2 C4 per-encoding width evidence).
 - Merge note: idea-31 branch on 777f7a52a; its 2 commits = empty intersection
   with 777f..8fcc0fe0b → rebase onto the final R2 tip = mechanical (at
   handover). INSTALLABLE = .80 GNU-14 canonical census + the rebase.
+
+## Flip #160 SOURCE ACK (2026-11-10, 972c0081)
+- Bounded SOURCE ACK; no blocking finding. Selection verified (:195-203 +
+  :323-325 -> codebooks0/4 S4 both policies; 5/IQ4_XS/Q6/ASIMD/grouped
+  unchanged); bodies/order/admission unchanged; S4 tiles 64-col chunk; stores
+  reject inactive strips; 'allows' wording. Minimum discriminator (:807-811):
+  asymmetric flag carried into the nibble width query; the 816-vs-864-vs-960
+  case = source-derived explanation; NO rebaseline (the derived expectation
+  CHANGES correctly -> 'unchanged counts' != unchanged erroneous 960).
+  Strips0 added to the recorded checks (1/2/4 retained); the fresh
+  installing-tip canonical witness includes the S4 bodies (supersedes #159's
+  'installed S2' only at 972c; pre-flip receipt not retroactive). Bounds kept.
+- Disposition: Mac 9-cell canonical GREEN; .80 GNU-14 canonical census +
+  full-byte + economy (measured) = the last qualification at 972c0081; rebase
+  onto the final R2 tip (empty intersection, mechanical) -> INSTALLABLE.
