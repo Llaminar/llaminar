@@ -1,14 +1,46 @@
 # ARM CPU kernel implementation evidence
 
-Updated: 2026-11-06. Branch `codex/qfn-ngram-continuation-arm64`, based on
-`2cba3ca1d`. This is an in-progress draft publication; immutable handoffs retain
-their own base-plus-overlay identities. This record distinguishes verified
-kernel slices from the unfinished objective in
-[the implementation plan](ARM_CPU_INFERENCE_KERNEL_PLAN.md).
+Updated: 2026-11-10. Branch `codex/qfn-ngram-continuation-arm64`, currently
+based on `2948b1e49`. Historical entries and immutable handoffs retain their own
+source, toolchain and qualification boundaries. See
+[the implementation plan](ARM_CPU_INFERENCE_KERNEL_PLAN.md) for the current frontier.
 
-**Not a serving/performance certificate:** the complete native engine,
-production factory/workspace bindings, real models, HTTP/MTP/prefix campaigns,
-exact-overlay installation and final `Perf__` scaling have not passed.
+**Not a serving/performance certificate:** focused compiler, kernel, metadata
+and lifecycle evidence does not replace full Release model, HTTP/MTP/prefix or
+`Perf__` qualification at the final installed source.
+
+## Flash Next planning maintenance — 2026-11-10
+
+The real four-split Qwen3.8-Flash-Next-UD source at `e8866ec04` fails automatic
+planning at context 4096 with `Unclassified request work: output_hc_down.weight`.
+The focused native baseline regression reproduces all nine missing Flash Next
+semantic-role classifications, not only that first encountered tensor.
+
+`58dcdaff5` uses the existing source-role authority for HC/indexer/PLE projections
+and scalar parameters. Schema-declared terminal inputs consume one compact final
+row. The original immutable table instead becomes a typed native-row gather on
+its declared decoder-layer consumer; neither a whole-table GEMM nor allocation
+capacity is charged as live lookup traffic. Unknown roles remain fatal, and PMA
+placement/admission is unchanged. Lookup pricing explicitly remains a source-byte
+and FP32 proxy without fitted backing-tier/cache latency.
+
+`0d6f09919` completes the shared sparse metadata fixture's terminal HC, indexer
+gain and PLE inputs and passes explicit closed original-rank service evidence
+through admission. This repairs the first test attempt's incomplete inputs; it
+does not bypass production service admission. Native GNU14 NEON Integration
+build and `V2_Integration_PlanningFlashNextWeightWorkContract` pass (two GTests,
+including synthetic CPU/CUDA/ROCm observations; no accelerator/payload loaded).
+The broader `V2_Unit_MemoryPlanner` run passes 415/424 cases; nine ngram fixtures
+still declare foreign or unknown CPU/GPU NUMA ownership and fail before request
+classification. Fixture ownership corrections and PP consumer coverage are next;
+this is not a complete Unit/preflight pass.
+
+The actual `.79` planning proof is separately reserved at `0d6f09919`, with the
+same 4096/8192 commands and canonical non-attached driver-diagnostic window.
+The 8192 `Higher-priority PMA plan must fit before ngram storage selection`
+failure remains an independent unverified admission issue, not an assumed
+consequence of weight classification. No inference or attached profiling is
+admitted by this diagnostic window.
 
 ## 2026-11-06 immutable4e56 successor audit
 

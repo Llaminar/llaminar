@@ -14,6 +14,16 @@ evidence (K-series snapshots, seals, falsification controls) lives in
 
 ### Maintenance frontier — 2026-11-10
 
+- Engine #71: `58dcdaff5` classifies Flash Next source roles through the shared
+  typed work authority, with schema-owned compact terminal work and a native-row
+  lookup consumer at the PLE decoder layer. PMA admission is unchanged.
+  `0d6f09919` completes the sparse source/service fixture; its focused native
+  preflight passes. The broader planning Unit run exposes nine stale NUMA-owner
+  fixtures (415/424 pass); corrections and PP ownership coverage are pending.
+  Actual Qwen3.8-UD planning proof is reserved separately at `0d6f09919`; context
+  8192's PMA failure remains independent until rechecked. No model-performance
+  or final register-gate qualification follows from this diagnostic.
+
 - The rebase onto `2948b1e49` is published. Full CPU-only ARM NEON Integration
   compilation passed at `e5ee7f672`, after compiler OOM-killed parity objects
   were resumed without changing build settings. Focused MPI/OpenMP/NUMA checks

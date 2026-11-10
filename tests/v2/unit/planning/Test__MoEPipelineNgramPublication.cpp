@@ -29,6 +29,7 @@ ClusterInventory publicationInventory()
     rank.cpu.numa_node = 0;
     rank.cpu_cores = rank.cpu_worker_threads = 8;
     rank.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    rank.numa_nodes = 1;
     rank.cpu.memory_bytes = rank.cpu.free_memory_bytes = rank.cpu_memory_bytes = 512ULL << 30;
     for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
         rank.gpus.push_back({.type = backend, .local_device_id = 0,
