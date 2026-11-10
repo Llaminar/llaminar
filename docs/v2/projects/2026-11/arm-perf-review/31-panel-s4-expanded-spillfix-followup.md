@@ -70,3 +70,14 @@ Status: OPEN (2026-11-09; queued via R2 C4 per-encoding width evidence).
 - VERDICT: AppleClang parity holds (spill-free both compilers). Limits:
   non-certifying census; the INSTALL needs the canonical witness extension +
   the .80 economy gate (already measured); no Mac timing.
+
+## Idea-31 candidate #159 SOURCE ACK (2026-11-10, b4dd753c8)
+- Bounded candidate SOURCE ACK; no blocking finding. Verified: retireNibbleGroup
+  = compiler-dataflow empty asm (no HW sync); constexpr gate Rows1/S4/non-ASIMD/
+  plain-NibbleLUT/no-minimum; maps reach the panel; arithmetic/order/scale/
+  guards unchanged; panelStrips UNCHANGED (installed nibble still S2); recorded
+  replay + independent test-owned reference = recorded-input (not a regenerated
+  fixture); registration/coverage consistent. BOUNDS: 'leaves the activation
+  block in registers' = intended compiler outcome (-> 'allows it to remain');
+  176-installed witness != forced-S4 coverage; owner evidence unauthenticated;
+  ACK = candidate delta on 777 only; flip/rebases = own exact-pin checks.
