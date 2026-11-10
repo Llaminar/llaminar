@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <thread>
 
 namespace llaminar2::test
@@ -37,6 +38,8 @@ using llaminar::v2::beginWorkshare;
 using llaminar::v2::inActiveParallelRegion;
 using llaminar::v2::inLexicalWorkshare;
 using llaminar::v2::isInParallelRegion;
+using llaminar::v2::noteOpenMPTeamFork;
+using llaminar::v2::openMPTeamForkSnapshot;
 using llaminar::v2::teamPlacement;
 
 /** @brief Keep requested retained teams exact without leaking caller policy. */
@@ -572,4 +575,99 @@ TEST(OpenMPWorkshare, CanonicalPlacementAuthority)
     EXPECT_FALSE(isInParallelRegion());
     EXPECT_FALSE(inLexicalWorkshare());
 }
+/**
+ * @brief The exact fork/join contract of the one team-fork authority.
+ *
+ * Every macro family must observe exactly its own real fork: standalone forks
+ * count once, retained reuse counts nothing, and the if(false) serial branch
+ * still counts because it creates (and costs) a real one-thread team. The
+ * counter is process-wide and monotonic across test shards, so every assertion
+ * uses deltas between snapshots, never absolute values.
+ */
+TEST(OpenMPWorkshare, TeamForkCounterCountsExactlyTheRealForks)
+{
+    const TeamPolicy policy;
+    const NumThreadsGuard threads(4);
+
+    // Standalone workshare: one fork per invocation.
+    std::uint64_t before = openMPTeamForkSnapshot();
+    auto one_work = [] {};
+    OMP_WORKSHARE_REGION(one_work);
+    OMP_WORKSHARE_REGION(one_work);
+    EXPECT_EQ(openMPTeamForkSnapshot() - before, 2u);
+
+    // Standalone sync workshare: the explicit barrier adds no fork.
+    before = openMPTeamForkSnapshot();
+    OMP_WORKSHARE_REGION_SYNC(one_work);
+    EXPECT_EQ(openMPTeamForkSnapshot() - before, 1u);
+
+    // Standalone retained-team forms still fork for real participants.
+    before = openMPTeamForkSnapshot();
+    OMP_WORKSHARE_REGION_IF(one_work, true);
+    EXPECT_EQ(openMPTeamForkSnapshot() - before, 1u);
+    // The false branch creates a real one-thread team: it forks and costs.
+    OMP_WORKSHARE_REGION_IF(one_work, false);
+    EXPECT_EQ(openMPTeamForkSnapshot() - before, 2u);
+
+    before = openMPTeamForkSnapshot();
+    OMP_WORKSHARE_COLLAPSE2_IF(one_work, true);
+    OMP_WORKSHARE_COLLAPSE2_IF(one_work, false);
+    OMP_WORKSHARE_COLLAPSE3_IF(one_work, true);
+    OMP_WORKSHARE_COLLAPSE3_IF(one_work, false);
+    EXPECT_EQ(openMPTeamForkSnapshot() - before, 4u);
+
+    before = openMPTeamForkSnapshot();
+    OMP_LAYER_PARALLEL({});
+    EXPECT_EQ(openMPTeamForkSnapshot() - before, 1u);
+
+    // Retained reuse re-executes the exact team without any fork at all.
+#pragma omp parallel num_threads(2)
+    {
+        before = openMPTeamForkSnapshot();
+        OMP_WORKSHARE_REGION(one_work);
+        OMP_WORKSHARE_REGION_SYNC(one_work);
+        OMP_WORKSHARE_REGION_IF(one_work, false);
+        OMP_WORKSHARE_COLLAPSE2_IF(one_work, true);
+        OMP_LAYER_PARALLEL({});
+        EXPECT_EQ(openMPTeamForkSnapshot() - before, 0u);
+    }
+}
+
+/**
+ * @brief The counter's own admission and publication contract.
+ *
+ * Default serving materializes no "omp" record at all (the off-default
+ * asserted only against a bound that is generous against a loaded shared
+ * runner (the fork it describes costs microseconds).
+ *
+ * The collector-visible publication contracts (off-default shape, family
+ * selection, cost recorded as a PerfStats record) live in the bootstrap
+ * fixture, which is the witness that links the collector.
+ */
+TEST(OpenMPWorkshare, TeamForkCounterPublicationCostAndDefault)
+{
+    // The note's own cost is asserted here against a generous ceiling and
+    // reported for the record; the collector-visible evidence cell (off-default
+    // publication shape, family selection, recorded cost) lives in the
+    // bootstrap fixture, which links the collector.
+    constexpr std::uint64_t kMeasuredNotes = 1u << 20;
+    const std::uint64_t before = openMPTeamForkSnapshot();
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
+        noteOpenMPTeamFork();
+    const auto elapsed_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count());
+    const double ns_per_note =
+        static_cast<double>(elapsed_ns) / static_cast<double>(kMeasuredNotes);
+    EXPECT_EQ(openMPTeamForkSnapshot() - before, kMeasuredNotes);
+    // The fork itself costs microseconds; anything past this bound would mean
+    // the observation costs a material fraction of the observed event.
+    EXPECT_LT(ns_per_note, 100.0);
+    std::cout << "[evidence] openmp_team_fork_note_self_cost=" << ns_per_note
+              << " ns/invocation over " << kMeasuredNotes << " invocations"
+              << std::endl;
+}
+
 } // namespace llaminar2::test
