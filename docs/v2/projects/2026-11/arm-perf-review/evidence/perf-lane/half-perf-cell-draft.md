@@ -203,3 +203,24 @@ FloatingPointGemmKernel.h (completeSkinnyMatmulValue + HalfRNE completion;
 multiply_tensor; grouped verifier branch; executeHalfOperands/executeHalfBundle
 incl. fixed 1/0/0). No arithmetic/API contract created/altered; existing owners
 untouched.
+
+## Synchronized status (2026-11-10; replaces the v2/v2.1 header lines)
+- Reviewer #150 RELEASED the v2.1 public-API/test-owned-oracle/state/
+  observation checkpoint (checked at 69ad36d6f vs 777f). Coordinator GO
+  covers this independently owned TEST-ONLY cell/smoke, SECOND after the
+  idea31 nibble-lifetime slice; it does NOT cover native leaf/ISA/admission/
+  scratch intrinsic work. FP16 gate1 archival COMPLETE (bodies/relocations +
+  argv/literal-includes + SHAs verified; includes receipt SHA c1fbadb2...).
+- CONTRACT TEXT = the v2.1 body above (unchanged): borrowed/owning
+  constructor (placement-before-precision), explicit-dimension multiply_tensor,
+  real homogeneous verifier bundle/scope (1/0/0 + rejection), HalfRNE
+  completion order, all-oracle-stages test-owned, K257 order fixture
+  (0x3f800000 vs 0x00000000), C0-per-invocation-v1, requested-vs-observed
+  worker fields, pre-dispatch ISA vs resolved-leaf separation.
+- OBLIGATIONS (release requirements): every ACTUAL public call returns
+  successful bool (warmup/timed/postcheck; false rejects the run even if old
+  bytes match); immutable/guard bytes preserved; stats outside clean timing;
+  no private helper timing; proved in the actual test source.
+- Sequence: idea31 .80 economy + explicit disposition → separate 777f branch
+  → this cell/smoke → .80 production baseline/economy → only then separate
+  native candidate/leaf slice. No arithmetic/API contract created/altered.
