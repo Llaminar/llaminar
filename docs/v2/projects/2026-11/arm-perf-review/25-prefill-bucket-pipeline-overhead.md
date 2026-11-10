@@ -223,3 +223,19 @@ plans at 5b in a new canonical driver window (artifacts
 binaries + config/compileDB retained with matching hash mapping before the
 incremental; e886 controls untouched). Awaiting the TYPED REJECTION
 outcome — NOT claiming 8192 now fits.
+
+### #71/#74 COMPLETE (bounded scope) — .79 handed back (2026-11-10, ~23:17Z)
+
+Exact 5b real proof: **4096 PASS** (CPU single); **8192 = honest canonical
+NoFit** (mandatory 126324719040 B > available 123457634304) — no
+invalid_argument/table-selection leak, no accounting/placement/row retry
+= the typed capacity rejection the fix was designed to produce. Both
+source ACKs + native Unit + focused 20x green. Final driver
+complete/pass 0 findings; source clean; e886 controls + model stats
+unchanged; 35- and 5b-era actual binaries/config/compileDB retained with
+hash mapping. Dir-B at 8192 = NOT ADMITTED by real capacity (a hardware
+limit, correctly typed — the trace's -c8192 request is CAPACITY-excluded,
+not a defect); the 4096 CPU plan is planning evidence, NOT GPU
+trace/inference evidence. Source/doc checkpoint follows; #72
+(GroupedSealedPlan stub) queued next, #73 (FusedFinalAdd policy triage)
+after; addon #175 + A1 #180 independent holds unchanged.
