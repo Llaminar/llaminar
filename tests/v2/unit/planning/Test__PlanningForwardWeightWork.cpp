@@ -150,6 +150,35 @@ TEST(PlanningForwardWeightWork, FlashNextSourceRolesHaveExplicitWorkKinds)
     EXPECT_EQ(planningOrdinaryWeightKind(WeightRole::Other), PlanningOrdinaryWeightKind::Unclassified);
 }
 
+/** @test Terminal normalization keeps prefill rows while only the following vocabulary head compacts. */
+TEST(PlanningForwardWeightWork, TerminalOwnershipDoesNotCompactNormalizationRows)
+{
+    test::PlanningGGUFFixture file(false, false, GGUFTensorType::F32);
+    PlanningModelSource source(file.path());
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    {
+        const auto candidate = admit(proposal(source, backend, OrchestrationStrategy::SingleDevice), source);
+        for (const auto phase : {PlanningMainForwardPhase::Prefill, PlanningMainForwardPhase::Decode})
+        {
+            const auto work = compilePlanningForwardWeightWork(source.metadata(), candidate, phase);
+            ASSERT_EQ(work.size(), 1u);
+            const auto &norm = find(work.front(), "output_norm.weight", WeightRole::OutputNorm);
+            const auto &head = find(work.front(), "output.weight", WeightRole::LMHead);
+            const int rows = phase == PlanningMainForwardPhase::Prefill ? 64 : 1;
+            EXPECT_EQ(norm.invocation_site, PlanningWeightInvocationSite::Terminal);
+            EXPECT_EQ(norm.invocationRows(rows), rows);
+            EXPECT_EQ(head.invocationRows(rows), 1);
+            EXPECT_THROW(norm.invocationRows(0), std::invalid_argument);
+            auto invalid = head;
+            invalid.invocation_site = PlanningWeightInvocationSite::Layer;
+            EXPECT_THROW(invalid.invocationRows(rows), std::logic_error);
+            invalid = norm;
+            invalid.row_policy = static_cast<PlanningWeightRowPolicy>(255);
+            EXPECT_THROW(invalid.invocationRows(rows), std::invalid_argument);
+        }
+    }
+}
+
 TEST(PlanningForwardWeightWork, MainInvocationExcludesRetainedDepthFifteenAndPreservesRankIdentity)
 {
     test::PlanningGGUFFixture file(false, true);

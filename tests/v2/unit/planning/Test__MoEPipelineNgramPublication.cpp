@@ -98,6 +98,8 @@ TEST(MoEPipelineNgramPublication, PublishesExactPlacementWithTheAdmittedRows)
                                 ++terminal_mixers;
                                 EXPECT_EQ(participant.device, DeviceId::rocm(0));
                                 EXPECT_EQ(value.weight.invocation_site, PlanningWeightInvocationSite::Terminal);
+                                const int rows = phase == PlanningMainForwardPhase::Prefill ? 32 : 1;
+                                EXPECT_EQ(value.weight.invocationRows(rows), rows);
                             }
                         }, operation);
                         if (const auto *lookup = std::get_if<PlanningImmutableLookupWeight>(&operation))

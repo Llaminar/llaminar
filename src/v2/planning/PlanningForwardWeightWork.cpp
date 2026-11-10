@@ -25,6 +25,21 @@
 
 namespace llaminar2
 {
+    int PlanningWeightOperand::invocationRows(int invocation_rows) const
+    {
+        if (invocation_rows <= 0)
+            throw std::invalid_argument("Planning weight invocation requires positive active rows");
+        switch (row_policy)
+        {
+        case PlanningWeightRowPolicy::AllInvocationRows: return invocation_rows;
+        case PlanningWeightRowPolicy::CompactFinalRow:
+            if (invocation_site != PlanningWeightInvocationSite::Terminal)
+                throw std::logic_error("Compact weight rows require the actual terminal selection boundary");
+            return 1;
+        default: throw std::invalid_argument("Planning weight invocation has an unknown row policy");
+        }
+    }
+
     PlanningOrdinaryWeightKind planningOrdinaryWeightKind(WeightRole role) noexcept
     {
         if (isFlashNextProjectionRole(role)) return PlanningOrdinaryWeightKind::Projection;
@@ -273,9 +288,9 @@ namespace llaminar2
             const bool decode = phase == PlanningMainForwardPhase::Decode;
             const bool full_decode = decode && hasSet(device, AdditionalPersistentWeightSet::ReplicatedDenseDecode);
             const bool full_embedding = full_decode || (decode && hasSet(device, AdditionalPersistentWeightSet::MirroredDecodeEmbedding));
-            // Terminal ownership also applies to prefill's compact final-row
-            // projection. It does not follow the transformer's row count or
-            // whether this request currently enables speculative generation.
+            // Only the last stage owns terminal work. Final norm/HC mixers
+            // still process every invocation row BEFORE the vocabulary head's
+            // row select; ownership alone never implies one-row arithmetic.
             const bool full_head = full_decode || device.mtp_terminal_logits_layout ==
                 MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
             WeightShardGeometryResolver sharded(profile, device.device, device.shard_index, device.total_shards,
@@ -310,7 +325,9 @@ namespace llaminar2
                         role, tensor.name, profile.architecture, debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic),
                     role == WeightRole::Embedding ? PlanningWeightInvocationSite::Entry :
                         role == WeightRole::LMHead || terminal_sources.contains(tensor.name) ? PlanningWeightInvocationSite::Terminal :
-                        PlanningWeightInvocationSite::Layer};
+                        PlanningWeightInvocationSite::Layer,
+                    role == WeightRole::LMHead ? PlanningWeightRowPolicy::CompactFinalRow :
+                        PlanningWeightRowPolicy::AllInvocationRows};
             };
             for (const auto &tensor : profile.tensors)
             {
