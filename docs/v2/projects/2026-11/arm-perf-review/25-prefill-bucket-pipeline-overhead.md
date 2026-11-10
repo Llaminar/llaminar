@@ -159,3 +159,15 @@ a separate admission gate, not weakened. Lands on #43 (always-push) →
 NO CPU kernel/checker/budget/probe/envelope files → the register-gate
 receipts' native inputs are UNCHANGED → binding re-verification against the
 new tree; receipts expected to survive; reviewer confirms at re-re-pin).
+
+### #71 window reconciliation (2026-11-10, ~22:46Z) — UNSTARTED → Main executing
+
+arm-sparks confirmed the .79 real-model plan-only window was NEVER STARTED
+(neither at 0d6 nor at 35a827a2 — no new build/output/evidence exists; the
+'awaiting outcomes' framing replaced by: unstarted → Main executing NOW).
+Exclusive .79 handback to Main is explicit (GPU idle, no concurrent owner);
+Main inspects the prepared sketch and executes the corrected-35 build +
+exact 4096/8192 plans with the canonical driver begin/finish; e886
+controls untouched. arm-sparks' stance: zero GPU action until Main hands
+back; its .80 A2 rider set = booked next, outputs HELD pending the A1 #180
+fix-back re-review.
