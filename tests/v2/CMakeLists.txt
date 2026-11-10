@@ -23564,6 +23564,13 @@ target_link_libraries(v2_unit_prefill_decode_transition
     GTest::gmock
     GTest::gtest_main
 )
+# Recorded serving-slot handoff baseline. Captured at the reference production
+# source identity through the device-free boundary; replay compares behavior
+# and never requires an identical commit. Regeneration is the explicit capture
+# switch only, never an automatic reaction to a failing comparison.
+target_compile_definitions(v2_unit_prefill_decode_transition PRIVATE
+    LLAMINAR_CB_HANDOFF_GOLDEN="${CMAKE_CURRENT_LIST_DIR}/../../tests/v2/fixtures/serving_slot_handoff/pin28dd_replay_baseline.txt"
+)
 add_v2_test(V2_Unit_PrefillDecodeTransition
     COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
     LABELS "V2;Unit;Orchestration;OrchestrationRunner;Regression;PrefillDecode"
@@ -23595,6 +23602,25 @@ add_v2_test(V2_Integration_MTPDirectTokenHistoryContracts
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MTPDirectTokenHistoryContracts)
+
+# Serving-slot handoff: recorded-input replay of the production controller
+# through the device-free boundary (reference identity recorded separately in
+# the fixture) plus the capacity-one lifecycle contracts. Registered beside the
+# prefill→decode family because they share its executable and mock harness.
+add_v2_test(V2_Integration_ServingSlotHandoffRecordedReplay
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffReplay.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ServingSlotHandoff;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSlotHandoffRecordedReplay)
+
+add_v2_test(V2_Unit_ServingSlotHandoffLifecycle
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffLifecycle.*
+    LABELS "V2;Unit;Orchestration;OrchestrationRunner;ServingSlotHandoff;Lifecycle;DeviceFree;CPU;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 
 add_v2_test(V2_Integration_MTPBoundedSamplingPositionEvidence
     COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>

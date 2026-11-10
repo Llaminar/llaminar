@@ -59,9 +59,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -7462,6 +7464,143 @@ namespace
             } reset{runner};
             runner->setDecodeStepTokenBudget(token_budget);
             return runner->decodeStepBatch(request_batch);
+        }
+
+        /**
+         * @brief Run one deterministic device-free serving-slot scenario and
+         *        return its normalized observable event stream.
+         *
+         * The recorded replay drives the PRODUCTION controller (never a test
+         * mirror) through fixed request lifecycles - admission, serial decode,
+         * forced-token, MTP transactions at the exercised verifier width, the
+         * convenience generate() surface, the direct next-admission edge, and
+         * the canonical clearCache retirement boundary - and records exactly
+         * the public observables: admission success, per-step returned tokens,
+         * completion, typed commit state, and error lengths.
+         */
+        std::string runServingSlotScenario(const std::string &kind)
+        {
+            std::ostringstream events;
+            auto recordPrefill = [&events](bool ok, size_t prompt_tokens)
+            {
+                events << "R" << prompt_tokens << ':' << (ok ? '1' : '0') << '\n';
+            };
+            auto recordStep = [&events](const GenerationResult &result)
+            {
+                events << "D";
+                for (int32_t token : result.tokens)
+                    events << token << ',';
+                events << ':' << (result.is_complete ? '1' : '0')
+                       << ':' << static_cast<int>(result.returned_token_commit)
+                       << ':' << result.error.size() << '\n';
+            };
+            auto recordGenerate = [&events](const GenerationResult &result)
+            {
+                events << "G";
+                for (int32_t token : result.tokens)
+                    events << token << ',';
+                events << ':' << result.error.size() << '\n';
+            };
+
+            if (kind == "serial3")
+            {
+                auto [runner, mock] = createRunner();
+                (void)mock;
+                for (const auto &prompt : std::vector<std::vector<int32_t>>{
+                         {1, 2, 3, 4, 5}, {9, 8}, {42}})
+                {
+                    recordPrefill(runner->prefill(prompt), prompt.size());
+                    recordStep(decodeWithBudget(runner, 3));
+                    recordStep(decodeWithBudget(runner, 3));
+                    runner->clearCache();
+                    events << "C\n";
+                }
+            }
+            else if (kind == "mtp_greedy2")
+            {
+                auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+                (void)mock;
+                for (const auto &prompt : std::vector<std::vector<int32_t>>{{1, 2, 3}, {4}})
+                {
+                    recordPrefill(runner->prefill(prompt), prompt.size());
+                    recordStep(decodeWithBudget(runner, 3));
+                    recordStep(decodeWithBudget(runner, 3));
+                    runner->clearCache();
+                    events << "C\n";
+                }
+            }
+            else if (kind == "mtp_spec_seed")
+            {
+                auto [runner, mock] = createRunner(
+                    /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr,
+                    false, false, DeviceId::cpu(), 1, false, false, {},
+                    MTPVerifyMode::SpeculativeSampling);
+                (void)mock;
+                SamplingParams params;
+                params.temperature = 0.7f;
+                params.top_k = 7;
+                params.top_p = 0.9f;
+                params.seed = 123u;
+                runner->setSamplingParams(params);
+                recordPrefill(runner->prefill({1, 2, 3}), 3);
+                mock->setHostTerminalSamplingLogits({0.3f, 0.4f, 0.1f, 0.2f, -0.1f,
+                                                     0.0f, -0.3f, -0.2f, -0.5f, -0.4f});
+                recordStep(decodeWithBudget(runner, 3));
+                recordStep(decodeWithBudget(runner, 3));
+                runner->clearCache();
+                events << "C\n";
+            }
+            else if (kind == "forced")
+            {
+                auto [runner, mock] = createRunner();
+                (void)mock;
+                recordPrefill(runner->prefill({1, 2}), 2);
+                recordStep(runner->forceDecodeToken(42));
+                recordStep(decodeWithBudget(runner, 2));
+                runner->clearCache();
+                events << "C\n";
+            }
+            else if (kind == "generate2")
+            {
+                auto [runner, mock] = createRunner();
+                (void)mock;
+                recordGenerate(runner->generate({1, 2}, 3, SamplingParams{}));
+                recordGenerate(runner->generate({9}, 2, SamplingParams{}));
+            }
+            else if (kind == "direct_prefill")
+            {
+                auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+                (void)mock;
+                recordPrefill(runner->prefill({1, 2}), 2);
+                recordStep(decodeWithBudget(runner, 1));
+                /*
+                 * Direct next admission without the canonical clearCache
+                 * boundary: the admission edge itself must retire the previous
+                 * request's handoff bank before the new request opens. The
+                 * recorded baseline carries whatever the pinned controller
+                 * actually does here; the lifecycle suite asserts the intended
+                 * per-slot semantics separately.
+                 */
+                recordPrefill(runner->prefill({3, 4}), 2);
+                recordStep(decodeWithBudget(runner, 2));
+                runner->clearCache();
+                events << "C\n";
+            }
+            else if (kind == "decode_after_clear")
+            {
+                auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+                (void)mock;
+                recordPrefill(runner->prefill({1, 2}), 2);
+                recordStep(decodeWithBudget(runner, 1));
+                runner->clearCache();
+                events << "C\n";
+                recordStep(decodeWithBudget(runner, 1));
+            }
+            else
+            {
+                events << "UNKNOWN:" << kind << '\n';
+            }
+            return events.str();
         }
 
         /**
@@ -18823,6 +18962,149 @@ namespace
             EXPECT_EQ(mpi->guard_checks,1u);
             EXPECT_TRUE(mpi->diagnostic_preceded_guard);
         }
+    }
+
+    // =========================================================================
+    // Serving-slot handoff: recorded replay + capacity-one lifecycle contracts
+    // =========================================================================
+
+    /** Recorded-replay suite over the shared production-controller harness. */
+    class Test__ServingSlotHandoffReplay : public Test__PrefillDecodeTransition {};
+
+    /** Synthetic lifecycle-contract suite over the same harness. */
+    class Test__ServingSlotHandoffLifecycle : public Test__PrefillDecodeTransition {};
+
+    /**
+     * @brief Recorded-input replay of the production controller baseline.
+     *
+     * The golden was captured at the reference production source/build identity
+     * (pin 28ddbe253c76977c91989da4cde584377bca9fa1) through the real device-free
+     * boundary. The comparison is behavioral: the reference and candidate
+     * identities are recorded separately in the fixture header, so replay never
+     * requires an identical commit and never rebaselines after an edit.
+     * Regeneration happens ONLY through the explicit capture environment
+     * switch; a failing replay must be investigated, never auto-regenerated.
+     */
+    TEST_F(Test__ServingSlotHandoffReplay, MatchesRecordedProductionBaseline)
+    {
+        const bool capture = std::getenv("LLAMINAR_CB_HANDOFF_CAPTURE") != nullptr;
+        std::string actual;
+        for (const char *kind : {"serial3", "mtp_greedy2", "mtp_spec_seed",
+                                 "forced", "generate2", "direct_prefill",
+                                 "decode_after_clear"})
+        {
+            actual += "=== ";
+            actual += kind;
+            actual += " ===\n";
+            actual += runServingSlotScenario(kind);
+        }
+
+        const std::filesystem::path golden{LLAMINAR_CB_HANDOFF_GOLDEN};
+        if (capture)
+        {
+            std::filesystem::create_directories(golden.parent_path());
+            std::ofstream output(golden);
+            output << actual;
+            ASSERT_TRUE(output.good()) << "cannot write " << golden;
+            GTEST_SKIP() << "capture mode wrote the recorded baseline at " << golden;
+        }
+
+        ASSERT_TRUE(std::filesystem::exists(golden))
+            << "recorded baseline missing: " << golden;
+        std::ifstream input(golden);
+        std::ostringstream expected;
+        expected << input.rdbuf();
+        EXPECT_EQ(actual, expected.str())
+            << "production controller behavior diverged from the recorded "
+               "reference baseline; investigate the divergence instead of "
+               "regenerating the fixture automatically";
+    }
+
+    /**
+     * @brief Sequential request reuse must serve each request from its own
+     *        handoff bank, not from a predecessor's leftover state.
+     *
+     * Request B on a runner that served request A must match a fresh runner
+     * serving only B, byte-for-byte in observable tokens. The two terminal
+
+     * rows are deliberately distinct so any inherited condition, seed, or
+     * penalty state from A changes B's stream and fails this contract.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, SequentialReuseMatchesFreshRunner)
+    {
+        const std::vector<float> rowA = {0.10f, 0.20f, 0.90f, 0.30f, 0.20f,
+                                         0.10f, 0.05f, 0.04f, 0.03f, 0.02f};
+        const std::vector<float> rowB = {0.10f, 0.20f, 0.10f, 0.20f, 0.30f, 0.90f,
+                                         0.05f, 0.04f, 0.03f, 0.02f};
+
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        mock->setHostTerminalSamplingLogits(rowA);
+        const GenerationResult a1 = decodeWithBudget(runner, 3);
+        ASSERT_TRUE(a1.success()) << a1.error;
+        runner->clearCache();
+        ASSERT_TRUE(runner->prefill({4, 5}));
+        mock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult b1 = decodeWithBudget(runner, 3);
+        const GenerationResult b2 = decodeWithBudget(runner, 3);
+        ASSERT_TRUE(b1.success()) << b1.error;
+
+        auto [controlA, controlAMock] = createRunner(/*mtp_enabled=*/true);
+        (void)controlAMock;
+        ASSERT_TRUE(controlA->prefill({1, 2, 3}));
+        controlAMock->setHostTerminalSamplingLogits(rowA);
+        const GenerationResult ca1 = decodeWithBudget(controlA, 3);
+        ASSERT_TRUE(ca1.success()) << ca1.error;
+
+        auto [controlB, controlBMock] = createRunner(/*mtp_enabled=*/true);
+        (void)controlBMock;
+        ASSERT_TRUE(controlB->prefill({4, 5}));
+        controlBMock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult cb1 = decodeWithBudget(controlB, 3);
+        const GenerationResult cb2 = decodeWithBudget(controlB, 3);
+        ASSERT_TRUE(cb1.success()) << cb1.error;
+
+        EXPECT_EQ(a1.tokens, ca1.tokens) << "request A must match its fresh-run control";
+        EXPECT_EQ(b1.tokens, cb1.tokens)
+            << "request B inherited prior-request handoff state";
+        EXPECT_EQ(b2.tokens, cb2.tokens);
+    }
+
+    /**
+     * @brief A direct next admission (no clearCache) still opens B's handoff
+     *        bank from B's own request: the admission edge retires the
+     *        predecessor visibly instead of inheriting its condition state.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, DirectPrefillRetiresPriorRequestHandoff)
+    {
+        const std::vector<float> rowA = {0.10f, 0.20f, 0.90f, 0.30f, 0.20f,
+                                         0.10f, 0.05f, 0.04f, 0.03f, 0.02f};
+        const std::vector<float> rowB = {0.10f, 0.20f, 0.10f, 0.20f, 0.30f, 0.90f,
+                                         0.05f, 0.04f, 0.03f, 0.02f};
+
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        mock->setHostTerminalSamplingLogits(rowA);
+        const GenerationResult a1 = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(a1.success()) << a1.error;
+
+        ASSERT_TRUE(runner->prefill({3, 4}));
+        mock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult b1 = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(b1.success()) << b1.error;
+
+        auto [control, controlMock] = createRunner(/*mtp_enabled=*/true);
+        (void)controlMock;
+        ASSERT_TRUE(control->prefill({3, 4}));
+        controlMock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult cb1 = decodeWithBudget(control, 2);
+        ASSERT_TRUE(cb1.success()) << cb1.error;
+
+        EXPECT_EQ(b1.tokens, cb1.tokens)
+            << "a direct admission must not inherit the previous request's "
+               "ready condition or speculative handoff";
     }
 
 } // namespace
