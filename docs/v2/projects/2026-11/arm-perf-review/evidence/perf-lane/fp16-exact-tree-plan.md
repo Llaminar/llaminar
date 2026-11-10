@@ -134,3 +134,19 @@ reviewer v2.1 release, canonical .80 census, explicit first-slice
 confirmation. Next possible slice = the independently owned test-only
 perf cell/smoke; native half rounding/schedule/admission = later separate
 slice after .80 baseline. Full gated family ~3-5 focused engineer-days.
+
+## Gate-1 BOUND evidence — CORRECTED wording (2026-11-10, lane read of the
+## actual bodies; supersedes the earlier wrapper-only + 'no 256-lane' claims)
+- rel-777f7a52a Release NEON_I8MM, obj SHA e01c7c1a..., source
+  KernelFactory.cpp SHA a9dc843f... (verified locally by the lane), g++-14
+  14.2.0; full -dr dump of E2 dotRows<4> bodies (relocations included).
+- ACTUAL HalfRNE true/false + true/true dotRows bodies: EACH = ONE static
+  scalar FMADD + ONE reduction FADD (the '6 per m4' aggregate included the
+  unrelated Native false/false body's 4). They contain EXPLICIT k&0xff lane
+  indexing -> the 256-lane structure IS present (implemented SCALARLY).
+  'No 256-lane structure' = WITHDRAWN (not in the plan).
+- GAP (supported): scalar y - vectorized FMLAL potential at the SAME exact
+  256-lane contract (k&0xff indexing); replacement of scalar FMADD/FADD with
+  vector FMLAL ops while preserving lanes/order. Opportunity stands.
+- Final evidence piece: exact compile argv (build.ninja CXX entry) pending
+  relay (non-blocking; idea31 in progress).
