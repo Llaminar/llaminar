@@ -38,8 +38,14 @@ evidence (K-series snapshots, seals, falsification controls) lives in
 - The grouped sealed-plan synthetic observation now explicitly owns the real
   schema's empty optional `physical_launch_evidence`. The registered script
   reproduces ten missing-field errors before repair and passes after repair;
-  production eligibility/validator behavior is unchanged. Fused-final-add
-  single-worker policy triage remains separate.
+  production eligibility/validator behavior is unchanged.
+- Fused-final-add triage reproduces a correct default-on nonfinite rejection of
+  the authored NaN/Inf corpus, not a single-worker capability gap. Test-only
+  `e33bf1de6` separates diagnostic special-value arithmetic from default policy
+  checks with RAII restoration; source ACK #182, native Unit and scalar/NEON
+  preflight aliases pass, including 20 repetitions each. Production validation
+  and optimized dispatch are unchanged; the arithmetic comparison is
+  metamorphic and does not newly certify fused-ticket publication or economy.
 
 - The rebase onto `2948b1e49` is published. Full CPU-only ARM NEON Integration
   compilation passed at `e5ee7f672`, after compiler OOM-killed parity objects

@@ -104,6 +104,28 @@ container rerun passes the complete registered script. The initial host-Mac
 attempt could not import NumPy; that environment failure is separate from the
 actual reproduced fixture defect. No kernel/economy qualification is implied.
 
+## Fused final-add validation-policy triage — 2026-11-10
+
+The original scalar preflight reproduces rejection at workers=1, columns=1,
+degree=2. This is correct default-on `fail_on_nan` behavior for the test's
+authored NaN/Inf corpus, not a worker/cohort capability restriction. The raw
+combine API performs arithmetic; publication helpers separately enforce the
+nonfinite policy.
+
+`e33bf1de6` changes only the test: its special-value arithmetic comparison owns
+an explicit diagnostic policy with cached-state RAII restoration. Separate
+preweight tests check finite acceptance, NaN/sNaN/positive and negative infinity
+under both validation policies, empty work, inactive/source bytes and one/three
+requested workers. The production validation/ISA/optimized dispatch is unchanged.
+The native GNU14 NEON build passes `V2_Unit_CPUShardRouteCollective` and the scalar
+and NEON fused-final-add preflight aliases; each alias also passes 20 consecutive
+repetitions. Exact bounded source ACK #182 covers the test-policy separation.
+
+The combine-plus-preweight versus fused comparison is metamorphic, not an
+independent numerical oracle. The new policy test exercises preweight, not an
+actual fused-ticket publication; that unchanged publisher's final finite gate
+is not newly certified by this test. No end-to-end or economy claim follows.
+
 ## 2026-11-06 immutable4e56 successor audit
 
 Main independently verified the x86 return archive SHA256
