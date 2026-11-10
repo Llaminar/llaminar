@@ -933,3 +933,21 @@ merge-gating: full Integration build + Unit/preflight on .80 + the cell's
 economy receipts (authentic GDN geometry/recorded fixture). NOT merge-ready.
 Pending: reviewer source review (routed) → .80 window (booked after the
 combined-candidate receipts) → Main.
+
+### Reviewer #171 IN PROGRESS (half-perf cell @ adb1c98e9) — early blocking finding
+
+- Confirmed: direct e886 child; exactly 3 test/docs/CMake paths; the
+  supplied v2.1 body (pre-synchronized-status) exactly matches the released
+  69ad object.
+- EARLY BLOCKING DEFECT: Fixture::check():123-124 compares
+  FP16Tensor::data() (the DEQUANTIZED FP32 cache,
+  src/v2/tensors/FP16Tensor.cpp:112+) against uint16_t half-word arrays —
+  not native-byte immutability; the default-order fixture's first half
+  0x6c00 widens to FP32 0x45800000, so the arrays differ even with an
+  untouched correct kernel. FIX: native typed_data() with exact native
+  extents. More findings pending — ONE comprehensive fix-back after the
+  full #171 verdict.
+- Registration precision: the new correctness alias is
+  Integration/ProductionTestPreflight only; smoke is Performance (the
+  RELEASED plan says smoke not Unit) — the released plan governs over the
+  draft's registration line. No tests run by the reviewer.
