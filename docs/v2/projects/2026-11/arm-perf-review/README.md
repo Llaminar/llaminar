@@ -444,3 +444,18 @@ rebase/re-pin/bound gates. e5ee7f672 = current CUDA build/rerun target.
   **superseded evidence, NOT a receipt** (binds a soon-dead SHA); JSONs
   archived at arm-addon-notes/evidence/census-870bb545e-appleclang/. Value =
   strong prior for the final census at the settled install SHA.
+
+### Bundle-1 re-rebased onto 28ddbe253 (2026-11-10, lane; LOCAL ONLY)
+
+- Candidate **a4ebff3dd** (11 commits on 28ddbe253; --onto from 8fcc0fe0b;
+  NO conflicts). Proof: range-diff 11/11 `=` vs 897727484 (10/11 `=` vs
+  5d606a108 — same CMake anchor `!`); delta-equality (39 identical added
+  lines, 0 base removals; the expected three-way CMake interaction with
+  28dd's x86 gating did NOT materialize — far offset in the file);
+  reconfigure+build OK; ctest -N both sets (x86-only OrderedNibbleSplitDot
+  registrations correctly ABSENT on aarch64 = 28dd gating confirmed);
+  5/5 rerun. Files: /tmp/armqual-b1/01-ff-28ddbe253-*.
+- Bound run stays at 5d606a108 (queued; content identity proven — no
+  push-before-acceptance). After Main's SETTLED + publish: one more
+  mechanical re-rebase onto the settled tip, then push a4ebff3dd' on the
+  green bound result → Main FF.
