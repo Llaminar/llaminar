@@ -4088,21 +4088,21 @@ namespace llaminar2
                 "already consumed by its retirement boundary; refusing to "
                 "open a new bank over unretired state");
         }
+        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
+        {
+            return setError(
+                "Serving-slot admission generation exhausted before request "
+                "admission; refusing to wrap the monotonic counter or retire "
+                "the predecessor's handoff");
+        }
         if (slot_handoff_.hasPayload())
         {
             LOG_WARN("[OrchestrationRunner] Direct admission retires the previous "
                      "request's live handoff bank (generation "
                      << slot_handoff_.admission_epoch
                      << ") through the explicit lease-first retirement boundary");
-            slot_handoff_.retire();
         }
-        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
-        {
-            return setError(
-                "Serving-slot admission generation exhausted before request "
-                "admission; refusing to wrap the monotonic counter");
-        }
-        slot_handoff_.openFor(++serving_slot_generation_);
+        slot_handoff_.retire();
         generation_request_seeds_.reset();
         clearBatchedDecodeState();
         last_token_ = prompt_tokens.back();
@@ -4682,10 +4682,24 @@ namespace llaminar2
                         return setError("Prefix cache reusable-boundary harvest failed");
                 }
 
+                // The admission generation is minted after the last
+                // failure-prone prefix step and before the first handoff
+                // publication: restored hit state must land in a live bank.
+                if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
+                {
+                    return setError(
+                        "Serving-slot admission generation exhausted before the "
+                        "prefix-cache admission could be opened; refusing to wrap "
+                        "the monotonic counter");
+                }
+                slot_handoff_.openFor(++serving_slot_generation_);
                 if (suffix_start < static_cast<int>(prompt_tokens.size()))
                 {
                     if (!forward_prefix_interval(static_cast<int>(prompt_tokens.size())))
+                    {
+                        slot_handoff_.retire();
                         return false;
+                    }
                     slot_handoff_.prefill_logits_ready_ = true;
                 }
                 else if ((!common_hit.requires_terminal_logits ||
@@ -4787,10 +4801,16 @@ namespace llaminar2
                 {
                     return false;
                 }
-                return complete_distributed_prefill();
+                if (!complete_distributed_prefill())
+                {
+                    slot_handoff_.retire();
+                    return false;
+                }
+                return true;
             }
             catch (const std::exception &e)
             {
+                slot_handoff_.retire();
                 return setError(std::string("Prefill with prefix cache failed: ") + e.what());
             }
         }
@@ -4823,21 +4843,35 @@ namespace llaminar2
             return setError(std::string("Prefill failed: ") + e.what());
         }
 
-        // Signal that prefill logits are ready for sampling.
-        // The first decodeStep() will sample from these logits directly
-        // instead of re-feeding the last prompt token (which would cause
-        // the model to see it twice at consecutive positions, corrupting
-        // GDN recurrence state and KV cache entries).
+        // The admission generation is minted only after the last failure-prone
+        // admission step: opening earlier would authorize decode/force against
+        // an admission that later failed. Post-open failures below retire
+        // explicitly instead of leaving a live bank for an admission that did
+        // not complete.
+        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
+        {
+            return setError(
+                "Serving-slot admission generation exhausted before the "
+                "admission could be opened; refusing to wrap the monotonic counter");
+        }
+        slot_handoff_.openFor(++serving_slot_generation_);
         slot_handoff_.prefill_logits_ready_ = true;
 
         if (!initializeDecodeTransactionPlanningPositionAfterPrefill(
                 static_cast<int>(prompt_tokens.size()),
                 "ordinary_prefill"))
         {
+            slot_handoff_.retire();
             return false;
         }
 
-        return complete_distributed_prefill();
+        if (!complete_distributed_prefill())
+        {
+            slot_handoff_.retire();
+            return false;
+        }
+
+        return true;
     }
 
     bool OrchestrationRunner::supportsPrefillBatch(int request_batch) const
@@ -4975,21 +5009,21 @@ namespace llaminar2
                 "already consumed by its retirement boundary; refusing to "
                 "open a new bank over unretired state");
         }
+        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
+        {
+            return setError(
+                "Serving-slot admission generation exhausted before request "
+                "admission; refusing to wrap the monotonic counter or retire "
+                "the predecessor's handoff");
+        }
         if (slot_handoff_.hasPayload())
         {
             LOG_WARN("[OrchestrationRunner] Direct admission retires the previous "
                      "request's live handoff bank (generation "
                      << slot_handoff_.admission_epoch
                      << ") through the explicit lease-first retirement boundary");
-            slot_handoff_.retire();
         }
-        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
-        {
-            return setError(
-                "Serving-slot admission generation exhausted before request "
-                "admission; refusing to wrap the monotonic counter");
-        }
-        slot_handoff_.openFor(++serving_slot_generation_);
+        slot_handoff_.retire();
         last_token_ = next_states.front().last_token;
 
         if (!runner_->forward_batch(converted))
@@ -5018,11 +5052,21 @@ namespace llaminar2
         }
 
         /*
-         * From this point onward the scalar decode state is intentionally
-         * invalid. decodeStepBatch() is the only API allowed to consume this
-         * request set, because it must advance and publish every request slot
-         * under the same ownership transaction.
+         * The batched admission succeeded: mint the slot generation here —
+         * after every failure-prone batched step — and open the handoff bank
+         * for the admitted request set. From this point onward the scalar
+         * decode state is intentionally invalid. decodeStepBatch() is the only
+         * API allowed to consume this request set, because it must advance and
+         * publish every request slot under the same ownership transaction.
          */
+        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
+        {
+            return setError(
+                "Serving-slot admission generation exhausted before the "
+                "batched admission could be opened; refusing to wrap the "
+                "monotonic counter");
+        }
+        slot_handoff_.openFor(++serving_slot_generation_);
         batched_request_states_ = std::move(next_states);
         batched_decode_active_ = true;
         return true;
@@ -25669,18 +25713,11 @@ namespace llaminar2
          * Clear lease-bearing values before their host companions. Although no
          * caller can observe this synchronous transition halfway through, this
          * order makes the performance-critical backend event lifetime explicit
-         * to readers and to custom shared-pointer deleters.
+         * to readers and to custom shared-pointer deleters. The clearing order
+         * is owned by ServingSlotHandoff::retire(); this boundary delegates to
+         * it and marks the bank retired.
          */
-        slot_handoff_.ready_mtp_condition_.reset();
-        slot_handoff_.pending_mtp_condition_resident_state_.reset();
-        slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();
-
-        slot_handoff_.pending_mtp_condition_token_.reset();
-        slot_handoff_.pending_mtp_condition_params_.reset();
-        slot_handoff_.prelaunched_mtp_first_sidecar_params_.reset();
-        slot_handoff_.prefill_logits_ready_ = false;
-        slot_handoff_.decode_transaction_planning_position_.reset();
-        slot_handoff_.retired = true;
+        slot_handoff_.retire();
     }
 
     /**

@@ -2009,10 +2009,12 @@ namespace llaminar2
             }
 
             /**
-             * @brief Retire the bank at an exact retirement boundary.
+             * @brief THE single clearing implementation, owning the order.
              *
              * Clears lease-bearing resident values before their host
-             * companions, in the documented order.
+             * companions, in the documented order. retireMTPRequestContinuation
+             * State(), admission replacement, and openFor() all delegate here;
+             * no other code may duplicate this sequence.
              */
             void retire() noexcept
             {
@@ -2028,26 +2030,16 @@ namespace llaminar2
                 retired = true;
             }
 
-            /** @brief Open a fresh bank for a newly admitted request generation.
+            /**
+             * @brief Open a fresh bank for a newly admitted request generation.
              *
-             * Clears lease-bearing resident values before their host companions,
-             * mirroring the retirement helper's documented order. Never a
-             * wholesale default assignment: the member declaration order would
-             * clear the pending host token/params before their resident lease,
-             * which is exactly the ordering the retirement boundary must not
-             * have.
+             * Delegates the clearing to retire() so exactly one implementation
+             * owns the lease-first order; then stamps the admission generation
+             * and marks the bank live.
              */
             void openFor(std::uint64_t generation) noexcept
             {
-                ready_mtp_condition_.reset();
-                pending_mtp_condition_resident_state_.reset();
-                prelaunched_mtp_first_sidecar_resident_state_.reset();
-
-                pending_mtp_condition_token_.reset();
-                pending_mtp_condition_params_.reset();
-                prelaunched_mtp_first_sidecar_params_.reset();
-                prefill_logits_ready_ = false;
-                decode_transaction_planning_position_.reset();
+                retire();
                 admission_epoch = generation;
                 retired = false;
             }
@@ -2057,6 +2049,25 @@ namespace llaminar2
         ServingSlotHandoff slot_handoff_;
         /** Monotonic per-slot admission generation owned by this runner. */
         std::uint64_t serving_slot_generation_{0};
+
+    protected:
+        /**
+         * @brief Narrow production seam for exhaustion/near-max testing.
+         *
+         * Stages the admission generation without public API surface. Only the
+         * derived lifecycle-test fixture uses this; production callers never
+         * see it, and the admission edge still validates the staged value at
+         * its pre-mutation check.
+         */
+        void stageServingSlotGenerationForTest(std::uint64_t value) noexcept
+        {
+            serving_slot_generation_ = value;
+        }
+
+        [[nodiscard]] std::uint64_t servingSlotGenerationForTest() const noexcept
+        {
+            return serving_slot_generation_;
+        }
         /** One immutable CPU/composed response admission; never a progress counter. */
         std::optional<DeviceGenerationAdmissionRequest> host_sparse_query_admission_;
         /**

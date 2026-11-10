@@ -5674,6 +5674,20 @@ TEST_F(Test__RankOrchestrator,
         readSourceFileForRankOrchestratorTest(
             "src/v2/execution/runner/OrchestrationRunner.cpp");
     ASSERT_FALSE(runner_source.empty());
+    const std::string runner_header =
+        readSourceFileForRankOrchestratorTest(
+            "src/v2/execution/runner/OrchestrationRunner.h");
+    ASSERT_FALSE(runner_header.empty());
+    const auto runner_header_retire_begin = runner_header.find(
+        "void retire() noexcept");
+    const auto runner_header_retire_end = runner_header.find(
+            "void openFor(std::uint64_t generation) noexcept",
+            runner_header_retire_begin);
+    ASSERT_NE(runner_header_retire_begin, std::string::npos);
+    ASSERT_NE(runner_header_retire_end, std::string::npos);
+    const std::string runner_header_retire_body = runner_header.substr(
+        runner_header_retire_begin,
+        runner_header_retire_end - runner_header_retire_begin);
     const std::string device_source =
         readSourceFileForRankOrchestratorTest(
             "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
@@ -5713,14 +5727,20 @@ TEST_F(Test__RankOrchestrator,
     ASSERT_NE(continuation_end, std::string::npos);
     const std::string continuation = runner_source.substr(
         continuation_begin, continuation_end - continuation_begin);
+    // The terminal retirement delegates to the single clearing owner; the
+    // lease-first reset sequence lives in ServingSlotHandoff::retire() and is
+    // verified there, so one implementation owns the order everywhere.
+    EXPECT_NE(continuation.find("slot_handoff_.retire();"), std::string::npos)
+        << "The terminal MTP retirement transition must delegate to the single "
+           "ServingSlotHandoff clearing owner";
     for (const char *lease_owner : {
-             "slot_handoff_.ready_mtp_condition_.reset();",
-             "slot_handoff_.pending_mtp_condition_resident_state_.reset();",
-             "slot_handoff_.prelaunched_mtp_first_sidecar_resident_state_.reset();",
+             "ready_mtp_condition_.reset();",
+             "pending_mtp_condition_resident_state_.reset();",
+             "prelaunched_mtp_first_sidecar_resident_state_.reset();",
          })
     {
-        EXPECT_NE(continuation.find(lease_owner), std::string::npos)
-            << "The terminal MTP retirement transition omitted " << lease_owner;
+        EXPECT_NE(runner_header_retire_body.find(lease_owner), std::string::npos)
+            << "ServingSlotHandoff::retire() omitted " << lease_owner;
     }
     for (const char *forbidden_drain : {
              "synchronizeRunnerDevicesBeforeRelease",

@@ -61,6 +61,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -18993,6 +18994,110 @@ namespace
     // Serving-slot handoff: recorded replay + capacity-one lifecycle contracts
     // =========================================================================
 
+    // Recorded-trace parsing: strict versioned schema with exact
+    // scenario/config compatibility. Reference and candidate identities are
+    // separate fields and need not be equal; malformed, missing, duplicate,
+    // or unsupported declarations are rejected with precise reasons.
+    namespace serving_slot_replay
+    {
+        struct RecordedTrace
+        {
+            std::map<std::string, std::string> metadata;
+            std::vector<std::string> declaredScenarios;
+            std::map<std::string, std::string> referenceStreams;
+        };
+
+        RecordedTrace parseRecordedTrace(
+            const std::string &raw,
+            const std::vector<std::string> &expectedScenarios)
+        {
+            RecordedTrace trace;
+            std::istringstream reader(raw);
+            std::string line;
+            std::string current;
+            bool inHeader = true;
+            while (std::getline(reader, line))
+            {
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+                if (line.rfind("# ", 0) == 0)
+                {
+                    if (!inHeader)
+                        throw std::runtime_error(
+                            "recorded trace: metadata line after scenario sections");
+                    const std::string body = line.substr(2);
+                    const auto separator = body.find(": ");
+                    if (separator == std::string::npos)
+                        continue; // free-form comment line, not a declaration
+                    const std::string key = body.substr(0, separator);
+                    const std::string value = body.substr(separator + 2);
+                    if (key == "scenarios")
+                    {
+                        if (!trace.declaredScenarios.empty())
+                            throw std::runtime_error(
+                                "recorded trace: duplicate scenarios declaration");
+                        std::istringstream values(value);
+                        std::string scenario;
+                        while (values >> scenario)
+                            trace.declaredScenarios.push_back(scenario);
+                        continue;
+                    }
+                    static const std::set<std::string> known = {
+                        "format", "reference-source", "reference-capture-host",
+                        "reference-build", "reference-harness-blob", "policy",
+                        "candidate-binding"};
+                    if (!known.count(key))
+                        throw std::runtime_error(
+                            "recorded trace: unsupported metadata key: " + key);
+                    if (trace.metadata.count(key))
+                        throw std::runtime_error(
+                            "recorded trace: duplicate metadata key: " + key);
+                    if (value.empty())
+                        throw std::runtime_error(
+                            "recorded trace: empty metadata value for: " + key);
+                    trace.metadata[key] = value;
+                    continue;
+                }
+                if (line.rfind(">>> ", 0) == 0)
+                {
+                    inHeader = false;
+                    current = line.substr(4);
+                    if (trace.referenceStreams.count(current))
+                        throw std::runtime_error(
+                            "recorded trace: duplicate scenario section: " + current);
+                    trace.referenceStreams[current] = {};
+                    continue;
+                }
+                if (inHeader)
+                    throw std::runtime_error(
+                        "recorded trace: event line before any scenario section");
+                if (current.empty())
+                    throw std::runtime_error(
+                        "recorded trace: event outside scenario section");
+                trace.referenceStreams[current] += line + "\n";
+            }
+            if (trace.metadata.count("format") == 0 ||
+                trace.metadata.at("format") != "1")
+                throw std::runtime_error(
+                    "recorded trace: unsupported or missing format (need format: 1)");
+            for (const char *key : {"reference-source", "reference-capture-host",
+                                    "reference-build", "reference-harness-blob",
+                                    "policy"})
+                if (!trace.metadata.count(key))
+                    throw std::runtime_error(
+                        std::string("recorded trace: missing required metadata: ") + key);
+            if (trace.declaredScenarios != expectedScenarios)
+                throw std::runtime_error(
+                    "recorded trace: declared scenario list does not match the harness scenarios");
+            for (const auto &scenario : expectedScenarios)
+                if (!trace.referenceStreams.count(scenario) ||
+                    trace.referenceStreams.at(scenario).empty())
+                    throw std::runtime_error(
+                        "recorded trace: missing or empty reference stream for: " + scenario);
+            return trace;
+        }
+    }
+
     /** Recorded-replay suite over the shared production-controller harness. */
     class Test__ServingSlotHandoffReplay : public Test__PrefillDecodeTransition {};
 
@@ -19010,53 +19115,54 @@ namespace
      * Regeneration happens ONLY through the explicit capture environment
      * switch; a failing replay must be investigated, never auto-regenerated.
      */
-    TEST_F(Test__ServingSlotHandoffReplay, MatchesRecordedProductionBaseline)
+    TEST_F(Test__ServingSlotHandoffReplay, MatchesRecordedReferenceBaseline)
     {
-        const std::vector<const char *> scenarios = {
+        const std::vector<std::string> scenarios = {
             "serial3", "mtp_greedy2", "mtp_w2_greedy", "mtp_spec_seed",
             "mtp_w2_spec", "forced", "generate2", "direct_prefill"};
-        const bool capture = std::getenv("LLAMINAR_CB_HANDOFF_CAPTURE") != nullptr;
-        std::string actual;
-        for (const char *kind : scenarios)
-        {
-            actual += "=== ";
-            actual += kind;
-            actual += " ===\n";
-            actual += runServingSlotScenario(kind);
-        }
+        std::map<std::string, std::string> actual;
+        for (const auto &kind : scenarios)
+            actual[kind] = runServingSlotScenario(kind);
 
         const std::filesystem::path golden{LLAMINAR_CB_HANDOFF_GOLDEN};
-        if (capture)
+        if (std::getenv("LLAMINAR_CB_HANDOFF_CAPTURE") != nullptr)
         {
             /*
-             * Capture refuses to write an identity-less golden: the reference
-             * source, capture host, and build identities must be supplied by
-             * the capture invocation and describe the actual capture, never
-             * invented retrospective provenance. The pre-hardening
-             * decode_after_clear observation stays in fixture history
-             * (15b93b850); after-clear decode is now an intentionally hardened
-             * invalid-input contract covered by the lifecycle suite.
+             * Capture writes the REFERENCE streams and must be run against the
+             * unchanged base production source with this exact harness; the
+             * required identity environment describes the actual capture and
+             * is never invented retrospectively. Candidate verification never
+             * regenerates this file.
              */
             const char *source = std::getenv("LLAMINAR_CB_HANDOFF_REFERENCE_SOURCE");
             const char *captureHost = std::getenv("LLAMINAR_CB_HANDOFF_CAPTURE_HOST");
             const char *build = std::getenv("LLAMINAR_CB_HANDOFF_BUILD");
+            const char *harnessBlob = std::getenv("LLAMINAR_CB_HANDOFF_HARNESS_BLOB");
             ASSERT_NE(source, nullptr) << "capture requires LLAMINAR_CB_HANDOFF_REFERENCE_SOURCE";
             ASSERT_NE(captureHost, nullptr) << "capture requires LLAMINAR_CB_HANDOFF_CAPTURE_HOST";
             ASSERT_NE(build, nullptr) << "capture requires LLAMINAR_CB_HANDOFF_BUILD";
+            ASSERT_NE(harnessBlob, nullptr) << "capture requires LLAMINAR_CB_HANDOFF_HARNESS_BLOB";
             std::filesystem::create_directories(golden.parent_path());
             std::ofstream output(golden);
-            output << "# llaminar serving-slot handoff recorded replay\n"
+            output << "# format: 1\n"
                    << "# reference-source: " << source << "\n"
-                   << "# capture-host: " << captureHost << "\n"
-                   << "# build: " << build << "\n"
-                   << "# harness: Test__PrefillDecodeTransition device-free production-controller harness\n"
-                   << "# policy: greedy default unless a scenario sets seeded params; prefix-cache disabled; mtp draft widths 1 and 2; device-free mock boundary\n"
+                   << "# reference-capture-host: " << captureHost << "\n"
+                   << "# reference-build: " << build << "\n"
+                   << "# reference-harness-blob: " << harnessBlob << "\n"
+                   << "# policy: greedy default unless a scenario sets seeded params; prefix-cache disabled; mtp draft widths 1 and 2 with chained sidecars; device-free mock boundary\n"
+                   << "# candidate-binding: external, via qualification receipts pairing worktree HEAD, clean-tree status, and the full test-name inventory\n"
                    << "# scenarios:";
-            for (const char *kind : scenarios)
+            for (const auto &kind : scenarios)
                 output << ' ' << kind;
-            output << "\n" << actual;
+            output << "\n";
+            for (const auto &kind : scenarios)
+            {
+                output << ">>> " << kind << "\n" << actual[kind];
+                if (!actual[kind].empty() && actual[kind].back() != '\n')
+                    output << "\n";
+            }
             ASSERT_TRUE(output.good()) << "cannot write " << golden;
-            GTEST_SKIP() << "capture mode wrote the recorded baseline at " << golden;
+            GTEST_SKIP() << "capture mode wrote the recorded reference baseline at " << golden;
         }
 
         ASSERT_TRUE(std::filesystem::exists(golden))
@@ -19064,36 +19170,152 @@ namespace
         std::ifstream input(golden);
         std::ostringstream raw;
         raw << input.rdbuf();
-        const std::string expectedRaw = raw.str();
-        // Structural validation: reject incomplete or incompatible traces.
-        for (const char *key : {"# reference-source:", "# capture-host:",
-                                "# build:", "# harness:", "# policy:",
-                                "# scenarios:"})
-            EXPECT_NE(expectedRaw.find(key), std::string::npos)
-                << "recorded baseline missing metadata key " << key;
-        std::ostringstream expected;
-        bool inHeader = true;
-        std::istringstream reader(expectedRaw);
-        std::string metadataLine;
-        while (std::getline(reader, metadataLine))
+        serving_slot_replay::RecordedTrace trace;
+        try
         {
-            if (metadataLine.rfind("# scenarios:", 0) == 0)
-            {
-                for (const char *kind : scenarios)
-                    EXPECT_NE(metadataLine.find(kind), std::string::npos)
-                        << "recorded scenario list missing " << kind;
-                inHeader = false;
-                continue;
-            }
-            if (inHeader)
-                continue; // metadata lines are validated, not behavior-compared
-            expected << metadataLine << '\n';
+            trace = serving_slot_replay::parseRecordedTrace(raw.str(), scenarios);
         }
-        EXPECT_EQ(actual, expected.str())
-            << "production controller behavior diverged from the recorded "
-               "reference baseline; investigate the divergence instead of "
-               "regenerating the fixture automatically";
+        catch (const std::exception &error)
+        {
+            FAIL() << "recorded baseline rejected by the strict trace parser: "
+                   << error.what();
+        }
+        for (const auto &kind : scenarios)
+            EXPECT_EQ(actual[kind], trace.referenceStreams[kind])
+                << "production controller behavior diverged from the recorded "
+                   "reference baseline for scenario " << kind
+                << "; investigate the divergence instead of regenerating the "
+                   "fixture automatically";
     }
+
+    /**
+     * @brief The strict trace parser rejects malformed, incomplete,
+     *        duplicated, and unsupported declarations, and accepts a trace
+     *        whose reference identity differs from any candidate identity
+     *        (reference and candidate are separate fields that never need to
+     *        be equal).
+     */
+    TEST_F(Test__ServingSlotHandoffReplay, RejectsMalformedAndIncompatibleTraces)
+    {
+        const std::vector<std::string> scenarios = {"serial3", "mtp_greedy2"};
+        const auto makeValid = []()
+        {
+            return std::string(
+                "# format: 1\n"
+                "# reference-source: base\n"
+                "# reference-capture-host: host\n"
+                "# reference-build: build\n"
+                "# reference-harness-blob: blob\n"
+                "# policy: p\n"
+                "# scenarios: serial3 mtp_greedy2\n"
+                ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n");
+        };
+        EXPECT_NO_THROW(serving_slot_replay::parseRecordedTrace(
+            makeValid(), scenarios));
+
+        struct Case
+        {
+            const char *name;
+            std::string trace;
+        };
+        const std::vector<Case> cases = {
+            {"missing format",
+             "# reference-source: base\n"
+             "# reference-capture-host: host\n"
+             "# reference-build: build\n"
+             "# reference-harness-blob: blob\n"
+             "# policy: p\n"
+             "# scenarios: serial3 mtp_greedy2\n"
+             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
+            {"unsupported format",
+             "# format: 2\n"
+             "# reference-source: base\n"
+             "# reference-capture-host: host\n"
+             "# reference-build: build\n"
+             "# reference-harness-blob: blob\n"
+             "# policy: p\n"
+             "# scenarios: serial3 mtp_greedy2\n"
+             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
+            {"missing required identity",
+             "# format: 1\n"
+             "# reference-capture-host: host\n"
+             "# reference-build: build\n"
+             "# reference-harness-blob: blob\n"
+             "# policy: p\n"
+             "# scenarios: serial3 mtp_greedy2\n"
+             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
+            {"duplicate identity key",
+             "# format: 1\n"
+             "# reference-source: base\n"
+             "# reference-source: base\n"
+             "# reference-capture-host: host\n"
+             "# reference-build: build\n"
+             "# reference-harness-blob: blob\n"
+             "# policy: p\n"
+             "# scenarios: serial3 mtp_greedy2\n"
+             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
+            {"unsupported metadata key",
+             "# format: 1\n"
+             "# reference-source: base\n"
+             "# reference-capture-host: host\n"
+             "# reference-build: build\n"
+             "# reference-harness-blob: blob\n"
+             "# future-key: x\n"
+             "# policy: p\n"
+             "# scenarios: serial3 mtp_greedy2\n"
+             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
+            {"empty metadata value",
+             "# format: 1\n"
+             "# reference-source: base\n"
+             "# reference-capture-host: host\n"
+             "# reference-build: build\n"
+             "# reference-harness-blob: blob\n"
+             "# policy: \n"
+             "# scenarios: serial3 mtp_greedy2\n"
+             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
+            {"duplicate scenario section",
+             "# format: 1\n"
+             "# reference-source: base\n"
+             "# reference-capture-host: host\n"
+             "# reference-build: build\n"
+             "# reference-harness-blob: blob\n"
+             "# policy: p\n"
+             "# scenarios: serial3 mtp_greedy2\n"
+             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n>>> serial3\nR1:1\n"},
+            {"event before section",
+             "# format: 1\n"
+             "R1:1\n"
+             "# reference-source: base\n"
+             "# scenarios: serial3 mtp_greedy2\n"
+             ">>> serial3\nR1:1\n"},
+            {"empty scenario stream",
+             "# format: 1\n"
+             "# reference-source: base\n"
+             "# reference-capture-host: host\n"
+             "# reference-build: build\n"
+             "# reference-harness-blob: blob\n"
+             "# policy: p\n"
+             "# scenarios: serial3 mtp_greedy2\n"
+             ">>> serial3\nR1:1\n>>> mtp_greedy2\n"},
+            {"declared scenario missing from stream",
+             "# format: 1\n"
+             "# reference-source: base\n"
+             "# reference-capture-host: host\n"
+             "# reference-build: build\n"
+             "# reference-harness-blob: blob\n"
+             "# policy: p\n"
+             "# scenarios: serial3\n"
+             ">>> serial3\nR1:1\n"},
+        };
+        for (const auto &attempt : cases)
+        {
+            SCOPED_TRACE(attempt.name);
+            EXPECT_THROW(serving_slot_replay::parseRecordedTrace(
+                             attempt.trace, scenarios),
+                         std::runtime_error);
+        }
+    }
+
 
     /**
      * @brief Sequential request reuse must serve each request from its own
