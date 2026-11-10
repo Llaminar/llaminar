@@ -283,3 +283,20 @@ base-by-name attribution and whole-output tags.
 | `15/extract.py` | — | Shared block splitter |
 
 Revision 2 (`classify_v2.py`, `classification-v2.csv`) is not archived; it is superseded by v3.
+
+## #146 recheck (2026-11-10) — rev4 items
+- R1: 'scoped' mislabeled 'case-bound' (classify_v3.py:66-67 whole-output when
+  no FAILED marker) + CSV split evidence (G2 8 scoped/7 bound/9 whole; G6 2/1/4;
+  N2 1/0/1) + doc:165 + G2/G6 observed columns vs correct table -> use
+  SCOPED/WHOLE labels or exact splits; narrow stderr claim to 'failed-gtest
+  TEXT segments' (all segment lines appended; marker position = selection
+  rule, not logger-proof; incomplete/no-marker output weaker incl. aborted/
+  timed-out); no row reclassification without observations.
+- R2: machine artifact 'verdict' column still carries ENVIRONMENT(launch/VM)/
+  VM budget/PRODUCT GAP despite prose withholding -> rename heuristic
+  category + cause=not-established unless supported + docstring:13-15.
+- Cleanup: duplicate G8 withdrawal; stale archive notes; anchor list +=
+  RuntimeInitPhase.cpp + ClusterInventoryGatherer.cpp.
+- #146 = substantive ACK otherwise (287 unique rows; counts reconcile; 9
+  anchors byte-identical + 2 consumers unchanged; G1-G7 wording + I8MM
+  name-set/open-cause addressed; X1/rerun separate). #145 HOLD independent.
