@@ -526,3 +526,11 @@ build-neon*.llaminar.lock lock files (NOT a submodule), cnpy nonexistent,
 corpora submodule must NOT be inited; own worktree or own external bind —
 NEVER a shared writable external/. Campaigns COMPLETE; build_v2_dgx/ =
 historical evidence, no active reservation.
+
+- (addendum) FOCUSED I8MM BYTE-CELL SET GREEN at df15aca96 (Integration
+  NEON_I8MM SHARED_CORE=ON; all 7 matched tests PASSED, 1.71s):
+  PreparedProjection Unit 3886 + Integration 3887, PanelTailsMatchSerial
+  3890, I8MMOperandGrouping 3892, I8MMTailsMatchSDOT 3893 (+2). = content
+  evidence; the final focused set runs at the COMBINED tip post-SETTLED
+  (composition constraint). arm-sparks queue now: bound run (.80) + .79
+  CUDA rerun build at e5ee7f672 (parallel hosts).
