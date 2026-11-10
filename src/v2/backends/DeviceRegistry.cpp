@@ -156,7 +156,8 @@ namespace llaminar2
         // with CPUs, in ascending node order. Raw readdir registered
         // CPU-less memory nodes (Grace GPU/CXL memory) and in directory
         // order, so cpu:0 could be a node without CPUs or capacity.
-        for (const auto &node : NodeTopology::detect().numaNodes())
+        const NodeTopology topology = NodeTopology::detect();
+        for (const auto &node : topology.numaNodes())
         {
             GlobalDeviceAddress addr = GlobalDeviceAddress::cpu(node.node_id);
             std::string key = getKey(addr);
