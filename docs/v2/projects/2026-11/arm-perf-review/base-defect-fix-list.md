@@ -267,3 +267,28 @@ CONFIRMS the in-class classification given to the continuous-batching lane
    (d) memory-only-NUMA placement semantics — topology-infeasible on this
    host but parameterizable; (e) MPI hwloc bind — SETUP-class candidate.
    Each class: evidence, owner, fixable-vs-not verdict.
+
+### B11 station-comparison protocol REFINED (continuous-batching lane, 2026-11-10) — four corrections adopted
+
+1. NARROWED CLAIM: reproducing SIGSEGV without MPI rules out MPI-launcher
+   NECESSITY for that configuration, NOT allocator-vs-test-vs-permission
+   causality; MPI-fail/direct-pass = a launcher-DEPENDENT observation, not
+   automatically a harmless env closure.
+2. ONE IDENTITY for both arms: single source/build/binary/container
+   identity at the station (historical binaries may be overwritten →
+   REBUILD from one source — the original failure's base 28ddbe253 — and
+   run BOTH arms from that single build).
+3. INSPECT, don't infer: record differences from the original 28dd
+   evidence; inspect assertion text / null-deref sites / permission(EPERM)
+   context / affinity directly rather than inferring root cause from exit
+   status.
+4. The MISSING 39TH CASE in the Spark 38/39 result
+   (FirstTouchOverridesInheritedRemoteMemoryPolicy) comes from its existing
+   log/owner (.79 /home/factory/idea25/b11-nompi.log) — NOT from a new
+   station run (no conflation).
+Protocol: at the station, arms = (A) canonical mpirun-launched run (expect
+repro) vs (B) direct non-MPI run; comparison = launcher dependence; within-A
+inspection = causality evidence. Station container identities (SYS_NICE /
+seccomp / flags) come from the 64K validation owner's runbook. Coordinator
+routes; the CB worker executes on its own host without interrupting its
+proof fixes.
