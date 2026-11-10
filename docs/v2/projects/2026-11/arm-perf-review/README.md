@@ -1000,3 +1000,14 @@ Scope confirmed (3 paths/+288; no production edits; v2.1 body = released
   standard for the new source. Generated diagnostics ≠ recorded GDN
   capture; Linux validation stays outstanding.
 - No builds/tests/auth performed. Await ONE exact comprehensive successor.
+
+### Half-perf fix-back committed (2026-11-10, ~16:4xZ): 1ea0821184cb090bb2fa9bc961927df2f0a2ff7b
+
+One comprehensive successor on codex/arm-half-perf-cell (parent adb1c98e9)
+addressing #171's complete five-finding set (HP-1 native typed_data + exact
+extents; HP-2 rounding-boundary discriminators + nonzero-beta interval-path
+control; HP-3 selected-native-storage hash + declared-profiler + FP-scope;
+HP-4 enforced timing-only fresh-process selection; HP-5 whole-case admission
+before first allocation) + Doxygen standard. Hook-disabled Mac commit; Linux
+validation remains merge-gating. Routed to the reviewer for #172 re-review;
+.80 window follows the combined-candidate receipts.
