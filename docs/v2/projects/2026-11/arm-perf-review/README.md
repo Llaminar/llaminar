@@ -1411,3 +1411,11 @@ Merge-readiness package routes to the reviewer with that attribution.
   DEFECTS FIXED at a847 per Main — attributed away from the lane);
   economy receipts = the hpb-cells 5/5 outputs per plan v2.1 (.80
   build/hp-b512.* + trees/b512e25a). Reviewer verdict → merge-ready → Main.
+- Half-cell EXACT-PIN SOURCE ACK at b512e25a (reviewer): direct 1ea08211
+  child, only Doxygen expansions; #173 closed. Count correction accepted:
+  residue = +166/−13 (NET +153), not +153/−0; adb..b512 aggregate +255/−21.
+  HP-1..HP-5 source closure preserved; NOT merge readiness: the Linux gate
+  counts + failed-name attributions + a847 fixes = owner evidence, not
+  green gates; the hpb 5/5 logs are uninspected owner evidence — smoke/
+  correctness alone cannot certify plan-v2.1 throughput/actual workers/
+  FP/profiler identity. #175 + Flash-Next #177 HOLDs independent.
