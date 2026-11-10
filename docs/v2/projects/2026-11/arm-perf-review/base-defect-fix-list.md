@@ -118,3 +118,11 @@ future 64K ARM; x86 unaffected (hwloc path) for B5, 4K-normal for B1/B2/B6.
 - Grace close-out at ce9ddb326 in flight (NUMATopologyCPUList* + DeviceRegistry
   + membership cells). Memory-only-node Delta = B10 (solved) + ClusterInventory
   Bootstrap (known env) + expectations correct.
+
+## B10 CLOSED on real 64K (2026-11-10) — ce9ddb326 Grace close-out
+- Focused unmasked 9/9 PASS (NUMATopologyCPUList(+Membership), DeviceRegistry,
+  NUMATopology, NUMATopologySysfs, DeviceRegistryStartupPolicy, NodeTopology
+  (+DensePackageIds+fixture)) — garbage values GONE; the ref-qualified
+  numaNodes() lvalue/temporary contract fixed the use-after-free. B1-B7+B10
+  COMPLETE on Grace. Evidence: build_v2_dgx/b-fix-ce9ddb326/. Sanitizer
+  stopped (valgrind 3.23 build aborted; not needed).
