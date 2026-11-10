@@ -88,3 +88,15 @@ future 64K ARM; x86 unaffected (hwloc path) for B5, 4K-normal for B1/B2/B6.
   env class. Open: B8 (idea-20 residual), B9 (addon R2). Grace re-run of the
   3 flipped tests at 9490b66bc = requested (would close B1-B7 there). Test
   docs: page-owner tests in Docker need SYS_NICE + seccomp=unconfined.
+
+## B1-B7 CLOSED on real 64K — 9490b66bc EOL (2026-11-10)
+- Focused unmasked run 17/21: 3 regressions fixed; HostPage* 3/3; B3/B4 cells
+  4/4; 11-flip sample 5/5. 4 FAILs = ONE env class (memory-only NUMA nodes;
+  node1 255GB/0CPU, 2-8 zero capacity), test-side, no page/affinity
+  regression: NUMATopologyCPUList(+Membership)
+  RegistryCPUEndpointsFollowNodeTopology (registry CPU-bearing-only vs
+  NodeTopology incl. memory-only node1); V2_Unit_DeviceRegistry (same
+  interplay); ClusterInventoryBootstrap (cpu:0 ambiguous; specify NUMA node).
+- RECOMMENDED (test-side): align those cells with B3 semantics (filter
+  memory-only nodes / compare CPU-bearing sets); no engine change.
+  Memory-only-node Delta = next host-qual doc item (15 env classes).
