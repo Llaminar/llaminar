@@ -1090,3 +1090,33 @@ CLOSED for the half-perf cell.
   move 717b2/source or recompile unchanged bindings.
 - Still owed to Main: actual Mac + GNU receipt/phase-log/build artifact
   PATHS for the 18×14 acceptance inspection.
+
+### B9 strengthening READY (arm-addon3, 2026-11-10): codex/arm-b9-strengthening @ 0185f69b3 (3 test-only commits, NOT landed)
+
+Branch off e8866ec04; each commit touches ONLY
+tests/v2/unit/cmake/test_cpu_native_tile_register_evidence.py (+79 total;
+checker/budget/CMake untouched → checker_sha256 UNMOVED — the B9 commit in
+the combined stack is what changes it). Implements #165's three controls:
+(a) 3ed993968 offset-sensitive live-slot (advance must land exactly on a
+live ABI save slot; negatives: one-past, wrong-slot-with-pending, #0,
+two-save per-register binding; catches no-increment AND fixed-step-8);
+(b) f3faa540c actual stored-stack-pointer RELOAD through the new post-index
+form (str x9,[sp] → ldr x11,[x10],#400 → str q0,[x11] = 1 spill; restore
+through the reloaded pointer = 0; post-advance whole-X reload; negative
+misaligned ldur); (c) 0185f69b3 narrow-read width pinned both ways against
+slot [400,408) (a h→4 mutation fails ONLY this control — the exact #165
+gap). MUTATION SELF-TEST (scratch copies): M1 no-increment → (a)+(b); M1b
+fixed-step-8 → same; M2 h→4 → (c) alone; M3 missing-reload → (b); all 62
+pre-existing analysis cases pass under M1. VALIDATION on the B9 composition
+(a16591eed): analysis 64/64, binding 4/4; rebase rehearsal onto a16591eed =
+one trivial conflict, resolved byte-identical, shard green. LANDING DEFERRED
+post-combined-FF (checker-epoch consequence documented: full 18-cell
+re-campaign at landing). Worktrees left for inspection:
+/tmp/b9-strengthen-branch, /tmp/b9-strengthen-wt.
+
+ITEM 2 (census Debug look): root-caused to the two documented same-day
+mechanisms (pre-fix fixed-out-dir reuse [grep artifact] + the .80 disk-full
+[Debug×3 = last cells, first victims under active fill]); no in-script
+retry existed; existing fixes close both; RECOMMENDATION = document benign
+(reordering Debug first is cosmetic). Pending: pin the specific mechanism
+from the retained g-*.census.log files on .80 (arm-sparks to cat).
