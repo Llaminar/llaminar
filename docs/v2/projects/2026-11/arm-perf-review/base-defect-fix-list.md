@@ -199,3 +199,29 @@ lane) and extracted concrete diagnostics that REFINE the classification:
    ISA-specific tests); some system-out truncated at 1024 bytes — do NOT
    claim all native cases executed or full-signature equality from those
    excerpts.
+
+### GroupedSealedPlan candidate CLOSED (addon verdict, 2026-11-10): standing base failure, NOT ARM-induced
+
+The "ARM-induced harness staleness" hypothesis is REFUTED:
+- The failure is IDENTICAL at the R1 base 425002104 (r1e.unit.log: the same
+  10 `AttributeError: 'types.SimpleNamespace' object has no attribute
+  'physical_launch_evidence'` at adaptive_tournament.py:188; g-8fcc0fe0b
+  has exactly 10 too).
+- Authorship: adaptive_tournament.py + the SimpleNamespace _observation()
+  stub = a0fd16d04 (2026-11-09), part of #43's new base — not the addon
+  diff. git diff 425002104..28ddbe253 over adaptive_tournament.py /
+  candidate_observation.py / exact_oracle.py / the grouped-sealed-plan test
+  = EMPTY (nearby 83f82897a only refactored candidate_observation.py's
+  core-count helper into host_cores).
+- Mechanism: the stub omits `physical_launch_evidence`, an OPTIONAL
+  observation column since 77e17645b (2026-10-22); is_promotion_grade()
+  accesses it UNCONDITIONALLY → AttributeError. Already on the R1
+  known-failure list; V2_Unit_CPUNativeQuantisedGroupedSealedPlan = the
+  standing base failure in every gate (13/987 at 28ddbe253).
+- The tournament work touched only Perf__CPUNativeNEONPanelTournament.cpp
+  (separate binary) — never the dispatch corpus schema or is_promotion_grade.
+- BONUS: this also explains the earlier "R2-2 partial" gate error at
+  623e44ccf — same 10 errors, same stub, different path.
+- OWNER: Main (one-line stub repair: getattr(observation,
+  'physical_launch_evidence', {})-class or an explicit stub field), outside
+  R2. Classification: in-class standing base failure.
