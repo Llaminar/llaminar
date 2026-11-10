@@ -33,15 +33,13 @@
 #include <numaif.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include "utils/HostPageSize.h"
 
 namespace llaminar2
 {
 
     namespace
     {
-        // Page size for first-touch initialization
-        constexpr size_t PAGE_SIZE = 4096;
-
         // Minimum alignment for cache line efficiency
         constexpr size_t MIN_ALIGNMENT = 64;
 
@@ -346,7 +344,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        size_t allocation_alignment = std::max(alignment, PAGE_SIZE);
+        size_t allocation_alignment = std::max(alignment, hostPageBytes());
         size_t aligned_bytes = alignUp(bytes, allocation_alignment);
         void *ptr = std::aligned_alloc(allocation_alignment, aligned_bytes);
         if (!ptr)
@@ -426,18 +424,18 @@ namespace llaminar2
         }
 
         const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
-        if ((address % PAGE_SIZE) != 0)
+        if ((address % hostPageBytes()) != 0)
         {
             LOG_ERROR("NUMAAllocator: External receive range " << ptr
                                                                << " is not page aligned");
             return false;
         }
-        if (bytes > std::numeric_limits<size_t>::max() - (PAGE_SIZE - 1))
+        if (bytes > std::numeric_limits<size_t>::max() - (hostPageBytes() - 1))
         {
             LOG_ERROR("NUMAAllocator: External receive range byte extent overflows page rounding");
             return false;
         }
-        const size_t page_bytes = alignUp(bytes, PAGE_SIZE);
+        const size_t page_bytes = alignUp(bytes, hostPageBytes());
         return firstTouchPageRangeOnNode(ptr, page_bytes, numa_node);
     }
 
@@ -445,8 +443,8 @@ namespace llaminar2
         void *ptr, size_t page_bytes, int numa_node) const
     {
         if (!ptr || page_bytes == 0 ||
-            (reinterpret_cast<uintptr_t>(ptr) % PAGE_SIZE) != 0 ||
-            (page_bytes % PAGE_SIZE) != 0 ||
+            (reinterpret_cast<uintptr_t>(ptr) % hostPageBytes()) != 0 ||
+            (page_bytes % hostPageBytes()) != 0 ||
             numa_node < 0 || numa_node >= num_numa_nodes_)
         {
             LOG_ERROR("NUMAAllocator: Invalid exact page range supplied to first-touch authority");
@@ -471,7 +469,7 @@ namespace llaminar2
             return false;
 
         volatile auto *pages = static_cast<volatile uint8_t *>(ptr);
-        for (size_t offset = 0; offset < page_bytes; offset += PAGE_SIZE)
+        for (size_t offset = 0; offset < page_bytes; offset += hostPageBytes())
         {
             // One store per revoked page establishes the physical owner; the
             // subsequent transport overwrites the complete logical range.
@@ -483,7 +481,7 @@ namespace llaminar2
         constexpr size_t kCertificationBatchPages = 1024;
         std::array<void *, kCertificationBatchPages> page_addresses{};
         std::array<int, kCertificationBatchPages> page_status{};
-        const size_t page_count = page_bytes / PAGE_SIZE;
+        const size_t page_count = page_bytes / hostPageBytes();
         for (size_t first_page = 0;
              first_page < page_count;
              first_page += kCertificationBatchPages)
@@ -493,7 +491,7 @@ namespace llaminar2
             for (size_t index = 0; index < batch_pages; ++index)
             {
                 page_addresses[index] = static_cast<uint8_t *>(ptr) +
-                    ((first_page + index) * PAGE_SIZE);
+                    ((first_page + index) * hostPageBytes());
                 page_status[index] = -1;
             }
             if (move_pages(
@@ -520,7 +518,7 @@ namespace llaminar2
                 if (observed_node != numa_node)
                 {
                     const size_t offset =
-                        (first_page + index) * PAGE_SIZE;
+                        (first_page + index) * hostPageBytes();
                     LOG_ERROR("NUMAAllocator: First-touch certification observed node "
                               << observed_node << " (batch status " << page_status[index]
                               << ") instead of "

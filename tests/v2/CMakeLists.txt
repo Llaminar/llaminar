@@ -8358,6 +8358,27 @@ add_v2_test(V2_Unit_NUMAAllocator
     MPI_PROCS 1  # NUMAAllocator is single-rank only (memory allocation)
 )
 
+# AArch64 hosts run 4/16/64 KiB base pages. Page-granular owners (NUMA policy,
+# first touch, CPU expert admission, MoE fabric layout) use the observed host
+# page; a hard-coded 4 KiB made mbind/madvise fail and admission under-count
+# on 64 KiB hosts. Device-free; the scan forbids page-size literals.
+add_executable(v2_test_host_page_size unit/utils/Test__HostPageSize.cpp)
+target_link_libraries(v2_test_host_page_size llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_HostPageSize
+    COMMAND $<TARGET_FILE:v2_test_host_page_size>
+    LABELS "V2;Unit;Memory;NUMA;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_HostPageSizeOwners
+    COMMAND $<TARGET_FILE:v2_test_host_page_size>
+    LABELS "V2;Integration;ProductionTestPreflight;Memory;NUMA;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_test(NAME V2_Integration_HostPageLiteralPolicy
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_host_page_literals.py
+            --repo-root ${CMAKE_SOURCE_DIR}/../..)
+set_tests_properties(V2_Integration_HostPageLiteralPolicy PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;SourcePolicy;Memory;Regression"
+    TIMEOUT 30)
+
 # This test certifies physical page ownership, rather than a policy request.
 # Linux may legally fall back to another node when a concurrently running
 # unit-test process puts the requested node below its allocation watermarks;
@@ -39508,6 +39529,7 @@ add_v2_test(V2_Integration_ExpertGemmRegistryHashDistribution
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1"
 )
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertGemmRegistryHashDistribution)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HostPageSizeOwners V2_Integration_HostPageLiteralPolicy)
 
 # nvcc --split-compile partitions a module nondeterministically, so register
 # allocation and the fatal spill verdict changed between identical compiles.
