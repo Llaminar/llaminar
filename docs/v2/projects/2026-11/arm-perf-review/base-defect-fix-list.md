@@ -225,3 +225,17 @@ The "ARM-induced harness staleness" hypothesis is REFUTED:
 - OWNER: Main (one-line stub repair: getattr(observation,
   'physical_launch_evidence', {})-class or an explicit stub field), outside
   R2. Classification: in-class standing base failure.
+
+### B11 CANDIDATE CLOSED — env class confirmed (arm-sparks non-MPI repro, 2026-11-10, ~18:43Z)
+
+v2_test_numa_allocator run DIRECTLY (no mpirun/hwloc launcher; .79 GB10,
+e8866ec04 Integration build, same container class): **38/39 PASSED, 0
+failures, RC=0** (58 ms). The 1 SKIPPED = FirstTouchOverridesInherited-
+RemoteMemoryPolicy (skip guard = the inherited-policy precondition, not a
+fault). NO segfault without mpirun → the SIGSEGV seen in the
+continuous-batching lane's canonical driver run = the **mpirun/hwloc env
+class**, NOT a real allocator defect on the memory-only-node topology.
+B11-candidate CLOSED (no tracker upgrade, no Main fix-back). Evidence:
+.79 /home/factory/idea25/b11-nompi.log (sealed). Cross-program note: this
+CONFIRMS the in-class classification given to the continuous-batching lane
+(mpi-hwloc env).
