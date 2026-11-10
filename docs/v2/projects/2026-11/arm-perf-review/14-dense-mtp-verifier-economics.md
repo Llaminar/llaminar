@@ -163,3 +163,18 @@ or production certification; exact compile flags + file SHAs recorded;
 canonical CTest evidence, if the reviewer requires it later, runs on .80
 (SHARED_CORE=ON runbook). Read-only lifecycle/fixture audit continues in
 parallel.
+
+## A DELIVERABLE COMPLETE (2026-11-10, station lane; self-check evidence class)
+
+29/29 trace + 71/71 controller + 1/1 bookkeeping owner tests PASS at c007
+(zero source changes); 15+5 hashes rechecked; failed attempts preserved
+with SHAs. Bookkeeping overhead = **14.6-55.5 ns/step** (synthetic composite,
+wall-ns) — negligible vs a ~200 ms decode step: controller bookkeeping is
+NOT a candidate cause of any dense-MTP loss. Readiness semantics audited:
+terminal WindowNotReady + windows>0 = partial-tail explanation, NOT
+never-ready; request-wide 43.4% ≠ a depth-10-window sample; the CPU/dense
+controller has NO timing authority (counters only), so acceptance alone
+cannot establish economic loss; the C-era trajectory stays unproven without
+its inputs. Full packet + digests: evidence/idea14-A-owner-selfcheck.md.
+Decision gate = Plan B (booked paired GB10 wave). Routed to reviewer at
+c007a59a2.
