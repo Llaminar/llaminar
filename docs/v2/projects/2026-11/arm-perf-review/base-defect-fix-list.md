@@ -126,3 +126,45 @@ future 64K ARM; x86 unaffected (hwloc path) for B5, 4K-normal for B1/B2/B6.
   numaNodes() lvalue/temporary contract fixed the use-after-free. B1-B7+B10
   COMPLETE on Grace. Evidence: build_v2_dgx/b-fix-ce9ddb326/. Sanitizer
   stopped (valgrind 3.23 build aborted; not needed).
+
+## Cross-program classification (2026-11-10): station failures from the
+## continuous-batching slice qualification (28ddbe253 base, NEON_I8MM
+## Integration, canonical driver, exit 8; sets IDENTICAL pin-vs-slice, 140
+## signatures identical, zero new)
+
+Classification vs the ARM station baseline (39c24d8b4 classes): the
+overwhelming majority are IN-CLASS — documented station env classes (64K
+pages, memory-only NUMA nodes 1-8, MPI hwloc bind/abort), fixture-missing
+(ModelLoaderRowSlice qwen2.5-0.5b GGUF; ROCm trainer CSV ×4; ModelKLDCanary),
+and known-base classes (ROCm registration, GroupedSealedPlan,
+MoEForbiddenDependencyScan, CommonDispatchPolicy, FusedFinalAdd,
+registration/selection family). Strong non-ISA-specificity signal:
+CPUShardFusedFinalAddPreweight fails IDENTICALLY on scalar, neon AND
+neon_i8mm — common cause, not an ARM-kernel bug. The bulk
+qwen4exp/immutable-lookup gtest-assert family is consistent with the
+memory-only-node topology infeasibility class (placement semantics
+untestable where nodes 1-8 have no CPUs) — matches the documented
+"memory-only nodes" env class; bulk, not individually enumerated at
+39c24d8b4.
+
+TRIAGE CANDIDATES (entered, not confirmed):
+- **B11-candidate: V2_Unit_NUMAAllocator SIGSEGV** (mpirun "process rank 0
+  exited on signal 11") under the memory-only-node topology, AT 28ddbe253 —
+  i.e. AFTER B1-B4 fixes. Either an incomplete B-fix for this topology
+  corner or mpirun/hwloc env interference; needs a non-MPI reproduction to
+  attribute. Evidence: station artifacts
+  /home/tdsynnex/repo/llaminar-cb-c1/artifacts/cb-c1-staging/
+  {pin-qualification,slice-qualification}/ (worker:
+  subagent-chat-01a1c527-8869-727c@dgx-station; found by the
+  continuous-batching lane's qualification — operator-initiated cross-check).
+- Mild unclassified-vs-39c24d8b4 items to verify against the ARM station
+  run identities: V2_Unit_NativeSourceFinalRetirement [assert,env-numa];
+  V2_Unit_ProductionParityCampaigns [gtest-assert];
+  V2_Integration_DevelopPRGateContract [gtest-assert]. Possibly in-class
+  (env/registration families); verify before treating as defects.
+
+Method note (batch-inference lane, accepted): identities+signatures
+compared, not counts; unchanged failures do not prove non-ARM causality;
+outside-class = triage candidate, not automatically an ARM regression; no
+qualification transfer from historical B10 receipts (different rewritten
+ancestry).
