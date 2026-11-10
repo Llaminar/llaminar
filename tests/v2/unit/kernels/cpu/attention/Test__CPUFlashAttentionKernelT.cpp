@@ -1626,6 +1626,22 @@ TEST_F(Test__CPUFlashAttention_TP_GQA, Q16LayoutAdmissionPrecedesEveryWrite)
             query_rows, kv_len, n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {}, {}));
     }
 
+    // Residual A: a row width whose byte stride wraps size_t. B blocks of 136
+    // bytes is 2^64 + 16, so a mutable [1, 64 B] tensor holds only 16 live
+    // bytes; a wrapped stride would let that bank certify a B-block row.
+    {
+        constexpr std::size_t B = ((std::size_t(1) << 61) + 2) / 17;
+        static_assert(B * 136 == 16, "the stride must wrap to the allocation");
+        auto K = std::make_unique<Q16_1Tensor>(std::vector<std::size_t>{1, 64 * B}, Q16BlockSize::BLOCK_64);
+        auto V = std::make_unique<Q16_1Tensor>(std::vector<std::size_t>{1, 64 * B}, Q16BlockSize::BLOCK_64);
+        ASSERT_EQ(K->size_bytes(), 16u);
+        auto Q = fp32(1, head_dim, 0.25f);
+        auto O = fp32(1, head_dim, 123.0f);
+        EXPECT_FALSE(kernel_.compute_tensor(Q.get(), K.get(), V.get(), O.get(), 1, 1, 1, 1, 1, head_dim, true, -1,
+            nullptr, nullptr, &mpi_ctx_, -1, 0, 1, 1, 0, {}, {}));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+    }
+
     // R2-3 ordering: heads x rows beyond int is rejected before it is formed
     // (the head-major query predicate used to compute it first).
     {
