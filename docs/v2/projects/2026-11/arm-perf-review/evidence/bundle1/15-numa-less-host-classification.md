@@ -256,7 +256,8 @@ ccache. Unit 957/984 and preflight 2296/2374 passed: 105 failing tests, 28 with 
 
 Cross-host reading (tags, not causes):
 
-- N1/N2/N3 occur only on the NUMA-less Mac.
+- N1 and N3 text occurs only on the NUMA-less Mac. N2 text occurs on the Mac (25 rows) and once on
+  DGX: ClusterInventoryBootstrap, in both the canonical run and the rerun.
 - G1/G2/G6 text occurs only on 64K-page Grace.
 - E2/E3/F1 occur on both ARM hosts. Whether x86 shares them cannot be seen in the WSL logs.
 
@@ -292,16 +293,7 @@ Classifiers, all in the tracker at `docs/v2/projects/2026-11/arm-perf-review/evi
 | 3 | `classify_v3.py`, `classification-v3.csv` | Superseded: mislabelled scope, causal `verdict` column |
 | — | `extract.py` | Shared block splitter |
 
-**To add (revision 4, authoritative):** `15/classify_v4.py` (`a8c175ef…`) and `15/classification-v4.csv`
-(`c0dee033…`). The CSV columns are `x86_same_name`, `evidence_scope`, `tags`, `whole_output_tags`,
-`heuristic_category`, `cause_status` (always `not-established`) and `related_source_gap`.
-
-## #148 ACK (2026-11-10) — classification-report review CLOSED
-- R1/R2 closed (segments vs whole-output; heuristic_category/cause_status=
-  not-established; no causal language). CSV bookkeeping verified (287 unique;
-  canonical 130 / rerun 52=16+36 / Mac 105 reconcile). Prior G1-G7/I8MM/
-  historical-X1 qualifications intact. NO grants (no attribution/qualification/
-  execution/merge authority).
-- Nonblocking editorial: (1) line ~259 'N1/N2/N3 only on Mac' -> N2 ALSO on
-  DGX (ClusterInventoryBootstrap); (2) lines ~295-296 v4 'To add' -> already
-  in tree. Rev4.1 expected. #145 HOLD + half-cell checkpoint independent.
+**Revision 4 (authoritative), in the same tracker directory:** `classify_v4.py` (`a8c175ef…`) and
+`classification-v4.csv` (`c0dee033…`). The CSV columns are `x86_same_name`, `evidence_scope`, `tags`,
+`whole_output_tags`, `heuristic_category`, `cause_status` (always `not-established`) and
+`related_source_gap`.
