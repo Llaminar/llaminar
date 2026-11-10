@@ -240,9 +240,12 @@ namespace llaminar2
             // do not duplicate its interpretation of an unset activation row cap.
             auto memory = MemoryPlanner::planLargestFittingResidentGraphRows(profile, devices,
                 normalizePrefillGraphBuckets(policy.prefill_bucket_rows));
-            // Rows are frozen before the lowest-priority table is considered.
-            // A final table failure escapes directly; it cannot rerun this search.
-            auto final_plan=memory.memory_plan.physicalPlan();
+            // The row selector may return its smallest failed diagnostic plan.
+            // Authenticate mandatory capacity through the canonical authority
+            // before optional-table selection, whose input must already fit.
+            // This rejects the candidate; it never reopens frozen rows/quotas.
+            const PhysicalMemoryPlanAdmissionCertificate mandatory(memory.memory_plan.physicalPlan());
+            auto final_plan=mandatory.plan();
             std::vector<std::shared_ptr<const ResolvedImmutableRowTablePlacement>> placements;
             for(const auto &request:candidateTableRequests(profile,ranks,memory.device_inputs))
             {
