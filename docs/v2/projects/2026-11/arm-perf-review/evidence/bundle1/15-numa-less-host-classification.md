@@ -1,6 +1,6 @@
 # Idea 15: heuristic failure classification on NUMA-less and 64K-page ARM hosts
 
-Status: classification record, revision 3 (reviewer #144). Report only, no production change. Gap
+Status: classification record, revision 4 (reviewers #144/#146). Report only, no production change. Gap
 tickets go through arm-perf.
 
 What this record does and does not establish:
@@ -14,9 +14,10 @@ What this record does and does not establish:
   - What does correspond: every §4 anchor file is byte-identical between 39c24d8b4 and a27c7ed4f
     (`git diff --stat` empty). Those files are `NUMAAllocator.cpp`, `CPUBackend.cpp`,
     `DeviceRegistry.cpp`, `NUMATopology.cpp`, `ExpertPreparedMemoryGeometry.h`, `CPUStorageRoot.h`,
-    `AlignedVector.h`, `ImmutableRowTablePolicy.cpp` and `MoEOverlayNodeLocalDeviceControllerFabric.cpp`.
+    `AlignedVector.h`, `ImmutableRowTablePolicy.cpp` and `MoEOverlayNodeLocalDeviceControllerFabric.cpp`,
+    plus G5's consumers `RuntimeInitPhase.cpp` and `ClusterInventoryGatherer.cpp`.
 
-Every count below is produced by `classify_v3.py` from the raw logs in §6.
+Every count below is produced by `classify_v4.py` from the raw logs in §6.
 
 ## 1. Host records
 
@@ -80,51 +81,60 @@ Each failing test of each ARM run gets these fields:
 | Field | Meaning |
 |---|---|
 | `x86_same_name` | The same test name also failed on WSL x86 at 39c24d8b4. Observation only. |
-| `evidence_scope` | `failed-gtest-cases` when the output contains failed gtest cases. Tag text is then taken **only** from `[ RUN ] X` … `[  FAILED  ] X` segments of the failed cases, so passing or expected-negative siblings are excluded. `whole-output` for Python, MPI and non-gtest output, where no case binding is possible. |
+| `evidence_scope` | `failed-gtest-text-segments` when the output contains completed `[  FAILED  ] X (` markers: rule text is selected only from the lines between `[ RUN ] X` and that marker of each failed case, which excludes completed passing siblings. `whole-output-no-failure-marker` otherwise (Python, MPI, non-gtest output, and aborted or timed-out gtests): the whole output is used, and the evidence is **weaker**. |
 | `tags` | Rule matches within that scope. They overlap. |
 | `whole_output_tags` | The same rules over the unbound whole ctest output, kept as weaker context. |
-| `primary` | The first scoped tag in the priority order below, or **NO-TAG**. Exactly one per test, so each run's primary counts partition its tests. A primary is a **diagnostic tag, not a cause**. |
+| `heuristic_category` | The first scoped tag in the priority order below, or **NO-TAG**. Exactly one per test, so each run's category counts partition its tests. It is a **heuristic text category, not a cause**. |
+| `cause_status` | Always `not-established`. `related_source_gap` names the §4 analysis that a G-tag refers to; it does not attribute that row's failure to the gap. |
 
-Binding limit: logger lines go to stderr and are not positioned inside a gtest case in ctest's merged
-output (verified: `Test__NUMAAllocator`'s "Could not revoke" lines precede the first `[ RUN ]`). For
-gtest rows, case-bound evidence therefore sees only assertion and exception text. Rows whose only
-evidence is a logger line become NO-TAG, with that evidence kept in `whole_output_tags`.
+Segment selection is a **text-selection rule**, not proof of which case produced a line. Logger output
+(stderr) and gtest output (stdout) are not reliably ordered in ctest's merged log:
 
-Tags in priority order:
+- On DGX, `Test__NUMAAllocator`'s "Could not revoke" text falls inside its failed case's segment.
+- On the Mac, the same kind of logger text precedes the first `[ RUN ]`.
 
-| Tag | Matched text | Reading |
-|---|---|---|
-| X1 | Test executable missing (`could not access … executable`, `cannot prepare exact child spawn`) | build break at a27c7ed4f |
-| S1 | `mbind`/`set_mempolicy`/`get_mempolicy` errno=1/EPERM, Open MPI "failed to bind memory" | container launch (seccomp) |
-| G1, G2, G3, G6 | See §4 | source-evidenced gap where §4 says so |
-| N2 | "Multi-rank hardware discovery / Rank-local CPU backend … requires exact NUMA affinity", "CPU shorthand requires observed NUMA affinity" | NUMA-affinity requirement (G5/G7 detection path) |
-| N1 | "libnuma reports NUMA unavailable", "NUMA policy APIs are unavailable", `get_mempolicy: Function not implemented`, node −1 | NUMA policy unavailable (WP J) |
-| N3 | "Streaming CPU measurement requires observed aggregate cache coverage" | unpublished cache sizes (WP J) |
-| M1 | "Topology exposes no CPU on requested NUMA node" | test targets a CPU-less node |
-| T1 | "immutable row mmap window must be page-aligned and nonzero" | test passes a 4096-byte window; production default 64 KiB |
-| T2 | 4K-host literals/caps (4491052224, 8392704, `recordedFragmentBytes`, 49×4096, `< 31`, staging cap) | test assumption |
-| E1 | oneDNN origin-probe text | container git |
-| E2 | `No such file or directory: 'docker'` | container |
-| E3 | "Configuring incomplete" | nested configure failure; the configure error itself not extracted |
-| F1 | `rocm/fixtures` missing | fixture absent from tree |
-| V1 / V2 | Mac timeouts | see §5 |
+A segment therefore holds whatever lines happen to lie between the markers. Rows whose matching text
+lies outside every failed segment become NO-TAG, and that text stays in `whole_output_tags`. No row
+was re-categorized by hand.
+
+Tags in priority order. The labels describe matched text only; §4 holds the separate source analysis.
+
+| Tag | Matched text |
+|---|---|
+| X1 | Test executable missing (`could not access … executable`, `cannot prepare exact child spawn`) |
+| S1 | EPERM from `mbind`/`set_mempolicy`/`get_mempolicy`, or Open MPI "failed to bind memory" |
+| G1 | "Could not revoke … Invalid argument" |
+| G2 | `[CPUBackend] mbind(…) errno=22` |
+| G3 | "CPU memory capacity should be positive" |
+| G6 | "live claim exceeds admitted routed_expert_weights" |
+| N2 | "… requires exact CPU NUMA affinity" / "CPU shorthand requires observed NUMA affinity" |
+| N1 | "libnuma reports NUMA unavailable", "NUMA policy APIs are unavailable", `get_mempolicy: Function not implemented`, node −1 |
+| N3 | "Streaming CPU measurement requires observed aggregate cache coverage" |
+| M1 | "Topology exposes no CPU on requested NUMA node" |
+| T1 | "immutable row mmap window must be page-aligned and nonzero" |
+| T2 | 4K-host literal in the failing assertion (4491052224, 8392704, `recordedFragmentBytes`, 49×4096, `< 31`, staging cap) |
+| E1 | oneDNN origin-probe text |
+| E2 | `No such file or directory: 'docker'` |
+| E3 | "Configuring incomplete" |
+| F1 | `rocm/fixtures` path missing |
+| V1 / V2 | Mac only: timed out in the gate; passed once standalone (V1), or 34 s standalone against a 30 s budget (V2) |
 
 ## 3. Results
 
 **DGX canonical run** (39c24d8b4, NEON, default seccomp): 130 failing tests, 27 with `x86_same_name`.
 
-| Primary diagnostic tag | Tests | x86_same_name | failed-case-bound |
-|---|---|---|---|
-| T1 | 46 | 0 | 46 |
-| S1 | 33 | 2 | 23 |
-| NO-TAG | 18 | 10 | 14 |
-| T2 | 15 | 0 | 15 |
-| E3 | 9 | 9 | 0 |
-| F1 | 4 | 4 | 0 |
-| E2 | 2 | 2 | 0 |
-| E1 | 2 | 0 | 0 |
-| G3 | 1 | 0 | 1 |
-| **Total** | **130** | **27** | |
+| Heuristic category | Tests | x86_same_name | in failed-gtest text segments | whole output, no FAILED marker |
+|---|---|---|---|---|
+| T1 | 46 | 0 | 46 | 0 |
+| S1 | 33 | 2 | 23 | 10 |
+| NO-TAG | 18 | 10 | 14 | 4 |
+| T2 | 15 | 0 | 15 | 0 |
+| E3 | 9 | 9 | 0 | 9 |
+| F1 | 4 | 4 | 0 | 4 |
+| E1 | 2 | 0 | 0 | 2 |
+| E2 | 2 | 2 | 0 | 2 |
+| G3 | 1 | 0 | 1 | 0 |
+| **Total** | **130** | **27** | **99** | **31** |
 
 - Of the 18 NO-TAG rows, 8 carry an S1 whole-output tag and 2 a T2 whole-output tag.
 - **8 carry no tag at all:** MoEForbiddenDependencyScan, ProductionParityCampaigns,
@@ -150,20 +160,26 @@ with** the seccomp mask, but it is one run per launch, so flakiness and the othe
 
 **Failed, 36 tests:**
 
-| Primary diagnostic tag | Tests | x86_same_name | failed-case-bound |
-|---|---|---|---|
-| NO-TAG | 10 | 4 | 9 |
-| T1 | 8 | 0 | 8 |
-| G2 | 8 | 0 | 7 |
-| T2 | 5 | 0 | 5 |
-| G6 | 2 | 0 | 1 |
-| G1 | 1 | 0 | 1 |
-| G3 | 1 | 0 | 1 |
-| N2 | 1 | 0 | 0 |
-| **Total** | **36** | **4** | |
+| Heuristic category | Tests | x86_same_name | in failed-gtest text segments | whole output, no FAILED marker |
+|---|---|---|---|---|
+| NO-TAG | 10 | 4 | 9 | 1 |
+| G2 | 8 | 0 | 7 | 1 |
+| T1 | 8 | 0 | 8 | 0 |
+| T2 | 5 | 0 | 5 | 0 |
+| G6 | 2 | 0 | 1 | 1 |
+| G1 | 1 | 0 | 1 | 0 |
+| G3 | 1 | 0 | 1 | 0 |
+| N2 | 1 | 0 | 0 | 1 |
+| **Total** | **36** | **4** | **32** | **4** |
 
-Tag occurrences, case-bound vs whole-output: G1 1/1, G2 8/9, G3 1/1, G6 2/4, N2 1/1, M1 1/2, T1 8/9,
-T2 7/9. Three NO-TAG rows carry no tag even in whole output: CPUStartupAffinity,
+Tag counts as scoped (= in failed-gtest segments + without a FAILED marker) vs whole output:
+
+| Tag | G1 | G2 | G3 | G6 | N2 | M1 | T1 | T2 |
+|---|---|---|---|---|---|---|---|---|
+| Scoped | 1 (1+0) | 8 (7+1) | 1 (1+0) | 2 (1+1) | 1 (0+1) | 1 (1+0) | 8 (8+0) | 7 (7+0) |
+| Whole output | 1 | 9 | 1 | 4 | 1 | 2 | 9 | 9 |
+
+Three NO-TAG rows carry no tag even in whole output: CPUStartupAffinity,
 CPURootedGatherParallelCopyReplay and CPUShardRouteCollective.
 
 **DGX NEON_I8MM run** (same SHA, `LLAMINAR_CPU_ISA=NEON_I8MM`): Unit 29/985 and preflight 102/2373
@@ -185,12 +201,12 @@ Source anchors are unchanged between 39c24d8b4 and a27c7ed4f (see header).
 | ID | Severity | Source-evidenced defect | Observed in runs | Not established |
 |---|---|---|---|---|
 | G1 | HIGH | `NUMAAllocator.cpp:43` `constexpr PAGE_SIZE = 4096` drives `aligned_alloc` alignment, `madvise(MADV_DONTNEED)`, the first-touch stride and `move_pages`. On a 64K kernel a pointer that is only 4K-aligned makes `madvise` fail with EINVAL, and the allocation returns null. **Static hazard:** if a pointer happens to be 64K-aligned with a range under 64K, the kernel applies DONTNEED to the whole 64K page, which **can** zero a neighbouring allocation's data. | EINVAL → null: `V2_Unit_NUMAAllocator` (rerun; logger line "Could not revoke 4096 bytes … Invalid argument", whole-output) | No run observed corruption |
-| G2 | HIGH (scope) | `CPUBackend::allocate` aligns to 4096, then calls `mbind(MPOL_BIND)` on that range. EINVAL unless the pointer is 64K-aligned. **Static hazard:** when it is 64K-aligned, the policy covers the whole runtime page and **can** bind memory belonging to a neighbouring allocation. | `mbind … errno=22` and workspace allocation failure in 8 case-bound / 9 whole-output rerun tests | Neighbour mis-binding not observed |
+| G2 | HIGH (scope) | `CPUBackend::allocate` aligns to 4096, then calls `mbind(MPOL_BIND)` on that range. EINVAL unless the pointer is 64K-aligned. **Static hazard:** when it is 64K-aligned, the policy covers the whole runtime page and **can** bind memory belonging to a neighbouring allocation. | `mbind … errno=22` and workspace allocation failure in 8 scoped rerun tests (7 in failed-gtest segments + 1 without a FAILED marker: PlanCommandPublication_MPI); 9 by whole output | Neighbour mis-binding not observed |
 | G3 | MED | **API defect:** `DeviceRegistry::discoverCPU` registers every `/sys/devices/system/node/nodeN` as a CPU device, including CPU-less and zero-memory nodes (DGX nodes 1–8; probes), in `readdir` order. | `V2_Unit_DeviceRegistry`: first CPU device has capacity 0 | Which planner or runtime paths consume these entries |
 | G4 | LOW | `MoEOverlayNodeLocalDeviceControllerFabric::planLayout` is called with a literal `4096u` "first-touch granularity" (`…Fabric.cpp:897`). Owner byte ranges stay non-overlapping, but on 64K pages adjacent owners can share one runtime page. Per-owner first-touch page ownership is therefore not guaranteed. | Source only | Any measured effect; moot on Grace's single CPU node |
 | G5 | MED (maxim 29) | `NUMATopology::detectLocalNUMANode` falls back to `local_numa_node = 0` with `detection_succeeded = false` and a WARN "assuming node 0". The defect is **misleading synthetic metadata and log text**. The checked consumers reject failed detection: `RuntimeInitPhase.cpp:59,143` and `ClusterInventoryGatherer.cpp:262`. | WARN on DGX and Mac | That any consumer accepts node 0 |
-| G6 | MED | `ExpertPreparedMemoryGeometry::cpuProjectionBytes` prices CPU expert storage as Heap with a 4096 minimum; Heap is promoted to the runtime page only for payloads of at least one page. A NUMA-node `CPUStorageRoot` materializes as an AnonymousPageMapping rounded to the runtime page. The admission **can** therefore be smaller than the mapping for sub-page payloads whose 4096-rounded size is below the page, i.e. ≤ 61440 B on 64K. A payload of 61441–65535 B rounds to 65536 either way. PMA's rejection is a separate, correct check. | "live claim exceeds admitted routed_expert_weights … admitted=4096 requested=65536" in 2 case-bound / 4 whole-output rerun tests | Size distribution of real model projections |
-| G7 | MED | `NUMATopology::detectViaProcfs` decides a CPU's node by **substring** search in the node's `cpulist` and scans only nodes 0–7. It misses CPU 9 in `"0-71"` and **falsely accepts** CPU 1 for `"10-19"` and CPU 2 for `"0-1,12"`. This is a host-independent parse defect. | ClusterInventoryBootstrap N2 on the rerun (hwloc also returned −1) | Which hosts reach the procfs path in production |
+| G6 | MED | `ExpertPreparedMemoryGeometry::cpuProjectionBytes` prices CPU expert storage as Heap with a 4096 minimum; Heap is promoted to the runtime page only for payloads of at least one page. A NUMA-node `CPUStorageRoot` materializes as an AnonymousPageMapping rounded to the runtime page. The admission **can** therefore be smaller than the mapping for sub-page payloads whose 4096-rounded size is below the page, i.e. ≤ 61440 B on 64K. A payload of 61441–65535 B rounds to 65536 either way. PMA's rejection is a separate, correct check. | "live claim exceeds admitted routed_expert_weights … admitted=4096 requested=65536" in 2 scoped rerun tests (1 in a failed-gtest segment + 1 without a FAILED marker: CPUJointBoundedNativeFormatWindows); 4 by whole output | Size distribution of real model projections |
+| G7 | MED | `NUMATopology::detectViaProcfs` decides a CPU's node by **substring** search in the node's `cpulist` and scans only nodes 0–7. It misses CPU 9 in `"0-71"` and **falsely accepts** CPU 1 for `"10-19"` and CPU 2 for `"0-1,12"`. This is a host-independent parse defect. | ClusterInventoryBootstrap N2 text on the rerun: scoped without a FAILED marker, i.e. whole-output strength (hwloc also returned −1) | Which hosts reach the procfs path in production |
 
 **Benign (not gaps):**
 
@@ -200,32 +216,29 @@ Source anchors are unchanged between 39c24d8b4 and a27c7ed4f (see header).
 - The `ExpertPreparedMemoryGeometry` 4096 minimum alignment is benign for payloads of at least one
   page. G6 covers the sub-page case.
 
-**Withdrawn:** G8 (activation arena). The ERROR line comes from the passing deliberate rejection test
-`CPUGraphArenaDeclarations.SmallActualSchemaMaterializesExactlyAndRejectsShortOwnerBudget`.
-
 **Withdrawn:** G8 (activation arena). Its ERROR line came from the passing deliberate rejection test
 `CPUGraphArenaDeclarations.SmallActualSchemaMaterializesExactlyAndRejectsShortOwnerBudget`. That
-withdrawal is one instance of the whole-output problem, which §2's case binding now addresses
-generally.
+withdrawal is one instance of the whole-output problem that §2's segment selection narrows. It does
+not remove that problem.
 
 ## 5. Mac record (a27c7ed4f; NUMA-less kernel, 4K pages, no published cache sizes)
 
 Launch: SYS_NICE, seccomp unconfined, 16 GiB shm. NEON_DOTPROD envelope, Integration build, private
 ccache. Unit 957/984 and preflight 2296/2374 passed: 105 failing tests, 28 with `x86_same_name`.
 
-| Primary diagnostic tag | Tests | x86_same_name | failed-case-bound |
-|---|---|---|---|
-| N1 | 32 | 1 | 31 |
-| N2 | 25 | 2 | 13 |
-| NO-TAG | 19 | 10 | 14 |
-| E3 | 9 | 9 | 0 |
-| X1 | 8 | 0 | 0 |
-| F1 | 4 | 4 | 0 |
-| V1 | 3 | 0 | 0 |
-| E2 | 2 | 2 | 0 |
-| V2 | 2 | 0 | 0 |
-| N3 | 1 | 0 | 0 |
-| **Total** | **105** | **28** | |
+| Heuristic category | Tests | x86_same_name | in failed-gtest text segments | whole output, no FAILED marker |
+|---|---|---|---|---|
+| N1 | 32 | 1 | 31 | 1 |
+| N2 | 25 | 2 | 13 | 12 |
+| NO-TAG | 19 | 10 | 14 | 5 |
+| E3 | 9 | 9 | 0 | 9 |
+| X1 | 8 | 0 | 0 | 8 |
+| F1 | 4 | 4 | 0 | 4 |
+| V1 | 3 | 0 | 0 | 3 |
+| E2 | 2 | 2 | 0 | 2 |
+| V2 | 2 | 0 | 0 | 2 |
+| N3 | 1 | 0 | 0 | 1 |
+| **Total** | **105** | **28** | **58** | **47** |
 
 - **NO-TAG (19).** 9 carry an N1 whole-output tag (logger-line evidence only). 10 carry no tag at all:
   MoEForbiddenDependencyScan, ProductionParityCampaigns, CPUNativeQuantisedGroupedSealedPlan,
@@ -270,33 +283,15 @@ Raw logs, relative to `/tmp/armqual-b1`:
 
 Mac probes: `mac/env-probe-a27c7ed4f.log`, `mac/env-probe-seccomp-split.log`, `mac/env_probe.c`.
 
-Classifiers. Revision 1 is in the tracker at `docs/v2/projects/2026-11/arm-perf-review/evidence/bundle1/`: `classify.py`, `classification-39c24d8b4.csv`,
-`classify_mac.py` and `classification-mac-a27c7ed4f.csv`. They are **superseded**: they used
-base-by-name attribution and whole-output tags.
+Classifiers, all in the tracker at `docs/v2/projects/2026-11/arm-perf-review/evidence/bundle1/`:
 
-**To archive (revision 3, authoritative):**
-
-| File | SHA-256 | Notes |
+| Revision | Files | Status |
 |---|---|---|
-| `15/classify_v3.py` | `6aeda387…` | |
-| `15/classification-v3.csv` | `4c6f2e3a…` | One row per (run, test): `x86_same_name`, `evidence_scope`, `tags`, `whole_output_tags`, `primary` |
-| `15/extract.py` | — | Shared block splitter |
+| 1 | `classify.py`, `classification-39c24d8b4.csv`, `classify_mac.py`, `classification-mac-a27c7ed4f.csv` | Superseded: base-by-name attribution |
+| 2 | `classify_v2.py`, `classification-v2.csv` | Superseded: whole-output tags as primary |
+| 3 | `classify_v3.py`, `classification-v3.csv` | Superseded: mislabelled scope, causal `verdict` column |
+| — | `extract.py` | Shared block splitter |
 
-Revision 2 (`classify_v2.py`, `classification-v2.csv`) is not archived; it is superseded by v3.
-
-## #146 recheck (2026-11-10) — rev4 items
-- R1: 'scoped' mislabeled 'case-bound' (classify_v3.py:66-67 whole-output when
-  no FAILED marker) + CSV split evidence (G2 8 scoped/7 bound/9 whole; G6 2/1/4;
-  N2 1/0/1) + doc:165 + G2/G6 observed columns vs correct table -> use
-  SCOPED/WHOLE labels or exact splits; narrow stderr claim to 'failed-gtest
-  TEXT segments' (all segment lines appended; marker position = selection
-  rule, not logger-proof; incomplete/no-marker output weaker incl. aborted/
-  timed-out); no row reclassification without observations.
-- R2: machine artifact 'verdict' column still carries ENVIRONMENT(launch/VM)/
-  VM budget/PRODUCT GAP despite prose withholding -> rename heuristic
-  category + cause=not-established unless supported + docstring:13-15.
-- Cleanup: duplicate G8 withdrawal; stale archive notes; anchor list +=
-  RuntimeInitPhase.cpp + ClusterInventoryGatherer.cpp.
-- #146 = substantive ACK otherwise (287 unique rows; counts reconcile; 9
-  anchors byte-identical + 2 consumers unchanged; G1-G7 wording + I8MM
-  name-set/open-cause addressed; X1/rerun separate). #145 HOLD independent.
+**To add (revision 4, authoritative):** `15/classify_v4.py` (`a8c175ef…`) and `15/classification-v4.csv`
+(`c0dee033…`). The CSV columns are `x86_same_name`, `evidence_scope`, `tags`, `whole_output_tags`,
+`heuristic_category`, `cause_status` (always `not-established`) and `related_source_gap`.
