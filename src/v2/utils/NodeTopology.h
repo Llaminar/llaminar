@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <utility>
 #include <vector>
 #include <unordered_map>
 #include <string>
@@ -105,10 +106,15 @@ namespace llaminar2
         int numCPUs() const { return total_cpus_; }
 
         /** @return All detected NUMA nodes */
-        const std::vector<NUMANode> &numaNodes() const { return numa_nodes_; }
+        // Lvalue topologies lend their node list; a temporary returns a copy.
+        // `for (auto &n : NodeTopology::detect().numaNodes())` would otherwise
+        // iterate a vector destroyed before the loop body (C++20 range-for).
+        const std::vector<NUMANode> &numaNodes() const & { return numa_nodes_; }
+        std::vector<NUMANode> numaNodes() && { return std::move(numa_nodes_); }
 
         /** @return All detected inter-socket links */
-        const std::vector<InterSocketLink> &interSocketLinks() const { return inter_socket_links_; }
+        const std::vector<InterSocketLink> &interSocketLinks() const & { return inter_socket_links_; }
+        std::vector<InterSocketLink> interSocketLinks() && { return std::move(inter_socket_links_); }
 
         // =========================================================================
         // Queries
