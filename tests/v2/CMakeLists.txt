@@ -27881,6 +27881,13 @@ add_v2_test(V2_Integration_PlanningFlashNextWeightWorkContract
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningFlashNextWeightWorkContract)
+add_v2_test(V2_Integration_NgramMandatoryBaseCapacity
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=OrchestrationCandidateNgramAdmission.MandatoryBaseCapacityRejectsBeforeOptionalTableSelection
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Ngram;MemoryBudget;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NgramMandatoryBaseCapacity)
 
 # Immediate native packers use the same capped append workspace as streamed loading.
 add_v2_test(V2_Integration_ImmediateNativeWeightPackingEconomy
