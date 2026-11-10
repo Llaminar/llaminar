@@ -10,6 +10,7 @@
 #include "utils/NUMATopology.h"
 
 #include <gtest/gtest.h>
+#include <type_traits>
 
 using llaminar2::NUMATopology;
 
@@ -100,7 +101,8 @@ TEST(NUMATopologyCPUList, RegistryCPUEndpointsFollowNodeTopology)
     for (const auto &device : registry.devicesByType(llaminar2::DeviceType::CPU))
         registered.push_back(device.numa_node);
     std::vector<int> expected;
-    for (const auto &node : llaminar2::NodeTopology::detect().numaNodes())
+    const auto topology = llaminar2::NodeTopology::detect();
+    for (const auto &node : topology.numaNodes())
         expected.push_back(node.node_id);
     EXPECT_EQ(registered, expected);
 }
@@ -117,4 +119,22 @@ TEST(NUMATopologyCPUList, UndetectedAffinityIsNeverNodeZero)
         EXPECT_EQ(info.local_numa_node, -1);
         EXPECT_EQ(info.detection_method, "unknown");
     }
+}
+
+/** @test A temporary topology yields an owned node list, never a dangling one. */
+TEST(NUMATopologyCPUList, TemporaryTopologyNodeListIsOwned)
+{
+    static_assert(std::is_same_v<decltype(llaminar2::NodeTopology::detect().numaNodes()),
+                                 std::vector<llaminar2::NUMANode>>,
+                  "numaNodes() on a temporary must return by value");
+    const auto topology = llaminar2::NodeTopology::createForTest(2, 2, 4);
+    static_assert(std::is_same_v<decltype(topology.numaNodes()),
+                                 const std::vector<llaminar2::NUMANode> &>);
+    std::vector<int> ids;
+    for (const auto &node : llaminar2::NodeTopology::createForTest(2, 2, 4).numaNodes())
+        ids.push_back(node.node_id);
+    std::vector<int> expected;
+    for (const auto &node : topology.numaNodes())
+        expected.push_back(node.node_id);
+    EXPECT_EQ(ids, expected);
 }
