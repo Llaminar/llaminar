@@ -127,6 +127,29 @@ namespace llaminar2
         static int getNumNUMANodes();
 
         /**
+         * @brief Parse a Linux CPU list ("0-7,16-23,32") exactly.
+         * @param list Kernel cpulist text; surrounding whitespace is ignored.
+         * @return Ascending CPU ids.
+         * @throws std::invalid_argument For any malformed token or reversed range.
+         */
+        static std::vector<int> parseCPUListExact(const std::string &list);
+
+        /**
+         * @brief Resolve the NUMA node whose cpulist contains @p cpu.
+         * @param cpu CPU id to locate.
+         * @param node_cpulists Every node's (id, cpulist) pair; nodes need not
+         *        be dense or bounded (64-node and sparse topologies are valid).
+         * @return The owning node, or -1 when no node lists the CPU.
+         * @throws std::invalid_argument When a cpulist is malformed or two
+         *         nodes claim the same CPU.
+         *
+         * Membership uses parsed ranges, never substring matches: "10-19"
+         * does not contain CPU 1, and "8-9" does contain CPU 9.
+         */
+        static int nodeOwningCPU(int cpu,
+            const std::vector<std::pair<int, std::string>> &node_cpulists);
+
+        /**
          * @brief Detect NUMA node for CUDA GPU
          *
          * Uses CUDA PCI IDs plus Linux sysfs to query GPU NUMA affinity.

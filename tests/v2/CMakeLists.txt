@@ -8775,6 +8775,18 @@ add_v2_test(V2_Integration_HostPageSizeOwners
     COMMAND $<TARGET_FILE:v2_test_host_page_size>
     LABELS "V2;Integration;ProductionTestPreflight;Memory;NUMA;DeviceFree;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+# Procfs NUMA detection parses node cpulists exactly over every node; the old
+# substring match misplaced CPUs ("10-19" vs CPU 1) and stopped at node 7.
+add_executable(v2_test_numa_cpulist unit/utils/Test__NUMATopologyCPUList.cpp)
+target_link_libraries(v2_test_numa_cpulist llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_NUMATopologyCPUList
+    COMMAND $<TARGET_FILE:v2_test_numa_cpulist>
+    LABELS "V2;Unit;NUMA;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_NUMATopologyCPUListMembership
+    COMMAND $<TARGET_FILE:v2_test_numa_cpulist>
+    LABELS "V2;Integration;ProductionTestPreflight;NUMA;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_test(NAME V2_Integration_HostPageLiteralPolicy
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_host_page_literals.py
             --repo-root ${CMAKE_SOURCE_DIR}/../..)
@@ -41039,7 +41051,8 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertGemmRegistry
 # The original stage-family owner also validates exact fixed-ticket condition purposes.
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEPipelineStageGraphFamily)
 
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HostPageSizeOwners V2_Integration_HostPageLiteralPolicy)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HostPageSizeOwners V2_Integration_HostPageLiteralPolicy
+    V2_Integration_NUMATopologyCPUListMembership)
 
 # nvcc --split-compile partitions a module nondeterministically, so register
 # allocation and the fatal spill verdict changed between identical compiles.
