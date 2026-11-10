@@ -426,3 +426,14 @@ After i8mm merge (same tile / post-merge):
   4-cell rerun at e5ee7f672 = the tip-settling event; Main declares
   settlement → addon re-rebases → censuses + focused set run ONCE at the
   final install/handover tip → FF.
+
+### Settlement protocol (Main, 2026-11-10)
+
+Tip NOT settled for handovers. Hold stack re-rebases/censuses until Main's
+explicit SETTLED declaration, after the .79 rerun + its GPU iteration/fix-
+backs. Rerun expectations at e5ee7f672: the 20 stream-fixed cases GREEN +
+the 2 known arena/transfer cases STILL FAILING (that is the slot's purpose;
+hand the GPU over on that outcome, not a wholly green padding cell). Further
+pushes expected (2 arena/transfer fixes, possibly tile/occupancy). Main will
+publish ONE settled exact SHA + overlap list for the final
+rebase/re-pin/bound gates. e5ee7f672 = current CUDA build/rerun target.
