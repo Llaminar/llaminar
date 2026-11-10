@@ -43,3 +43,64 @@ TEST(NUMATopologyCPUList, ConsultsEveryNodeAndRejectsDuplicates)
     EXPECT_THROW((void)NUMATopology::nodeOwningCPU(3, {{0, "0-7"}, {1, "3"}}), std::invalid_argument);
     EXPECT_THROW((void)NUMATopology::nodeOwningCPU(3, {{0, "0-x"}}), std::invalid_argument);
 }
+
+#include "utils/NodeTopology.h"
+#include "backends/DeviceRegistry.h"
+
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
+
+namespace
+{
+    /** @brief Write one sysfs-shaped node directory under a temporary root. */
+    void writeNode(const std::filesystem::path &root, const std::string &name,
+                   const char *cpulist, const char *meminfo_kb)
+    {
+        std::filesystem::create_directories(root / name);
+        if (cpulist)
+            std::ofstream(root / name / "cpulist") << cpulist << "\n";
+        if (meminfo_kb)
+            std::ofstream(root / name / "meminfo")
+                << "Node " << name.substr(4) << " MemTotal:       " << meminfo_kb << " kB\n";
+    }
+}
+
+/** @test Grace-shaped sysfs: CPU-less memory nodes are not CPU endpoints. */
+TEST(NUMATopologyCPUList, CPULessMemoryNodesAreNotCPUEndpoints)
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        ("llaminar_grace_nodes_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    // Directory creation order deliberately differs from node order.
+    writeNode(root, "node12", "", "4194304");     // GPU/CXL memory, no CPUs
+    writeNode(root, "node1", "72-143", "16777216");
+    writeNode(root, "node4", nullptr, "8388608"); // memory-only, no cpulist
+    writeNode(root, "node0", "0-71", "16777216");
+    std::filesystem::create_directories(root / "nodeX");
+    std::filesystem::create_directories(root / "possible");
+
+    const auto nodes = llaminar2::NodeTopology::detectNUMANodesAt(root.string());
+    std::filesystem::remove_all(root);
+    ASSERT_EQ(nodes.size(), 2u);
+    EXPECT_EQ(nodes[0].node_id, 0);
+    EXPECT_EQ(nodes[1].node_id, 1);
+    EXPECT_EQ(nodes[0].cpu_ids.size(), 72u);
+    EXPECT_EQ(nodes[0].memory_bytes, 16777216ull * 1024ull);
+}
+
+/** @test The device registry's CPU endpoints are exactly NodeTopology's nodes. */
+TEST(NUMATopologyCPUList, RegistryCPUEndpointsFollowNodeTopology)
+{
+    if (!std::filesystem::exists("/sys/devices/system/node"))
+        GTEST_SKIP() << "Host exposes no NUMA sysfs";
+    auto &registry = llaminar2::DeviceRegistry::instance();
+    registry.discover();
+    std::vector<int> registered;
+    for (const auto &device : registry.devicesByType(llaminar2::DeviceType::CPU))
+        registered.push_back(device.numa_node);
+    std::vector<int> expected;
+    for (const auto &node : llaminar2::NodeTopology::detect().numaNodes())
+        expected.push_back(node.node_id);
+    EXPECT_EQ(registered, expected);
+}
