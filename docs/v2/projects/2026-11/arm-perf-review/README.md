@@ -1136,3 +1136,33 @@ from the retained g-*.census.log files on .80 (arm-sparks to cat).
   closes: single mechanism (silent fixed-out-dir cache mismatch), fixed by
   the per-cell fresh dirs + stamps; reordering Debug first = cosmetic, no
   change recommended.
+
+### arm-addon3 Item 2 final note (verbatim, 2026-11-10)
+
+ITEM 2 (census Debug configure, CLOSED): root cause = the pre-fix FIXED
+out-dir reuse defect, mechanism CONFIRMED from retained .80 evidence
+(cache-mismatch, NOT ENOSPC). `census-gnu-obj` was first configured for
+trees/46c9ffc58; every later tree's `cmake -B` into that dir failed with
+"The source /work/trees/8fcc0fe0b/... does not match the source
+/work/trees/46c9ffc58/... used to generate cache" (verbatim in
+census-gnu-obj/b-Debug-NEON.cfg.log and all 8 siblings). The
+`Debug * CONFIGURE_FAILED` lines in g-*.census.log are exactly these 9
+failures propagated through a summary that read stale f3b28a120 JSONs;
+Debug-only visibility was a log-grep artifact, not a Debug-specific
+failure. Zero ENOSPC in any retained .err/.cfg.log (Debug-*.err are 0
+bytes — CMake errored to the .cfg.log before any census step); the
+disk-full era affected the int-* builds, not the census cells. No
+in-script retry existed; "retried" = a second invocation. FIX MAPPING
+(already deployed): per-cell fresh dirs + `rm -rf` pre-clean kills the
+cross-tree cache reuse; nonzero exit + per-tree out-dirs + tree stamps
+kill the silent stale-JSON path. NO ORDER CHANGE RECOMMENDED: the loop
+order (Integration→Release→Debug) is cosmetic — cells are independent and
+rc=1 if any fails; reordering would only have moved the victim cell.
+Portability CMakeLists has no Debug-specific configure work, so there is
+nothing Debug-fragile to fix. Benign; closed.
+
+FINAL SHA STATE (arm-addon3): codex/arm-b9-strengthening off e8866ec04,
+tip 825fe8deb (3ed993968 a / f3faa540c b / 825fe8deb c), not landed,
+byte-identical to the validated B9 composition (analysis 64/64, binding
+4/4). Both arm-addon3 items CLOSED; standing by for the fold-time
+re-rebase or new assignment.
