@@ -866,3 +866,32 @@ clean). Addresses both P2s:
   confirmed. Mac: self-test 0 failed; real STRIPS=0 run over all 7 formats
   passes byte checks + CSV strips=0; STRIPS=3 still rejected (updated
   message). No FF until re-review + GNU receipt + focused set at ee7bf0596.
+
+### Reviewer #169 SOURCE ACK — I31-C1/C2 closed at ee7bf0596 (fix-back +32/−6, two files)
+
+- C1 verified: tournament:178 admits canonical 0..4 (3 explicitly
+  rejected); runStrips():258 forwards 0 → run<Instruction,0> →
+  batch.execute → tile.executeAdmitted → unchanged run() selecting
+  panelStrips at Strips==0 — the REAL installed table, not forced4 or a
+  substituted path. Positive self-test (admitted0/asimd/Q4_0+IQ4_NL) fails
+  on exception; the full-project alias supplies the real-entry-0 run. The
+  I8MM M>=2 strips>1 predicate was already present — 0 admitted without
+  weakening it.
+- C2 verified: CMake:19181 pins
+  Q4_0,IQ4_NL,Q4_K,Q6_K,IQ3_S,IQ4_XS,Q8_0; defaults include both missing
+  nibble sources → the M1 DotProd path reaches both idea-31 S4 no-minimum
+  programs; IQ4_XS stays the distinct S2 source-scale program; ASIMD
+  installed choice remains S1 (CSV strips=0 = table selection, not a
+  measured width witness).
+- Unchanged: finite Strips1 reference, retained-team/observed-width,
+  per-invocation dirt, byte comparisons, guards, immutable inputs;
+  metamorphic production-path coverage. Prior five re-pins preserved; no
+  production/checker/budget/probe/envelope bytes change.
+- Nonblocking prose follow-up: tournament file-header default-format list
+  (line 41) still lists the old five — update at the next touch.
+- Reviewer note: its local branch/origin-tracking refs still named
+  a16591eed (it reviewed the ee7bf0596 OBJECT directly; no remote-state
+  check performed) — addon to confirm the origin ref state.
+- Scope: static source ACK; not compilation/execution/receipt
+  authentication/FF permission. #169 done → the FF gate = GNU driver
+  receipt + focused set at ee7bf0596 (in flight) → Main.
