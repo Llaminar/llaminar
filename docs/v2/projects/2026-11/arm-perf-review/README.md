@@ -366,3 +366,22 @@ After i8mm merge (same tile / post-merge):
   df15aca96 (GO) → B9 census at c4536cf3c (queued). Install receipt at
   870bb545e = content-bound to the GREEN 3027d7bb8 receipt; re-run only if
   the reviewer requires. Reviewer re-pins requested for both stacks.
+
+### arm-sparks status report (2026-11-10, ~11:21Z)
+
+- int-3027d7bb8 DELETED (in-container): 473 G freed; .80 = 84% used /
+  **564 G free**. Nothing else touched.
+- **Bundle-1 bound run (5d606a108) = CASUALTY, never started** — the disk
+  filled during the int-3027d7bb8 static-core build BEFORE the bound run
+  began (no results dir). Requeued FRESH at SHARED_CORE=ON per runbook.
+- Census queue: 3027d7bb8 GREEN, 8fcc0fe0b GREEN (9/9 exit=0, Rows1=0,
+  budgets 1029/1176/1274, 176 programs each; tree-stamp "unknown" — see
+  note), **c4536cf3c GREEN with PROPER STAMP** (`tree=c4536cf3c` in all 9
+  summary lines; B9 receipt complete).
+- Tooling note (to addon): the first two runs' summary tree field read empty
+  for tree dirnames that matched an existing worktree path but were not
+  git-dir-parseable; the c4536 run (after `worktree add` of that exact
+  dirname) stamps correctly; JSON `tree` field exists in all. Re-stamping
+  3027/8fcc optional (trees still present) — provenance was independently
+  verified via compile_commands.
+- MTP trace-inventory sweep queued (read-only).
