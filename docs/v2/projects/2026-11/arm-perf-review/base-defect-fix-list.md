@@ -22,3 +22,26 @@ Notes: G1/G2 masked by seccomp on some hosts (unmasking log = direct
 reproduction); B8/B9 are work items for the respective owners (overlay table
 owner / register-gate tooling). 64K-page hosts = Grace/Neoverse-V2 + any
 future 64K ARM; x86 unaffected (hwloc path) for B5, 4K-normal for B1/B2/B6.
+
+## Main triage (2026-11-10)
+
+- GB10 + .79 = 4KiB (getconf 4096; 6.17.0-nvidia) -> B1/B2/B6/B7 latent here,
+  REAL on 64KiB (Grace/Neoverse-V2) = ARM-port robustness; fixing on #43:
+  ONE host page-size authority (cached sysconf, fatal if invalid/not power of
+  two) replacing literals in NUMAAllocator (PAGE_SIZE, externalRangeAlignment),
+  CPUBackend allocate/first-touch, ExpertPreparedMemoryGeometry, MoE fabric
+  planLayout, route-exchange kPageBytes; regressions page-size-parameterized +
+  device-free + source scan banning new hard-coded host-page literals there.
+  LIMIT: B6 uses the PLANNING host page size; mixed-page-size clusters
+  unsupported; admission rejects mismatch (not under-admit) - noted in plan.
+- B5 (procfs substring parse + nodes 0-7 only): same series; exact range-list
+  parse + full node enumeration. B3 (CPU-less/zero-memory nodes): after B5;
+  skip as compute endpoints + Grace-shaped sysfs fixture. B4 (silent node-0
+  fallback): decision after B3/B5; NUMA-less-unsupported => fail-fast likely,
+  but Mac-VM behavior check first.
+- B8 (overlay table envelope binding): LOW while installed table empty; next
+  overlay-table change binds it (idea-20 residual).
+- B9 (register-evidence classifier ldr post-index): OWNER = addon lane (R2).
+- 64K unmasked window: DGX Grace (the only 64K host); booked via the DGX lane
+  when the fix lands (Unit + page-size-parameterized regressions + B1/B2/B6/B7
+  direct repro checks); .80 proves no 4KiB regression.
