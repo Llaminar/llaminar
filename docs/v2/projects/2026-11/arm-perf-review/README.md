@@ -1476,3 +1476,19 @@ source-bytes / policy-restore contract tests; existing preflight ISA
 aliases auto-select them. NO production validation/dispatch change.
 Native Unit + scalar/NEON aliases 20x + review running. Main thanks for
 the DirB scope pause; no gate waiver / no implicit GPU qualification.
+
+## MAIN SETTLED HANDOVER BASE: 1f01cb3e54ba31256239de4fba4bb8cf38604015 (2026-11-10, ~23:34Z)
+
+#43 = 185 above 2948; MERGEABLE/CLEAN; doc-only after the test-only e33
+(#73); production unchanged from 5b76a146c. #71/#74/#72/#73 DONE (bounded
+scopes); #73 native Unit + scalar/NEON preflights 20x each GREEN + reviewer
+#182 source ACK; correct NaN-policy fixture mismatch; no production
+validation change; no metamorphic→independent-oracle/fused-publisher claim.
+.79 handback acknowledged by arm-sparks; **Dir-B CPU/4096 scope still needs
+the coordinator's explicit intent/prereq approval** (paused — the exact
+spec from arm-sparks + Main's sign-off pending). Addon #175: owner
+acknowledges the full 18×14/current-binding HOLD; the restored Mac contexts
+are NOT admission. DIRECTIVES: the owner completes the comprehensive #175,
+then MECHANICALLY RE-BASES + re-pins the final candidate onto EXACT
+**1f01cb3e5** and obtains review — **NO FF yet** (Main decides after the
+reviewed re-pin).
