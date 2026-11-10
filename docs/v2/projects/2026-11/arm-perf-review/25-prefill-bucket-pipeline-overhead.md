@@ -171,3 +171,16 @@ exact 4096/8192 plans with the canonical driver begin/finish; e886
 controls untouched. arm-sparks' stance: zero GPU action until Main hands
 back; its .80 A2 rider set = booked next, outputs HELD pending the A1 #180
 fix-back re-review.
+
+### #71 Main execution LAUNCHED (2026-11-10, ~22:52Z) — path-verified, no outcomes claimed
+
+.79 tip-gb10 FF verified exact 35a827a2a (bounded source bundle; exclusive
+source clean). New host-owned canonical driver begin/finish wraps a fresh
+/home/factory/idea25/build-gb10i-e5ee2 configure + unrestricted build +
+exact 4096/8192 plan invocations. Artifacts:
+/home/factory/idea25/plan71-main-35a827a2a/; owned watcher monitors the SSH
+job (no attached tools/inference/OMP overrides); e886 baseline
+binary/core hashes + 4-split model stats captured before/after. The
+owner draft was REJECTED (invalid driver CLI + hardcoded OMP20); Main's
+scripts retained in artifacts. No outcomes claimed until terminal
+artifacts exist.
