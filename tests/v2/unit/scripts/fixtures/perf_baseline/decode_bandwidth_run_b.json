@@ -1,0 +1,124 @@
+{
+ "harness": "Perf__CPUNativeQuantised_DecodeBandwidth",
+ "metrics": {
+  "Q4_K.n128k256.req1.effective_gbps": {
+   "better": "higher",
+   "samples": [
+    11.4296913277805,
+    11.664,
+    11.664,
+    11.914198161389173,
+    11.664
+   ],
+   "unit": "GB/s",
+   "value": 11.664
+  },
+  "Q4_K.n128k512.req1.effective_gbps": {
+   "better": "higher",
+   "samples": [
+    13.672296296296297,
+    14.198153846153847,
+    14.198153846153847,
+    14.384039900249377,
+    14.198153846153847
+   ],
+   "unit": "GB/s",
+   "value": 14.198153846153847
+  },
+  "Q4_K.n256k512.req1.effective_gbps": {
+   "better": "higher",
+   "samples": [
+    15.076771329935887,
+    15.610553191489362,
+    15.610553191489362,
+    15.610553191489362,
+    15.722955597462713
+   ],
+   "unit": "GB/s",
+   "value": 15.610553191489362
+  },
+  "Q4_K.n64k256.req1.effective_gbps": {
+   "better": "higher",
+   "samples": [
+    6.913348946135831,
+    8.85821455363841,
+    8.85821455363841,
+    9.146398140975988,
+    9.139318885448917
+   ],
+   "unit": "GB/s",
+   "value": 8.85821455363841
+  }
+ },
+ "observations": {
+  "timings": [
+   {
+    "metric": "Q4_K.n64k256.req1.effective_gbps",
+    "upper_median_us": 1.333
+   },
+   {
+    "metric": "Q4_K.n128k256.req1.effective_gbps",
+    "upper_median_us": 2.0
+   },
+   {
+    "metric": "Q4_K.n128k512.req1.effective_gbps",
+    "upper_median_us": 3.25
+   },
+   {
+    "metric": "Q4_K.n256k512.req1.effective_gbps",
+    "upper_median_us": 5.875
+   }
+  ]
+ },
+ "parameters": {
+  "build_isa": "NEON_DOTPROD",
+  "cpu0_published_caches": [],
+  "formats": [
+   "Q4_K"
+  ],
+  "iterations": 5,
+  "max_weight_bytes": 131072,
+  "omp_max_threads": 1,
+  "omp_num_procs": 10,
+  "rate": "effective bytes / upper-median time (logical footprint proxy, not measured traffic)",
+  "requested_threads": [
+   1
+  ],
+  "runtime_isa_tag": "NEON+DotProd",
+  "steps": [
+   {
+    "effective_bytes": 11808,
+    "format": "Q4_K",
+    "k": 256,
+    "n": 64,
+    "requested_threads": 1,
+    "weight_bytes": 11264
+   },
+   {
+    "effective_bytes": 23328,
+    "format": "Q4_K",
+    "k": 256,
+    "n": 128,
+    "requested_threads": 1,
+    "weight_bytes": 22528
+   },
+   {
+    "effective_bytes": 46144,
+    "format": "Q4_K",
+    "k": 512,
+    "n": 128,
+    "requested_threads": 1,
+    "weight_bytes": 45056
+   },
+   {
+    "effective_bytes": 91712,
+    "format": "Q4_K",
+    "k": 512,
+    "n": 256,
+    "requested_threads": 1,
+    "weight_bytes": 90112
+   }
+  ],
+  "warmup": 1
+ }
+}

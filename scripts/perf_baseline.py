@@ -1,51 +1,52 @@
 #!/usr/bin/env python3
 """Record and compare identity-bound performance baselines.
 
-A baseline document (schema ``llaminar.perf-baseline.v2``) is one measured
-result plus the identity needed to decide whether a later result is
-comparable with it. Two ways of producing one:
+A baseline document (schema ``llaminar.perf-baseline.v3``) is one measured
+result plus the identity needed to decide whether a later result is comparable.
 
-``run``
-    Executes the measuring command itself. The executable must live inside
-    ``--build-dir``; it and every shared library it loads from that build tree
-    are SHA-256 digested before and after the run and must not change. The
-    command must exit 0 and must create ``--result-json``, which may not exist
-    beforehand. Declared inputs (``--input-file NAME=PATH``: model, saved plan,
-    prompt file, ...) are digested into the workload identity, together with
-    every ``LLAMINAR_*``/``OMP_*``/``GOMP_*``/``KMP_*`` environment variable
-    and the exact argv. Only a ``run`` from a clean tree in a ``Release`` build
-    receives grade ``bound``.
+``run`` (Linux only)
+    Executes the measuring command itself through ONE admitted executable: the
+    command's first word is resolved to a real path inside ``--build-dir``, and
+    exactly that resolved path is executed and verified. Before and after the
+    run, the executable and every shared library ``ldd`` resolves for it inside
+    the build tree are SHA-256 digested, as are the declared input files; any
+    change is fatal, and a missing or failing ``ldd`` is fatal. ``ldd`` reports
+    the loader's initial resolution only: libraries opened later with
+    ``dlopen`` are not observed. The command must exit 0 and must create
+    ``--result-json``, which may not exist beforehand. Argv, working directory,
+    CPU affinity and the launch environment (``LLAMINAR_*``, ``OMP_*``,
+    ``GOMP_*``, ``KMP_*``, ``HSA_*``, ``NCCL_*``, ``RCCL_*``, ``LD_LIBRARY_PATH``,
+    ``LD_PRELOAD`` and the GPU visibility variables) are recorded; every
+    occurrence of the result path in argv or environment values is replaced by
+    ``<result-json>`` so that fresh per-run destinations do not split identity.
 ``import``
-    Wraps an already existing result. Nothing ties that file to the build or
-    host it is stamped with, so its grade is always ``unbound``.
+    Wraps an existing result; there is no launch record.
 
-``bound`` is a local self-attestation of how the record was produced, not a
-tamper-proof certificate and not the repository's image certification.
+Grades: ``bound`` only for a ``run`` from a clean tree, in a ``Release`` build,
+without ``--allow-dirty``; everything else is ``unbound``. ``bound`` is a local
+self-attestation of how the record was produced: not tamper-proof, not compiler
+provenance (build fields are read from CMake's cache), not image certification.
 
 Input kinds:
 
 ``llaminar-benchmark``
-    The ``llaminar.benchmark.v1`` document of ``llaminar2 benchmark
-    --benchmark-json-output``. ``success``, ``prefill_success`` and
-    ``decode_success`` must be true. The workload identity is the prompt,
-    token counts, iteration/warmup counts, runtime state architecture,
-    execution path and primary device, and the complete
-    ``runtime_configuration`` (sampling, MTP, prefix cache, ...). The model is
-    NOT in that document: declare it with ``--input-file model=PATH``. The
-    generated token ids form a separate ``output`` identity.
+    ``llaminar.benchmark.v1`` from ``llaminar2 benchmark --benchmark-json-output``.
+    All three success flags must be true and ``--input-file model=PATH`` is
+    required. Identity: prompt, token and iteration counts, runtime state and the
+    complete ``runtime_configuration``; generated token ids form a separate
+    ``output`` identity. Throughput and latency are the metrics.
 ``kernel-metrics``
-    ``{"harness": str, "parameters": {...}, "metrics": {name: {"value",
-    "unit", "better": "higher"|"lower", "samples"?}}}`` from ``Perf__``
-    harnesses; harness and parameters are the workload identity.
+    ``{"harness", "parameters", "metrics", "observations"?}``. ``harness`` and
+    ``parameters`` are identity; ``metrics`` are compared; ``observations``
+    (per-run timings and other measured context) are kept but never compared.
 
-``diff`` validates both documents completely, then refuses to compare unless
-every identity field matches or is named with ``--allow-identity-change``.
-A metric regresses when it moves in the worse direction by more than
-``max(--threshold-pct, 2 * hypot(spread_a, spread_b))``, where a spread is the
-robust relative spread ``1.4826 * MAD / median`` of that metric's samples.
-Exit codes: 0 comparable without regression, 1 regression, 2 refused or
-invalid input. Store baselines with the measurement evidence, never in this
-source tree.
+``diff`` validates both documents completely, then compares only when every
+identity field matches. A field that is unknown (absent or null) in either
+document never matches. ``--allow-identity-change FIELD`` waives exactly one
+field. A metric regresses when it moves the wrong way by more than
+``max(--threshold-pct, 2 * hypot(spread_a, spread_b))``, spread being the robust
+relative spread ``1.4826 * MAD / median`` of its samples. Exit codes: 0 comparable
+without regression, 1 regression, 2 refused or invalid input.
 """
 
 from __future__ import annotations
@@ -56,18 +57,23 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import statistics
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-SCHEMA = "llaminar.perf-baseline.v2"
+SCHEMA = "llaminar.perf-baseline.v3"
 KINDS = ("llaminar-benchmark", "kernel-metrics")
 GRADES = ("bound", "unbound")
-LAUNCH_ENV_PREFIXES = ("LLAMINAR_", "OMP_", "GOMP_", "KMP_")
+ENV_PREFIXES = ("LLAMINAR_", "OMP_", "GOMP_", "KMP_", "HSA_", "NCCL_", "RCCL_")
+ENV_EXACT = ("LD_LIBRARY_PATH", "LD_PRELOAD", "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES",
+             "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
+RESULT_PLACEHOLDER = "<result-json>"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class BaselineError(Exception):
@@ -79,7 +85,7 @@ def _reject_constant(name: str) -> None:
 
 
 def load_json(path: Path) -> Any:
-    """Parse strict JSON: NaN/Infinity literals are rejected, not silently accepted."""
+    """Parse strict JSON: NaN/Infinity literals are rejected."""
 
     try:
         return json.loads(path.read_text(), parse_constant=_reject_constant)
@@ -95,32 +101,181 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+# ---------------------------------------------------------------------------------------------
+# Typed field checks shared by every producer and by validate_document().
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise BaselineError(message)
+
+
+def _text(value: Any, what: str, *, allow_empty: bool = False) -> str:
+    _require(isinstance(value, str) and (allow_empty or bool(value)), f"{what} must be a{'' if allow_empty else ' non-empty'} string")
+    return value
+
+
+def _int(value: Any, what: str, minimum: int = 0) -> int:
+    _require(isinstance(value, int) and not isinstance(value, bool) and value >= minimum,
+             f"{what} must be an integer >= {minimum}")
+    return value
+
+
+def _finite(value: Any, what: str) -> float:
+    _require(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value),
+             f"{what} {value!r} is not a finite number")
+    return float(value)
+
+
+def _positive(value: Any, what: str) -> float:
+    number = _finite(value, what)
+    _require(number > 0, f"{what} {number} must be positive")
+    return number
+
+
+def _hex64(value: Any, what: str) -> str:
+    _require(isinstance(value, str) and bool(HEX64.match(value)), f"{what} must be a SHA-256 hex digest")
+    return value
+
+
+def _object(value: Any, what: str, *, allow_empty: bool = False) -> Mapping[str, Any]:
+    _require(isinstance(value, Mapping) and (allow_empty or bool(value)),
+             f"{what} must be a{'n' if allow_empty else ' non-empty'} object")
+    return value
+
+
+def _metric(entry: Any, name: str) -> dict[str, Any]:
+    """Finite positive value, non-empty unit, direction, and finite positive samples."""
+
+    entry = _object(entry, f"metric {name!r}")
+    metric: dict[str, Any] = {"value": _positive(entry.get("value"), f"metric {name!r} value"),
+                              "unit": _text(entry.get("unit"), f"metric {name!r} unit"),
+                              "better": entry.get("better")}
+    _require(metric["better"] in ("higher", "lower"), f"metric {name!r} direction must be 'higher' or 'lower'")
+    samples = entry.get("samples")
+    if samples is not None:
+        _require(isinstance(samples, list) and bool(samples), f"metric {name!r} samples must be a non-empty list")
+        metric["samples"] = [_positive(s, f"metric {name!r} sample") for s in samples]
+    return metric
+
+
+def _metrics(raw: Any) -> dict[str, Any]:
+    return {str(name): _metric(entry, str(name)) for name, entry in _object(raw, "metrics").items()}
+
+
+def _check_build(build: Any) -> None:
+    build = _object(build, "build")
+    for key in ("build_type", "cpu_isa", "cxx_compiler", "cxx_compiler_version"):
+        _text(build.get(key), f"build.{key}")
+    _text(build.get("cxx_flags"), "build.cxx_flags", allow_empty=True)
+    backends = _object(build.get("backends"), "build.backends")
+    for key in ("cuda", "rocm"):
+        _text(backends.get(key), f"build.backends.{key}")
+
+
+def _check_host(host: Any) -> None:
+    host = _object(host, "host")
+    for key in ("machine", "kernel", "cpu_model"):
+        _text(host.get(key), f"host.{key}")
+    _int(host.get("logical_cpus"), "host.logical_cpus", 1)
+    _int(host.get("page_size"), "host.page_size", 1)
+    _require(isinstance(host.get("numa_nodes"), list), "host.numa_nodes must be a list")
+
+
+def _check_workload(kind: str, workload: Any) -> None:
+    workload = _object(workload, "workload")
+    inputs = _object(workload.get("declared_inputs"), "workload.declared_inputs", allow_empty=True)
+    for name, digest in inputs.items():
+        _hex64(digest, f"declared input {name!r}")
+    if kind == "llaminar-benchmark":
+        _require("model" in inputs, "a llaminar-benchmark record requires the declared input 'model'")
+        prompt = _object(workload.get("prompt"), "workload.prompt")
+        _hex64(prompt.get("sha256"), "workload.prompt.sha256")
+        tokens = _object(workload.get("tokens"), "workload.tokens")
+        for key in ("prefill", "decode", "decode_after_prefill"):
+            _int(tokens.get(key), f"workload.tokens.{key}")
+        _int(workload.get("measurement_iterations"), "workload.measurement_iterations", 1)
+        _int(workload.get("warmup_iterations"), "workload.warmup_iterations")
+        state = _object(workload.get("runtime_state"), "workload.runtime_state")
+        for key in ("architecture", "execution_path", "primary_device"):
+            _text(state.get(key), f"workload.runtime_state.{key}")
+        _object(workload.get("runtime_configuration"), "workload.runtime_configuration")
+    else:
+        _text(workload.get("harness"), "workload.harness")
+        _object(workload.get("parameters"), "workload.parameters")
+
+
+def _check_launch(launch: Any) -> None:
+    launch = _object(launch, "launch")
+    argv = launch.get("argv")
+    _require(isinstance(argv, list) and bool(argv) and all(isinstance(a, str) for a in argv), "launch.argv must be a non-empty string list")
+    env = _object(launch.get("env"), "launch.env", allow_empty=True)
+    _require(all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()), "launch.env must map strings")
+    _text(launch.get("cwd"), "launch.cwd")
+    affinity = launch.get("cpu_affinity")
+    _require(isinstance(affinity, list) and bool(affinity) and all(isinstance(c, int) for c in affinity),
+             "launch.cpu_affinity must be a non-empty integer list")
+    binaries = _object(launch.get("binaries"), "launch.binaries")
+    for name, digest in binaries.items():
+        _hex64(digest, f"launch.binaries[{name!r}]")
+    _text(launch.get("loader_observation"), "launch.loader_observation")
+    _hex64(launch.get("result_sha256"), "launch.result_sha256")
+    started, finished = _finite(launch.get("started_unix"), "launch.started_unix"), _finite(launch.get("finished_unix"), "launch.finished_unix")
+    _require(finished >= started, "launch.finished_unix precedes started_unix")
+
+
+def validate_document(document: Any) -> None:
+    """Complete typed validation of a baseline document; every entry point uses it."""
+
+    document = _object(document, "baseline document")
+    _require(document.get("schema") == SCHEMA, f"expected schema {SCHEMA}")
+    kind, grade = document.get("kind"), document.get("grade")
+    _require(kind in KINDS and grade in GRADES, "document kind or grade is invalid")
+    source = _object(document.get("source"), "source")
+    _require(isinstance(source.get("commit"), str) and bool(re.fullmatch(r"[0-9a-f]{40}", source["commit"])),
+             "source.commit must be a full commit id")
+    _require(isinstance(source.get("dirty"), bool) and isinstance(source.get("allow_dirty"), bool), "source flags are incomplete")
+    _check_build(document.get("build"))
+    _check_host(document.get("host"))
+    _check_workload(kind, document.get("workload"))
+    if document.get("launch") is not None:
+        _check_launch(document["launch"])
+    if grade == "bound":
+        _require(document.get("launch") is not None, "a bound document requires a launch record")
+        _require(not source["dirty"] and not source["allow_dirty"], "a bound document requires a clean tree without --allow-dirty")
+        _require(document["build"]["build_type"] == "Release", "a bound document requires a Release build")
+    if kind == "llaminar-benchmark":
+        _hex64(_object(document.get("output"), "output").get("generated_token_ids_sha256"), "output digest")
+    _metrics(document.get("metrics"))
+    if kind == "kernel-metrics" and document.get("observations") is not None:
+        _object(document["observations"], "observations", allow_empty=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# Identity observation.
+
 def _git(source_dir: Path, *args: str) -> str:
     result = subprocess.run(["git", "-C", str(source_dir), *args], capture_output=True, text=True)
-    if result.returncode != 0:
-        raise BaselineError(f"git {' '.join(args)} failed in {source_dir}: {result.stderr.strip()}")
+    _require(result.returncode == 0, f"git {' '.join(args)} failed in {source_dir}: {result.stderr.strip()}")
     return result.stdout
 
 
 def source_identity(source_dir: Path, allow_dirty: bool) -> dict[str, Any]:
-    """Return the exact commit; a dirty tree is refused unless explicitly allowed."""
+    """Exact commit; a dirty tree is refused unless --allow-dirty (which forces unbound)."""
 
     commit = _git(source_dir, "rev-parse", "HEAD").strip()
     dirty = bool(_git(source_dir, "status", "--porcelain", "--untracked-files=no").strip())
-    if dirty and not allow_dirty:
-        raise BaselineError("source tree has uncommitted tracked changes; commit them or pass --allow-dirty")
-    identity: dict[str, Any] = {"commit": commit, "dirty": dirty}
+    _require(not dirty or allow_dirty, "source tree has uncommitted tracked changes; commit them or pass --allow-dirty")
+    identity: dict[str, Any] = {"commit": commit, "dirty": dirty, "allow_dirty": allow_dirty}
     if dirty:
         identity["diff_sha256"] = hashlib.sha256(_git(source_dir, "diff", "HEAD").encode()).hexdigest()
     return identity
 
 
 def build_identity(build_dir: Path) -> dict[str, Any]:
-    """Read the build envelope from CMakeCache.txt and CMake's detected compiler file."""
+    """Build envelope as recorded in CMakeCache.txt and CMake's detected-compiler file (not compiler provenance)."""
 
     cache = build_dir / "CMakeCache.txt"
-    if not cache.is_file():
-        raise BaselineError(f"{cache} not found; --build-dir must be a configured CMake build tree")
+    _require(cache.is_file(), f"{cache} not found; --build-dir must be a configured CMake build tree")
     values: dict[str, str] = {}
     for line in cache.read_text(errors="replace").splitlines():
         if not line or line.startswith(("#", "//")) or "=" not in line or ":" not in line.split("=", 1)[0]:
@@ -132,7 +287,7 @@ def build_identity(build_dir: Path) -> dict[str, Any]:
             if line.startswith("set(CMAKE_CXX_COMPILER_VERSION "):
                 values.setdefault("CMAKE_CXX_COMPILER_VERSION", line.split('"')[1])
     build_type = values.get("CMAKE_BUILD_TYPE") or None
-    return {
+    build = {
         "build_type": build_type,
         "cpu_isa": values.get("LLAMINAR_CPU_ISA") or None,
         "cxx_compiler": values.get("CMAKE_CXX_COMPILER") or None,
@@ -140,8 +295,9 @@ def build_identity(build_dir: Path) -> dict[str, Any]:
         "cxx_flags": " ".join(filter(None, (values.get("CMAKE_CXX_FLAGS"),
                                             values.get(f"CMAKE_CXX_FLAGS_{(build_type or '').upper()}")))),
         "backends": {"cuda": values.get("HAVE_CUDA") or None, "rocm": values.get("HAVE_ROCM") or None},
-        "shared_core": values.get("LLAMINAR_SHARED_CORE") or None,
     }
+    _check_build(build)
+    return build
 
 
 def _cpu_model() -> str | None:
@@ -159,8 +315,8 @@ def _cpu_model() -> str | None:
     if sys.platform == "darwin":
         result = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True)
         if result.returncode == 0:
-            return result.stdout.strip()
-    return platform.processor() or None
+            return result.stdout.strip() or None
+    return None
 
 
 def _numa_nodes() -> list[dict[str, Any]]:
@@ -179,62 +335,24 @@ def _numa_nodes() -> list[dict[str, Any]]:
 
 
 def host_identity() -> dict[str, Any]:
-    """Describe the measuring host; NUMA nodes are empty where the kernel publishes none."""
+    """Measuring host; an unobservable CPU model is fatal rather than recorded as unknown."""
 
-    return {
-        "hostname": platform.node(),
-        "machine": platform.machine(),
-        "kernel": platform.release(),
-        "cpu_model": _cpu_model(),
-        "logical_cpus": os.cpu_count(),
-        "page_size": os.sysconf("SC_PAGE_SIZE"),
-        "numa_nodes": _numa_nodes(),
-    }
+    host = {"hostname": platform.node(), "machine": platform.machine(), "kernel": platform.release(),
+            "cpu_model": _cpu_model(), "logical_cpus": os.cpu_count(), "page_size": os.sysconf("SC_PAGE_SIZE"),
+            "numa_nodes": _numa_nodes()}
+    _check_host(host)
+    return host
 
 
-def _finite(value: Any, what: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
-        raise BaselineError(f"{what} {value!r} is not a finite number")
-    return float(value)
+def extract(kind: str, document: Any) -> tuple[dict[str, Any], Any, dict[str, Any], Any]:
+    """Return (workload identity without declared inputs, output identity, metrics, observations)."""
 
-
-def _metric(entry: Any, name: str) -> dict[str, Any]:
-    """Validate and normalize one metric; shared by input extraction and document validation."""
-
-    if not isinstance(entry, Mapping):
-        raise BaselineError(f"metric {name!r} must be an object")
-    value = _finite(entry.get("value"), f"metric {name!r} value")
-    if value <= 0:
-        raise BaselineError(f"metric {name!r} value {value} must be positive")
-    unit, better = entry.get("unit"), entry.get("better")
-    if not isinstance(unit, str) or not unit:
-        raise BaselineError(f"metric {name!r} requires a non-empty unit")
-    if better not in ("higher", "lower"):
-        raise BaselineError(f"metric {name!r} direction {better!r} must be 'higher' or 'lower'")
-    metric: dict[str, Any] = {"value": value, "unit": unit, "better": better}
-    samples = entry.get("samples")
-    if samples is not None:
-        if not isinstance(samples, list) or not samples:
-            raise BaselineError(f"metric {name!r} samples must be a non-empty list")
-        metric["samples"] = [_finite(s, f"metric {name!r} sample") for s in samples]
-    return metric
-
-
-def _metrics(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, Mapping) or not raw:
-        raise BaselineError("metrics must be a non-empty object")
-    return {str(name): _metric(entry, str(name)) for name, entry in raw.items()}
-
-
-def extract(kind: str, document: Mapping[str, Any]) -> tuple[dict[str, Any], Any, dict[str, Any]]:
-    """Return (workload identity, output identity, metrics) for one input document."""
-
+    document = _object(document, "input document")
     if kind == "llaminar-benchmark":
-        if document.get("schema") != "llaminar.benchmark.v1":
-            raise BaselineError(f"expected schema llaminar.benchmark.v1, got {document.get('schema')!r}")
+        _require(document.get("schema") == "llaminar.benchmark.v1",
+                 f"expected schema llaminar.benchmark.v1, got {document.get('schema')!r}")
         for flag in ("success", "prefill_success", "decode_success"):
-            if document.get(flag) is not True:
-                raise BaselineError(f"benchmark {flag} is {document.get(flag)!r}; failed runs are not baselines")
+            _require(document.get(flag) is True, f"benchmark {flag} is {document.get(flag)!r}; failed runs are not baselines")
         try:
             state, tokens = document["runtime_state"], document["tokens"]
             workload = {
@@ -245,8 +363,10 @@ def extract(kind: str, document: Mapping[str, Any]) -> tuple[dict[str, Any], Any
                 "runtime_state": {key: state[key] for key in ("architecture", "execution_path", "primary_device")},
                 "runtime_configuration": document["runtime_configuration"],
             }
-            output = {"generated_token_ids_sha256": hashlib.sha256(
-                json.dumps(document["generated_token_ids"]).encode()).hexdigest()}
+            token_ids = document["generated_token_ids"]
+            _require(isinstance(token_ids, list) and all(isinstance(t, int) and not isinstance(t, bool) for t in token_ids),
+                     "generated_token_ids must be an integer list")
+            output = {"generated_token_ids_sha256": hashlib.sha256(json.dumps(token_ids).encode()).hexdigest()}
             throughput, latency = document["throughput_tokens_per_sec"], document["decode_latency_ms"]
             metrics = _metrics({
                 "prefill_tokens_per_sec": {"value": throughput["prefill"], "unit": "tok/s", "better": "higher"},
@@ -256,145 +376,149 @@ def extract(kind: str, document: Mapping[str, Any]) -> tuple[dict[str, Any], Any
             })
         except (KeyError, TypeError) as error:
             raise BaselineError(f"llaminar.benchmark.v1 document lacks {error}") from error
-        return workload, output, metrics
+        return workload, output, metrics, None
     if kind == "kernel-metrics":
-        harness, parameters = document.get("harness"), document.get("parameters")
-        if not isinstance(harness, str) or not harness:
-            raise BaselineError("kernel-metrics document requires a non-empty 'harness'")
-        if not isinstance(parameters, Mapping):
-            raise BaselineError("kernel-metrics document requires a 'parameters' object")
-        return {"harness": harness, "parameters": parameters}, None, _metrics(document.get("metrics"))
+        observations = document.get("observations")
+        if observations is not None:
+            _object(observations, "observations", allow_empty=True)
+        return ({"harness": document.get("harness"), "parameters": document.get("parameters")}, None,
+                _metrics(document.get("metrics")), observations)
     raise BaselineError(f"unknown kind {kind!r}; expected one of {KINDS}")
 
 
-def _declared_inputs(specs: Sequence[str]) -> dict[str, str]:
-    inputs: dict[str, str] = {}
+def _declared_inputs(specs: Sequence[str]) -> dict[str, Path]:
+    inputs: dict[str, Path] = {}
     for spec in specs:
         name, sep, path = spec.partition("=")
-        if not sep or not name or not path:
-            raise BaselineError(f"--input-file expects NAME=PATH, got {spec!r}")
-        if name in inputs:
-            raise BaselineError(f"--input-file {name!r} declared twice")
-        if not Path(path).is_file():
-            raise BaselineError(f"--input-file {name}: {path} is not a file")
-        inputs[name] = _sha256_file(Path(path))
+        _require(bool(sep and name and path), f"--input-file expects NAME=PATH, got {spec!r}")
+        _require(name not in inputs, f"--input-file {name!r} declared twice")
+        _require(Path(path).is_file(), f"--input-file {name}: {path} is not a file")
+        inputs[name] = Path(path).resolve()
     return inputs
 
 
-def _build_tree_closure(executable: Path, build_dir: Path) -> dict[str, str]:
-    """Digest the executable and every shared library it resolves inside the build tree."""
+def _digest_inputs(inputs: Mapping[str, Path]) -> dict[str, str]:
+    return {name: _sha256_file(path) for name, path in sorted(inputs.items())}
 
+
+def _build_tree_closure(executable: Path, build_dir: Path) -> dict[str, str]:
+    """Digest the executable and the build-tree libraries of its initial loader resolution.
+
+    A missing ldd, a failing ldd or an unresolved library is fatal: an
+    unobserved closure is never reported as empty.
+    """
+
+    ldd = shutil.which("ldd")
+    _require(ldd is not None, "run requires ldd to observe the executable's library closure")
+    listing = subprocess.run([ldd, str(executable)], capture_output=True, text=True)
+    _require(listing.returncode == 0, f"ldd failed for {executable}: {(listing.stderr or listing.stdout).strip()}")
     paths = {executable}
-    if shutil.which("ldd"):
-        listing = subprocess.run(["ldd", str(executable)], capture_output=True, text=True).stdout
-        for line in listing.splitlines():
-            parts = line.split("=>")
-            target = (parts[1] if len(parts) > 1 else parts[0]).strip().split(" (")[0]
-            if target.startswith("/") and Path(target).resolve().is_relative_to(build_dir):
-                paths.add(Path(target).resolve())
+    for line in listing.stdout.splitlines():
+        _require("not found" not in line, f"unresolved library for {executable}: {line.strip()}")
+        parts = line.split("=>")
+        target = (parts[1] if len(parts) > 1 else parts[0]).strip().split(" (")[0]
+        if target.startswith("/") and Path(target).resolve().is_relative_to(build_dir):
+            paths.add(Path(target).resolve())
     return {str(path.relative_to(build_dir)): _sha256_file(path) for path in sorted(paths)}
 
 
-def _document(kind: str, raw: Mapping[str, Any], *, grade: str, source: dict, build: dict, inputs: dict,
+def _launch_environment(result_path: str) -> dict[str, str]:
+    return {key: value.replace(result_path, RESULT_PLACEHOLDER) for key, value in sorted(os.environ.items())
+            if key.startswith(ENV_PREFIXES) or key in ENV_EXACT}
+
+
+def _assemble(kind: str, raw: Any, *, grade: str, source: dict, build: dict, inputs: Mapping[str, str],
               launch: dict | None) -> dict[str, Any]:
-    workload, output, metrics = extract(kind, raw)
-    workload = {**workload, "declared_inputs": inputs}
-    if launch is not None:
-        workload["launch_env"] = launch["env"]
+    workload, output, metrics, observations = extract(kind, raw)
     document = {"schema": SCHEMA, "kind": kind, "grade": grade, "source": source, "build": build,
-                "host": host_identity(), "launch": launch, "workload": workload, "output": output,
-                "metrics": metrics, "raw": raw}
+                "host": host_identity(), "launch": launch, "workload": {**workload, "declared_inputs": dict(inputs)},
+                "output": output, "metrics": metrics, "observations": observations, "raw": raw}
     validate_document(document)
     return document
 
 
 def run(kind: str, build_dir: Path, result_json: Path, command: Sequence[str], *, source_dir: Path,
         inputs: Sequence[str] = (), allow_dirty: bool = False) -> dict[str, Any]:
-    """Execute one measurement and bind its result to the executable that produced it."""
+    """Execute one measurement through one admitted executable and bind the result to it."""
 
-    if not command:
-        raise BaselineError("run requires the measuring command after --")
+    _require(sys.platform.startswith("linux"), "run is supported on Linux only (it requires ldd)")
+    _require(bool(command), "run requires the measuring command after --")
     build_dir = build_dir.resolve()
     found = shutil.which(command[0])
-    if not found:
-        raise BaselineError(f"executable {command[0]!r} not found")
+    _require(found is not None, f"executable {command[0]!r} not found")
     executable = Path(found).resolve()
-    if not executable.is_relative_to(build_dir):
-        raise BaselineError(f"executable {executable} is not inside --build-dir {build_dir}")
-    if result_json.exists():
-        raise BaselineError(f"{result_json} already exists; a run must create its result")
-    source, build, declared = source_identity(source_dir, allow_dirty), build_identity(build_dir), _declared_inputs(inputs)
-    before = _build_tree_closure(executable, build_dir)
-    env = {key: value for key, value in sorted(os.environ.items()) if key.startswith(LAUNCH_ENV_PREFIXES)}
+    _require(executable.is_relative_to(build_dir), f"executable {executable} is not inside --build-dir {build_dir}")
+    result_json = result_json.resolve()
+    _require(not result_json.exists(), f"{result_json} already exists; a run must create its result")
+    source, build = source_identity(source_dir, allow_dirty), build_identity(build_dir)
+    declared = _declared_inputs(inputs)
+    inputs_before, binaries_before = _digest_inputs(declared), _build_tree_closure(executable, build_dir)
+    argv = [str(executable), *command[1:]]
     started = time.time()
-    completed = subprocess.run(list(command))
+    completed = subprocess.run(argv)
     finished = time.time()
-    if completed.returncode != 0:
-        raise BaselineError(f"measuring command exited {completed.returncode}")
-    if _build_tree_closure(executable, build_dir) != before:
-        raise BaselineError("executable or build-tree library changed during the run")
-    if not result_json.is_file():
-        raise BaselineError(f"measuring command did not create {result_json}")
-    grade = "bound" if build["build_type"] == "Release" and not source["dirty"] else "unbound"
-    launch = {"argv": list(command), "env": env, "binaries": before, "started_unix": started,
-              "finished_unix": finished, "result_sha256": _sha256_file(result_json)}
-    return _document(kind, load_json(result_json), grade=grade, source=source, build=build, inputs=declared,
+    _require(completed.returncode == 0, f"measuring command exited {completed.returncode}")
+    _require(_build_tree_closure(executable, build_dir) == binaries_before,
+             "executable or build-tree library changed during the run")
+    _require(_digest_inputs(declared) == inputs_before, "a declared input file changed during the run")
+    _require(result_json.is_file(), f"measuring command did not create {result_json}")
+    grade = "bound" if build["build_type"] == "Release" and not source["dirty"] and not allow_dirty else "unbound"
+    result = str(result_json)
+    launch = {
+        "argv": [str(executable.relative_to(build_dir)), *(a.replace(result, RESULT_PLACEHOLDER) for a in command[1:])],
+        "env": _launch_environment(result), "cwd": os.getcwd(),
+        "cpu_affinity": sorted(os.sched_getaffinity(0)), "binaries": binaries_before,
+        "loader_observation": "ldd initial resolution; dlopen-loaded libraries not observed",
+        "started_unix": started, "finished_unix": finished, "result_sha256": _sha256_file(result_json),
+    }
+    return _assemble(kind, load_json(result_json), grade=grade, source=source, build=build, inputs=inputs_before,
                      launch=launch)
 
 
 def import_result(kind: str, input_path: Path, build_dir: Path, *, source_dir: Path, inputs: Sequence[str] = (),
                   allow_dirty: bool = False) -> dict[str, Any]:
-    """Wrap an existing result. Nothing binds it to this build or host: always unbound."""
+    """Wrap an existing result; nothing binds it to this build or host, so it is always unbound."""
 
-    return _document(kind, load_json(input_path), grade="unbound", source=source_identity(source_dir, allow_dirty),
-                     build=build_identity(build_dir), inputs=_declared_inputs(inputs), launch=None)
-
-
-def validate_document(document: Any) -> None:
-    """Complete structural and numeric validation; every entry point uses it."""
-
-    if not isinstance(document, Mapping) or document.get("schema") != SCHEMA:
-        raise BaselineError(f"expected a {SCHEMA} document")
-    if document.get("kind") not in KINDS or document.get("grade") not in GRADES:
-        raise BaselineError("document kind or grade is invalid")
-    for section in ("source", "build", "host", "workload"):
-        if not isinstance(document.get(section), Mapping):
-            raise BaselineError(f"document lacks the {section!r} object")
-    if not isinstance(document["source"].get("commit"), str) or not isinstance(document["source"].get("dirty"), bool):
-        raise BaselineError("source identity is incomplete")
-    if document["grade"] == "bound" and (document.get("launch") is None or document["source"]["dirty"]
-                                         or document["build"].get("build_type") != "Release"):
-        raise BaselineError("a bound document requires a recorded launch, a clean tree and a Release build")
-    _metrics(document.get("metrics"))
+    return _assemble(kind, load_json(input_path), grade="unbound", source=source_identity(source_dir, allow_dirty),
+                     build=build_identity(build_dir), inputs=_digest_inputs(_declared_inputs(inputs)), launch=None)
 
 
-# Identity that must match (or be named with --allow-identity-change) before comparison.
-IDENTITY_FIELDS = {
+# ---------------------------------------------------------------------------------------------
+# Comparison.
+
+def _launch_field(key: str) -> Callable[[Mapping[str, Any]], Any]:
+    return lambda b: (b.get("launch") or {}).get(key)
+
+
+IDENTITY_FIELDS: dict[str, Callable[[Mapping[str, Any]], Any]] = {
     "kind": lambda b: b["kind"],
-    "workload": lambda b: {k: v for k, v in b["workload"].items() if k not in ("declared_inputs", "launch_env")},
-    "declared_inputs": lambda b: b["workload"].get("declared_inputs"),
-    "launch_env": lambda b: b["workload"].get("launch_env"),
-    "output": lambda b: b.get("output"),
-    "build_type": lambda b: b["build"].get("build_type"),
-    "cpu_isa": lambda b: b["build"].get("cpu_isa"),
-    "compiler": lambda b: (b["build"].get("cxx_compiler"), b["build"].get("cxx_compiler_version")),
-    "cxx_flags": lambda b: b["build"].get("cxx_flags"),
-    "backends": lambda b: b["build"].get("backends"),
-    "host_cpu": lambda b: b["host"].get("cpu_model"),
-    "host_topology": lambda b: (b["host"].get("logical_cpus"), b["host"].get("numa_nodes")),
-    "host_page_size": lambda b: b["host"].get("page_size"),
-    "host_kernel": lambda b: b["host"].get("kernel"),
+    "workload": lambda b: {k: v for k, v in b["workload"].items() if k != "declared_inputs"},
+    "declared_inputs": lambda b: b["workload"]["declared_inputs"],
+    "output": lambda b: b.get("output") if b["kind"] == "llaminar-benchmark" else "n/a",
+    "argv": _launch_field("argv"),
+    "launch_env": _launch_field("env"),
+    "cwd": _launch_field("cwd"),
+    "cpu_affinity": _launch_field("cpu_affinity"),
+    "build_type": lambda b: b["build"]["build_type"],
+    "cpu_isa": lambda b: b["build"]["cpu_isa"],
+    "compiler": lambda b: [b["build"]["cxx_compiler"], b["build"]["cxx_compiler_version"]],
+    "cxx_flags": lambda b: b["build"]["cxx_flags"],
+    "backends": lambda b: b["build"]["backends"],
+    "host_cpu": lambda b: b["host"]["cpu_model"],
+    "host_topology": lambda b: [b["host"]["logical_cpus"], b["host"]["numa_nodes"]],
+    "host_page_size": lambda b: b["host"]["page_size"],
+    "host_kernel": lambda b: b["host"]["kernel"],
 }
 
 
 def _relative_spread(metric: Mapping[str, Any]) -> float:
-    """Robust relative spread 1.4826*MAD/median; isolated stalls cannot widen or fake a verdict."""
+    """Robust relative spread 1.4826 * MAD / median of positive samples."""
 
     samples = metric.get("samples") or []
     if len(samples) < 2:
         return 0.0
     median = statistics.median(samples)
-    return 0.0 if median == 0 else 1.4826 * statistics.median(abs(s - median) for s in samples) / abs(median)
+    return 1.4826 * statistics.median(abs(s - median) for s in samples) / median
 
 
 def diff(baseline: Any, candidate: Any, threshold_pct: float, allowed_changes: Sequence[str] = ()) -> dict[str, Any]:
@@ -403,43 +527,41 @@ def diff(baseline: Any, candidate: Any, threshold_pct: float, allowed_changes: S
     validate_document(baseline)
     validate_document(candidate)
     threshold_pct = _finite(threshold_pct, "--threshold-pct")
-    if threshold_pct < 0:
-        raise BaselineError("--threshold-pct must be non-negative")
-    unknown = set(allowed_changes) - set(IDENTITY_FIELDS)
-    if unknown:
-        raise BaselineError(f"unknown identity fields {sorted(unknown)}; choose from {sorted(IDENTITY_FIELDS)}")
-    changed = [name for name, get in IDENTITY_FIELDS.items() if get(baseline) != get(candidate)]
-    refused = [name for name in changed if name not in allowed_changes]
-    if refused:
-        raise BaselineError(f"baselines are not comparable; differing identity: {refused}")
-    if set(baseline["metrics"]) != set(candidate["metrics"]):
-        raise BaselineError("baselines carry different metric sets")
+    _require(threshold_pct >= 0, "--threshold-pct must be non-negative")
+    unknown_fields = set(allowed_changes) - set(IDENTITY_FIELDS)
+    _require(not unknown_fields, f"unknown identity fields {sorted(unknown_fields)}; choose from {sorted(IDENTITY_FIELDS)}")
+    differing, unknown = [], []
+    for name, get in IDENTITY_FIELDS.items():
+        a, b = get(baseline), get(candidate)
+        if a is None or b is None:
+            unknown.append(name)
+        elif a != b:
+            differing.append(name)
+    refused = [name for name in differing + unknown if name not in allowed_changes]
+    _require(not refused, f"baselines are not comparable; differing identity: {sorted(n for n in refused if n in differing)}"
+                          f", unknown identity: {sorted(n for n in refused if n in unknown)}")
+    _require(set(baseline["metrics"]) == set(candidate["metrics"]), "baselines carry different metric sets")
     rows = []
     for name in sorted(baseline["metrics"]):
         base, cand = baseline["metrics"][name], candidate["metrics"][name]
-        if base["better"] != cand["better"] or base["unit"] != cand["unit"]:
-            raise BaselineError(f"metric {name!r} changed unit or direction")
+        _require(base["better"] == cand["better"] and base["unit"] == cand["unit"], f"metric {name!r} changed unit or direction")
         change_pct = 100.0 * (cand["value"] - base["value"]) / base["value"]
         tolerance_pct = max(threshold_pct, 200.0 * math.hypot(_relative_spread(base), _relative_spread(cand)))
         worse = change_pct < 0 if base["better"] == "higher" else change_pct > 0
         verdict = "within-tolerance" if abs(change_pct) <= tolerance_pct else ("regressed" if worse else "improved")
         rows.append({"metric": name, "unit": base["unit"], "baseline": base["value"], "candidate": cand["value"],
                      "change_pct": change_pct, "tolerance_pct": tolerance_pct, "verdict": verdict})
-    return {
-        "baseline_commit": baseline["source"]["commit"],
-        "candidate_commit": candidate["source"]["commit"],
-        "grade": "bound" if baseline["grade"] == candidate["grade"] == "bound" else "unbound",
-        "allowed_identity_changes": changed,
-        "metrics": rows,
-        "regressions": [row["metric"] for row in rows if row["verdict"] == "regressed"],
-    }
+    return {"baseline_commit": baseline["source"]["commit"], "candidate_commit": candidate["source"]["commit"],
+            "grade": "bound" if baseline["grade"] == candidate["grade"] == "bound" else "unbound",
+            "waived_identity": sorted(n for n in differing + unknown if n in allowed_changes),
+            "metrics": rows, "regressions": [row["metric"] for row in rows if row["verdict"] == "regressed"]}
 
 
 def _print_diff(report: Mapping[str, Any]) -> None:
     print(f"baseline {report['baseline_commit'][:12]} -> candidate {report['candidate_commit'][:12]} "
           f"(grade {report['grade']})")
-    if report["allowed_identity_changes"]:
-        print(f"declared identity changes: {', '.join(report['allowed_identity_changes'])}")
+    if report["waived_identity"]:
+        print(f"waived identity fields: {', '.join(report['waived_identity'])}")
     for row in report["metrics"]:
         print(f"  {row['metric']:<28} {row['baseline']:>12.4f} -> {row['candidate']:>12.4f} {row['unit']:<6}"
               f" {row['change_pct']:+7.2f}% (tol {row['tolerance_pct']:.2f}%) {row['verdict']}")
@@ -455,7 +577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         p.add_argument("--source-dir", type=Path, default=Path(__file__).resolve().parents[1])
         p.add_argument("--output", type=Path, required=True)
         p.add_argument("--input-file", action="append", default=[], metavar="NAME=PATH")
-        p.add_argument("--allow-dirty", action="store_true", help="permit a dirty tree; the record is unbound")
+        p.add_argument("--allow-dirty", action="store_true", help="permit a dirty tree; the record is always unbound")
         if name == "run":
             p.add_argument("--result-json", type=Path, required=True, help="file the command must create")
             p.add_argument("measure", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
