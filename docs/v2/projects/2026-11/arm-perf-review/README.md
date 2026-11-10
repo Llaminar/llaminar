@@ -1074,3 +1074,19 @@ CLOSED for the half-perf cell.
   (comment-only delta over the #172-ACKed 1ea08211). Reviewer light
   confirmation requested per the 717b precedent. Lane pending: Linux
   validation → merge-ready → Main.
+
+### Main's FF admission UNDERWAY (2026-11-10, ~17:20Z) — HOLD pending artifacts + one driver repair
+
+- Main independently confirmed: exact 717b2 linear descendant; the source
+  ACK covers the exact pin; production scan clean; actual range = EIGHT
+  commits. HOLD pending ACTUAL artifact paths/log inspection (requested
+  directly from the addon — summaries no longer suffice for the 18×14
+  acceptance).
+- NEW FINDING (aggregate-driver error path): register-gate.sh does not check
+  the Python reconciliation subprocess exit → a malformed proof/cache
+  exception can leave identity EMPTY while status stays PASS. Directive:
+  fail-closed DRIVER-ONLY repair + a focused forced-failure check. Valid
+  native artifacts are not automatically invalidated; the repair need not
+  move 717b2/source or recompile unchanged bindings.
+- Still owed to Main: actual Mac + GNU receipt/phase-log/build artifact
+  PATHS for the 18×14 acceptance inspection.
