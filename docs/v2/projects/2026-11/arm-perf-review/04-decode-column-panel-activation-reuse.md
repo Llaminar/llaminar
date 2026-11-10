@@ -186,3 +186,15 @@ in the plan. Any NibbleMap touch points must remain seam-based.
 - R2 EVIDENCE COMPLETE: gate (0 new/0 gone; census 12/12, 9/9, 0 mismatches),
   r2fa (base/env, idea22), A1 (green, byte-identical, decode wins).
   remaining: #151 fix-back -> reviewer recheck -> WSL gate -> handover.
+
+## R2 final-tip evidence COMPLETE (2026-11-10, 8fcc0fe0b vs 29351a57e)
+- Short engine confirmation (w-r2es-20261110T060322Z, 35B ABBAx2): byte
+  identity token sha base==R2 both cells; decode 35B-nomtp +7.9%
+  (23.82->25.71), mtp +2.3% (34.11->34.88); prefill neutral.
+- Gate at the final tip GATES_DONE (BUILD=0, PCH 9/9, census 12/12 + GNU-14
+  9/9 Rows1=0 budgets byte-equal, proof 242/1274, REL both =0); focused 43/43
+  = FIRST FA public-entry execution (owner gap closed). R2 remaining = WSL
+  x86 leg only -> handover doc to Main (engine row filled; WSL pending).
+- GB10 CUDA gate seal: K14-GB10-CUDA-F69446E3C-20261110 (51/64; tracked cells
+  incl. RoPEGraphCaptureNoH2D GREEN; FA null-stream = single real defect,
+  attribution + base control in flight).
