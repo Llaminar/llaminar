@@ -534,3 +534,12 @@ historical evidence, no active reservation.
   evidence; the final focused set runs at the COMBINED tip post-SETTLED
   (composition constraint). arm-sparks queue now: bound run (.80) + .79
   CUDA rerun build at e5ee7f672 (parallel hosts).
+
+- (addendum) Rebase VALIDATION COMPLETE at e5ee7f672: full local ARM NEON
+  CPU-only Integration build EXIT 0 (same unrestricted/-k0 settings; prior
+  parity-compiler OOM attempts retained); focused 14/14 target-selection,
+  4/4 MPI/OpenMP/NUMA CTest cells + 7/7 NUMA/socket fixtures PASS; live
+  registry case unselected on the NUMA-less VM. PR body updated;
+  GitHub MERGEABLE/CLEAN. Still NOT CUDA qualification / NOT SETTLED for
+  handovers (.79 rerun + GPU slot outstanding). The earlier
+  "published-while-compiling" caveat is closed for the CPU-only side.
