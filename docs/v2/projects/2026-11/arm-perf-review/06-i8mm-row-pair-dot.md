@@ -349,3 +349,24 @@ failures GONE at this base. RE-GATE GO to arm-sparks.
 - i8mm evidence set COMPLETE: gate clean + Mac quadrant PASS + gcc-14 objdump
   96/96 identical + reviewer ACK (no open P1). Merged (302318f1e), no
   follow-up. (107-error scare = arm-sparks harness vendor overwrite; corrected.)
+
+## x86 evidence TRIFECTA COMPLETE (2026-11-10, WSL) — i8mm x86-safe PROVEN
+
+- FINAL pure-i8mm control 79c1f62ab -> ea5402a54 (gcc 14.2, AVX512
+  Integration flags, CCACHE_DISABLE=1): PASS. 209/209 objects (149
+  i8mm-header-dep + 60 sampled CPUFeatures.h-only): 164 IDENTICAL, 43
+  TEXT-IMMEDIATE-ONLY (ALL exactly +7 = CPUNativeVNNIGemmKernel.h __LINE__
+  shift; 6 llaminar2_core: MoEExpertComputeStage, CpuExpertSlotPool,
+  KernelFactory, CPUPreparedWeightWriter, WeightManager,
+  PlanningProjectionMeasurement), 2 TEXT-NON-LINE (test TUs only:
+  Test__CPUNativeVNNI_GEMV + Perf__CPUNativeVNNI_ThreadScaling), 0 RODATA.
+  OOM-redo 22: 12 IDENTICAL + 10 +7-only. Correction: OrchestrationRunner
+  not selected (ninja-dep-closure); gap = 22 test TUs.
+- TRIFECTA (armq/evidence/): (1) ISA scan 5d4e3716a AVX512 (1914/1914 x86-64;
+  0 smmla/sdot in 792 ELFs); (2) whole-branch objdiff 46c35f15b->5d4e3716a
+  (attribution-limited); (3) pure-i8mm control PASS. + N2 verdict
+  (base-gap, CUDA-only targets).
+- Infra (WSL): queue-restart artifact fixed (progress truncated -> restored;
+  evidence untouched); host cleanup -> 36% disk; arm-qual = only lane on WSL.
+- NEXT: N3 (a2-5d4e3716a AVX2; started 01:00Z; 8 jobs/28GB) -> Unit +
+  Preflight + EVEX/AVX-512 scan.
