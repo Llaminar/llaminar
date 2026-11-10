@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Regress fresh-leaf CPU grouped verifier certification plans."""
+"""@file test_cpu_native_quantised_grouped_sealed_plan.py
+@brief Exercise fresh-leaf grouped-verifier plan and evidence ownership contracts.
+
+Synthetic development rows expose the same observation fields as real corpus
+rows. Empty optional launch evidence does not invent a tournament measurement;
+these fixtures prove planner behavior, not kernel performance or certification.
+"""
 
 from __future__ import annotations
 
@@ -207,6 +213,7 @@ def _observation(
         numerical_correctness=True,
         ordered_reduction=True,
         uses_atomic_reduction=False,
+        physical_launch_evidence={},
     )
 
 

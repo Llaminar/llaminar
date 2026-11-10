@@ -27,11 +27,19 @@ evidence (K-series snapshots, seals, falsification controls) lives in
   Integration build and real Qwen3.8-UD 4096-context planning pass; selection is
   CPU single, not GPU trace/inference proof. Context 8192 independently exposes
   a nonfitting mandatory plan reaching optional table selection before capacity
-  certification. Followup #74 will reject that base through canonical PMA before
-  selecting optional storage, without retries/accounting/placement workarounds.
-  The real window's driver diagnostics pass, and original binary/model identity
-  records are preserved. No model-performance or final register-gate
-  qualification follows from this diagnostic.
+  certification. `5b76a146c` (#74) rejects that base through canonical PMA before
+  optional storage, without retries/accounting/placement workarounds. Its source
+  review and native planning Unit/both focused preflights/20 repetitions pass.
+  Real 4096 planning passes again; 8192 now reports canonical capacity rejection
+  (126,324,719,040 mandatory bytes versus 123,457,634,304 available), not the
+  optional-table contract error. Both driver windows pass, original binaries/
+  model identity records are retained, and `.79` is handed back. This does not
+  admit 8192, prove GPU inference, or qualify performance/final register state.
+- The grouped sealed-plan synthetic observation now explicitly owns the real
+  schema's empty optional `physical_launch_evidence`. The registered script
+  reproduces ten missing-field errors before repair and passes after repair;
+  production eligibility/validator behavior is unchanged. Fused-final-add
+  single-worker policy triage remains separate.
 
 - The rebase onto `2948b1e49` is published. Full CPU-only ARM NEON Integration
   compilation passed at `e5ee7f672`, after compiler OOM-killed parity objects
