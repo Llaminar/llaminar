@@ -4262,6 +4262,49 @@ namespace llaminar2
              * complete transaction gate below remains the publication
              * authority and rechecks interactions with participant movement.
              */
+            // One existing exact swap search per active layer, only for
+            // isolated two-edge exchanges against this immutable source epoch.
+            // It owns derived inputs for this proposal only; final composed
+            // admission and longer cycles keep the complete-map scorer.
+            int swap_layer = -1;
+            std::vector<std::int32_t> swap_owners;
+            std::optional<ObservedTransactionServiceObjective::SwapSearch> swap_search;
+            const auto isolated_cycle_service = [&](const MoEOverlayTierMigrationCycle &cycle)
+            {
+                if (cycle.migration_indices.size() == 2u)
+                {
+                    const auto &first = tier_target_transaction.migrations.at(cycle.migration_indices[0]);
+                    const auto &second = tier_target_transaction.migrations.at(cycle.migration_indices[1]);
+                    if (first.layer_idx == cycle.layer_idx && second.layer_idx == cycle.layer_idx &&
+                        first.expert_id != second.expert_id &&
+                        economyExecutionTarget(first.source).word() == economyExecutionTarget(second.destination).word() &&
+                        economyExecutionTarget(first.destination).word() == economyExecutionTarget(second.source).word())
+                    {
+                        if (!swap_search || swap_layer != cycle.layer_idx)
+                        {
+                            swap_search.reset();
+                            swap_owners.assign(observed_service->numExperts(), -1);
+                            for (const auto &owner : previous->placementOwnerMap().placementsForLayer(cycle.layer_idx))
+                                swap_owners.at(static_cast<std::size_t>(owner.expert_id)) = observed_service->targetIndex(owner);
+                            // Keep complete-map source/error validation even
+                            // when all observed phases happen to be unpriced.
+                            (void)observed_service->score(cycle.layer_idx, swap_owners, swap_owners);
+                            swap_search = observed_service->prepareSwapSearch(cycle.layer_idx, swap_owners, {});
+                            swap_layer = cycle.layer_idx;
+                        }
+                        // A cohort remains ONE dense certified target. Never
+                        // use its absent scalar owner or split physical heat.
+                        if (swap_owners.at(static_cast<std::size_t>(first.expert_id)) != observed_service->targetIndex(first.source) ||
+                            swap_owners.at(static_cast<std::size_t>(second.expert_id)) != observed_service->targetIndex(second.source))
+                            throw std::logic_error("ExpertOverlay economy migration source disagrees with published ownership");
+                        return swap_search->scoreSwap(static_cast<std::uint32_t>(first.expert_id),
+                                                      static_cast<std::uint32_t>(second.expert_id));
+                    }
+                }
+                return scoreObservedMigrationSet(*observed_service, tier_target_transaction,
+                    cycle.layer_idx, {}, cycle.migration_indices);
+            };
+
             const auto bounded_tier_cycle_score =
                 [&](const std::size_t cycle_index)
             {
@@ -4298,9 +4341,7 @@ namespace llaminar2
 
                 const auto &state = *economy_state_;
                 const auto &policy = *config_.migration_economy_policy;
-                const auto observed_cost = scoreObservedMigrationSet(
-                    *observed_service, tier_target_transaction, cycle.layer_idx,
-                    {}, cycle.migration_indices);
+                const auto observed_cost = isolated_cycle_service(cycle);
                 WideCost service_gain_one_window = 0;
                 bool phase_safe = true;
                 for (const auto &phase : observed_cost.by_phase)

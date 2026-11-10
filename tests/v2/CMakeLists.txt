@@ -39655,3 +39655,27 @@ if(TARGET v2_integration_moe_overlay_residency_consensus_mpi)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEContinuationOriginalPublisherReplay_MPI)
     endif()
 endif()
+
+# Existing exact swap primitive plus the source-bound joint CPU/GPU controller owner.
+if(TARGET v2_unit_moe_overlay_transaction_cost)
+    add_v2_test(V2_Integration_MoEIsolatedTierSwapCostEquality
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_transaction_cost>
+            --gtest_filter=PreparedTransactionSwapSearch.*:TransactionCostFixture.PreparedSwap*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Economy;Exact;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    if(TEST V2_Integration_MoEIsolatedTierSwapCostEquality)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEIsolatedTierSwapCostEquality)
+    endif()
+endif()
+if(TARGET v2_unit_moe_overlay_residency_authority)
+    add_v2_test(V2_Integration_MoEIsolatedTierSwapJointAuthorityReplay
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+            --gtest_filter=CPUJointWholeGPUAuthorityReplay.*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;CPUJoint;Economy;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    if(TEST V2_Integration_MoEIsolatedTierSwapJointAuthorityReplay)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEIsolatedTierSwapJointAuthorityReplay)
+    endif()
+endif()

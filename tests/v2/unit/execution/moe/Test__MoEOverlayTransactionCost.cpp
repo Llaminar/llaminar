@@ -474,5 +474,47 @@ namespace llaminar2::test
             EXPECT_EQ(overflow.cost.before_ns, 0u);
             EXPECT_EQ(overflow.cost.after_ns, 0u);
         }
+        /** Current logical geometry retains exact phase/batch/zero/tail costs for every swap. */
+        TEST(PreparedTransactionSwapSearch, IsolatedTierCurrentGeometryMatchesCompleteMaps)
+        {
+            constexpr uint32_t experts = 512, participants = 3, top_k = 10, stride = 13;
+            std::vector<int32_t> owners(experts);
+            for (uint32_t expert = 0; expert < experts; ++expert) owners[expert] = expert % participants;
+            std::vector<ServiceCostPair> scratch(participants);
+            std::mt19937 random(4257);
+            for (const uint32_t rows : {1u, 3u, 64u, 448u})
+            {
+                std::vector<int32_t> routes((rows + 17) * stride, -1);
+                for (uint32_t row = 0; row < rows; ++row)
+                    for (uint32_t slot = 0; slot < top_k; ++slot)
+                        routes[row * stride + slot] = (row * 17 + slot * 13) % (experts - 1);
+                const PreparedTransactionCost prepared({routes.data(), routes.size(), rows, top_k, stride}, experts);
+                for (uint32_t phase = 0; phase < 3; ++phase)
+                {
+                    const std::array<uint64_t, participants> prices{1 + phase * 7u, 3 + phase * 11u, 29 + phase * 13u};
+                    const PreparedTransactionSwapSearch search(prepared, owners, prices);
+                    for (uint32_t trial = 0; trial < 96; ++trial)
+                    {
+                        const auto first = trial == 0 ? experts - 1 : random() % experts;
+                        const auto second = random() % experts;
+                        auto after = owners;
+                        std::swap(after[first], after[second]);
+                        const auto full = prepared.score({owners.data(), after.data(), prices.data(), experts, participants},
+                            scratch.data(), participants);
+                        const auto narrow = search.scoreSwap(first, second);
+                        ASSERT_EQ(narrow.status, full.status);
+                        ASSERT_TRUE(full.complete());
+                        EXPECT_EQ(narrow.cost.before_ns, full.cost.before_ns);
+                        EXPECT_EQ(narrow.cost.after_ns, full.cost.after_ns);
+                        const auto repeated_full = repeatPreparedTransaction(full, 3);
+                        const auto repeated_narrow = repeatPreparedTransaction(narrow, 3);
+                        EXPECT_EQ(repeated_narrow.status, repeated_full.status);
+                        EXPECT_EQ(repeated_narrow.cost.before_ns, repeated_full.cost.before_ns);
+                        EXPECT_EQ(repeated_narrow.cost.after_ns, repeated_full.cost.after_ns);
+                    }
+                }
+            }
+        }
+
     }
 }

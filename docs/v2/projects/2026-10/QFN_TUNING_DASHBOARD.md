@@ -7,14 +7,13 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Latest M448 native-Q8 slice: **332.087 P /39.851 after-prefill D**;
-continuation controls327.546–331.486/39.679–39.893. All768 IDs/MTP/config
-match;17 focused host/AMD registrations pass. Model difference is small.
-[Dispatch/results](../2026-11/QFN_ROCM_M448_NATIVE_Q8_20261110.md).
-Prior migration continuation improved P4.0–5.3%, with D−0.24–0.77%;
-[limits/replays](../2026-11/QFN_ACTIVE_PROGRESS_MIGRATION_20261110.md).
-[Earlier cache/planner wins](../2026-11/QFN_CACHE_AND_PLACEMENT_ECONOMY_20261110.md).
-Goal remains open; memory/retirement pass.
+Latest exact-scoring slice: **332.183 P /40.372 after-prefill D**, versus
+332.087/39.851: P flat, D+1.31% in one run. All768 IDs/MTP/config match;
+11 focused registrations and memory/retirement pass. Goal remains open.
+[Scoring/results/profile](../2026-11/QFN_ISOLATED_TIER_SWAP_SCORING_20261110.md).
+[Measured M448 dispatch](../2026-11/QFN_ROCM_M448_NATIVE_Q8_20261110.md),
+[migration continuation](../2026-11/QFN_ACTIVE_PROGRESS_MIGRATION_20261110.md),
+[cache/planner](../2026-11/QFN_CACHE_AND_PLACEMENT_ECONOMY_20261110.md).
 Historical remote-GPU rates are numerical controls, **not a placement speedup
 baseline**. Standalone benchmark rank→PID publication remains open.
 [SDK status](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md).
@@ -44,7 +43,7 @@ placement match. Runtime pause-loop cycle shares are not removable wall time.
 [OpenMP evidence](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
 **Native Q8:** M448 measured tiles installed on gfx906/gfx1100;
 M64 remains unchanged. Original whole four-cell candidate stays unpromoted.
-Next: reduce repeated exact tier-cycle pricing; keep final coherent admission.
+Next: preserve cycle order while reducing global traversal; component profile identifies DFS16.38%.
 Fresh trace:665ms root wait,20.7ms pooled lookup; result copy near its measured transport ceiling.
 [Scope/results](../2026-11/QFN_ROCM_NATIVE_Q8_PREFILL_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
