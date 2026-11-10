@@ -918,3 +918,18 @@ clean). Addresses both P2s:
   not receipt authentication or FF permission. Review side COMPLETE for the
   combined candidate; remaining FF gate = GNU driver receipt + focused set
   at 717b2bfe6 (arm-sparks, in flight) → Main.
+
+### Half-perf cell checkpoint (2026-11-10, ~16:0xZ): adb1c98e9 — test-only, review + Linux validation pending
+
+New lane arm-halfperf (cpu-tuning agent, gpt-6.1-sol:low; operator-directed
+parallel implementation) completed its first checkpoint:
+**codex/arm-half-perf-cell @ adb1c98e9** ("test(cpu): add independently
+owned half operand projection cell"; worktree /Users/floriankinder/repo/
+llaminar-halfperf). Branch off settled e8866ec04. TEST-ONLY per plan v2.1
+(#150): Perf__CPUHalfOperand* registration; oracle test-owned;
+C0-per-invocation-v1. Mac commit = hook-disabled per program pattern
+(AppleClang/OpenMP structural limitation), Linux validation OUTSTANDING and
+merge-gating: full Integration build + Unit/preflight on .80 + the cell's
+economy receipts (authentic GDN geometry/recorded fixture). NOT merge-ready.
+Pending: reviewer source review (routed) → .80 window (booked after the
+combined-candidate receipts) → Main.
