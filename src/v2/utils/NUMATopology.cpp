@@ -82,11 +82,12 @@ namespace llaminar2
             return info;
         }
 
-        // Fallback to node 0 (single-socket assumption)
-        info.local_numa_node = 0;
+        // Unknown affinity is not node 0: a consumer that skipped the flag
+        // would otherwise restrict itself to node 0's resources.
+        info.local_numa_node = -1;
         info.detection_succeeded = false;
-        info.detection_method = "fallback";
-        LOG_WARN("[NUMATopology] NUMA detection failed, assuming node 0 (single socket)");
+        info.detection_method = "undetected";
+        LOG_WARN("[NUMATopology] NUMA affinity could not be detected; reporting node -1 (unknown)");
         return info;
     }
 

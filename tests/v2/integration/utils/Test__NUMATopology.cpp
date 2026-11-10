@@ -42,7 +42,7 @@ TEST(Test__Integration_NUMATopology, DetectionMethod_IsValid)
     EXPECT_TRUE(info.detection_method == "hwloc" ||
                 info.detection_method == "procfs" ||
                 info.detection_method == "sysfs" ||
-                info.detection_method == "fallback");
+                info.detection_method == "undetected");
 }
 
 // =============================================================================

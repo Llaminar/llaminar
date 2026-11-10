@@ -24,7 +24,7 @@ namespace llaminar2
      */
     struct NUMAInfo
     {
-        int local_numa_node = 0;          ///< NUMA node this process is running on
+        int local_numa_node = -1;         ///< Detected node; -1 whenever detection_succeeded is false
         int total_numa_nodes = 1;         ///< Total NUMA nodes in system
         bool detection_succeeded = false; ///< Whether detection was successful
         std::string detection_method;     ///< How node was detected ("hwloc", "procfs", "fallback")
@@ -65,7 +65,7 @@ namespace llaminar2
          * Tries multiple methods in order:
          * 1. hwloc_get_cpubind() if available
          * 2. Parse /proc/self/status Cpus_allowed_list
-         * 3. Fallback to node 0
+         * 3. Otherwise report detection failure with node -1 (unknown)
          *
          * @return NUMA info with detection status
          */
