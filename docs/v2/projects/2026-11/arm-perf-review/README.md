@@ -250,3 +250,27 @@ After i8mm merge (same tile / post-merge):
 - YTD merged chain: base -> R1 -> ideas-7+25 -> CUDA stack -> B-series (B1-B7
   + B10) -> R2. Remaining handovers: idea-31 (post-census rebase) + Bundle-1
   (FF-time rebase target 8fcc0fe0b).
+
+## .80 disk-full incident + build-tree rule (2026-11-10, addon lane)
+
+- `/` hit 100% (6.3 MB free); the idea-31 census attempt at 3027d7bb8 died
+  with `ld: final link failed: No space left on device` (i31-run.log RC=1,
+  i31-build.log). **No idea-31 GNU census receipt exists yet.**
+- Root cause: `build/int-3027d7bb8` = **473 GB** — configured with the
+  CPU-only default `LLAMINAR_SHARED_CORE=OFF` → full core statically linked
+  into all ~380 test binaries (~1.2 GB each). Gate trees use
+  `-DLLAMINAR_SHARED_CORE=ON` → ~30 GB each. (Same lesson as the WSL
+  400G+ trees.)
+- RULE (runbook): **every new Integration int dir on .80/.79/WSL/station is
+  configured with `-DLLAMINAR_SHARED_CORE=ON`** unless a static-core build
+  is explicitly required and its size budgeted.
+- Cleanup: addon lane deleted its own superseded gate dirs (int-f9f190059,
+  int-777f7a52a, int-8c90cd879; logs kept) → 91 GB free (98%). arm-sparks
+  to delete its own int-3027d7bb8 from inside the container (root-owned).
+- Receipt recipe (no full Integration build needed): `census-matrix.sh`
+  builds only the witness probes for the 9 GNU-14 cells (~25 min), then
+  `r2cmp.py` per cell; if Unit/preflight TileRegister tests are wanted,
+  reconfigure the int tree with SHARED_CORE=ON (r2gate2.sh pattern).
+- Side observation (non-blocking, census tooling): `g-*.census.log` shows
+  `Debug * CONFIGURE_FAILED` lines before the 9 results — a first-attempt
+  Debug configure that was retried; addon lane to investigate.
