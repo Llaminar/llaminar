@@ -84,3 +84,34 @@ grouped verify is wasted. Two open questions:
 ## Base-dependent result (2026-11-08, afe62c5ef + i8mm c3)
 
 On the NEW base, 27B MTP dyn **5.455—5.545 vs no-MTP 5.28 tok/s** — MTP now beats no-MTP on this base (acceptance 43.4%), opposite of the older 268cd81de numbers (4.24/4.27 vs 4.49). The dense-MTP decision is base/version-sensitive: evaluate the economics for each base, not once. (Root causes of the flip are not yet separated — likely the upstream perf/prefill fixes.)
+
+## Activation (2026-11-10, operator: address it)
+
+Current-tip facts before any policy change:
+
+1. **Lever 1 (i8mm for M>=2) is already implemented**: the grouped kernel
+   (`CPUNativeQuantisedGemmKernel.h`) runs SMMLA row-pairs on shared-row
+   tiles and executes the SDOT leaf for a lone row — that lone-row fallback
+   is the "M=1 guard". The remaining economics are therefore acceptance +
+   depth policy + LM-head-per-row, not missing SMMLA.
+2. **`MTPDepthDefaults.h` has no CPU profile** (Portable/CUDARTX3090/
+   ROCmMI50 only; Portable adaptive max depth = full range 15, demotion
+   rate 0.30). The C-era finding (depth 10 at 43.4% acceptance, decision
+   `window_not_ready`) is consistent with device-tuned defaults.
+3. **Base sensitivity**: on the new base MTP already WINS dense
+   (5.455-5.545 vs 5.28). Re-measure on the current tip before changing
+   policy; the C-era loss may be stale.
+
+Owner: **DGX station perf lane** (plan-first, policy-only). Scope in order:
+(a) root-cause `window_not_ready` on the current tip (code + controller
+replay with recorded traces + CPU timings — no live window needed);
+(b) re-measure dense-MTP economics on the current tip (live 27B runs booked
+through arm-perf/arm-sparks only, queued after the idea-31 census, B9
+census and the Bundle-1 bound run; a Grace station run may serve as a
+cross-check, not the canonical GB10 number);
+(c) only if economics are still negative on the current tip: add a measured
+CPU continuation profile / demotion backoff so the controller cannot run
+depth whose verifier cost per accepted token exceeds a decode step.
+Policy-only (no kernel byte changes); grouped rows stay byte-identical
+(MTP batch invariance); base feedback to Main (01a1a8bf); reviewer at a
+clean checkpoint; merge-ready handover to Main.
