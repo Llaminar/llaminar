@@ -23565,7 +23565,9 @@ target_link_libraries(v2_unit_prefill_decode_transition
     GTest::gtest_main
 )
 # Recorded serving-slot handoff baseline. Captured at the reference production
-# source identity through the device-free boundary; replay compares behavior
+# source identity (content-blob hashes recorded inside the fixture header,
+# written only by the explicit capture invocation) through the device-free
+# boundary; replay validates the metadata structurally, compares behavior,
 # and never requires an identical commit. Regeneration is the explicit capture
 # switch only, never an automatic reaction to a failing comparison.
 target_compile_definitions(v2_unit_prefill_decode_transition PRIVATE

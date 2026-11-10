@@ -1913,14 +1913,16 @@ namespace llaminar2
          * the admission that opened it, stamped by the runner at the public
          * request-admission edge from its own monotonic per-slot generation
          * counter. `retired` marks a bank whose request was retired at an
-         * exact retirement boundary. A retired bank must never hold payload,
-         * and consuming payload under a retired identity is a fatal request
-         * diagnostic, never a silent discard. Same-request speculative-sidecar
-         * invalidation (exact mailbox mismatch) and late external cancellation
-         * stay distinct, non-fatal paths. At capacity one the record is
-         * singular and replaced at every admission, so the epoch is retention
-         * bookkeeping for the qualified capacity increase rather than a
-         * runtime-visible selector today.
+         * exact retirement boundary. The epoch is admission bookkeeping and
+         * diagnostics for the qualified capacity increase; it is not a
+         * producer/consumer authentication token in this slice. Bank states
+         * are exactly three: live (opened by the current admission),
+         * retired-empty (consumed by an exact retirement boundary), and
+         * corrupt (payload present while retired — a detected inconsistency,
+         * refused as a fatal request diagnostic, never auto-repaired). Decode
+         * entries on a non-live bank are rejected before any mutation with a
+         * precise inactive-slot diagnostic; that is an intentionally hardened
+         * invalid-input contract, distinct from supported-call parity.
          */
         struct ServingSlotHandoff
         {
@@ -2006,10 +2008,46 @@ namespace llaminar2
                        decode_transaction_planning_position_.has_value();
             }
 
-            /** @brief Open a fresh bank for a newly admitted request generation. */
+            /**
+             * @brief Retire the bank at an exact retirement boundary.
+             *
+             * Clears lease-bearing resident values before their host
+             * companions, in the documented order.
+             */
+            void retire() noexcept
+            {
+                ready_mtp_condition_.reset();
+                pending_mtp_condition_resident_state_.reset();
+                prelaunched_mtp_first_sidecar_resident_state_.reset();
+
+                pending_mtp_condition_token_.reset();
+                pending_mtp_condition_params_.reset();
+                prelaunched_mtp_first_sidecar_params_.reset();
+                prefill_logits_ready_ = false;
+                decode_transaction_planning_position_.reset();
+                retired = true;
+            }
+
+            /** @brief Open a fresh bank for a newly admitted request generation.
+             *
+             * Clears lease-bearing resident values before their host companions,
+             * mirroring the retirement helper's documented order. Never a
+             * wholesale default assignment: the member declaration order would
+             * clear the pending host token/params before their resident lease,
+             * which is exactly the ordering the retirement boundary must not
+             * have.
+             */
             void openFor(std::uint64_t generation) noexcept
             {
-                *this = ServingSlotHandoff{};
+                ready_mtp_condition_.reset();
+                pending_mtp_condition_resident_state_.reset();
+                prelaunched_mtp_first_sidecar_resident_state_.reset();
+
+                pending_mtp_condition_token_.reset();
+                pending_mtp_condition_params_.reset();
+                prelaunched_mtp_first_sidecar_params_.reset();
+                prefill_logits_ready_ = false;
+                decode_transaction_planning_position_.reset();
                 admission_epoch = generation;
                 retired = false;
             }

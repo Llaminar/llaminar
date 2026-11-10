@@ -7586,15 +7586,40 @@ namespace
                 runner->clearCache();
                 events << "C\n";
             }
-            else if (kind == "decode_after_clear")
+            else if (kind == "mtp_w2_greedy")
             {
-                auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+                auto [runner, mock] = createRunner(/*mtp_enabled=*/true, true, {}, nullptr,
+                                                   false, false, DeviceId::cpu(), 2,
+                                                   /*chained_mtp_support=*/true);
                 (void)mock;
+                for (const auto &prompt : std::vector<std::vector<int32_t>>{{1, 2, 3}, {4}})
+                {
+                    recordPrefill(runner->prefill(prompt), prompt.size());
+                    recordStep(decodeWithBudget(runner, 3));
+                    recordStep(decodeWithBudget(runner, 3));
+                    runner->clearCache();
+                    events << "C\n";
+                }
+            }
+            else if (kind == "mtp_w2_spec")
+            {
+                auto [runner, mock] = createRunner(
+                    /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr,
+                    false, false, DeviceId::cpu(), 2, /*chained_mtp_support=*/true,
+                    false, {}, MTPVerifyMode::SpeculativeSampling);
+                (void)mock;
+                SamplingParams params;
+                params.temperature = 0.7f;
+                params.top_k = 7;
+                params.top_p = 0.9f;
+                params.seed = 123u;
+                runner->setSamplingParams(params);
                 recordPrefill(runner->prefill({1, 2}), 2);
-                recordStep(decodeWithBudget(runner, 1));
+                mock->setHostTerminalSamplingLogits({0.3f, 0.4f, 0.1f, 0.2f, -0.1f,
+                                                     0.0f, -0.3f, -0.2f, -0.5f, -0.4f});
+                recordStep(decodeWithBudget(runner, 3));
                 runner->clearCache();
                 events << "C\n";
-                recordStep(decodeWithBudget(runner, 1));
             }
             else
             {
@@ -18987,11 +19012,12 @@ namespace
      */
     TEST_F(Test__ServingSlotHandoffReplay, MatchesRecordedProductionBaseline)
     {
+        const std::vector<const char *> scenarios = {
+            "serial3", "mtp_greedy2", "mtp_w2_greedy", "mtp_spec_seed",
+            "mtp_w2_spec", "forced", "generate2", "direct_prefill"};
         const bool capture = std::getenv("LLAMINAR_CB_HANDOFF_CAPTURE") != nullptr;
         std::string actual;
-        for (const char *kind : {"serial3", "mtp_greedy2", "mtp_spec_seed",
-                                 "forced", "generate2", "direct_prefill",
-                                 "decode_after_clear"})
+        for (const char *kind : scenarios)
         {
             actual += "=== ";
             actual += kind;
@@ -19002,9 +19028,33 @@ namespace
         const std::filesystem::path golden{LLAMINAR_CB_HANDOFF_GOLDEN};
         if (capture)
         {
+            /*
+             * Capture refuses to write an identity-less golden: the reference
+             * source, capture host, and build identities must be supplied by
+             * the capture invocation and describe the actual capture, never
+             * invented retrospective provenance. The pre-hardening
+             * decode_after_clear observation stays in fixture history
+             * (15b93b850); after-clear decode is now an intentionally hardened
+             * invalid-input contract covered by the lifecycle suite.
+             */
+            const char *source = std::getenv("LLAMINAR_CB_HANDOFF_REFERENCE_SOURCE");
+            const char *captureHost = std::getenv("LLAMINAR_CB_HANDOFF_CAPTURE_HOST");
+            const char *build = std::getenv("LLAMINAR_CB_HANDOFF_BUILD");
+            ASSERT_NE(source, nullptr) << "capture requires LLAMINAR_CB_HANDOFF_REFERENCE_SOURCE";
+            ASSERT_NE(captureHost, nullptr) << "capture requires LLAMINAR_CB_HANDOFF_CAPTURE_HOST";
+            ASSERT_NE(build, nullptr) << "capture requires LLAMINAR_CB_HANDOFF_BUILD";
             std::filesystem::create_directories(golden.parent_path());
             std::ofstream output(golden);
-            output << actual;
+            output << "# llaminar serving-slot handoff recorded replay\n"
+                   << "# reference-source: " << source << "\n"
+                   << "# capture-host: " << captureHost << "\n"
+                   << "# build: " << build << "\n"
+                   << "# harness: Test__PrefillDecodeTransition device-free production-controller harness\n"
+                   << "# policy: greedy default unless a scenario sets seeded params; prefix-cache disabled; mtp draft widths 1 and 2; device-free mock boundary\n"
+                   << "# scenarios:";
+            for (const char *kind : scenarios)
+                output << ' ' << kind;
+            output << "\n" << actual;
             ASSERT_TRUE(output.good()) << "cannot write " << golden;
             GTEST_SKIP() << "capture mode wrote the recorded baseline at " << golden;
         }
@@ -19012,8 +19062,33 @@ namespace
         ASSERT_TRUE(std::filesystem::exists(golden))
             << "recorded baseline missing: " << golden;
         std::ifstream input(golden);
+        std::ostringstream raw;
+        raw << input.rdbuf();
+        const std::string expectedRaw = raw.str();
+        // Structural validation: reject incomplete or incompatible traces.
+        for (const char *key : {"# reference-source:", "# capture-host:",
+                                "# build:", "# harness:", "# policy:",
+                                "# scenarios:"})
+            EXPECT_NE(expectedRaw.find(key), std::string::npos)
+                << "recorded baseline missing metadata key " << key;
         std::ostringstream expected;
-        expected << input.rdbuf();
+        bool inHeader = true;
+        std::istringstream reader(expectedRaw);
+        std::string metadataLine;
+        while (std::getline(reader, metadataLine))
+        {
+            if (metadataLine.rfind("# scenarios:", 0) == 0)
+            {
+                for (const char *kind : scenarios)
+                    EXPECT_NE(metadataLine.find(kind), std::string::npos)
+                        << "recorded scenario list missing " << kind;
+                inHeader = false;
+                continue;
+            }
+            if (inHeader)
+                continue; // metadata lines are validated, not behavior-compared
+            expected << metadataLine << '\n';
+        }
         EXPECT_EQ(actual, expected.str())
             << "production controller behavior diverged from the recorded "
                "reference baseline; investigate the divergence instead of "
@@ -19105,6 +19180,132 @@ namespace
         EXPECT_EQ(b1.tokens, cb1.tokens)
             << "a direct admission must not inherit the previous request's "
                "ready condition or speculative handoff";
+    }
+
+    /**
+     * @brief Intentionally hardened invalid-input contract: a decode after the
+     *        exact retirement boundary has no admitted request to serve.
+     *
+     * The pre-hardening capture observed a successful stateless decode here;
+     * that historical observation is superseded by this contract and stays in
+     * fixture history (15b93b850 golden). The rejection must happen before any
+     * bank mutation, so the MTP publication path cannot create retired+payload
+     * state that a later decode would fatal on.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, DirectDecodeAfterRetirementIsRejected)
+    {
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        const GenerationResult a1 = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(a1.success()) << a1.error;
+        runner->clearCache();
+
+        const GenerationResult rejected = decodeWithBudget(runner, 1);
+        EXPECT_FALSE(rejected.success());
+        EXPECT_NE(rejected.error.find("no live admission"), std::string::npos)
+            << rejected.error;
+
+        // Recovery: the next admission opens a fresh bank and decoding works.
+        ASSERT_TRUE(runner->prefill({3, 4}));
+        const GenerationResult b1 = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(b1.success()) << b1.error;
+    }
+
+    /** Forced-token entry carries the same inactive-slot contract. */
+    TEST_F(Test__ServingSlotHandoffLifecycle, ForcedTokenAfterRetirementIsRejected)
+    {
+        auto [runner, mock] = createRunner();
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1}));
+        runner->clearCache();
+        const GenerationResult rejected = runner->forceDecodeToken(42);
+        EXPECT_FALSE(rejected.success());
+        EXPECT_NE(rejected.error.find("no live admission"), std::string::npos)
+            << rejected.error;
+    }
+
+    /**
+     * @brief A failed admission must not open or mutate the bank: the slot
+     *        stays retired, the hardened decode contract reports it, and the
+     *        next valid admission recovers immediately.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, FailedAdmissionLeavesRetiredBankUntouched)
+    {
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        const GenerationResult a1 = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(a1.success()) << a1.error;
+        runner->clearCache();
+
+        EXPECT_FALSE(runner->prefill({}));
+        const GenerationResult rejected = decodeWithBudget(runner, 1);
+        EXPECT_FALSE(rejected.success());
+        EXPECT_NE(rejected.error.find("no live admission"), std::string::npos)
+            << rejected.error;
+
+        ASSERT_TRUE(runner->prefill({5}));
+        const GenerationResult b1 = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(b1.success()) << b1.error;
+    }
+
+    /**
+     * @brief Resident capacity one is not verifier width one: exercise the
+     *        grouped verifier at draft width 2 across a retirement boundary.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, MTPWidthTwoSequentialReuseMatchesFreshRunner)
+    {
+        const std::vector<float> rowA = {0.10f, 0.20f, 0.90f, 0.30f, 0.20f,
+                                         0.10f, 0.05f, 0.04f, 0.03f, 0.02f};
+        const std::vector<float> rowB = {0.10f, 0.20f, 0.10f, 0.20f, 0.30f, 0.90f,
+                                         0.05f, 0.04f, 0.03f, 0.02f};
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr, false, false,
+            DeviceId::cpu(), /*mtp_draft_tokens=*/2, /*chained_mtp_support=*/true);
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        mock->setHostTerminalSamplingLogits(rowA);
+        const GenerationResult a1 = decodeWithBudget(runner, 3);
+        ASSERT_TRUE(a1.success()) << a1.error;
+        runner->clearCache();
+        ASSERT_TRUE(runner->prefill({4, 5}));
+        mock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult b1 = decodeWithBudget(runner, 3);
+        ASSERT_TRUE(b1.success()) << b1.error;
+
+        auto [control, controlMock] = createRunner(
+            /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr, false, false,
+            DeviceId::cpu(), /*mtp_draft_tokens=*/2, /*chained_mtp_support=*/true);
+        (void)controlMock;
+        ASSERT_TRUE(control->prefill({4, 5}));
+        controlMock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult cb1 = decodeWithBudget(control, 3);
+        ASSERT_TRUE(cb1.success()) << cb1.error;
+
+        EXPECT_EQ(b1.tokens, cb1.tokens)
+            << "width-2 request B inherited prior-request handoff state";
+    }
+
+    /**
+     * @brief Scalar/fixed-cohort boundary: the batched entry requires its own
+     *        batched prefill and must not disturb the live scalar handoff bank.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, BatchedBoundaryDoesNotDisturbScalarBank)
+    {
+        auto [runner, mock] = createRunner();
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        const GenerationResult before = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(before.success()) << before.error;
+
+        const GenerationBatchResult batched = decodeBatchWithBudget(runner, 1, 1);
+        EXPECT_FALSE(batched.error.empty())
+            << "batched decode without a batched prefill must be rejected";
+
+        const GenerationResult after = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(after.success()) << after.error;
     }
 
 } // namespace

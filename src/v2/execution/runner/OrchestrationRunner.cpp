@@ -4081,18 +4081,26 @@ namespace llaminar2
         hosted_device_generation_decode_progress_retired_.store(
             0u, std::memory_order_release);
         device_generation_admission_.reset();
-        if (slot_handoff_.hasPayload() && !slot_handoff_.retired)
+        if (slot_handoff_.hasPayload() && slot_handoff_.retired)
+        {
+            return setError(
+                "Corrupt serving-slot handoff: payload present in a bank "
+                "already consumed by its retirement boundary; refusing to "
+                "open a new bank over unretired state");
+        }
+        if (slot_handoff_.hasPayload())
         {
             LOG_WARN("[OrchestrationRunner] Direct admission retires the previous "
                      "request's live handoff bank (generation "
                      << slot_handoff_.admission_epoch
-                     << ") without an explicit retirement boundary");
+                     << ") through the explicit lease-first retirement boundary");
+            slot_handoff_.retire();
         }
-        else if (slot_handoff_.hasPayload())
+        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
         {
             return setError(
-                "Retired serving-slot handoff still holds payload at request "
-                "admission; refusing to open a new bank over unretired state");
+                "Serving-slot admission generation exhausted before request "
+                "admission; refusing to wrap the monotonic counter");
         }
         slot_handoff_.openFor(++serving_slot_generation_);
         generation_request_seeds_.reset();
@@ -4960,18 +4968,26 @@ namespace llaminar2
             0u, std::memory_order_release);
         device_generation_admission_.reset();
         prefix_request_summary_ = {};
-        if (slot_handoff_.hasPayload() && !slot_handoff_.retired)
+        if (slot_handoff_.hasPayload() && slot_handoff_.retired)
+        {
+            return setError(
+                "Corrupt serving-slot handoff: payload present in a bank "
+                "already consumed by its retirement boundary; refusing to "
+                "open a new bank over unretired state");
+        }
+        if (slot_handoff_.hasPayload())
         {
             LOG_WARN("[OrchestrationRunner] Direct admission retires the previous "
                      "request's live handoff bank (generation "
                      << slot_handoff_.admission_epoch
-                     << ") without an explicit retirement boundary");
+                     << ") through the explicit lease-first retirement boundary");
+            slot_handoff_.retire();
         }
-        else if (slot_handoff_.hasPayload())
+        if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
         {
             return setError(
-                "Retired serving-slot handoff still holds payload at request "
-                "admission; refusing to open a new bank over unretired state");
+                "Serving-slot admission generation exhausted before request "
+                "admission; refusing to wrap the monotonic counter");
         }
         slot_handoff_.openFor(++serving_slot_generation_);
         last_token_ = next_states.front().last_token;
@@ -8748,13 +8764,21 @@ namespace llaminar2
             result.error = "Invalid vocabulary size for MTP decode";
             return result;
         }
-        if (slot_handoff_.hasPayload() && slot_handoff_.retired)
+        if (slot_handoff_.retired)
         {
+            if (slot_handoff_.hasPayload())
+            {
+                result.error =
+                    "Corrupt serving-slot handoff: payload present in a bank "
+                    "already consumed by its retirement boundary; refusing to "
+                    "consume or auto-repair foreign request state";
+                LOG_ERROR("[OrchestrationRunner] decodeStepMTP refused corrupt slot handoff state");
+                return result;
+            }
             result.error =
-                "Stale serving-slot handoff: payload survived its retirement "
-                "boundary; refusing to consume foreign request state";
-            LOG_ERROR("[OrchestrationRunner] decodeStepMTP rejected stale slot "
-                      "handoff payload after retirement");
+                "decodeStepMTP() requires an admitted request: the serving "
+                "slot has no live admission after the last request boundary; "
+                "call prefill() first";
             return result;
         }
 
@@ -15332,13 +15356,21 @@ namespace llaminar2
                 "use decodeStepBatch()";
             return result;
         }
-        if (slot_handoff_.hasPayload() && slot_handoff_.retired)
+        if (slot_handoff_.retired)
         {
+            if (slot_handoff_.hasPayload())
+            {
+                result.error =
+                    "Corrupt serving-slot handoff: payload present in a bank "
+                    "already consumed by its retirement boundary; refusing to "
+                    "consume or auto-repair foreign request state";
+                LOG_ERROR("[OrchestrationRunner] decodeStep refused corrupt slot handoff state");
+                return result;
+            }
             result.error =
-                "Stale serving-slot handoff: payload survived its retirement "
-                "boundary; refusing to consume foreign request state";
-            LOG_ERROR("[OrchestrationRunner] decodeStep rejected stale slot "
-                      "handoff payload after retirement");
+                "decodeStep() requires an admitted request: the serving slot "
+                "has no live admission after the last request boundary; call "
+                "prefill() first";
             return result;
         }
         const bool mpi_coordinated_world =
@@ -16068,13 +16100,21 @@ namespace llaminar2
                 "forceDecodeToken() cannot consume request-batched prefill state";
             return result;
         }
-        if (slot_handoff_.hasPayload() && slot_handoff_.retired)
+        if (slot_handoff_.retired)
         {
+            if (slot_handoff_.hasPayload())
+            {
+                result.error =
+                    "Corrupt serving-slot handoff: payload present in a bank "
+                    "already consumed by its retirement boundary; refusing to "
+                    "consume or auto-repair foreign request state";
+                LOG_ERROR("[OrchestrationRunner] forceDecodeToken refused corrupt slot handoff state");
+                return result;
+            }
             result.error =
-                "Stale serving-slot handoff: payload survived its retirement "
-                "boundary; refusing to consume foreign request state";
-            LOG_ERROR("[OrchestrationRunner] forceDecodeToken rejected stale "
-                      "slot handoff payload after retirement");
+                "forceDecodeToken() requires an admitted request: the serving "
+                "slot has no live admission after the last request boundary; "
+                "call prefill() first";
             return result;
         }
         const int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;

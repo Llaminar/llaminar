@@ -1,3 +1,10 @@
+# llaminar serving-slot handoff recorded replay
+# reference-source: 28ddbe253-pin + working-tree content blobs: runner.h=290c3e264483 runner.cpp=18caa66a85c2 harness.cpp=daae6b347556 (captured pre-commit; these hashes equal the committed content of the correction commit; supersedes the w2 sections of the prior capture whose chained_mtp_support harness bug recorded failed admissions)
+# capture-host: dgx-station (tdsynnex, aarch64 Neoverse-V2, 64K pages)
+# build: Integration/SHARED_CORE=ON/NEON_I8MM/HAVE_CUDA=OFF/HAVE_ROCM=OFF/gcc-14/cmake4.0.3/ninja1.13/image:sha256:b3a70cb060bb...
+# harness: Test__PrefillDecodeTransition device-free production-controller harness
+# policy: greedy default unless a scenario sets seeded params; prefix-cache disabled; mtp draft widths 1 and 2; device-free mock boundary
+# scenarios: serial3 mtp_greedy2 mtp_w2_greedy mtp_spec_seed mtp_w2_spec forced generate2 direct_prefill
 === serial3 ===
 R5:1
 D7,:0:0:0
@@ -20,10 +27,23 @@ R1:1
 D7,9,:0:0:0
 D3,9,:0:0:0
 C
+=== mtp_w2_greedy ===
+R3:1
+D7,9,9,:0:0:0
+D3,9,9,:0:0:0
+C
+R1:1
+D7,9,9,:0:0:0
+D3,9,9,:0:0:0
+C
 === mtp_spec_seed ===
 R3:1
 D0,9,:0:0:0
 D3,9,:0:0:0
+C
+=== mtp_w2_spec ===
+R2:1
+D1,9,9,:0:0:0
 C
 === forced ===
 R2:1
@@ -39,8 +59,3 @@ D7,:0:0:0
 R2:1
 D9,9,:0:0:0
 C
-=== decode_after_clear ===
-R2:1
-D7,:0:0:0
-C
-D7,:0:0:0
