@@ -105,3 +105,34 @@ gate set includes these two as base-class until Main takes the fix.
   (preflight-appended); FULL portability CTest 293/293 green (Mac);
   Linux-engine targets syntax-validated under stubs (runtime validation at
   the canonical Linux gates at landing). A2 rider set BOOKED next (.80).
+
+### Reviewer #179 — A1 HOLD at 1d9141934 (comprehensive fix-back #180 required)
+
+Reviewer findings (four P2s; the macro+two-FA coverage cannot support
+"every real fork"; owner-scoped accounting required — NO production
+serialization workaround):
+- **A1-1 [P2] coverage not exhaustive:** live non-prep raw forks remain
+  UNCCOUNTED — Qwen4ExpBranchConcat.cpp:52 (CPU execution),
+  MoEOverlaySparseCollective.cpp:1059 (route publication),
+  MoELocalExpertStage.cpp:4255, HostBackend.cpp:979ff (collective
+  reductions). Audit the runtime inventory + explicit NAMED prep exemptions.
+- **A1-2 [P2] process-global snapshots not owned per-device/stage:**
+  concurrent TP/executor scopes count each other's forks; serializing one
+  executor's waves does not serialize other participants; the new
+  exact-attribution comments overclaim. REQUIRE owner-scoped accounting +
+  an overlapping-scope regression (no production serialization).
+- **A1-3 [P2] data race:** Test__OpenMPWorkshare.cpp:626 assigns shared
+  non-atomic `before` from every thread inside a retained parallel region —
+  race even when values happen to be equal. Fix: immutable snapshot outside
+  or private per-thread snapshot.
+- **A1-4 [P2] publication test doesn't exercise publishers:** the core
+  test only checks family enablement + self-cost — deleting BOTH production
+  publishers would still pass. Add actual-path off/on/filter/GPU-absence/
+  exact-delta regressions; RESTORE the cached DebugEnv/collector config
+  after env RAII (current final evidence config LEAKS beyond the test).
+- Positive recorded: standalone macro branches + both FA sites note;
+  summary CPU/decode/success/family-gated; both stage additions CPU-gated;
+  both preflight registrations present; no new launcher/concurrency cap;
+  self-cost loop = uncontended only (not contended/multi-executor).
+  293/293 + 2.26/2.32 ns = unauthenticated owner reports. No A2 evidence
+  acceptance or merge grant. Main: A1 HOLD respected; no FF.
