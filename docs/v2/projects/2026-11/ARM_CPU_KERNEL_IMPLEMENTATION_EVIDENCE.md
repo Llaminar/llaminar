@@ -45,15 +45,37 @@ ownership. HC and final normalization retain all active forward rows; only the
 vocabulary projection compacts to one row. Request pricing consumes the checked
 row API and reports the actual prefill/decode terminal counts it uses; focused
 assertions discriminate multirow prefill from one-row decode, including PP and
-legacy output normalization. Corrected-source validation remains pending.
+legacy output normalization. Exact `35a827a2a` has bounded source ACK #176/#177,
+passes the complete native planning Unit family and five-GTest focused preflight,
+and passes 20 consecutive focused repetitions. A temporary mirror-only control
+restoring the original `Terminal => 1` count expression fails both actual-pricing
+GTests while the other three pass; restoring production source makes them green.
 
-The actual `.79` planning proof is held before launch at the superseded
-`0d6f09919` until the corrected estimator pin is supplied, with the same
-4096/8192 commands and canonical non-attached driver-diagnostic window.
-The 8192 `Higher-priority PMA plan must fit before ngram storage selection`
-failure remains an independent unverified admission issue, not an assumed
-consequence of weight classification. No inference or attached profiling is
-admitted by this diagnostic window.
+No plan ran at superseded `0d6f09919`: the delegated window was prepared but
+never launched, and explicit exclusive handback preceded Main execution. Main
+then fast-forwarded the remote source to `35a827a2a` and built a fresh native
+GNU14/NEON/CUDA121 Integration `llaminar2` in `build-gb10i-e5ee2`. Both configure
+and unrestricted build pass. The exact real four-split UD source at context
+4096 now plans successfully and writes its apply JSON. Automatic selection is
+**CPU single**, one admitted candidate; this is not GPU inference/trace proof.
+Its pricing evidence reports prefill pre-head rows 256 versus vocabulary-head
+row 1, and both counts 1 in decode. Request-time estimates are not benchmarks.
+
+Context 8192 still rejects with `Higher-priority PMA plan must fit before ngram
+storage selection`. This is independent: the row selector may return a
+nonfitting mandatory diagnostic plan, but ordinary candidate admission passes it
+to optional table selection before the canonical capacity certificate. Followup
+#74 will certify the unchanged mandatory base first, preserving typed capacity
+rejection without reopening rows/quotas or modifying placement/accounting.
+
+The host-owned canonical driver window completes with zero records/findings;
+all phase exits are retained separately (4096=0, 8192=1, driver=0). Baseline
+`e8866ec04` application/core hashes and all four model-file stat identities are
+unchanged. The bounded first metadata split's full hash matches its supplied
+identity; no new full-payload hash certificate is claimed. Artifacts are on
+`.79` at `/home/factory/idea25/plan71-main-35a827a2a/`, with commands, logs,
+configuration, compile database, binary hashes and driver journal. No inference,
+attached profiling or final installed-state/register-gate qualification follows.
 
 ## 2026-11-06 immutable4e56 successor audit
 

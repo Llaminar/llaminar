@@ -21,11 +21,17 @@ evidence (K-series snapshots, seals, falsification controls) lives in
   locality checks; planning Unit passes 424/424 and focused preflight passes
   20 consecutive repetitions. Review #177 then rejects the initial terminal-HC
   compact-row assumption: HC/norm run before vocabulary-head row selection.
-  The corrective successor separates row policy from ownership and adds actual
-  pricing-count assertions. Its native validation and actual Qwen3.8-UD planning
-  proof remain pending; the earlier model window is held before launch. Context
-  8192's PMA failure remains independent until rechecked. No model-performance
-  or final register-gate qualification follows from this diagnostic.
+  Corrected `35a827a2a` separates row policy from ownership, has source ACK,
+  passes native planning Unit/preflight and 20 focused repetitions, and
+  discriminates the original bad pricing expression. Main's fresh native
+  Integration build and real Qwen3.8-UD 4096-context planning pass; selection is
+  CPU single, not GPU trace/inference proof. Context 8192 independently exposes
+  a nonfitting mandatory plan reaching optional table selection before capacity
+  certification. Followup #74 will reject that base through canonical PMA before
+  selecting optional storage, without retries/accounting/placement workarounds.
+  The real window's driver diagnostics pass, and original binary/model identity
+  records are preserved. No model-performance or final register-gate
+  qualification follows from this diagnostic.
 
 - The rebase onto `2948b1e49` is published. Full CPU-only ARM NEON Integration
   compilation passed at `e5ee7f672`, after compiler OOM-killed parity objects
