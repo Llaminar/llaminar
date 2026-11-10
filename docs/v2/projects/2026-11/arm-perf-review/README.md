@@ -1444,3 +1444,15 @@ Merge-readiness package routes to the reviewer with that attribution.
   .79 real-model 4096+8192 plan-only proof at 35 (canonical driver
   begin/finish). #71 completes after the independent model outcomes. Addon
   #175/bound-artifact HOLD unchanged.
+
+### Main queue progress (2026-11-10, ~23:20Z): tip a0393b64a2 (183; CLEAN) — #72 DONE
+
+#72 GroupedSealedPlan: the real registered script reproduced the 10
+missing-field errors/12; an explicit empty physical_launch_evidence
+fixture FIXED it; full registered native ARM script PASS. NO production
+fallback/validator change. Docs now record the actual 35/5b proof +
+handback; core production identical to 5b. #71 classification + #74
+category DONE; 8192 = NotAdmitted by true capacity. #73 FusedFinalAdd
+policy triage next. Addon FF admission + A1 #180 holds unchanged.
+**DO NOT launch the final register campaign until Main's next SETTLED
+notice** (the tip moves under it).
