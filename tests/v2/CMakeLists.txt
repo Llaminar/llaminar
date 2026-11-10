@@ -40045,8 +40045,8 @@ if(TARGET v2_unit_moe_overlay_residency_authority)
 endif()
 
 
-# Integer-only ordered nibble dependency split; original serial/M1 and AVX2 controls.
-if(TARGET v2_integration_cpu_native_quantised_fused_completion)
+# Integer-only x86 ordered nibble dependency split; original serial/M1 and AVX2 controls.
+if(V2_CPU_TARGET_X86 AND TARGET v2_integration_cpu_native_quantised_fused_completion)
     foreach(_split_dot_isa AVX2 AVX512)
         if(_split_dot_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
             continue()
