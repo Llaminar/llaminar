@@ -1397,3 +1397,17 @@ Merge-readiness package routes to the reviewer with that attribution.
   window DELEGATED to arm-sparks at exact 0d6** (canonical driver
   begin/finish; e886 preserved control) — the Qwen3.8-UD planning proof.
 - Addon still held; re-pin onto the eventual final Main tip mandatory.
+- LINEAGE CLARIFICATION (arm-sparks + coordinator): adb1c98e9..b512e25a =
+  +255/−21 (2 files) = the #172-ACKed functional fix-back (+102/−21) PLUS
+  the #173 comments-only Doxygen blocks (+153/0) — consistent; the
+  early-signal run (adb) was pre-fix-back, so the b512 run = the real
+  final-state validation. Merge-gating Linux validation COMPLETE at b512;
+  package → reviewer.
+- REVIEWER PACKAGE (half-perf merge-readiness): #172 source ACK at
+  1ea08211 (+153-line comment-only residue to b512 — 717b-precedent class);
+  Linux gate: Unit 990/16 + Preflight 2419/23 (failed-NAME sets = the
+  established base/env families + the #71 ngram/defaults class; count
+  deltas = base growth: 990 vs 979, 2419; the ngram names = FIXTURE
+  DEFECTS FIXED at a847 per Main — attributed away from the lane);
+  economy receipts = the hpb-cells 5/5 outputs per plan v2.1 (.80
+  build/hp-b512.* + trees/b512e25a). Reviewer verdict → merge-ready → Main.
