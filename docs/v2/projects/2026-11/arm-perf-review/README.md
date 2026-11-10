@@ -613,3 +613,22 @@ coordinator, NOT a new authority; native verification is host/toolchain-bound
 witness (never omitted/loosened/copied); shared budget key → max across
 configurations, never lowest/average. Old idea-31/B9 receipts still cannot
 substitute. Spec only — no driver approval/execution/merge grant.
+
+### Receipt driver v1 prepared (addon, 2026-11-10) — pre-#167 shape, adaptation directed
+
+- `arm-addon-notes/register-gate.sh` (+ .80 build/): per compiler run —
+  (a) native evidence per cell (3 build types × 3 ISA; fresh portability
+  configure; proof target; both native aliases; proof.json retained);
+  (b) checker shards per checker scope (10 TileRegisterEvidence tests, all
+  listed + pass). Fail-closed per class (native=/checker=/gate= summary);
+  nothing reused between runs; failures retained.
+- Mac trial (AppleClang-21 @ c4536cf3c; TOOLING TRIAL, not a receipt):
+  9/9 PASS, native/checker/gate PASS, rc 0; full binding in every
+  proof.json; Rows1=0. NEGATIVE CONTROL: lowered one grouped NEON key by 1
+  → the 3 NEON cells failed with PROOF_BUILD_FAILED citing the exact
+  checker reason; others passed; rc 1. Archived:
+  evidence/register-gate-trial-c4536cf3c-appleclang/.
+- Adaptation to reviewer #167 directed (envelope proof + aliases; 14
+  aliases/cell; full receipt artifact set; final-acceptance-via-aliases;
+  coordinator-not-authority; host binding; Debug semantics; shared-key max).
+  No gate runs before SETTLED.
