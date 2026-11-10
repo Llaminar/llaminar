@@ -7,11 +7,11 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Ordered cycle search: **328.794/39.609**, repeat **331.278/39.794** P/D;
-control332.183/40.372. 49-layer proposal **1.23× faster**, exact decisions;
-no model gain. IDs/MTP/config match;14 focused gates and retirement pass.
-Goal remains open. [Cycle results](../2026-11/QFN_ORDERED_MIGRATION_CYCLES_20261110.md),
-[scoring](../2026-11/QFN_ISOLATED_TIER_SWAP_SCORING_20261110.md).
+Working9-slot/9-cycle policy: **335.999/40.798 P/D**; same-capacity cap5
+**330.527/39.668** (+1.66%/+2.85%). IDs/MTP match. Global defaults unchanged;
+500/40 remains open. [Wave results](../2026-11/QFN_HYBRID_NINE_SLOT_MIGRATION_20261110.md).
+Cycle proposal **1.23× faster**, model gain unproven;14 focused gates pass.
+[Cycle results](../2026-11/QFN_ORDERED_MIGRATION_CYCLES_20261110.md).
 [Measured M448 dispatch](../2026-11/QFN_ROCM_M448_NATIVE_Q8_20261110.md),
 [migration continuation](../2026-11/QFN_ACTIVE_PROGRESS_MIGRATION_20261110.md),
 [cache/planner](../2026-11/QFN_CACHE_AND_PLACEMENT_ECONOMY_20261110.md).
@@ -20,7 +20,7 @@ baseline**. Standalone benchmark rank→PID publication remains open.
 [SDK status](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md).
 Short-prefill indexer elision saves **36 kernels/chunk/GPU**; its matched
 control showed **+7.09% P**, with unchanged output IDs/MTP.
-Fresh automatic sizing confirms **8066 total, 4033/card**, with identical placement.
+Automatic sizing: five slots **8066 total,4033/card**; nine **7940,3970/card**.
 Context stays 262144 with dynamic MTP/balancing, RAM ngrams, local GPU caches
 and 16/32 GiB RAM/disk prefix budgets.
 
@@ -44,7 +44,7 @@ placement match. Runtime pause-loop cycle shares are not removable wall time.
 [OpenMP evidence](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
 **Native Q8:** M448 measured tiles installed on gfx906/gfx1100;
 M64 remains unchanged. Original whole four-cell candidate stays unpromoted.
-Next:9-slot policy (admitted7940GPU experts), then CPU integer ILP. Neither promoted.
+CPU ILP parked at emitted-body spill check; next: native compact-route arithmetic witness.
 Fresh trace:665ms root wait,20.7ms pooled lookup; result copy near its measured transport ceiling.
 [Scope/results](../2026-11/QFN_ROCM_NATIVE_Q8_PREFILL_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
