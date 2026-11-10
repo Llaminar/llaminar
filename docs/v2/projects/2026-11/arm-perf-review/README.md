@@ -1456,3 +1456,12 @@ category DONE; 8192 = NotAdmitted by true capacity. #73 FusedFinalAdd
 policy triage next. Addon FF admission + A1 #180 holds unchanged.
 **DO NOT launch the final register campaign until Main's next SETTLED
 notice** (the tip moves under it).
+- #73 triage (Main, ~23:24Z): the preweight API has NO worker/degree gate;
+  the byte-oracle corpus deliberately contains NaN/Inf while the default
+  fail_on_nan=true correctly REJECTS nonfinite weighted rows; the fused
+  low-level combine is pure arithmetic and the fused publication wrapper
+  separately enforces the SAME fail_on_nan gate. => FIXTURE-POLICY
+  MISMATCH, not a single-worker/column capability gap. Fix scope: the
+  NONFINITE bit-oracle's diagnostic policy only, with RAII restoration +
+  separate default-on rejection / finite-admission / empty-work tests. NO
+  production validation weakening or optimization disable.
