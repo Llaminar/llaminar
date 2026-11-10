@@ -508,3 +508,21 @@ re-rebases onto the post-FF tip). No new runs before SETTLED.
   Strips!=0. Composition constraint reiterated: the final combined
   source+checker/config needs its own canonical proof. No grants; Main owns
   handover acceptance.
+
+### Correction from the 64K validation owner (2026-11-10)
+
+The b-fix-9490b66bc "4 FAILs = one env class (memory-only NUMA nodes)"
+attribution was imprecise: **3 of the 4 fails (NUMATopologyCPUList,
+Membership, DeviceRegistry) were B10 (use-after-free) showing through** —
+fixed at ce9ddb326 and green in the 9/9 focused run; only
+**ClusterInventoryBootstrap** is the true env-class residual. Main's
+counter-evidence push was the right call. Full station runbook relayed by
+the owner to the continuous-batching lane: devcontainer CPU-only image;
+.venv from requirements.txt (no model fetch); Integration CPU-only flags;
+bounded parallel build; SYS_NICE + seccomp=unconfined REQUIRED for
+page-owner tests (evidence: EPERM log line + 16-flip unmasking proof +
+unmask_cmd.txt); onednn = CMake AUTO-CLONE v3.11.3 with
+build-neon*.llaminar.lock lock files (NOT a submodule), cnpy nonexistent,
+corpora submodule must NOT be inited; own worktree or own external bind —
+NEVER a shared writable external/. Campaigns COMPLETE; build_v2_dgx/ =
+historical evidence, no active reservation.
