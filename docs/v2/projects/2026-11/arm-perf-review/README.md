@@ -632,3 +632,15 @@ substitute. Spec only — no driver approval/execution/merge grant.
   aliases/cell; full receipt artifact set; final-acceptance-via-aliases;
   coordinator-not-authority; host binding; Debug semantics; shared-key max).
   No gate runs before SETTLED.
+
+### .79 disk-full incident (2026-11-10, fixed) + pruning hygiene rule
+
+- .79 hit 100% during the e5ee7f672 Integration build (closing-depfile
+  failure at v2_test_native_source_final_retirement; 48 earlier FAILED
+  entries = the same starvation cascade — free-space artifact, NOT a tip
+  defect). arm-sparks cleaned 2 superseded build dirs it owns
+  (build-gb10i-c007 + build-gb10i-07d4; 70G freed; .79 = 69G/1.8T free) and
+  relaunched the -k 0 build (~32G expected; monitored).
+- HYGIENE RULE (both GB10 hosts): prune superseded gate build dirs once
+  their gates seal — keep the last sealed tip's dir + all logs. Accumulation
+  across tips starved .80 (473 G static-core) and .79 (70 G) the same day.
