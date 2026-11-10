@@ -239,3 +239,31 @@ B11-candidate CLOSED (no tracker upgrade, no Main fix-back). Evidence:
 .79 /home/factory/idea25/b11-nompi.log (sealed). Cross-program note: this
 CONFIRMS the in-class classification given to the continuous-batching lane
 (mpi-hwloc env).
+
+### METHODOLOGY CORRECTIONS ACCEPTED (continuous-batching lane, 2026-11-10): three downgrades
+
+1. **Classification ≠ green.** Paired failure parity + classified residuals
+   is baseline-relative evidence, NOT passing canonical gates; no waiver
+   authorized. Classification routes fixes/setup only. The ARM program's own
+   station runs recorded UNQUALIFIED-with-classification — never green.
+   (The SYS_NICE/seccomp=unconfined unmasked windows DID turn page-owner
+   tests green — SOME "env" classes are SETUP-fixable, not environmental.)
+2. **B11 downgraded to NON-REPRODUCTION on the .79 configuration** — not
+   proof of cause. The original failure host was the DGX STATION; the
+   non-MPI repro ran on .79 (different Spark host, different container).
+   Controlled comparison required: the SAME non-MPI run ON THE STATION with
+   matched host/source/binary/container/NUMA/policy identities, the one
+   non-passing case in 38/39 identified, and both failure contexts
+   documented. Route: the continuous-batching worker (matched host) or the
+   64K validation owner to execute the station-side repro; until then B11 =
+   open candidate with per-side identities recorded, prior evidence remains
+   EPERM→null→SIGSEGV (unattributed).
+3. **No blanket environment exemption for the 140.** Per-failure/per-class
+   evidence + owners instead. Class decomposition to bound:
+   (a) 64K-page mmap assumptions — possibly PAGE-SIZE-TEST-DEFECTS
+   (parameterizable), not env; (b) stale fixtures/schema (ROCm trainer CSVs
+   = fixture-missing; ModelKLDCanary = docker-missing setup); (c)
+   registration/selection family — possibly real registration defects;
+   (d) memory-only-NUMA placement semantics — topology-infeasible on this
+   host but parameterizable; (e) MPI hwloc bind — SETUP-class candidate.
+   Each class: evidence, owner, fixable-vs-not verdict.
