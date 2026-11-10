@@ -178,3 +178,54 @@ forwardGraphPerfContext BEFORE the publisher gate (side-effect/timing leak
 in the off path). Reviewer completing the remaining policy/test audit
 before ONE consolidated finding set. 295 portability/stubs = NOT
 engine-publication qualification.
+
+### Reviewer verdict #179/#180 successor — HOLD at 0ce033b6c; comprehensive fix-back #183 (seven findings)
+
+- **R1 [P2]** summary still computes globalSnapshot-entry_forks while the
+  engine passes scope.forks() — different quantities (isolated 3 → 0;
+  prior/concurrent forks contaminate). Publish the TYPED OWNER count
+  directly; add a nonzero-prior-total + overlapping-owners test.
+- **R2 [P2]** source checker NOT fail-closed/exhaustive: main skips files
+  without a matching raw pragma BEFORE the scan (orphan-only notes pass);
+  missing src/v2 passes empty; .inc/.inl and _Pragma/alternative whitespace
+  omitted (CPUNativeQuantisedWindowPacking.inc:122 is outside inventory and
+  NOT a named exemption); six-line matching accepts duplicate notes and
+  control-flow-separated notes; ENTIRE exempt files admit new arbitrary
+  runtime sites. Need actual-driver controls (the negative controls call
+  scan(), not the CLI, missing main's orphan bypass) + narrow named site
+  exemptions / explicit supported grammar.
+- **R3 [P2]** repeat tests use the WRONG collector contract:
+  PerfStatsCollector.cpp:722-723 adds count/value — the second execution
+  must produce deltas 2/5 or cumulative 4/10 with count 2, not value 2/5;
+  the engine repeat has the same assumption for unchanged keys. Do NOT
+  alter collector semantics to satisfy the test.
+- **R4 [P2]** ScopedForkEvidenceConfig destructors UNSET rather than
+  restore original env values; null options leave ambient selections
+  active; the MPIBootstrap reload runs BEFORE its live filter/summary RAII
+  destructors → cached config still leaks. Save/restore the EXACT prior
+  environment AFTER restoration incl. early assertions; test ambient
+  nondefault values.
+- **R5 [P2]** gate ownership incomplete: the summary call eagerly builds
+  forwardGraphPerfContext before the family check (main_condition_batch
+  can allocate) → off-default no-materialization regressed; the stage
+  publisher checks family/device but not cpuStageTimingEnabled (its direct
+  test publishes with timing off). The gate must own ALL materialization +
+  the explicit stage-enable policy.
+- **R6 [P2]** the new engine regression + the overlap/nesting test are NOT
+  explicitly in preflight filters; the new stage tests exercise the
+  ORDINARY executor, not the retained loop; the GPU engine call ignores
+  success (absence can pass before the seam). Add discriminating
+  actual-path controls/registration for BOTH loops +
+  success/failure/prefill-exclusion + GPU refusal; source/stub checks do
+  not replace these.
+- **R7** economy evidence gap: the unchanged million-note cost loop has no
+  owner scope — production now does global+owner atomics + stack walk
+  (often 2 owners). Measure the 0/1/2-owner + relevant concurrent configs;
+  the prior 2.26/2.32 ns does NOT price production instrumentation.
+- POSITIVE: the retained shared-before race fixed; the missed raw sites +
+  sampled tensor/DeviceContext/ShmemSpin/RoPE/SIMDHelpers branches now
+  noted; TLS cells isolate simultaneous caller-thread owners without
+  serialization. TLS does NOT propagate to worker threads — "workers never
+  fork" remains a contract requiring proof/rejection or explicit ownership
+  propagation, not a process-wide exactness guarantee.
+No execution/authentication; 295/295 + stubs = owner evidence.
