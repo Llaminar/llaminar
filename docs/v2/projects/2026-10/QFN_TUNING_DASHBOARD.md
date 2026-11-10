@@ -7,10 +7,11 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Latest exact-scoring slice: **332.183 P /40.372 after-prefill D**, versus
-332.087/39.851: P flat, D+1.31% in one run. All768 IDs/MTP/config match;
-11 focused registrations and memory/retirement pass. Goal remains open.
-[Scoring/results/profile](../2026-11/QFN_ISOLATED_TIER_SWAP_SCORING_20261110.md).
+Ordered cycle search: **328.794/39.609**, repeat **331.278/39.794** P/D;
+control332.183/40.372. 49-layer proposal **1.23× faster**, exact decisions;
+no model gain. IDs/MTP/config match;14 focused gates and retirement pass.
+Goal remains open. [Cycle results](../2026-11/QFN_ORDERED_MIGRATION_CYCLES_20261110.md),
+[scoring](../2026-11/QFN_ISOLATED_TIER_SWAP_SCORING_20261110.md).
 [Measured M448 dispatch](../2026-11/QFN_ROCM_M448_NATIVE_Q8_20261110.md),
 [migration continuation](../2026-11/QFN_ACTIVE_PROGRESS_MIGRATION_20261110.md),
 [cache/planner](../2026-11/QFN_CACHE_AND_PLACEMENT_ECONOMY_20261110.md).
@@ -43,7 +44,7 @@ placement match. Runtime pause-loop cycle shares are not removable wall time.
 [OpenMP evidence](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
 **Native Q8:** M448 measured tiles installed on gfx906/gfx1100;
 M64 remains unchanged. Original whole four-cell candidate stays unpromoted.
-Next: preserve cycle order while reducing global traversal; component profile identifies DFS16.38%.
+Next:9-slot policy (admitted7940GPU experts), then CPU integer ILP. Neither promoted.
 Fresh trace:665ms root wait,20.7ms pooled lookup; result copy near its measured transport ceiling.
 [Scope/results](../2026-11/QFN_ROCM_NATIVE_Q8_PREFILL_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),

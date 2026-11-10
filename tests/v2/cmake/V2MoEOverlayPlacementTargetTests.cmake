@@ -12,6 +12,16 @@ add_v2_test(V2_Integration_MoEOverlayPlacementCycleReplay
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayPlacementCycleReplay)
 
+# Exact original-DFS order and errors through the actual cycle builder.
+add_v2_test(V2_Integration_MoEOrderedCycleAdjacencyEquivalence
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_placement_targets>
+        --gtest_filter=MoEOverlayOrderedCycleEquivalence.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Residency;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOrderedCycleAdjacencyEquivalence)
+
+
 # Actual original protocol/backend replay. Native captures remain a distinct gate.
 add_v2_test(V2_Integration_MoEDeviceFinitePlacementProtocolReplay
     COMMAND $<TARGET_FILE:v2_test_moe_overlay_device_epoch_protocol>

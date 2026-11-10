@@ -6,12 +6,19 @@
  * logical expert identity and movement axes. They prove slot conservation and
  * shadow obligations without claiming native transfer, publication or throughput.
  * Widths beyond this host's two CPU sockets are metadata tests, never fake ranks.
+ * Ordered-adjacency equivalence retains the original global-scan DFS as a test oracle
+ * for exact edge choices, active-path backtracking and malformed diagnostics.
  */
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/MoEExpertShardCohort.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <memory>
+#include <limits>
+#include <numeric>
+#include <random>
+#include <set>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -61,6 +68,172 @@ MoEOverlayTierMigration edge(MoEExpertOwner source, MoEExpertOwner destination)
     return {.layer_idx = source.layer_idx, .expert_id = source.expert_id,
         .activation_count = 11, .estimated_weight_bytes = 4096,
         .source = std::move(source), .destination = std::move(destination)};
+}
+
+/**
+ * @brief Replay the original checked endpoint resolver, including foreign cuts.
+ * @param migration Original metadata edge, with no physical allocation.
+ * @return Complete typed endpoints or no value for an invalid source contract.
+ */
+std::optional<std::pair<MoEExpertPlacementTarget, MoEExpertPlacementTarget>>
+replayTargets(const MoEOverlayTierMigration &migration)
+{
+    if (migration.layer_idx < 0 || migration.expert_id < 0 ||
+        migration.source.layer_idx != migration.layer_idx ||
+        migration.destination.layer_idx != migration.layer_idx ||
+        migration.source.expert_id != migration.expert_id ||
+        migration.destination.expert_id != migration.expert_id)
+        return std::nullopt;
+    auto source = MoEExpertPlacementTarget::fromPlacement(migration.source);
+    auto destination = MoEExpertPlacementTarget::fromPlacement(migration.destination);
+    if (!source || !destination) return std::nullopt;
+    if (migration.source.shard_cohort && migration.destination.shard_cohort &&
+        (migration.source.shard_cohort->source() != migration.destination.shard_cohort->source() ||
+         migration.source.shard_cohort->ownership(0).geometry() != migration.destination.shard_cohort->ownership(0).geometry()))
+        return std::nullopt;
+    return std::pair{std::move(*source), std::move(*destination)};
+}
+
+/**
+ * @brief Retain the pre-optimization cycle validator as an independent oracle.
+ * @param cycle Authored candidate indices, including malformed cases.
+ * @param migrations Complete original edge vector.
+ * @return Original validity, including duplicate-index and expert checks.
+ */
+bool originalCycleValid(const MoEOverlayTierMigrationCycle &cycle,
+    const std::vector<MoEOverlayTierMigration> &migrations)
+{
+    if (cycle.layer_idx < 0 || cycle.migration_indices.empty())
+        return false;
+    std::vector<bool> seen(migrations.size(), false);
+    std::set<std::pair<int, int>> logical_edges;
+    for (size_t offset = 0; offset < cycle.migration_indices.size(); ++offset)
+    {
+        const size_t index = cycle.migration_indices[offset];
+        const size_t next_index = cycle.migration_indices[(offset + 1) % cycle.migration_indices.size()];
+        if (index >= migrations.size() || next_index >= migrations.size() || seen[index])
+            return false;
+        seen[index] = true;
+        const auto &edge = migrations[index];
+        const auto &next = migrations[next_index];
+        if (!logical_edges.emplace(edge.layer_idx, edge.expert_id).second)
+            return false;
+        const auto targets = replayTargets(edge);
+        const auto next_targets = replayTargets(next);
+        if (edge.layer_idx != cycle.layer_idx || next.layer_idx != cycle.layer_idx ||
+            !targets || !next_targets || targets->second != next_targets->first)
+            return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Retain the original global-scan DFS, not a second production mode.
+ * @param migrations Authored complete metadata population, in original order.
+ * @return Original ordered cycles; original exception text is retained.
+ */
+std::vector<MoEOverlayTierMigrationCycle> originalGlobalScanCycles(
+    const std::vector<MoEOverlayTierMigration> &migrations)
+{
+    if (!analyzeMoEOverlayMigrationCapacity(migrations).capacityPreserved())
+        throw std::logic_error("MoE migration requires complete capacity-preserving placement targets");
+    std::vector<std::pair<MoEExpertPlacementTarget, MoEExpertPlacementTarget>> targets;
+    targets.reserve(migrations.size());
+    for (const auto &edge : migrations)
+        targets.push_back(*replayTargets(edge));
+    std::vector<MoEOverlayTierMigrationCycle> cycles;
+    std::vector<bool> consumed(migrations.size(), false);
+    for (size_t seed_index = 0; seed_index < migrations.size(); ++seed_index)
+    {
+        if (consumed[seed_index])
+            continue;
+        const auto &seed = migrations[seed_index];
+        consumed[seed_index] = true;
+        MoEOverlayTierMigrationCycle cycle{.layer_idx = seed.layer_idx,
+            .migration_indices = {seed_index}};
+        if (targets[seed_index].first != targets[seed_index].second)
+        {
+            std::vector<size_t> return_path;
+            std::vector<MoEExpertPlacementTarget> visited;
+            // A cohort is one vertex, never one vertex per fragment or the
+            // absent scalar owner -1. Closing that vertex preserves every
+            // admitted member's capacity without splitting a logical move.
+            const auto find_return_path = [&](auto &&self,
+                const MoEExpertPlacementTarget &current) -> bool
+            {
+                if (current == targets[seed_index].first)
+                    return true;
+                if (std::find(visited.begin(), visited.end(), current) != visited.end())
+                    return false;
+                visited.push_back(current);
+                for (size_t index = 0; index < migrations.size(); ++index)
+                {
+                    if (consumed[index] || migrations[index].layer_idx != seed.layer_idx ||
+                        targets[index].first != current)
+                        continue;
+                    consumed[index] = true;
+                    return_path.push_back(index);
+                    if (self(self, targets[index].second))
+                        return true;
+                    return_path.pop_back();
+                    consumed[index] = false;
+                }
+                visited.pop_back();
+                return false;
+            };
+            if (!find_return_path(find_return_path, targets[seed_index].second))
+                throw std::logic_error("MoE placement delta cannot form complete whole/cohort cycles");
+            cycle.migration_indices.insert(cycle.migration_indices.end(),
+                return_path.begin(), return_path.end());
+        }
+        if (!originalCycleValid(cycle, migrations))
+            throw std::logic_error("MoE overlay produced an invalid placement migration cycle");
+        cycles.push_back(std::move(cycle));
+    }
+    return cycles;
+}
+
+/**
+ * @brief Compare exact cycle order and immutable inputs through the public builder.
+ * @param recorded Complete authored edge population; never a model route claim.
+ */
+void expectOriginalCycleOrder(const std::vector<MoEOverlayTierMigration> &recorded)
+{
+    const auto expected = originalGlobalScanCycles(recorded);
+    auto actual_input = recorded;
+    const auto actual = buildMoEOverlayMigrationCycles(actual_input);
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t index = 0; index < actual.size(); ++index)
+    {
+        EXPECT_EQ(actual[index].layer_idx, expected[index].layer_idx);
+        EXPECT_EQ(actual[index].migration_indices, expected[index].migration_indices);
+        EXPECT_EQ(actual[index].valid(recorded), originalCycleValid(actual[index], recorded));
+    }
+    ASSERT_EQ(actual_input.size(), recorded.size());
+    for (size_t index = 0; index < recorded.size(); ++index)
+    {
+        EXPECT_EQ(actual_input[index].source, recorded[index].source);
+        EXPECT_EQ(actual_input[index].destination, recorded[index].destination);
+        EXPECT_EQ(actual_input[index].axis, recorded[index].axis);
+    }
+}
+
+/**
+ * @brief Compare the precise original logic-error diagnostic, not just rejection.
+ * @param recorded Incomplete or malformed original metadata edge population.
+ */
+void expectOriginalCycleFailure(const std::vector<MoEOverlayTierMigration> &recorded)
+{
+    std::string expected;
+    try { (void)originalGlobalScanCycles(recorded); }
+    catch (const std::logic_error &error) { expected = error.what(); }
+    ASSERT_FALSE(expected.empty());
+    try
+    {
+        (void)decomposeMoEOverlayMigrationCycles(recorded);
+        FAIL() << "Invalid trace unexpectedly decomposed";
+    }
+    catch (const std::logic_error &error) { EXPECT_EQ(error.what(), expected); }
 }
 }
 
@@ -240,4 +413,119 @@ TEST(MoEOverlayPlacementTargets, MovedFromCohortRejectsWithoutTermination)
     row.shard_cohort = std::make_shared<const MoEExpertShardCohort>(std::move(retained));
     EXPECT_TRUE(MoEExpertPlacementTarget::fromPlacement(row));
 }
+
+TEST(MoEOverlayOrderedCycleEquivalence, OrderedAdjacencyMatchesOriginalAcrossLiveCountsAndInputOrders)
+{
+    std::mt19937 random(42);
+    for (const int targets : {1, 2, 3, 4, 5, 6, 7, 8, 17, 65})
+    {
+        SCOPED_TRACE(targets);
+        std::vector<MoEOverlayTierMigration> recorded;
+        for (const int layer : {103, 7, 4096})
+        {
+            int expert = 0;
+            const auto add = [&](int from, int to)
+            {
+                auto source = whole(expert, 100 + from, from % 5);
+                auto destination = whole(expert, 100 + to, to % 5);
+                source.layer_idx = destination.layer_idx = layer;
+                recorded.push_back(edge(std::move(source), std::move(destination)));
+                ++expert;
+            };
+            // Long forward/reverse rings, skewed repeated hub exchanges and
+            // self loops exercise arbitrary target counts without fake devices.
+            for (int target = 0; target < targets; ++target)
+                add(target, (target + 1) % targets);
+            for (int target = targets - 1; target >= 0; --target)
+                add(target, (target + targets - 1) % targets);
+            for (int repeat = 0; repeat < 9; ++repeat)
+            {
+                const int peer = targets == 1 ? 0 : 1 + repeat % (targets - 1);
+                add(0, peer);
+                add(peer, 0);
+            }
+            add(0, 0);
+        }
+        for (int ordering = 0; ordering < 4; ++ordering)
+        {
+            if (ordering != 0) std::shuffle(recorded.begin(), recorded.end(), random);
+            for (int replay = 0; replay < 3; ++replay)
+            {
+                expectOriginalCycleOrder(recorded);
+                expectOriginalCycleOrder({});
+                expectOriginalCycleOrder({edge(whole(0, 0, 0), whole(0, 0, 0))});
+            }
+        }
+    }
+}
+
+TEST(MoEOverlayOrderedCycleEquivalence, OrderedAdjacencyBacktracksAndExpiresActiveMarks)
+{
+    // B->C->B is encountered before B->A. It must fail the current path,
+    // restore both consumed edges, then close A->B->A in original edge order.
+    std::vector<MoEOverlayTierMigration> recorded{
+        edge(whole(0, 0, 0), whole(0, 1, 1)),
+        edge(whole(1, 1, 1), whole(1, 2, 2)),
+        edge(whole(2, 2, 2), whole(2, 1, 1)),
+        edge(whole(3, 1, 1), whole(3, 0, 0))};
+    for (int replay = 0; replay < 3; ++replay)
+    {
+        expectOriginalCycleOrder(recorded);
+        const auto actual = decomposeMoEOverlayMigrationCycles(recorded);
+        ASSERT_EQ(actual.size(), 2u);
+        EXPECT_EQ(actual[0].migration_indices, (std::vector<size_t>{0, 3}));
+        EXPECT_EQ(actual[1].migration_indices, (std::vector<size_t>{1, 2}));
+    }
+    for (const auto &indices : std::vector<std::vector<size_t>>{
+            {}, {0}, {0, 0}, {0, 3}, {3, 0}, {0, 1, 2, 3}, {0, 4},
+            {0, std::numeric_limits<size_t>::max()}})
+    {
+        const MoEOverlayTierMigrationCycle cycle{.layer_idx = 7, .migration_indices = indices};
+        EXPECT_EQ(cycle.valid(recorded), originalCycleValid(cycle, recorded));
+    }
+}
+
+TEST(MoEOverlayOrderedCycleEquivalence, OrderedAdjacencyKeepsExactCohortCutsAndOriginalDiagnostics)
+{
+    for (int width = 2; width <= 8; ++width)
+    {
+        SCOPED_TRACE(width);
+        auto original = cohort(0, 10, width, 1);
+        auto changed = original;
+        const auto &source = *original.shard_cohort;
+        const auto cuts = source.ownership(0).intermediateIntervals();
+        std::vector<MoEExpertShardCohort::Interval> intervals(cuts.begin(), cuts.end());
+        ++intervals[0].columns;
+        ++intervals[1].first_column;
+        --intervals[1].columns;
+        const auto members = source.participants();
+        changed.shard_cohort = std::make_shared<const MoEExpertShardCohort>(
+            MoEExpertShardCohort::checked(source.source(), 8,
+                std::vector<MoEExpertShardCohort::Participant>(members.begin(), members.end()), std::move(intervals)));
+        const auto at = [](MoEExpertOwner owner, int expert) { owner.expert_id = expert; return owner; };
+        std::vector<MoEOverlayTierMigration> recorded{
+            edge(whole(0, 0, 0), at(original, 0)),
+            edge(at(changed, 1), whole(1, 0, 0)),
+            edge(at(original, 2), whole(2, 0, 0)),
+            edge(whole(3, 0, 0), at(changed, 3))};
+        for (int replay = 0; replay < 3; ++replay)
+            expectOriginalCycleOrder(recorded);
+        const auto actual = decomposeMoEOverlayMigrationCycles(recorded);
+        ASSERT_EQ(actual.size(), 2u);
+        EXPECT_EQ(actual[0].migration_indices, (std::vector<size_t>{0, 2}));
+        EXPECT_EQ(actual[1].migration_indices, (std::vector<size_t>{1, 3}));
+        // Member/slot counts balance, but different source cuts cannot close
+        // one another. They deliberately collide in the scalar bucket key.
+        expectOriginalCycleFailure({recorded[0], recorded[1]});
+        expectOriginalCycleFailure({recorded[0]});
+        auto malformed = recorded;
+        malformed[0].destination.expert_id = 7;
+        expectOriginalCycleFailure(malformed);
+        malformed = recorded;
+        malformed[1].expert_id = malformed[0].expert_id;
+        malformed[1].source.expert_id = malformed[1].destination.expert_id = malformed[0].expert_id;
+        expectOriginalCycleFailure(malformed);
+    }
+}
+
 }

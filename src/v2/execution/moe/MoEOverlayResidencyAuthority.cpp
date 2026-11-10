@@ -23,6 +23,8 @@
  * only that interval's compact rows, rejecting evidence from another stage.
  * Optional pre-cut evidence projects already-scored tier alternatives without
  * treating isolated gains as a jointly feasible migration backlog.
+ * Cycle decomposition derives proposal-local exact-target adjacency once;
+ * original edge order still owns deterministic DFS closure and publication.
  */
 
 #include "MoEOverlayResidencyAuthority.h"
@@ -1784,15 +1786,16 @@ namespace llaminar2
     {
         if (layer_idx < 0 || migration_indices.empty())
             return false;
-        std::vector<bool> seen(migrations.size(), false);
+        // A repeated index necessarily repeats its logical (layer, expert)
+        // key. The existing key set rejects both without clearing a full-wave
+        // bitmap for every two-edge cycle in a large candidate population.
         std::set<std::pair<int, int>> logical_edges;
         for (size_t offset = 0; offset < migration_indices.size(); ++offset)
         {
             const size_t index = migration_indices[offset];
             const size_t next_index = migration_indices[(offset + 1) % migration_indices.size()];
-            if (index >= migrations.size() || next_index >= migrations.size() || seen[index])
+            if (index >= migrations.size() || next_index >= migrations.size())
                 return false;
-            seen[index] = true;
             const auto &edge = migrations[index];
             const auto &next = migrations[next_index];
             if (!logical_edges.emplace(edge.layer_idx, edge.expert_id).second)
@@ -8100,12 +8103,47 @@ namespace llaminar2
     {
         if (!analyzeMoEOverlayMigrationCapacity(migrations).capacityPreserved())
             throw std::logic_error("MoE migration requires complete capacity-preserving placement targets");
-        std::vector<std::pair<MoEExpertPlacementTarget, MoEExpertPlacementTarget>> targets;
+        // Buckets only narrow equality checks; the full original typed target
+        // (including cohort source and cuts) is the vertex identity. No pointer
+        // identity, target hash, physical owner ledger or sorted edge order is
+        // introduced. Distinct valid cuts may share all bucket scalars.
+        struct Vertex
+        {
+            MoEExpertPlacementTarget target;
+            std::vector<size_t> outgoing;
+            size_t active_epoch = 0;
+        };
+        using VertexBucket = std::tuple<int, int, bool, int>;
+        std::map<VertexBucket, std::vector<size_t>> buckets;
+        std::vector<Vertex> vertices;
+        vertices.reserve(migrations.size());
+        const auto vertex_for = [&](int layer, MoEExpertPlacementTarget target)
+        {
+            auto &bucket = buckets[{layer, target.tierIndex(), target.isCohort(), target.participantId(0)}];
+            for (const size_t vertex : bucket)
+                if (vertices[vertex].target == target)
+                    return vertex;
+            const size_t vertex = vertices.size();
+            vertices.push_back({std::move(target), {}, 0});
+            bucket.push_back(vertex);
+            return vertex;
+        };
+        std::vector<std::pair<size_t, size_t>> targets;
         targets.reserve(migrations.size());
-        for (const auto &edge : migrations)
-            targets.push_back(*migrationPlacementTargets(edge));
+        for (size_t index = 0; index < migrations.size(); ++index)
+        {
+            const auto &edge = migrations[index];
+            const auto original = *migrationPlacementTargets(edge);
+            const size_t source = vertex_for(edge.layer_idx, original.first);
+            const size_t destination = vertex_for(edge.layer_idx, original.second);
+            targets.emplace_back(source, destination);
+            // Original input order is the DFS tie authority, even when the
+            // caller supplies unsorted layers or interleaved physical targets.
+            vertices[source].outgoing.push_back(index);
+        }
         std::vector<MoEOverlayTierMigrationCycle> cycles;
         std::vector<bool> consumed(migrations.size(), false);
+        std::vector<size_t> return_path;
         for (size_t seed_index = 0; seed_index < migrations.size(); ++seed_index)
         {
             if (consumed[seed_index])
@@ -8116,23 +8154,24 @@ namespace llaminar2
                 .migration_indices = {seed_index}};
             if (targets[seed_index].first != targets[seed_index].second)
             {
-                std::vector<size_t> return_path;
-                std::vector<MoEExpertPlacementTarget> visited;
-                // A cohort is one vertex, never one vertex per fragment or the
-                // absent scalar owner -1. Closing that vertex preserves every
-                // admitted member's capacity without splitting a logical move.
-                const auto find_return_path = [&](auto &&self,
-                    const MoEExpertPlacementTarget &current) -> bool
+                return_path.clear();
+                // seed_index < migrations.size(), so this positive traversal
+                // epoch cannot overflow size_t. Failed branches clear their
+                // active mark; successful-path marks expire at the next seed.
+                const size_t search_epoch = seed_index + 1u;
+                const auto find_return_path = [&](auto &&self, size_t current) -> bool
                 {
                     if (current == targets[seed_index].first)
                         return true;
-                    if (std::find(visited.begin(), visited.end(), current) != visited.end())
+                    auto &vertex = vertices[current];
+                    if (vertex.active_epoch == search_epoch)
                         return false;
-                    visited.push_back(current);
-                    for (size_t index = 0; index < migrations.size(); ++index)
+                    vertex.active_epoch = search_epoch;
+                    // Exact vertex adjacency is the original global scan with
+                    // only its always-rejected layer/source rows removed.
+                    for (const size_t index : vertex.outgoing)
                     {
-                        if (consumed[index] || migrations[index].layer_idx != seed.layer_idx ||
-                            targets[index].first != current)
+                        if (consumed[index])
                             continue;
                         consumed[index] = true;
                         return_path.push_back(index);
@@ -8141,7 +8180,7 @@ namespace llaminar2
                         return_path.pop_back();
                         consumed[index] = false;
                     }
-                    visited.pop_back();
+                    vertex.active_epoch = 0;
                     return false;
                 };
                 if (!find_return_path(find_return_path, targets[seed_index].second))
