@@ -44,3 +44,8 @@ with tile choices far from the tournament-optimal ones.
   tile-policy recalibration or cell timeout/ISA policy review; owner = FA2
   tile policy (idea 22), not a lane. Gated-cell rerun (ctest solo) = wall
   time only; cannot flip the classification.
+
+- Gated-cell solo rerun (f9f190059, Integration, ctest): FAILED after 494.6 s
+  (NO timeout) — same base policy check, p95 regret 9.248% > 5%. Confirms:
+  the 600 s timeout in the parallel gate = LOAD on a cell that fails on base
+  anyway. Idea-22 classification FINAL (base/env).
