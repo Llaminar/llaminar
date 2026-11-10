@@ -307,6 +307,9 @@ TEST_F(Test__CUDAOpsParity, RMSNorm_FP32_Small)
 
     // CUDA kernel
     llaminar2::cuda::CUDARMSNormKernelT<ActivationPrecision::FP32> cuda_kernel;
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    cuda_kernel.setGPUStream(stream.get());
 
     // Allocate device memory
     float *d_input, *d_gamma, *d_output;
@@ -320,7 +323,7 @@ TEST_F(Test__CUDAOpsParity, RMSNorm_FP32_Small)
 
     // Execute
     ASSERT_TRUE(cuda_kernel.apply_typed(d_input, d_gamma, d_output, rows, cols, epsilon, 0));
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     // Copy back
     cudaMemcpy(cuda_output.data(), d_output, total * sizeof(float), cudaMemcpyDeviceToHost);
@@ -361,6 +364,9 @@ TEST_F(Test__CUDAOpsParity, RMSNorm_FP32_Large)
                      rows, cols, epsilon, false, nullptr, -1);
 
     llaminar2::cuda::CUDARMSNormKernelT<ActivationPrecision::FP32> cuda_kernel;
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    cuda_kernel.setGPUStream(stream.get());
 
     float *d_input, *d_gamma, *d_output;
     cudaMalloc(&d_input, total * sizeof(float));
@@ -371,7 +377,7 @@ TEST_F(Test__CUDAOpsParity, RMSNorm_FP32_Large)
     cudaMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), cudaMemcpyHostToDevice);
 
     ASSERT_TRUE(cuda_kernel.apply_typed(d_input, d_gamma, d_output, rows, cols, epsilon, 0));
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     cudaMemcpy(cuda_output.data(), d_output, total * sizeof(float), cudaMemcpyDeviceToHost);
 
@@ -420,6 +426,12 @@ TEST_F(Test__CUDAOpsParity, RMSNorm_FP32_VerifierRowsM234MatchSerialRowsByteExac
         ASSERT_EQ(cudaMemset(d_serial, 0, total * sizeof(float)), cudaSuccess);
 
         llaminar2::cuda::CUDARMSNormKernelT<ActivationPrecision::FP32> cuda_kernel;
+        ScopedCudaStream stream;
+        ASSERT_NE(stream.get(), nullptr);
+        cuda_kernel.setGPUStream(stream.get());
+        // The memsets above run on the legacy stream; the kernel stream is
+        // non-blocking, so order them explicitly before the launches.
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         ASSERT_TRUE(cuda_kernel.apply_typed(d_input, d_gamma, d_grouped, rows, cols, epsilon, 0))
             << "grouped rows=" << rows;
 
@@ -432,7 +444,7 @@ TEST_F(Test__CUDAOpsParity, RMSNorm_FP32_VerifierRowsM234MatchSerialRowsByteExac
                 1, cols, epsilon, 0))
                 << "serial row=" << row << " rows=" << rows;
         }
-        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
         ASSERT_EQ(cudaMemcpy(grouped_output.data(), d_grouped, total * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
         ASSERT_EQ(cudaMemcpy(serial_output.data(), d_serial, total * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
@@ -473,6 +485,9 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_FP32_Small)
 
     // CUDA kernel
     llaminar2::cuda::CUDASwiGLUKernelT<ActivationPrecision::FP32> cuda_kernel;
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    cuda_kernel.setGPUStream(stream.get());
 
     float *d_gate, *d_up, *d_output;
     cudaMalloc(&d_gate, total * sizeof(float));
@@ -483,7 +498,7 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_FP32_Small)
     cudaMemcpy(d_up, up_data.data(), total * sizeof(float), cudaMemcpyHostToDevice);
 
     ASSERT_TRUE(cuda_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     cudaMemcpy(cuda_output.data(), d_output, total * sizeof(float), cudaMemcpyDeviceToHost);
 
@@ -520,6 +535,9 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_FP32_Large)
                      rows, cols, false, nullptr, -1);
 
     llaminar2::cuda::CUDASwiGLUKernelT<ActivationPrecision::FP32> cuda_kernel;
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    cuda_kernel.setGPUStream(stream.get());
 
     float *d_gate, *d_up, *d_output;
     cudaMalloc(&d_gate, total * sizeof(float));
@@ -530,7 +548,7 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_FP32_Large)
     cudaMemcpy(d_up, up_data.data(), total * sizeof(float), cudaMemcpyHostToDevice);
 
     ASSERT_TRUE(cuda_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     cudaMemcpy(cuda_output.data(), d_output, total * sizeof(float), cudaMemcpyDeviceToHost);
 
@@ -574,6 +592,9 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_BF16_Small)
 
     // CUDA kernel
     llaminar2::cuda::CUDASwiGLUKernelT<ActivationPrecision::BF16> cuda_kernel;
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    cuda_kernel.setGPUStream(stream.get());
 
     uint16_t *d_gate, *d_up, *d_output;
     cudaMalloc(&d_gate, total * sizeof(uint16_t));
@@ -584,7 +605,7 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_BF16_Small)
     cudaMemcpy(d_up, up_bf16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
 
     ASSERT_TRUE(cuda_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     std::vector<uint16_t> cuda_output_bf16(total);
     cudaMemcpy(cuda_output_bf16.data(), d_output, total * sizeof(uint16_t), cudaMemcpyDeviceToHost);
@@ -632,6 +653,9 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_BF16_Large)
                           rows, cols, false, nullptr, -1);
 
     llaminar2::cuda::CUDASwiGLUKernelT<ActivationPrecision::BF16> cuda_kernel;
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    cuda_kernel.setGPUStream(stream.get());
 
     uint16_t *d_gate, *d_up, *d_output;
     cudaMalloc(&d_gate, total * sizeof(uint16_t));
@@ -642,7 +666,7 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_BF16_Large)
     cudaMemcpy(d_up, up_bf16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
 
     ASSERT_TRUE(cuda_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     std::vector<uint16_t> cuda_output_bf16(total);
     cudaMemcpy(cuda_output_bf16.data(), d_output, total * sizeof(uint16_t), cudaMemcpyDeviceToHost);
@@ -692,6 +716,9 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_FP16_Small)
 
     // CUDA kernel
     llaminar2::cuda::CUDASwiGLUKernelT<ActivationPrecision::FP16> cuda_kernel;
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    cuda_kernel.setGPUStream(stream.get());
 
     uint16_t *d_gate, *d_up, *d_output;
     cudaMalloc(&d_gate, total * sizeof(uint16_t));
@@ -702,7 +729,7 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_FP16_Small)
     cudaMemcpy(d_up, up_fp16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
 
     ASSERT_TRUE(cuda_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     std::vector<uint16_t> cuda_output_fp16(total);
     cudaMemcpy(cuda_output_fp16.data(), d_output, total * sizeof(uint16_t), cudaMemcpyDeviceToHost);
@@ -750,6 +777,9 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_FP16_Large)
                           rows, cols, false, nullptr, -1);
 
     llaminar2::cuda::CUDASwiGLUKernelT<ActivationPrecision::FP16> cuda_kernel;
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    cuda_kernel.setGPUStream(stream.get());
 
     uint16_t *d_gate, *d_up, *d_output;
     cudaMalloc(&d_gate, total * sizeof(uint16_t));
@@ -760,7 +790,7 @@ TEST_F(Test__CUDAOpsParity, SwiGLU_FP16_Large)
     cudaMemcpy(d_up, up_fp16.data(), total * sizeof(uint16_t), cudaMemcpyHostToDevice);
 
     ASSERT_TRUE(cuda_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaStreamSynchronize(stream.get()), cudaSuccess);
 
     std::vector<uint16_t> cuda_output_fp16(total);
     cudaMemcpy(cuda_output_fp16.data(), d_output, total * sizeof(uint16_t), cudaMemcpyDeviceToHost);
