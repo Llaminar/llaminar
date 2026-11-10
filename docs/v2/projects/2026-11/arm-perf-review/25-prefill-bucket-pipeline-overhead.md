@@ -123,3 +123,20 @@ the per-bucket trace; results → ideas 24/25.
 - Source-side possible at 425002104 (Qwen3.8-Flash-Next-UD schema present).
 - RUNTIME trace blocked on: operator go-ahead for the CUDA sm_121 fix lane →
   GPU build at 425002104' → per-bucket trace (Dir B). arm-sparks standby.
+
+## Dir-B trace BLOCKER (2026-11-10, arm-sparks @ e8866ec04): planner does not classify Qwen3.8-UD
+
+The Qwen3.8-Flash-Next-UD SCHEMA is present (Qwen4ExpSchema.h) but planning
+FAILS: `planning-selection.select: Unclassified request work:
+output_hc_down.weight` (also the 'Higher-priority PMA plan must fit before
+ngram storage selection' variant with different backend sets) — the
+ImmutableRowTablePlacementPlanner does not classify the Qwen3.8-UD expert
+tensors at this tip. SAME error at cff351901 → a PERSISTENT planner gap
+across tips, not a recent regression. Blocks the idea-25 Direction-B
+per-bucket trace (the trace's prerequisite). No known tip where the model
+was successfully planned.
+
+ROUTES: (a) Main fix-back for the planner classification of
+output_hc_down.weight (or an explanation if the model needs a registration
+step); (b) meanwhile the .79 window proceeds with idea-21b (occupancy
+candidate, non-attached). Evidence: arm-sparks' probe logs at e8866ec04.
