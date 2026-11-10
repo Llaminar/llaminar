@@ -685,3 +685,15 @@ Holding until SETTLED.
   met; .79 GPU FREE; Main's ~2h slot agenda: (0) CUDAOpsParity segfault,
   (a) 2 arena/transfer cases, (b) sm_121 tile inventory, (c) idea-21b
   grouped-IMMA probe. SETTLED after the slot + focused rerun.
+
+### GPU slot slice 1 GREEN (2026-11-10, ~14:32Z) — tip 18b455d62
+
+Main pushed **18b455d62** (first slot slice): compiled ops+padding owners
+with the native GB10 toolchain; full CUDAOpsParity + full
+CUDAAttentionPaddingParity + both new focused ProductionTestPreflight
+invocation aliases PASS (4 native CTest cells + model fixture). ROOT CRASH
+CAUSE (reproduced before fix): the local test's five-arg C redeclaration
+omitted the actual sixth stream argument → production declaration included
++ explicit same-stream I/O. **LMHead workspace + KV input admission fixes
+ALSO PASS** → the 2 known arena/transfer cases appear fixed. Continuing:
+sm121 tile inventory + idea21b probe. NOT SETTLED yet.
