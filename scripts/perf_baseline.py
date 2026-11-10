@@ -667,12 +667,18 @@ IDENTITY_FIELDS: dict[str, Callable[[Mapping[str, Any]], Any]] = {
 }
 
 
-def _median(values: Sequence[float]) -> float:
-    """Median of non-negative values, range-safe at both ends.
+_HALF_MAX = sys.float_info.max / 2
 
-    For the even case the midpoint is a + (b - a) / 2 with a <= b: it neither
-    overflows (b - a <= b) nor rounds equal subnormals away (a + 0 == a), so a
-    constant sample set has exactly its own value as median.
+
+def _median(values: Sequence[float]) -> float:
+    """Median of non-negative values with a correctly rounded even-count midpoint.
+
+    Range split: while ``high <= max/2`` the sum ``low + high`` cannot overflow
+    and ``(low + high) / 2`` is correctly rounded (halving is exact for normal
+    results; in the subnormal range the sum is exact and halving rounds once,
+    ties to even). Only at the large end is ``low/2 + high/2`` used, where both
+    halves are exact normal values. No branch adds an error term that could
+    invent spread for constant or near-constant samples.
     """
 
     ordered = sorted(values)
@@ -680,7 +686,9 @@ def _median(values: Sequence[float]) -> float:
     if len(ordered) % 2:
         return ordered[middle]
     low, high = ordered[middle - 1], ordered[middle]
-    return low + (high - low) / 2
+    if high <= _HALF_MAX:
+        return (low + high) / 2
+    return low / 2 + high / 2
 
 
 def _derived(value: float, what: str) -> float:

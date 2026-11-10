@@ -435,6 +435,24 @@ class PerfBaselineTest(unittest.TestCase):
         row = json.loads(collapsed.stdout)["metrics"][0]
         self.assertEqual((row["change_pct"], row["verdict"]), (-100.0, "regressed"))
 
+    @staticmethod
+    def _median_of(low: float, high: float) -> float:
+        sys.path.insert(0, str(SCRIPT.parent))
+        try:
+            import perf_baseline
+            return perf_baseline._median([low, high])
+        finally:
+            sys.path.pop(0)
+
+    def test_even_median_is_correctly_rounded_across_the_range(self) -> None:
+        d, top = 5e-324, sys.float_info.max
+        cases = {(d, d): d, (3 * d, 4 * d): 4 * d, (d, 2 * d): 2 * d, (7 * d, 7 * d): 7 * d,
+                 (1.0, 2.0): 1.5, (top, top): top, (top / 2, top): top * 0.75, (1e308, 1e308): 1e308}
+        for (low, high), expected in cases.items():
+            with self.subTest(low=low, high=high):
+                self.assertEqual(self._median_of(low, high), expected)
+                self.assertEqual(self._median_of(high, low), expected)
+
     def test_subnormal_samples_keep_exact_medians(self) -> None:
         waivers = [arg for field in ("argv", "launch_env", "cwd", "cpu_affinity")
                    for arg in ("--allow-identity-change", field)]
@@ -458,6 +476,23 @@ class PerfBaselineTest(unittest.TestCase):
         self.assertEqual(row["tolerance_pct"], 2.0)
         self.assertAlmostEqual(row["change_pct"], -57.142857, places=4)
         self.assertEqual(row["verdict"], "regressed")
+        # Mixed subnormals: the median of [3d, 4d] is the correctly rounded 3.5d -> 4d (ties to
+        # even), so the candidate spread is 1.4826 * 0.125 and the tolerance 37.065 %; -42.857 %
+        # is a regression. A biased 3d median would widen the tolerance to ~49.4 % and hide it.
+        self.assertEqual(self._median_of(3 * d, 4 * d), 4 * d)
+        mixed = record(4 * d, [3 * d, 4 * d])
+        hidden = self.diff(seven, mixed, *waivers)
+        self.assertEqual(hidden.returncode, 1, hidden.stderr)
+        row = json.loads(hidden.stdout)["metrics"][0]
+        self.assertAlmostEqual(row["tolerance_pct"], 37.065, places=3)
+        self.assertAlmostEqual(row["change_pct"], -42.857143, places=4)
+        self.assertEqual(row["verdict"], "regressed")
+        reverse = self.diff(mixed, seven, *waivers)
+        self.assertEqual(reverse.returncode, 0, reverse.stderr)
+        row = json.loads(reverse.stdout)["metrics"][0]
+        self.assertAlmostEqual(row["tolerance_pct"], 37.065, places=3)
+        self.assertAlmostEqual(row["change_pct"], 75.0, places=4)
+        self.assertEqual(row["verdict"], "improved")
         improved = self.diff(three, seven, *waivers)
         self.assertEqual(improved.returncode, 0, improved.stderr)
         row = json.loads(improved.stdout)["metrics"][0]
