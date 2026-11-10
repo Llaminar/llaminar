@@ -5078,28 +5078,29 @@ add_v2_test(V2_Integration_ROCmDensePrefillOverlayAdmission
     LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;Prefill;Policy;DeviceFree;Regression"
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 
-if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
-    # A focused kernel gate links the real public dispatch and arithmetic
-    # sources, not the entire engine. Unrelated backend failures therefore do
-    # not prevent rapid captured validation of a GEMM register-lifetime fix.
-    set(V2_ROCM_REGISTER_LIFETIME_SOURCES
-        integration/kernels/rocm/Test__NativeQuantisedRegisterLifetime.cpp
-        ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeQuantisedGemmDispatch.cpp
-        ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.cpp
-        ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip
-        ${CMAKE_SOURCE_DIR}/backends/rocm/HipDeviceGuard.cpp
-        ${CMAKE_SOURCE_DIR}/backends/rocm/ROCmRuntimeStartup.cpp
-        ${CMAKE_SOURCE_DIR}/utils/PerfStatsCollector.cpp)
-    foreach(V2_NATIVE_SHARD RANGE 0 7)
-        list(APPEND V2_ROCM_REGISTER_LIFETIME_SOURCES
-            ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeQuantisedGemmShard${V2_NATIVE_SHARD}.hip)
-    endforeach()
+add_v2_test(V2_Integration_ROCmNativeQ8ArchitectureExactReplay
+    COMMAND $<TARGET_FILE:v2_unit_rocm_dense_prefill_overlay>
+        --gtest_filter=ROCmDensePrefillOverlay.NativeQ8*
+    LABELS "V2;Integration;ProductionTestPreflight;NativeQuantised;Prefill;Architecture;DeviceFree;Replay;Regression"
+    NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+
+v2_test_target_selected(v2_integration_rocm_native_quantised_register_lifetime
+    V2_ROCM_REGISTER_LIFETIME_OWNER_SELECTED)
+if(HAVE_ROCM AND (NOT V2_PERF_TESTS_ONLY OR V2_ROCM_REGISTER_LIFETIME_OWNER_SELECTED))
+    # Keep the original owner on canonical production shards and hardware
+    # publication rather than duplicate native code with a second discovery path.
     add_executable(v2_integration_rocm_native_quantised_register_lifetime
-        ${V2_ROCM_REGISTER_LIFETIME_SOURCES})
+        integration/kernels/rocm/Test__NativeQuantisedRegisterLifetime.cpp)
     target_include_directories(v2_integration_rocm_native_quantised_register_lifetime
         PRIVATE ${CMAKE_SOURCE_DIR} ${ROCM_PATH}/include)
-    target_link_libraries(v2_integration_rocm_native_quantised_register_lifetime
-        PRIVATE hip::host GTest::gtest_main fort ${CMAKE_DL_LIBS})
+    if(LLAMINAR_SHARED_CORE)
+        target_link_libraries(v2_integration_rocm_native_quantised_register_lifetime
+            PRIVATE llaminar2_core hip::host GTest::gtest)
+    else()
+        target_link_libraries_with_groups(v2_integration_rocm_native_quantised_register_lifetime
+            llaminar2_core -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive
+            hip::host GTest::gtest)
+    endif()
     target_compile_features(v2_integration_rocm_native_quantised_register_lifetime
         PRIVATE cxx_std_23)
     set_target_properties(v2_integration_rocm_native_quantised_register_lifetime PROPERTIES
@@ -5905,6 +5906,17 @@ set_tests_properties(V2_Unit_NativeQuantisedProductionDensePrefillSweep PROPERTI
 add_test(NAME V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_production_dense_prefill_sweep.py
+            ProductionDensePrefillSweepTest.test_native_q8_family_identity_preserves_old_keys
+            ProductionDensePrefillSweepTest.test_native_q8_complete_alias_records_use_strong_reader
+            ProductionDensePrefillSweepTest.test_native_q8_cannot_relabel_expanded_clocks
+            ProductionDensePrefillSweepTest.test_native_q8_old_complete_records_reuse_original_producer
+            ProductionDensePrefillSweepTest.test_native_q8_emitter_retains_expanded_family_rows
+            ProductionDensePrefillSweepTest.test_native_q8_environment_and_batch_keep_family_bound
+            ProductionDensePrefillSweepTest.test_native_q8_missing_raw_samples_prevents_completion
+            ProductionDensePrefillSweepTest.test_native_q8_architecture_identity_and_receipt_are_strict
+            ProductionDensePrefillSweepTest.test_native_q8_two_architecture_retention_keeps_legacy_rows
+            ProductionDensePrefillSweepTest.test_native_q8_profile_requests_preserve_unforced_auto
+            ProductionDensePrefillSweepTest.test_native_q8_publication_authenticates_profiler_schema
             ProductionDensePrefillSweepTest.test_rocm_auto_streaming_observation_is_distinct_from_forced_tiles
             ProductionDensePrefillSweepTest.test_rocm_streaming_observation_rejects_invented_or_forced_launch
             ProductionDensePrefillSweepTest.test_rocm_q8_aliases_authenticate_their_int8_producers
@@ -20505,6 +20517,7 @@ if(HAVE_ROCM)
         performance/kernels/native_quantised_dispatch/ROCmTrainerVerification.hip
     )
     target_link_libraries(v2_perf_native_quantised_sweep
+        rocprofiler-sdk-roctx::rocprofiler-sdk-roctx
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
@@ -20532,6 +20545,12 @@ if(HAVE_ROCM)
         MPI_PROCS 1
         NO_MODELS
     )
+    add_v2_test(V2_Integration_ROCmNativeQ8TrainerMetadataStartup
+        COMMAND $<TARGET_FILE:v2_perf_native_quantised_sweep>
+                --gtest_filter=NativeQuantisedSweepTest.NativeQ8MetadataAvailableBeforePreparation
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;Startup;Regression"
+        ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+        TIMEOUT 30 MPI_PROCS 1 NO_MODELS)
     # Disjoint groups preserve all formats while keeping setup under the
     # ordinary per-test budget; no timing or reduced fixture coverage is used.
     set(V2_ROCM_DENSE_PREFILL_INSTALLED_TESTS "")
@@ -37117,6 +37136,10 @@ if(NOT V2_PERF_TESTS_ONLY)
         V2_Integration_MPILocalTransportDefault
         V2_Integration_MPILocalTransportExplicitNone)
 endif()
+
+# New native-Q8 evidence controls run in the existing exact evidence owner.
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity)
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})

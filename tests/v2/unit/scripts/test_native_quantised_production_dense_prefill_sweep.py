@@ -31,6 +31,7 @@ KERNEL_TOOLS = REPO_ROOT / "tests/v2/performance/kernels"
 if str(KERNEL_TOOLS) not in os.sys.path:
     os.sys.path.insert(0, str(KERNEL_TOOLS))
 
+from native_quantised_dispatch.gpu_architecture import GPUArchitecture
 from native_quantised_dispatch.format_registry import FORMAT_SPECS  # noqa: E402
 from native_quantised_dispatch.dense_production_overlay import (  # noqa: E402
     DenseOverlayEntry,
@@ -48,6 +49,7 @@ from native_quantised_dispatch.prefill_matrix import (  # noqa: E402
 )
 from native_quantised_dispatch.production_dense_prefill_sweep import (  # noqa: E402
     CUDA_AGGREGATE_COLUMNS,
+    ROCM_NATIVE_Q8_CANDIDATE_IDS,
     CUDA_CANDIDATE_IDS,
     CUDA_GENERIC_CANDIDATE_IDS,
     CUDA_TILE_NAMES,
@@ -165,6 +167,7 @@ def _write_cell(
         backend,
         cell.source_format,
         canonical_kpart_available=canonical_kpart_available,
+        prepared_family=cell.prepared_family,
     )
     samples_by_candidate = {
         candidate: tuple(
@@ -178,8 +181,8 @@ def _write_cell(
         aggregate_columns = CUDA_AGGREGATE_COLUMNS
         timing_columns = CUDA_TIMING_COLUMNS
     else:
-        aggregate_columns = ROCM_AGGREGATE_COLUMNS
-        timing_columns = ROCM_TIMING_COLUMNS
+        aggregate_columns = ROCM_AGGREGATE_COLUMNS + (("prepared_family", "gpu_architecture", "gpu_uuid", "gpu_pci", "native_ordinal") if cell.prepared_family is not None else ())
+        timing_columns = ROCM_TIMING_COLUMNS + (("prepared_family", "gpu_architecture", "gpu_uuid", "gpu_pci", "native_ordinal") if cell.prepared_family is not None else ())
 
     with paths.aggregate.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=aggregate_columns)
@@ -256,7 +259,7 @@ def _write_cell(
                     (sample - mean) ** 2 for sample in samples
                 ))
                 components = candidate.split("/")
-                int8 = cell.source_format.runtime_codebook("rocm") == 19
+                int8 = cell.effective_prepared_family == DensePreparedWeightFamily.INT8_BLOCKWISE
                 int8_v3 = candidate.startswith("INT8V3/")
                 explicit_unroll = (
                     int(components[3].removeprefix("U"))
@@ -266,6 +269,9 @@ def _write_cell(
                 writer.writerow({
                     "backend": "rocm",
                     "phase": "prefill",
+                    **({"prepared_family": "native_quantised", "gpu_architecture": cell.gpu_architecture,
+                        "gpu_uuid": "0123456789abcdef0123456789abcdef", "gpu_pci": "0000:8c:00.0", "native_ordinal": "0"}
+                       if cell.prepared_family is not None else {}),
                     "format": cell.source_format.label,
                     "codebook": cell.source_format.source_codebook_id,
                     "execution_codebook": cell.source_format.runtime_codebook("rocm"),
@@ -327,6 +333,9 @@ def _write_cell(
                 common = {
                     "backend": backend,
                     "phase": "prefill",
+                    **({"prepared_family": "native_quantised", "gpu_architecture": cell.gpu_architecture,
+                        "gpu_uuid": "0123456789abcdef0123456789abcdef", "gpu_pci": "0000:8c:00.0", "native_ordinal": "0"}
+                       if cell.prepared_family is not None else {}),
                     "format": cell.source_format.label,
                     "codebook": cell.source_format.source_codebook_id,
                     "shape": cell.shape.name,
@@ -392,6 +401,284 @@ def _commit_test_cells(
 
 class ProductionDensePrefillSweepTest(unittest.TestCase):
     """Keep the dense corpus comprehensive, exact, and safely resumable."""
+
+    @staticmethod
+    def _native_q8_source(label="Q8_0"):
+        """Bind the existing HC production shape; synthetic clocks remain test-only."""
+        return next(cell for cell in production_dense_prefill_cells("rocm")
+                    if cell.source_format.label == label
+                    and cell.shape.name == "Qwen4Exp_320x10240" and cell.m == 64)
+
+    def test_native_q8_family_identity_preserves_old_keys(self) -> None:
+        old = self._native_q8_source()
+        explicit_old = replace(old, prepared_family=DensePreparedWeightFamily.INT8_BLOCKWISE)
+        native = replace(old, prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture="gfx906")
+        self.assertEqual(old, explicit_old)
+        self.assertEqual(old.cell_id, explicit_old.cell_id)
+        self.assertNotIn("prepared_family", old.canonical_mapping())
+        self.assertEqual(old.identity, (old.backend, old.source_format.label,
+            old.source_format.source_codebook_id, old.source_format.runtime_codebook("rocm"),
+            old.shape.name, old.shape.n, old.shape.k, old.m))
+        self.assertNotEqual(old.cell_id, native.cell_id)
+        self.assertEqual(native.canonical_mapping()["prepared_family"], "native_quantised")
+        self.assertEqual(dense_prefill_candidate_ids("rocm", native.source_format,
+            prepared_family=native.prepared_family), ROCM_NATIVE_Q8_CANDIDATE_IDS)
+        self.assertTrue(all(candidate.startswith("INT8") or candidate == "Auto"
+                            for candidate in dense_prefill_candidate_ids("rocm", old.source_format)))
+        with self.assertRaisesRegex(ValueError, "typed prepared family"):
+            replace(old, prepared_family=0)
+        with self.assertRaisesRegex(ValueError, "original ROCm Q8"):
+            dense_prefill_candidate_ids("cuda", old.source_format,
+                prepared_family=DensePreparedWeightFamily.INT8_BLOCKWISE)
+
+    def test_native_q8_complete_alias_records_use_strong_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cells = tuple(replace(self._native_q8_source(label),
+                prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture="gfx906")
+                for label in ("Q8_0", "Q8_1", "Q8_K"))
+            for cell in cells:
+                _, paths = _write_cell(root, "rocm", cell=cell)
+                result = validate_production_dense_prefill_cell(paths.aggregate, paths.timing, cell, bench_runs=3)
+                self.assertEqual(result.candidate_count, 4)
+                self.assertEqual(result.sample_count, 12)
+            _commit_test_cells(root, "rocm", cells)
+            loaded, plan = load_planned_dense_prefill_cells(root / SWEEP_PLAN_FILENAME, "rocm")
+            self.assertEqual(loaded, cells)
+            entries = collect_dense_overlay_entries(root, "rocm", cells=cells, warmup_runs=2, bench_runs=3)
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].key.prepared_family, DensePreparedWeightFamily.NATIVE_QUANTISED)
+            self.assertEqual(entries[0].source_formats, ("Q8_0", "Q8_1", "Q8_K"))
+            self.assertEqual(entries[0].launch, (64, 16, 1, 2, 0, 0))
+            validate_dense_overlay_totality(entries, cells, "rocm")
+            self.assertEqual(plan["candidate_ids_by_source_format"]["Q8_K"], list(ROCM_NATIVE_Q8_CANDIDATE_IDS))
+
+    def test_native_q8_cannot_relabel_expanded_clocks(self) -> None:
+        old = self._native_q8_source()
+        native = replace(old, prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture="gfx906")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, old_paths = _write_cell(root, "rocm", cell=old)
+            with self.assertRaisesRegex(ValueError, "header"):
+                validate_production_dense_prefill_cell(old_paths.aggregate, old_paths.timing, native, bench_runs=3)
+            _, paths = _write_cell(root, "rocm", cell=native)
+            with paths.aggregate.open(newline="") as handle:
+                reader = csv.DictReader(handle); columns = reader.fieldnames; rows = list(reader)
+            rows[-1]["observed_producer"] = "int8_blockwise_v7"
+            with paths.aggregate.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=columns);writer.writeheader();writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, "invalid observed ROCm launch tuple"):
+                validate_production_dense_prefill_cell(paths.aggregate, paths.timing, native, bench_runs=3)
+
+    def test_native_q8_old_complete_records_reuse_original_producer(self) -> None:
+        for native_scope in (False, True):
+            with self.subTest(native=native_scope), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp);cell = self._native_q8_source()
+                if native_scope:
+                    cell = replace(cell, prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture="gfx906")
+                _, paths = _write_cell(root, "rocm", cell=cell)
+                producer = _test_provenance("rocm")
+                _commit_test_cells(root, "rocm", (cell,), provenance=producer)
+                before = {path.name: path.read_bytes() for path in (paths.aggregate, paths.timing, paths.manifest)}
+                binary = root / "trainer";binary.write_text("#!/bin/sh\nexit 0\n");binary.chmod(0o755)
+                with mock.patch("native_quantised_dispatch.production_dense_prefill_sweep._run_accelerator_cell") as launch:
+                    completed = run_missing_accelerator_cells(binary, root, (cell,), (0,),
+                        warmup_runs=2, bench_runs=3, producer=producer)
+                self.assertEqual(completed, ());launch.assert_not_called()
+                self.assertEqual(before, {path.name: path.read_bytes() for path in (paths.aggregate, paths.timing, paths.manifest)})
+                other = replace(cell, prepared_family=(DensePreparedWeightFamily.INT8_BLOCKWISE
+                    if native_scope else DensePreparedWeightFamily.NATIVE_QUANTISED),
+                    gpu_architecture=None if native_scope else "gfx906")
+                with self.assertRaises(ValueError):
+                    write_sweep_plan(root / SWEEP_PLAN_FILENAME, "rocm", (other,), producer, warmup_runs=2, bench_runs=3)
+                self.assertEqual(before, {path.name: path.read_bytes() for path in (paths.aggregate, paths.timing, paths.manifest)})
+
+    def test_native_q8_emitter_retains_expanded_family_rows(self) -> None:
+        old = self._native_q8_source()
+        native = replace(old, prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture="gfx906")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp);expanded_root = root / "expanded";expanded_root.mkdir()
+            native_root = root / "native";native_root.mkdir()
+            _write_cell(expanded_root, "rocm", cell=old);_commit_test_cells(expanded_root, "rocm", (old,))
+            aliases = tuple(replace(native, source_format=self._native_q8_source(label).source_format) for label in ("Q8_0", "Q8_1", "Q8_K"))
+            for alias in aliases:
+                _write_cell(native_root, "rocm", cell=alias)
+            _commit_test_cells(native_root, "rocm", aliases)
+            expanded = collect_dense_overlay_entries(expanded_root, "rocm", cells=(old,), warmup_runs=2, bench_runs=3)
+            measured = collect_dense_overlay_entries(native_root, "rocm", cells=aliases, warmup_runs=2, bench_runs=3)
+            self.assertEqual(expanded[0].key.prepared_family, DensePreparedWeightFamily.INT8_BLOCKWISE)
+            base = render_dense_overlay(expanded)
+            merged, receipt = retain_dense_overlay_base(base, measured)
+            self.assertEqual(receipt["retained_keys"], 1)
+            self.assertEqual(receipt["replaced_keys"], 0)
+            self.assertIn("DensePrefillWeightFamily::Int8Blockwise", merged)
+            self.assertIn("DensePrefillWeightFamily::NativeQuantised", merged)
+            self.assertEqual(retain_dense_overlay_base(merged, measured)[0], merged)
+
+    def test_native_q8_environment_and_batch_keep_family_bound(self) -> None:
+        old = self._native_q8_source();native = replace(old, prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture="gfx906")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,
+            {"LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_PREPARED_FAMILY": "native_quantised"}):
+            root = Path(tmp)
+            old_environment = _cell_environment(old, production_dense_prefill_cell_paths(root, old), 2, 2, 3)
+            environment = _cell_environment(native, production_dense_prefill_cell_paths(root, native), 2, 2, 3)
+            self.assertNotIn("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_PREPARED_FAMILY", old_environment)
+            self.assertEqual(environment["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_PREPARED_FAMILY"], "native_quantised")
+            self.assertEqual(environment["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS"].split(","), list(ROCM_NATIVE_Q8_CANDIDATE_IDS))
+            self.assertEqual(environment["HIP_VISIBLE_DEVICES"], "2")
+            with self.assertRaisesRegex(ValueError, "one format and geometry"):
+                _batch_environment((old, replace(native, m=448)), _batch_paths(root, (old, replace(native, m=448))), 2, 2, 3)
+            with self.assertRaisesRegex(ValueError, "one prepared-family protocol"):
+                write_sweep_plan(root / SWEEP_PLAN_FILENAME, "rocm", (old, native), _test_provenance("rocm"))
+
+    def test_native_q8_architecture_identity_and_receipt_are_strict(self) -> None:
+        """Authored metadata cannot relabel a different architecture or participant."""
+        cell = replace(self._native_q8_source(), prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture="gfx906")
+        other = replace(cell, gpu_architecture="gfx1100")
+        self.assertNotEqual(cell.cell_id, other.cell_id)
+        with tempfile.TemporaryDirectory() as tmp:
+            _, paths = _write_cell(Path(tmp), "rocm", cell=cell)
+            with self.assertRaisesRegex(ValueError, "architecture"):
+                validate_production_dense_prefill_cell(paths.aggregate, paths.timing, other, bench_runs=3)
+            for field, value in (("gpu_uuid", "0" * 32), ("gpu_pci", "missing"), ("native_ordinal", "1")):
+                _, paths = _write_cell(Path(tmp), "rocm", cell=cell)
+                with paths.aggregate.open(newline="") as handle:
+                    reader = csv.DictReader(handle); columns = reader.fieldnames; rows = list(reader)
+                rows[0][field] = value
+                with paths.aggregate.open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=columns); writer.writeheader(); writer.writerows(rows)
+                with self.assertRaisesRegex(ValueError, "participant"):
+                    validate_production_dense_prefill_cell(paths.aggregate, paths.timing, cell, bench_runs=3)
+
+    def test_native_q8_two_architecture_retention_keeps_legacy_rows(self) -> None:
+        """A new architecture delta replaces only its own complete runtime key."""
+        first = DenseOverlayEntry("rocm", DenseOverlayKey(19, 64, 320, 2560,
+            architecture=GPUArchitecture.parse("rocm", "gfx906")),
+            ("Q8_0", "Q8_1", "Q8_K"), ("authored",), "N64/MT16/MB1/U2", (64, 16, 1, 2, 0, 0), 1., 1., 1.)
+        second = replace(first, key=replace(first.key, architecture=GPUArchitecture.parse("rocm", "gfx1100")))
+        base = render_dense_overlay((first, second))
+        changed = replace(first, launch=(64, 32, 1, 2, 0, 0))
+        output, receipt = retain_dense_overlay_base(base, (changed,))
+        self.assertEqual(receipt["replaced_keys"], 1)
+        self.assertEqual(receipt["retained_keys"], 1)
+        self.assertIn(second.key.architecture.cpp_literal(), output)
+        with self.assertRaisesRegex(ValueError, "source-alias"):
+            render_dense_overlay((replace(first, source_formats=("Q8_0",)),))
+        with self.assertRaisesRegex(ValueError, "architecture"):
+            render_dense_overlay((replace(first, key=replace(first.key, architecture=None)),))
+
+    def test_native_q8_profile_requests_preserve_unforced_auto(self) -> None:
+        """Original common profiling lowers the physical baseline to actual Auto."""
+        from native_quantised_dispatch.native_q8_prefill_profiler import build_manifest, environment, validate_request
+        from native_quantised_dispatch.profiler_collectors import _profile_environment, _apply_device_placement, CollectorOptions
+        cells = tuple(replace(self._native_q8_source(label), prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED,
+                              gpu_architecture="gfx906") for label in ("Q8_0", "Q8_1", "Q8_K"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for cell in cells:
+                _write_cell(root, "rocm", cell=cell)
+            _commit_test_cells(root, "rocm", cells)
+            manifest = build_manifest(root, warmups=2, samples=3)
+            self.assertEqual(len(manifest.requests), 6)
+            for request in manifest.requests:
+                validate_request(request)
+                env = _profile_environment(request, root)
+                self.assertNotIn("LLAMINAR_ROCM_NATIVE_QUANTISED_DECODE_VARIANTS", env)
+                self.assertEqual(env["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_PREPARED_FAMILY"], "native_quantised")
+                self.assertEqual(env["LLAMINAR_ROCM_DENSE_PRODUCTION_PROFILE_CANDIDATE"], request.config_json["requested_candidate"])
+                if request.config_json["purpose"] == "baseline":
+                    self.assertEqual(request.config_json["requested_candidate"], "Auto")
+                    self.assertNotEqual(request.candidate_id, "Auto")
+            wrong = replace(manifest.requests[0], config_json={**manifest.requests[0].config_json, "launch": [128, 32, 1, 2, 0, 0]})
+            with self.assertRaisesRegex(ValueError, "witness"):
+                validate_request(wrong)
+
+    def test_native_q8_publication_authenticates_profiler_schema(self) -> None:
+        """Publish typed evidence through the real readers and reject stale versions."""
+        from native_quantised_dispatch.native_q8_prefill_profiler import build_manifest, require_profile
+        from native_quantised_dispatch.profiler_evidence import (
+            EXPECTED_PROFILER_TOOL, PROFILER_COLLECTOR_VERSION,
+            PROFILER_METRIC_SET_VERSION, MetricAvailability, ProfiledDispatch,
+            ProfiledDispatchKind, ProfilerEvidence, ProfilerEvidenceManifest,
+            ProfilerEvidenceStatus, ProfilerMetric, metric_definitions,
+            write_profiler_evidence_manifest, write_profiler_request_manifest,
+        )
+
+        cells = tuple(replace(self._native_q8_source(label),
+            prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED,
+            gpu_architecture="gfx906") for label in ("Q8_0", "Q8_1", "Q8_K"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for cell in cells:
+                _write_cell(root, "rocm", cell=cell)
+            _commit_test_cells(root, "rocm", cells)
+            requests = build_manifest(root, warmups=2, samples=3)
+            request_path = root / "profile-requests.json"
+            evidence_path = root / "profile-evidence.json"
+            write_profiler_request_manifest(request_path, requests)
+            records = []
+            for request in requests.requests:
+                metrics = tuple(ProfilerMetric(
+                    metric_id=definition.metric_id, category=definition.category,
+                    unit=definition.unit, availability=MetricAvailability.MEASURED,
+                    value=0.0 if definition.metric_id == "gpu.scratch_bytes" else 1.0,
+                    source_name="unit::" + definition.metric_id, reason=None,
+                ) for definition in metric_definitions(request.backend))
+                dispatch = ProfiledDispatch(
+                    dispatch_index=0, dispatch_kind=ProfiledDispatchKind.GPU_KERNEL,
+                    kernel_name="unitNativeQ8Kernel", kernel_fingerprint="sha256:" + "1" * 64,
+                    grid=(1, 1, 1), block=(64, 1, 1), metrics=metrics,
+                )
+                records.append(ProfilerEvidence(
+                    request_id=request.request_id, observation_digest=request.observation_digest,
+                    backend=request.backend, status=ProfilerEvidenceStatus.COMPLETE,
+                    status_reason=None, profiler_tool=EXPECTED_PROFILER_TOOL[request.backend],
+                    profiler_tool_version="unit-profiler-1", metric_set_version=PROFILER_METRIC_SET_VERSION,
+                    collector_version=PROFILER_COLLECTOR_VERSION,
+                    command_digest="sha256:" + "2" * 64, raw_artifact_digest="sha256:" + "3" * 64,
+                    profiler_pass_count=1, target_launches_per_profiler_pass=1, dispatches=(dispatch,),
+                ))
+            evidence = ProfilerEvidenceManifest(
+                request_manifest_digest=requests.digest(), corpus_digest=requests.corpus_digest,
+                candidate_registry_digest=requests.candidate_registry_digest, evidence=tuple(records),
+            )
+            write_profiler_evidence_manifest(evidence_path, evidence)
+            # No reader or typed field is mocked: this is the formerly failing
+            # publication boundary, including every source alias and Auto control.
+            require_profile(root, request_path, evidence_path, warmups=2, samples=3)
+
+            stale_record = replace(records[0], metric_set_version="stale-metric-set")
+            scratch_dispatch = replace(records[0].dispatches[0], metrics=tuple(
+                replace(metric, value=1.0) if metric.metric_id == "gpu.scratch_bytes" else metric
+                for metric in records[0].dispatches[0].metrics))
+            scratch_record = replace(records[0], dispatches=(scratch_dispatch,))
+            for label, changed, message in (
+                ("record version", replace(evidence, evidence=(stale_record, *records[1:])),
+                 "unsupported profiler metric set"),
+                ("missing control", replace(evidence, evidence=tuple(records[1:])),
+                 "coverage is incomplete"),
+                ("scratch", replace(evidence, evidence=(scratch_record, *records[1:])),
+                 "nonzero local/scratch traffic"),
+            ):
+                with self.subTest(case=label):
+                    write_profiler_evidence_manifest(evidence_path, changed)
+                    with self.assertRaisesRegex(ValueError, message):
+                        require_profile(root, request_path, evidence_path, warmups=2, samples=3)
+
+            raw = evidence.canonical_mapping()
+            raw["metric_set_version"] = "stale-metric-set"
+            evidence_path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(ValueError, "unsupported profiler evidence metric set"):
+                require_profile(root, request_path, evidence_path, warmups=2, samples=3)
+
+    def test_native_q8_missing_raw_samples_prevents_completion(self) -> None:
+        cell = replace(self._native_q8_source(), prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture="gfx906")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, paths = _write_cell(Path(tmp), "rocm", cell=cell)
+            lines = paths.timing.read_text().splitlines(keepends=True)
+            paths.timing.write_text("".join(lines[:-1]))
+            with self.assertRaisesRegex(ValueError, "samples, expected"):
+                validate_production_dense_prefill_cell(paths.aggregate, paths.timing, cell, bench_runs=3)
 
     def test_matrix_is_all_format_shape_and_m_complete_on_both_backends(self) -> None:
         expected_count = (
@@ -1427,10 +1714,10 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
     def test_rocm_same_geometry_retention_separates_prepared_families(self) -> None:
         """One family's refresh cannot erase or consume the other's exact row."""
         native = DenseOverlayEntry(
-            "rocm", DenseOverlayKey(19, 64, 512, 5120), (), (),
+            "rocm", DenseOverlayKey(19, 64, 512, 5120, architecture=GPUArchitecture.parse("rocm", "gfx906")), ("Q8_0", "Q8_1", "Q8_K"), (),
             "native_fixture", (64, 16, 1, 4, 0, 0), 0.0, 0.0, 1.0)
         expanded = replace(native, key=replace(native.key,
-            prepared_family=DensePreparedWeightFamily.INT8_BLOCKWISE),
+            prepared_family=DensePreparedWeightFamily.INT8_BLOCKWISE, architecture=None),
             candidate_id="int8_fixture", launch=(64, 16, 1, 4, 0, 2))
         base = render_dense_overlay((native, expanded))
         self.assertIn("5120, DensePrefillWeightFamily::NativeQuantised", base)
@@ -1443,7 +1730,7 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
         self.assertEqual(receipt["replaced_keys"], 1)
         self.assertEqual(receipt["retained_keys"], 1)
         self.assertEqual(receipt["output_keys"], 2)
-        self.assertEqual(receipt["key_schema"], "codebook-m-n-k-prepared-family")
+        self.assertEqual(receipt["key_schema"], "codebook-m-n-k-prepared-family-native-q8-architecture")
         self.assertEqual(retain_dense_overlay_base(output, (changed,))[0], output)
         for malformed in (replace(native, launch=expanded.launch),
                           replace(expanded, launch=native.launch)):
@@ -1461,7 +1748,7 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
         # must bind its original producer values explicitly before retention.
         with self.assertRaisesRegex(ValueError, "selector ABI mismatch"):
             retain_dense_overlay_base(base.replace(
-                "        DensePrefillWeightFamily family;\n", ""), (changed,))
+                '#include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlayTypes.h"\n', ""), (changed,))
 
     def test_installed_rocm_family_key_abi_is_retained_without_reinterpretation(self) -> None:
         """The installed program must match the generator's complete typed ABI."""
@@ -1471,13 +1758,15 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             DensePreparedWeightFamily.INT8_BLOCKWISE), (), (), "installed_identity",
             (64, 16, 1, 4, 0, 2), 0.0, 0.0, 1.0)
         output, receipt = retain_dense_overlay_base(base, (expanded,))
-        self.assertEqual(output, base)
+        for line in base.splitlines(keepends=True):
+            if line.startswith("        {"):
+                self.assertIn(line, output)
         self.assertEqual(receipt["replaced_keys"], 1)
         # Adding an uninstalled native row is a metadata fixture only. The base
         # INT8 row keeps exactly its original bytes and producer contract.
         native = replace(expanded, key=replace(expanded.key,
-            prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED),
-            launch=(64, 16, 1, 4, 0, 0))
+            prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, architecture=GPUArchitecture.parse("rocm", "gfx906")),
+            source_formats=("Q8_0", "Q8_1", "Q8_K"), launch=(64, 16, 1, 4, 0, 0))
         output, receipt = retain_dense_overlay_base(base, (native,))
         self.assertEqual(receipt["replaced_keys"], 0)
         self.assertEqual(receipt["output_keys"], receipt["base_keys"] + 1)
@@ -1490,14 +1779,14 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
         cell = next(cell for cell in production_dense_prefill_cells("rocm")
                     if cell.source_format.runtime_codebook("rocm") == 19)
         native = DenseOverlayEntry("rocm", DenseOverlayKey(19, cell.m,
-            cell.shape.n, cell.shape.k), (cell.source_format.label,),
+            cell.shape.n, cell.shape.k, architecture=GPUArchitecture.parse("rocm", "gfx906")), ("Q8_0", "Q8_1", "Q8_K"),
             (cell.shape.name,), "native_fixture", (64, 16, 1, 0, 0, 0),
             0.0, 0.0, 1.0)
         with self.assertRaisesRegex(ValueError, "not total"):
             validate_dense_overlay_totality((native,), (cell,), "rocm")
         expanded = replace(native, key=replace(native.key,
-            prepared_family=DensePreparedWeightFamily.INT8_BLOCKWISE),
-            launch=(64, 16, 1, 0, 0, 2))
+            prepared_family=DensePreparedWeightFamily.INT8_BLOCKWISE, architecture=None),
+            source_formats=(cell.source_format.label,), launch=(64, 16, 1, 0, 0, 2))
         validate_dense_overlay_totality((expanded,), (cell,), "rocm")
 
     def test_overlay_rejects_aliases_with_conflicting_physical_auto_launches(self) -> None:

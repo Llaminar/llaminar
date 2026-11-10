@@ -15,8 +15,10 @@ This distinction makes the corpus comprehensive without pretending that an
 execution-codebook key can observe source metadata that production discarded.
 Auto observations authenticate the executed physical family, not just the
 subset of cooperative geometries exposed as forced tournament candidates.
-Q8 aliases independently measure the INT8 blockwise producer and its own
-controls; low-bit NativeQuantised override names cannot label those launches.
+Source-default Q8 aliases independently measure the INT8 blockwise producer.
+An explicit plan-bound native-Q8 preparation measures its original cooperative
+ABI with a distinct cell identity, candidate matrix and CSV family field;
+legacy clocks cannot be relabeled as that producer.
 ROCm aggregate and timing rows explicitly bind physical execution identity next
 to original source codebook. Current schema rejects old or relabeled IQ4_XS
 rows; source4 and physical24 are never collapsed into a synthetic measurement.
@@ -31,14 +33,17 @@ import json
 import math
 import os
 import queue
+import re
 import statistics
 import subprocess
 import threading
 import uuid
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from .gpu_architecture import GPUArchitecture
 from .format_registry import CODEBOOK_PAYLOAD_BYTES, FORMAT_SPECS, NativeQuantisedFormatSpec, registry_digest
 from .corpus_provenance import (
     TRAINER_PROVENANCE_SCHEMA,
@@ -227,6 +232,18 @@ CELL_MANIFEST_SCHEMA = "native-quantised-production-dense-prefill-cell-v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
+class DensePreparedWeightFamily(IntEnum):
+    """Physical prepared operand ABI, independent of source/execution codebook."""
+
+    NATIVE_QUANTISED = 0
+    INT8_BLOCKWISE = 1
+
+
+ROCM_NATIVE_Q8_CANDIDATE_IDS = (
+    "N64/MT16/MB1/U2", "N64/MT32/MB1/U2", "N128/MT32/MB1/U2", "Auto",
+)
+
+
 @dataclass(frozen=True)
 class DensePrefillCell:
     """One independently resumable source-format/geometry/M tournament."""
@@ -235,6 +252,38 @@ class DensePrefillCell:
     source_format: NativeQuantisedFormatSpec
     shape: NativeQuantisedShape
     m: int
+    prepared_family: DensePreparedWeightFamily | None = None
+    gpu_architecture: str | None = None
+
+    def __post_init__(self) -> None:
+        """Preserve legacy IDs when an explicit family names the old contract."""
+        if self.prepared_family is None:
+            if self.gpu_architecture is not None:
+                raise ValueError("architecture scope is only supported by explicit native Q8")
+            return
+        if not isinstance(self.prepared_family, DensePreparedWeightFamily):
+            raise ValueError("dense cell requires a typed prepared family")
+        legacy = (DensePreparedWeightFamily.INT8_BLOCKWISE
+                  if self.backend == "rocm" and self.source_format.runtime_codebook("rocm") == 19
+                  else DensePreparedWeightFamily.NATIVE_QUANTISED)
+        if self.prepared_family == legacy:
+            object.__setattr__(self, "prepared_family", None)
+        elif not (self.backend == "rocm" and self.source_format.runtime_codebook("rocm") == 19
+                  and self.prepared_family == DensePreparedWeightFamily.NATIVE_QUANTISED):
+            raise ValueError("unsupported explicit dense prepared family")
+        if self.gpu_architecture is not None:
+            GPUArchitecture.parse(self.backend, self.gpu_architecture)
+            if self.prepared_family is None:
+                raise ValueError("architecture scope is only supported by explicit native Q8")
+
+    @property
+    def effective_prepared_family(self) -> DensePreparedWeightFamily:
+        """Return the actual ABI while keeping old source-default records unchanged."""
+        if self.prepared_family is not None:
+            return self.prepared_family
+        return (DensePreparedWeightFamily.INT8_BLOCKWISE
+                if self.backend == "rocm" and self.source_format.runtime_codebook("rocm") == 19
+                else DensePreparedWeightFamily.NATIVE_QUANTISED)
 
     @property
     def identity(self) -> tuple[object, ...]:
@@ -249,7 +298,7 @@ class DensePrefillCell:
             self.shape.n,
             self.shape.k,
             self.m,
-        )
+        ) + (("prepared_family", int(self.prepared_family)) if self.prepared_family is not None else ()) + (("gpu_architecture", self.gpu_architecture) if self.gpu_architecture is not None else ())
 
     @property
     def cell_id(self) -> str:
@@ -281,6 +330,8 @@ class DensePrefillCell:
             "m": self.m,
             "n": self.shape.n,
             "k": self.shape.k,
+            **({"prepared_family": "native_quantised"} if self.prepared_family is not None else {}),
+            **({"gpu_architecture": self.gpu_architecture} if self.gpu_architecture is not None else {}),
         }
 
 
@@ -322,10 +373,20 @@ def dense_prefill_candidate_ids(
     source_format: NativeQuantisedFormatSpec | None = None,
     *,
     canonical_kpart_available: bool = True,
+    prepared_family: DensePreparedWeightFamily | None = None,
 ) -> tuple[str, ...]:
     """Return the complete byte-eligible inventory for one prepared family."""
 
     normalized = backend.strip().lower()
+    if prepared_family is not None and not isinstance(prepared_family, DensePreparedWeightFamily):
+        raise ValueError("candidate inventory requires a typed prepared family")
+    if (normalized == "rocm" and source_format is not None
+            and source_format.runtime_codebook("rocm") == 19
+            and prepared_family == DensePreparedWeightFamily.NATIVE_QUANTISED):
+        return ROCM_NATIVE_Q8_CANDIDATE_IDS
+    if prepared_family == DensePreparedWeightFamily.INT8_BLOCKWISE and not (
+            normalized == "rocm" and source_format is not None and source_format.runtime_codebook("rocm") == 19):
+        raise ValueError("expanded INT8 inventory requires an original ROCm Q8 source")
     if normalized == "cuda":
         candidates = (
             CUDA_CANDIDATE_IDS if source_format is None else
@@ -369,14 +430,19 @@ def dense_prefill_candidate_ids(
 
 def production_dense_prefill_cells(
     backend: str,
+    *, prepared_family: DensePreparedWeightFamily | None = None,
+    gpu_architecture: str | None = None,
 ) -> tuple[DensePrefillCell, ...]:
     """Expand all formats, exact Qwen prefill geometries, and GPU M buckets."""
 
     normalized = backend.strip().lower()
     dense_prefill_candidate_ids(normalized)
+    if prepared_family is not None and (normalized != "rocm" or prepared_family != DensePreparedWeightFamily.NATIVE_QUANTISED):
+        raise ValueError("explicit preparation scope supports only ROCm native Q8")
     return tuple(
-        DensePrefillCell(normalized, source_format, measurement.shape, m)
+        DensePrefillCell(normalized, source_format, measurement.shape, m, prepared_family, gpu_architecture)
         for source_format in FORMAT_SPECS
+        if prepared_family is None or source_format.runtime_codebook("rocm") == 19
         for measurement in gpu_prefill_measurements()
         for m in measurement.m_values
     )
@@ -417,7 +483,7 @@ def _batch_group_key(cell: DensePrefillCell) -> tuple[object, ...]:
         cell.shape.name,
         cell.shape.n,
         cell.shape.k,
-    )
+    ) + (("prepared_family", int(cell.prepared_family)) if cell.prepared_family is not None else ()) + (("gpu_architecture", cell.gpu_architecture) if cell.gpu_architecture is not None else ())
 
 
 def _validated_batch_cells(
@@ -539,15 +605,15 @@ def _candidate_id(
     return row["variant"].strip()
 
 
-def _aggregate_columns(backend: str) -> tuple[str, ...]:
+def _aggregate_columns(backend: str, prepared_family: DensePreparedWeightFamily | None = None) -> tuple[str, ...]:
     return (
         CUDA_AGGREGATE_COLUMNS if backend == "cuda"
-        else ROCM_AGGREGATE_COLUMNS
+        else ROCM_AGGREGATE_COLUMNS + (("prepared_family", "gpu_architecture", "gpu_uuid", "gpu_pci", "native_ordinal") if prepared_family is not None else ())
     )
 
 
-def _timing_columns(backend: str) -> tuple[str, ...]:
-    return CUDA_TIMING_COLUMNS if backend == "cuda" else ROCM_TIMING_COLUMNS
+def _timing_columns(backend: str, prepared_family: DensePreparedWeightFamily | None = None) -> tuple[str, ...]:
+    return CUDA_TIMING_COLUMNS if backend == "cuda" else ROCM_TIMING_COLUMNS + (("prepared_family", "gpu_architecture", "gpu_uuid", "gpu_pci", "native_ordinal") if prepared_family is not None else ())
 
 
 def _validate_common_identity(
@@ -561,6 +627,17 @@ def _validate_common_identity(
     original-factor representation, independently of source-policy4 schedules.
     """
 
+    if cell.prepared_family is not None:
+        if cell.gpu_architecture is None or row.get("gpu_architecture") != cell.gpu_architecture:
+            raise ValueError(f"{context}: native architecture differs from the planned target")
+        GPUArchitecture.parse(cell.backend, row["gpu_architecture"])
+        if (not re.fullmatch(r"[0-9a-f]{32}", row.get("gpu_uuid", ""))
+                or int(row["gpu_uuid"], 16) == 0
+                or not re.fullmatch(r"(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]", row.get("gpu_pci", ""))
+                or row.get("native_ordinal") != "0"):
+            raise ValueError(f"{context}: incomplete selected native participant receipt")
+    if cell.prepared_family is not None and row.get("prepared_family") != "native_quantised":
+        raise ValueError(f"{context}: explicit prepared family disagrees with plan")
     if row["format"] != cell.source_format.label:
         raise ValueError(f"{context}: source format disagrees with plan")
     if int(row["codebook"]) != cell.source_format.source_codebook_id:
@@ -585,14 +662,14 @@ def _read_aggregate_rows(
 
     allowed = set(dense_prefill_candidate_ids(
         cell.backend, cell.source_format,
-        canonical_kpart_available=True,
+        canonical_kpart_available=True, prepared_family=cell.prepared_family,
     ))
     indexed: dict[str, dict[str, str]] = {}
     canonical_kpart_availability: set[bool] = set()
     with Path(path).open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         _require_exact_header(Path(path), reader.fieldnames, _aggregate_columns(
-            cell.backend
+            cell.backend, cell.prepared_family
         ))
         for line, row in enumerate(reader, start=2):
             context = f"{path}:{line}"
@@ -768,7 +845,7 @@ def _read_aggregate_rows(
                     int(row["observed_full_tiles"]),
                 )
                 producer = row["observed_producer"]
-                int8 = cell.source_format.runtime_codebook("rocm") == 19
+                int8 = cell.effective_prepared_family == DensePreparedWeightFamily.INT8_BLOCKWISE
                 # Auto also owns the barrier-free streaming family. Its
                 # complete launch identity is fixed: 256 columns, 8/16 rows,
                 # three waves, no cooperative unroll, and checked edges.
@@ -849,7 +926,7 @@ def _read_aggregate_rows(
     expected = set(dense_prefill_candidate_ids(
         cell.backend,
         cell.source_format,
-        canonical_kpart_available=canonical_kpart_available,
+        canonical_kpart_available=canonical_kpart_available, prepared_family=cell.prepared_family,
     ))
     if set(indexed) != expected:
         raise ValueError(
@@ -869,14 +946,14 @@ def _read_timing_rows(
     """Authenticate contiguous native-event samples for every candidate."""
 
     expected = set(
-        dense_prefill_candidate_ids(cell.backend, cell.source_format)
+        dense_prefill_candidate_ids(cell.backend, cell.source_format, prepared_family=cell.prepared_family)
         if expected_candidates is None else expected_candidates
     )
     samples: dict[str, list[float]] = {}
     with Path(path).open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         _require_exact_header(Path(path), reader.fieldnames, _timing_columns(
-            cell.backend
+            cell.backend, cell.prepared_family
         ))
         for line, row in enumerate(reader, start=2):
             context = f"{path}:{line}"
@@ -928,6 +1005,14 @@ def validate_production_dense_prefill_cell(
     timing = _read_timing_rows(
         Path(timing_path), cell, bench_runs, aggregate.keys()
     )
+    if cell.prepared_family is not None:
+        participants = set()
+        for original in (Path(aggregate_path), Path(timing_path)):
+            with original.open(newline="", encoding="utf-8") as handle:
+                participants.update(tuple(row[name] for name in ("gpu_uuid", "gpu_pci", "native_ordinal", "gpu_architecture"))
+                                    for row in csv.DictReader(handle))
+        if len(participants) != 1:
+            raise ValueError("native Q8 aggregate/samples mix physical participant receipts")
     for candidate, row in aggregate.items():
         values = timing[candidate]
         expected_min = min(values)
@@ -957,7 +1042,7 @@ def validate_production_dense_prefill_cell(
     # names must not manufacture a different winner when HIP event ticks tie.
     candidate_order = {
         candidate: index for index, candidate in enumerate(
-            dense_prefill_candidate_ids(cell.backend, cell.source_format))
+            dense_prefill_candidate_ids(cell.backend, cell.source_format, prepared_family=cell.prepared_family))
     }
     winners = sorted(aggregate,
         key=lambda candidate: (min(timing[candidate]), candidate_order[candidate]))
@@ -1007,6 +1092,13 @@ def _sweep_plan_payload(
         raise ValueError("sweep plan contains a cell for another backend")
     if trainer.get("backend") != normalized:
         raise ValueError("trainer provenance belongs to another backend")
+    scopes = {cell.prepared_family for cell in cells}
+    if len(scopes) != 1:
+        raise ValueError("one dense corpus must retain one prepared-family protocol")
+    native_labels = {cell.source_format.label for cell in cells if cell.prepared_family is not None}
+    native_targets = {cell.gpu_architecture for cell in cells if cell.prepared_family is not None}
+    if native_targets and (None in native_targets or len(native_targets) != 1):
+        raise ValueError("native Q8 collection requires one explicit architecture")
     body: dict[str, object] = {
         "schema_version": SWEEP_PLAN_SCHEMA,
         "backend": normalized,
@@ -1015,7 +1107,8 @@ def _sweep_plan_payload(
         "gpu_m_buckets": list(GPU_PREFILL_M_BUCKETS),
         "candidate_ids_by_source_format": {
             source_format.label: list(dense_prefill_candidate_ids(
-                normalized, source_format
+                normalized, source_format,
+                prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED if source_format.label in native_labels else None
             ))
             for source_format in FORMAT_SPECS
         },
@@ -1125,6 +1218,13 @@ def load_planned_dense_prefill_cells(
         cell.cell_id: cell
         for cell in production_dense_prefill_cells(normalized)
     }
+    if normalized == "rocm":
+        targets = {row.get("gpu_architecture") for row in planned_rows if isinstance(row, dict) and row.get("prepared_family") == "native_quantised"}
+        for target in targets:
+            if target is None:
+                raise ValueError("native Q8 plan lacks its architecture; unqualified records cannot be relabeled")
+            available.update({cell.cell_id: cell for cell in production_dense_prefill_cells(
+                normalized, prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture=target)})
     selected = []
     seen: set[str] = set()
     for index, row in enumerate(planned_rows):
@@ -1315,6 +1415,7 @@ def _cell_environment(
 
     environment = os.environ.copy()
     environment["GTEST_COLOR"] = "no"
+    environment.pop("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_PREPARED_FAMILY", None)
     if cell.backend == "cuda":
         environment.pop("ROCR_VISIBLE_DEVICES", None)
         environment.pop("HIP_VISIBLE_DEVICES", None)
@@ -1350,6 +1451,12 @@ def _cell_environment(
                 paths.timing_staging
             ),
         })
+    if cell.prepared_family is not None:
+        if cell.gpu_architecture is None:
+            raise ValueError("native Q8 execution requires its expected architecture")
+        environment["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_PREPARED_FAMILY"] = "native_quantised"
+        environment["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_ARCHITECTURE"] = cell.gpu_architecture
+        environment["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS"] = ",".join(ROCM_NATIVE_Q8_CANDIDATE_IDS)
     return environment
 
 
@@ -1429,8 +1536,8 @@ def _split_batch_csv(
 
     ordered = _validated_batch_cells(cells)
     columns = (
-        _timing_columns(ordered[0].backend)
-        if timing else _aggregate_columns(ordered[0].backend)
+        _timing_columns(ordered[0].backend, ordered[0].prepared_family)
+        if timing else _aggregate_columns(ordered[0].backend, ordered[0].prepared_family)
     )
     cells_by_m = {cell.m: cell for cell in ordered}
     rows_by_m: dict[int, list[dict[str, str]]] = {
@@ -1804,12 +1911,12 @@ def combine_production_dense_prefill_cells(
     _combine_csvs_atomic(
         aggregate,
         (path.aggregate for path in paths),
-        _aggregate_columns(backend),
+        _aggregate_columns(backend, cells[0].prepared_family),
     )
     _combine_csvs_atomic(
         timing,
         (path.timing for path in paths),
-        _timing_columns(backend),
+        _timing_columns(backend, cells[0].prepared_family),
     )
     return aggregate, timing
 
@@ -1833,7 +1940,12 @@ def _parse_positive_ints(raw: str) -> tuple[int, ...]:
 
 
 def _filtered_cells(args: argparse.Namespace) -> tuple[DensePrefillCell, ...]:
-    cells = production_dense_prefill_cells(args.backend)
+    family = (DensePreparedWeightFamily.NATIVE_QUANTISED
+              if getattr(args, "prepared_family", "source-default") == "native-quantised-q8" else None)
+    target = getattr(args, "gpu_architecture", None)
+    if (family is not None) != (target is not None):
+        raise ValueError("--gpu-architecture is required only for native-quantised-q8")
+    cells = production_dense_prefill_cells(args.backend, prepared_family=family, gpu_architecture=target)
     if args.format:
         selected = {value.upper() for value in args.format}
         cells = tuple(
@@ -1860,6 +1972,9 @@ def main() -> int:
         subparser.add_argument("--backend", choices=("cuda", "rocm"), required=True)
         subparser.add_argument("--output-dir", type=Path, required=True)
         subparser.add_argument("--format", action="append")
+        subparser.add_argument("--prepared-family", choices=("source-default", "native-quantised-q8"),
+                               default="source-default", help="Explicit ROCm native-Q8 ABI; source-default preserves old corpus identities")
+        subparser.add_argument("--gpu-architecture", help="Expected native target; independently authenticated by native CSV metadata")
         subparser.add_argument("--shape", action="append")
         subparser.add_argument("--m", type=_parse_positive_ints)
         subparser.add_argument(

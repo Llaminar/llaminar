@@ -12,31 +12,10 @@
 
 #include <cstddef>
 #include <cstdint>
-#include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"
-#include "kernels/rocm/gemm/ROCmDensePrefillPreparedWeightFamily.h"
+#include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlayTypes.h"
 
 namespace llaminar2::rocm::generated
 {
-    struct ROCmDensePrefillOverlayConfig
-    {
-        int n_tile;
-        int m_tile;
-        int min_blocks;
-        int unroll;
-        bool full_tiles;
-        VNNIPrefillProducer producer;
-    };
-
-    struct ROCmDensePrefillOverlayEntry
-    {
-        uint8_t codebook;
-        int m;
-        int n;
-        int k;
-        DensePrefillWeightFamily family;
-        ROCmDensePrefillOverlayConfig config;
-    };
-
     inline constexpr ROCmDensePrefillOverlayEntry
         kROCmDensePrefillOverlayEntries[] = {
         {0, 64, 512, 5120, DensePrefillWeightFamily::NativeQuantised, {64, 16, 2, 4, false, VNNIPrefillProducer::NativeCooperative}},
@@ -658,6 +637,8 @@ namespace llaminar2::rocm::generated
         uint8_t codebook, int m, int n, int k, DensePrefillWeightFamily family,
         ROCmDensePrefillOverlayConfig &config)
     {
+        if (codebook == 19 && family == DensePrefillWeightFamily::NativeQuantised)
+            return false;
         size_t first = 0;
         size_t last = sizeof(kROCmDensePrefillOverlayEntries) /
                       sizeof(kROCmDensePrefillOverlayEntries[0]);

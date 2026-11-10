@@ -24,16 +24,17 @@ import os
 import re
 import statistics
 from dataclasses import dataclass
-from enum import IntEnum
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from .gpu_architecture import GPUArchitecture
 from .production_dense_prefill_sweep import (
     DEFAULT_BENCH_RUNS,
     DEFAULT_WARMUP_RUNS,
     SWEEP_PLAN_FILENAME,
     ROCM_PRODUCER_IDS,
     DensePrefillCell,
+    DensePreparedWeightFamily,
     _cuda_candidate_is_spill_free,
     _read_aggregate_rows,
     _read_timing_rows,
@@ -45,13 +46,6 @@ from .production_dense_prefill_sweep import (
 )
 
 
-class DensePreparedWeightFamily(IntEnum):
-    """Physical prepared operand ABI, independent of source/execution codebook."""
-
-    NATIVE_QUANTISED = 0
-    INT8_BLOCKWISE = 1
-
-
 @dataclass(frozen=True, order=True)
 class DenseOverlayKey:
     """One runtime-visible exact key, including the prepared operand ABI."""
@@ -61,11 +55,16 @@ class DenseOverlayKey:
     n: int
     k: int
     prepared_family: DensePreparedWeightFamily = DensePreparedWeightFamily.NATIVE_QUANTISED
+    architecture: GPUArchitecture | None = None
 
     def __post_init__(self) -> None:
         """Reject untyped family identities before grouping or retention."""
         if not isinstance(self.prepared_family, DensePreparedWeightFamily):
             raise ValueError("dense overlay key requires a typed prepared family")
+        if self.architecture is not None and (not isinstance(self.architecture, GPUArchitecture)
+                or self.architecture.backend != "rocm" or self.execution_codebook != 19
+                or self.prepared_family != DensePreparedWeightFamily.NATIVE_QUANTISED):
+            raise ValueError("architecture-qualified dense keys are native ROCm Q8 only")
 
 
 @dataclass(frozen=True)
@@ -84,16 +83,8 @@ class DenseOverlayEntry:
 
 
 def _canonical_sweep_prepared_family(cell: DensePrefillCell) -> DensePreparedWeightFamily:
-    """Name the existing trainer's actual preparation contract, not a runtime rule.
-
-    The canonical ROCm trainer expands Q8 into INT8 VNNI; its authenticated
-    aggregate parser requires that physical producer. Other cells retain their
-    native preparation. A native-Q8 trainer would need a separately typed plan;
-    this repair neither invents that mode nor installs native-Q8 measurements.
-    """
-    if cell.backend == "rocm" and cell.source_format.runtime_codebook("rocm") == 19:
-        return DensePreparedWeightFamily.INT8_BLOCKWISE
-    return DensePreparedWeightFamily.NATIVE_QUANTISED
+    """Use the plan-bound physical ABI; legacy source-default identities stay intact."""
+    return cell.effective_prepared_family
 
 
 def _validate_prepared_identity(entry: DenseOverlayEntry) -> None:
@@ -107,11 +98,18 @@ def _validate_prepared_identity(entry: DenseOverlayEntry) -> None:
         raise ValueError("unsupported dense overlay backend")
     if len(entry.launch) != 6 or entry.launch[5] not in range(4):
         raise ValueError("ROCm dense overlay requires an exact producer identity")
+    if entry.key.execution_codebook == 19 and family == DensePreparedWeightFamily.NATIVE_QUANTISED:
+        if entry.key.architecture is None:
+            raise ValueError("native Q8 publication requires authenticated architecture")
+        if set(entry.source_formats) != {"Q8_0", "Q8_1", "Q8_K"}:
+            raise ValueError("native Q8 publication requires independent complete source-alias evidence")
     int8 = entry.launch[5] in (2, 3)
     if int8 != (family == DensePreparedWeightFamily.INT8_BLOCKWISE):
         raise ValueError("ROCm measured producer disagrees with prepared family")
     if int8 and entry.key.execution_codebook != 19:
         raise ValueError("expanded INT8 producer requires its Q8 execution decoder")
+    if entry.key.architecture is not None and entry.launch[5] != 0:
+        raise ValueError("architecture-qualified native Q8 requires NativeCooperative")
 
 
 def _expected_overlay_inventory(
@@ -132,6 +130,8 @@ def _expected_overlay_inventory(
             n=cell.shape.n,
             k=cell.shape.k,
             prepared_family=_canonical_sweep_prepared_family(cell),
+            architecture=(GPUArchitecture.parse(cell.backend, cell.gpu_architecture)
+                          if cell.gpu_architecture is not None else None),
         )
         source_formats, shape_names = grouped.setdefault(
             key, (set(), set())
@@ -326,6 +326,8 @@ def collect_dense_overlay_entries(
             n=cell.shape.n,
             k=cell.shape.k,
             prepared_family=_canonical_sweep_prepared_family(cell),
+            architecture=(GPUArchitecture.parse(cell.backend, cell.gpu_architecture)
+                          if cell.gpu_architecture is not None else None),
         )
         grouped.setdefault(key, []).append((cell, aggregate, timing))
 
@@ -576,7 +578,7 @@ def _render_cuda(entries: Sequence[DenseOverlayEntry]) -> str:
     ]), "cuda")
 
 
-def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
+def _render_rocm(entries: Sequence[DenseOverlayEntry], *, inline_legacy: bool = False) -> str:
     producers = (
         "NativeCooperative", "NativeStreaming", "Int8BlockwiseV3", "Int8BlockwiseV7",
     )
@@ -594,7 +596,8 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         f"{{{entry.launch[0]}, {entry.launch[1]}, "
         f"{entry.launch[2]}, {entry.launch[3]}, "
         f"{str(bool(entry.launch[4])).lower()}, VNNIPrefillProducer::{producers[entry.launch[5]]}}}"
-        "},"
+        + (", " + entry.key.architecture.cpp_literal() if entry.key.architecture is not None else "")
+        + "},"
         for entry in entries
     ]
     return _generated_doxygen("\n".join([
@@ -603,11 +606,17 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         "",
         "#include <cstddef>",
         "#include <cstdint>",
+        *([
+        '#include "kernels/common/NativeQuantisedArchitecture.h"',
         '#include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"',
         '#include "kernels/rocm/gemm/ROCmDensePrefillPreparedWeightFamily.h"',
+        ] if inline_legacy else [
+            '#include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlayTypes.h"',
+        ]),
         "",
         "namespace llaminar2::rocm::generated",
         "{",
+        *([
         "    struct ROCmDensePrefillOverlayConfig",
         "    {",
         "        int n_tile;",
@@ -626,8 +635,10 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         "        int k;",
         "        DensePrefillWeightFamily family;",
         "        ROCmDensePrefillOverlayConfig config;",
+        "        ::llaminar2::native_quantised::NativeQuantisedArchitecture architecture{};",
         "    };",
         "",
+        ] if inline_legacy else []),
         "    inline constexpr ROCmDensePrefillOverlayEntry",
         "        kROCmDensePrefillOverlayEntries[] = {",
         *rows,
@@ -654,6 +665,8 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         "        uint8_t codebook, int m, int n, int k, DensePrefillWeightFamily family,",
         "        ROCmDensePrefillOverlayConfig &config)",
         "    {",
+        "        if (codebook == 19 && family == DensePrefillWeightFamily::NativeQuantised)",
+        "            return false;",
         "        size_t first = 0;",
         "        size_t last = sizeof(kROCmDensePrefillOverlayEntries) /",
         "                      sizeof(kROCmDensePrefillOverlayEntries[0]);",
@@ -726,8 +739,20 @@ def _split_generated_overlay(
     legacy_prefix = _strip_generated_doxygen(expected_prefix)
     legacy_suffix = _strip_generated_doxygen(expected_suffix)
     suffix = expected_suffix if tail.endswith(expected_suffix) else legacy_suffix
-    if (not found or prefix not in (expected_prefix, legacy_prefix)
-            or not tail.endswith(suffix)):
+    accepted_prefixes = {expected_prefix, legacy_prefix}
+    accepted_suffixes = {expected_suffix, legacy_suffix}
+    if backend == "rocm":
+        inline_prefix, _, inline_suffix = _render_rocm((), inline_legacy=True).partition(marker)
+        accepted_prefixes |= {inline_prefix, _strip_generated_doxygen(inline_prefix)}
+        accepted_suffixes |= {inline_suffix, _strip_generated_doxygen(inline_suffix)}
+        def old_abi(value: str) -> str:
+            return (value.replace('#include "kernels/common/NativeQuantisedArchitecture.h"\n', "")
+                    .replace("        ::llaminar2::native_quantised::NativeQuantisedArchitecture architecture{};\n", "")
+                    .replace("        if (codebook == 19 && family == DensePrefillWeightFamily::NativeQuantised)\n            return false;\n", ""))
+        accepted_prefixes |= {old_abi(value) for value in tuple(accepted_prefixes)}
+        accepted_suffixes |= {old_abi(value) for value in tuple(accepted_suffixes)}
+    suffix = next((value for value in sorted(accepted_suffixes, key=len, reverse=True) if tail.endswith(value)), "")
+    if (not found or prefix not in accepted_prefixes or not suffix):
         raise ValueError("retained dense overlay selector ABI mismatch")
     body = tail[:-len(suffix)]
     config = (
@@ -741,7 +766,9 @@ def _split_generated_overlay(
                       if backend == "rocm" else "")
     row_pattern = re.compile(
         r"        \{(\d+), (\d+), (\d+), (\d+)" + family_pattern
-        + r", \{" + config + r"\}\},\n"
+        + r", \{" + config + r"\}"
+        + (r"(?:, ::llaminar2::native_quantised::NativeQuantisedArchitecture::rocm\((\d+)u?, (\d+)u?, (\d+)u?\))?" if backend == "rocm" else "")
+        + r"\},\n"
     )
     rows: dict[DenseOverlayKey, str] = {}
     for line in body.splitlines(keepends=True):
@@ -751,7 +778,11 @@ def _split_generated_overlay(
         family = (DensePreparedWeightFamily.INT8_BLOCKWISE
                   if backend == "rocm" and match.group(5) == "Int8Blockwise"
                   else DensePreparedWeightFamily.NATIVE_QUANTISED)
-        key = DenseOverlayKey(*(int(value) for value in match.groups()[:4]), family)
+        architecture = (GPUArchitecture("rocm", *(int(value) for value in match.groups()[5:8]))
+                        if backend == "rocm" and match.group(6) is not None else None)
+        key = DenseOverlayKey(*(int(value) for value in match.groups()[:4]), family, architecture)
+        if backend == "rocm" and key.execution_codebook == 19 and family == DensePreparedWeightFamily.NATIVE_QUANTISED and architecture is None:
+            raise ValueError("unqualified historical native Q8 rows cannot be relabeled")
         if backend == "rocm":
             int8 = "VNNIPrefillProducer::Int8Blockwise" in line
             if int8 != (family == DensePreparedWeightFamily.INT8_BLOCKWISE):
@@ -791,7 +822,7 @@ def retain_dense_overlay_base(
     return encoded, {
         "schema": ("dense-prefill-additive-exact-overlay-v2" if backend == "rocm"
                    else "dense-prefill-additive-exact-overlay-v1"),
-        "key_schema": ("codebook-m-n-k-prepared-family" if backend == "rocm"
+        "key_schema": ("codebook-m-n-k-prepared-family-native-q8-architecture" if backend == "rocm"
                        else "codebook-m-n-k"),
         "backend": backend,
         "base_sha256": digest(base),
@@ -864,7 +895,7 @@ def write_overlay_summary(
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = output.with_name(output.name + ".inprogress")
     columns = (
-        "backend", "execution_codebook", "prepared_family", "source_formats", "shape_names",
+        "backend", "execution_codebook", "prepared_family", "gpu_architecture", "source_formats", "shape_names",
         "m", "n", "k", "candidate_id", "launch",
         "geometric_mean_regret", "maximum_alias_regret",
         "geometric_mean_speedup_vs_auto",
@@ -877,6 +908,7 @@ def write_overlay_summary(
                 "backend": entry.backend,
                 "execution_codebook": entry.key.execution_codebook,
                 "prepared_family": entry.key.prepared_family.name.lower(),
+                "gpu_architecture": entry.key.architecture.native_target if entry.key.architecture else "",
                 "source_formats": "/".join(entry.source_formats),
                 "shape_names": "/".join(entry.shape_names),
                 "m": entry.key.m,
@@ -909,6 +941,8 @@ def main() -> int:
                         help="retain unrelated exact rows and the unchanged generated selector")
     parser.add_argument("--retention-receipt", type=Path,
                         help="required audit receipt when retaining an installed base")
+    parser.add_argument("--profiler-requests", type=Path, help="Required only for new architecture-qualified native Q8 publication")
+    parser.add_argument("--profiler-evidence", type=Path, help="Separate complete winner/actual-Auto hardware-counter evidence")
     args = parser.parse_args()
     entries = collect_dense_overlay_entries(
         args.work_dir,
@@ -916,6 +950,12 @@ def main() -> int:
         warmup_runs=args.warmup_runs,
         bench_runs=args.bench_runs,
     )
+    if any(entry.key.architecture is not None for entry in entries):
+        if args.profiler_requests is None or args.profiler_evidence is None:
+            raise ValueError("new native Q8 publication requires separate complete profiler evidence")
+        from .native_q8_prefill_profiler import require_profile
+        require_profile(args.work_dir, args.profiler_requests, args.profiler_evidence,
+                        warmups=args.warmup_runs, samples=args.bench_runs)
     write_dense_overlay(args.output, entries, base_include=args.retain_base_include,
                         retention_receipt=args.retention_receipt)
     write_overlay_summary(args.summary_csv, entries)

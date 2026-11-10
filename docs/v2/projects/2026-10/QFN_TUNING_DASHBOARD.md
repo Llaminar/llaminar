@@ -1,13 +1,13 @@
 # QFN tuning dashboard
 
-Updated 2026-11-09. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-11-10. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Provisional NUMA-correct ROCm 10.1 Release closes at **300.092 P /38.357
+Latest unchanged-default ROCm 10.1 control: **299.003 P /38.292
 after-prefill D**; all 768 IDs/MTP/initial placement match. Historical remote-GPU
 rates are numerical controls, **not a placement speedup baseline**. Passive
 PID masks are local, but benchmark rank→PID publication is missing; nonzero DRM
@@ -15,7 +15,7 @@ discovery bytes do not prove ownership. Native inventory/ownership gates pass.
 [SDK status](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md).
 Short-prefill indexer elision saves **36 kernels/chunk/GPU**; its matched
 control showed **+7.09% P**, with unchanged output IDs/MTP.
-Paired retained graphs cost eight GPU expert slots: **8066 total, 4033/card**.
+Saved resolved GPU quotas: **8066 total, 4033/card**. Fresh automatic sizing is next.
 Context stays 262144 with dynamic MTP/balancing, RAM ngrams, local GPU caches
 and 16/32 GiB RAM/disk prefix budgets.
 
@@ -31,18 +31,19 @@ CPU Auto: all21 byte-exact; mixed FFN improves **2.5–14%** in16 formats,
 five within **+2.5%**. QFN-shaped FFN saves **26–31%** in both row orders.
 Cache/work block sizes1–4 pass; model uses Auto. CPU-result readiness remains next.
 [All-format evidence](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md).
-**Latest CPU slice:** selected M1 loops have zero vector stack traffic;
-20 focused tests pass, all 768 IDs/MTP/placement match. No model speedup proved;
-final-add fusion withdrawn; eight-row candidate rejected: bytes/spills pass,
-component +0.9%/−4.5% throughput in reversed orders. [Decision](../2026-11/QFN_CPU_EIGHT_ROW_REGISTER_TILE_20261109.md). Two complete P/D profile
-pairs: exact GNU libgomp uses **59–68% P /76–82% D user cycles**, nearly all in
-two pause loops—not wall overhead or saved time. Original requested-SIGINT
-receipt stays red; separate actual-recorder control retires/flushes correctly.
-**Keep GNU wait policy unchanged:** fresh unset 299.560P/38.994D; spin0
-199.393/29.381 and spin1000 203.445/32.726 regress. All 768/MTP/config/initial
-placement match; actual inputs verified, dynamic movement can differ.
-[OpenMP result/limits](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
-[Evidence](../2026-11/QFN_CPU_M1_SCALE_LIFETIME_20261109.md).
+**Latest CPU slice:** the eight-row candidate passes bytes/spills but loses
+in reversed timing order; production retains paired rows. [Decision](../2026-11/QFN_CPU_EIGHT_ROW_REGISTER_TILE_20261109.md).
+**GNU wait policy stays unchanged:** unset **299.560P/38.994D**; spin0
+199.393/29.381 and spin1000 203.445/32.726 regress. All 768 IDs/MTP/config/initial
+placement match. Runtime pause-loop cycle shares are not removable wall time.
+[OpenMP evidence](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
+**Native Q8 candidates stay unpromoted:** MI50 **1.106–1.366×**, XTX
+**1.088–1.103×** component wins; 24 profiles/card and nine installed-Auto
+registrations/card pass. Four model lifetimes preserve IDs/MTP/config, but
+candidate decode **36.960/37.736** trails controls **38.152/38.292**. Defaults
+retained; fresh automatic GPU residency sizing is next. Table-only application
+rebuild takes **3.90s** without HIP shard compilation.
+[Scope/results](../2026-11/QFN_ROCM_NATIVE_Q8_PREFILL_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
 [timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md),
 [root phases](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md),

@@ -19,8 +19,11 @@
  * The separate captured-production probe reuses this preparation and byte
  * oracle, but records the installed Auto route for isolated shard economics.
  * Its raw sample CSV is diagnostic evidence, never an installable tournament.
- * Q8 source formats use their own blockwise INT8 producer inventory. Their
- * independent byte proofs may not be mislabeled as low-bit NativeQuantised tuning.
+ * Q8 source-default records use their blockwise INT8 producer inventory. An
+ * explicit native_quantised preparation scope instead packs original K32 Q8
+ * payload/scales and measures its bounded cooperative family. These distinct
+ * prepared ABIs retain separate plan/CSV identity and byte oracles; neither
+ * family can reuse or reinterpret the other family's clocks.
  * Aggregate and event CSVs retain source codebook and physical execution ID
  * separately. IQ4_XS source4 executes24; source-policy4 remains the arithmetic
  * schedule authority. Candidate inspection proves the actual physical launch
@@ -52,8 +55,13 @@
 #include <vector>
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/gemm/ROCmWeightPacker.h"
+#include "kernels/rocm/gemm/ROCmDensePrefillPreparedWeightFamily.h"
 #include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"
 #include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.h"
+#include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlayGenerated.inc"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
@@ -62,6 +70,7 @@
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/ScopedGPUStream.h"
 #include "../native_quantised_dispatch/GPUTrainerVerification.h"
+#include "../native_quantised_dispatch/NativeQuantisedProfilerControl.h"
 #include "../../../utils/DensePrefillTiming.h"
 #include "../native_quantised_dispatch/NativeQuantisedShapeManifest.h"
 #include "fort.hpp"
@@ -70,6 +79,7 @@
 #include "backends/rocm/HIPGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <hip/hip_runtime.h>
+#include <rocprofiler-sdk-roctx/roctx.h>
 #endif
 
 using namespace llaminar2;
@@ -397,7 +407,8 @@ namespace
 
     /** Return the exact candidate inventory launchable for one source format. */
     static std::vector<VariantConfig> trainerVariantsForFormat(
-        const std::string &format_name)
+        const std::string &format_name,
+        std::optional<DensePrefillWeightFamily> prepared_family = std::nullopt)
     {
         std::vector<VariantConfig> result;
         result.reserve(NATIVE_QUANTISED_VARIANTS.size() + 32);
@@ -408,6 +419,16 @@ namespace
             { return variant.name == "Auto"; });
         if (format_name == "Q8_0" || format_name == "Q8_1" || format_name == "Q8_K")
         {
+            if (prepared_family == DensePrefillWeightFamily::NativeQuantised)
+            {
+                // Explicit original native K32 payload/scales. These three
+                // existing physical configurations are the bounded prepared-Q8
+                // comparison, not aliases for the expanded INT8 producers.
+                return {{"N64/MT16/MB1/U2",64,16,1,2,0,VNNIPrefillProducer::NativeCooperative},
+                        {"N64/MT32/MB1/U2",64,32,1,2,0,VNNIPrefillProducer::NativeCooperative},
+                        {"N128/MT32/MB1/U2",128,32,1,2,0,VNNIPrefillProducer::NativeCooperative},
+                        *auto_iterator};
+            }
             // These controls belong to the actual INT8 blockwise producer.
             // NativeQuantised overrides have no effect on Q8 and must not create
             // fictitious distinct candidates with identical physical launches.
@@ -684,13 +705,20 @@ namespace
     class PreparedROCmSweepExecution
     {
     public:
+        /**
+         * @brief Prepare one original source ABI and its retained exact-M oracle.
+         * @param prepared_family Null preserves source-default preparation; the
+         * explicit NativeQuantised value admits original native Q8 only.
+         * The choice is immutable throughout this invocation and capture.
+         */
         PreparedROCmSweepExecution(
             const GEMMShape &shape,
             int m,
             TensorBase *weights,
             const std::vector<VariantConfig> &variants,
             int maximum_bench_runs,
-            SweepDispatch dispatch = SweepDispatch::GenericTournament)
+            SweepDispatch dispatch = SweepDispatch::GenericTournament,
+            std::optional<DensePrefillWeightFamily> prepared_family = std::nullopt)
             : overlay_lookup_(dispatch), shape_(shape), m_(m)
         {
             if (!weights || m_ <= 0 || shape_.N <= 0 || shape_.K <= 0 ||
@@ -702,7 +730,13 @@ namespace
             requireHip(hipSetDevice(kDeviceOrdinal), "select device");
             expected_codebook_ = canonicalDeviceVnniCodebookId(
                 requireNativeQuantisedInfo(weights, "ROCm tournament source weights"));
-            if (!packWeightsToROCm(weights, packed_))
+            if (prepared_family && (expected_codebook_ != 19 ||
+                *prepared_family != DensePrefillWeightFamily::NativeQuantised))
+                throw std::invalid_argument("Explicit sweep preparation requires original native Q8");
+            const bool packed = prepared_family
+                ? packNativeQuantised(weights, packed_)
+                : packWeightsToROCm(weights, packed_);
+            if (!packed)
                 throw std::runtime_error(
                     "failed to pack persistent ROCm NativeQuantised weights");
 
@@ -813,7 +847,7 @@ namespace
                 if (!kernel_->exportNativeQuantisedMatrixDesc(weights) || !weights.valid())
                     throw std::runtime_error(
                         "Producer-only NativeQuantised probe requires a NativeQuantised matrix; "
-                        "Q8 production weights use the separate INT8-VNNI producer");
+                        "This prepared family uses the separate expanded INT8 producer");
             }
             BenchResult result = inspectCandidate(variant);
 
@@ -955,6 +989,61 @@ namespace
             result.first_byte_mismatch_vs_auto = certificate[1];
             result.correctness_pass = certificate[0] == 0;
             return result;
+        }
+
+        /** @brief Profile one exact complete projection through retained production capture.
+         * @param variant Exact physical candidate, selected from the existing trainer inventory.
+         * @param request_id Immutable profiler request bound to sealed unprofiled observations.
+         * @param warmups Untimed retained replay count before hardware-counter collection.
+         * @throws std::runtime_error For resource, capture, byte or profiler-control failures.
+         * The owning stream is explicit throughout. Oracle preparation and dirty
+         * byte checks stay outside the ROCTx range; only one graph launch is resumed.
+         */
+        void profileExactCandidate(const VariantConfig &variant, const std::string &request_id, int warmups)
+        {
+            if (request_id.empty() || warmups <= 0)
+                throw std::invalid_argument("ROCm dense profiler needs one complete exact request");
+            const auto observed = inspectCandidate(variant);
+            const std::string physical = std::to_string(observed.observed_n_tile) + "," +
+                std::to_string(observed.observed_m_tile) + "," + std::to_string(observed.observed_min_blocks) + "," +
+                std::to_string(observed.observed_unroll) + "," + (observed.observed_full_tiles ? "1" : "0") + "," +
+                std::to_string(static_cast<int>(observed.observed_producer));
+            if (physical != getEnvString("LLAMINAR_ROCM_DENSE_PRODUCTION_PROFILE_EXPECTED_LAUNCH"))
+                throw std::runtime_error("native Q8 profiler physical launch differs from sealed timing");
+            HIPGraphCapture graph(stream_, kDeviceOrdinal);
+            ScopedBackendGraphCapture capture(graph, "ROCm dense exact-candidate profiler");
+            if (!capture.begin()) throw std::runtime_error("cannot capture ROCm dense profiler projection");
+            launch(output_.get());
+            capture.finish();
+            if (!graph.instantiate()) throw std::runtime_error("cannot instantiate ROCm dense profiler projection");
+            for (int replay = 0; replay < warmups; ++replay)
+                if (!graph.launch()) throw std::runtime_error("ROCm dense profiler warmup failed");
+            requireHip(hipMemsetAsync(output_->gpu_data_ptr(), 0xff,
+                static_cast<size_t>(m_) * shape_.N * sizeof(float), stream_), "poison profiler precondition");
+            if (!graph.launch() || certify()[0] != 0)
+                throw std::runtime_error("ROCm dense profiler dirty replay changed exact-M output bytes");
+            requireHip(hipMemsetAsync(output_->gpu_data_ptr(), 0xff,
+                static_cast<size_t>(m_) * shape_.N * sizeof(float), stream_), "poison collected replay destination");
+            checkStream("settle exact profiler preconditioning");
+            const std::string range = "NativeQuantisedProfile::" + request_id;
+            if (roctxRangePushA(range.c_str()) < 0)
+                throw std::runtime_error("cannot open ROCm dense profiler range");
+            if (roctxProfilerResume(0) != 0)
+            {
+                (void)roctxRangePop();
+                throw std::runtime_error("cannot resume ROCm dense profiler collection");
+            }
+            const bool launched = graph.launch();
+            const hipError_t completion = hipStreamSynchronize(stream_);
+            const int paused = roctxProfilerPause(0);
+            const int range_level = roctxRangePop();
+            if (!launched || completion != hipSuccess || paused != 0 || range_level < 0)
+                throw std::runtime_error("isolated ROCm dense profiler replay failed");
+            if (certify()[0] != 0)
+                throw std::runtime_error("collected ROCm dense replay changed exact-M output bytes");
+            std::fprintf(stderr,
+                "[NativeQuantisedProfiler][ROCm-Dense-Prefill] request=%s candidate=%s M=%d launches=1\n",
+                request_id.c_str(), variant.name.c_str(), m_);
         }
 
     private:
@@ -1141,23 +1230,21 @@ namespace
     // Test fixture
     // =========================================================================
 
+    /** @brief Publish original device facts before receipts or prepared operands consume them. */
     class NativeQuantisedSweepTest : public ::testing::Test
     {
     protected:
+        /** @brief Admit the canonical inventory without relying on a later tensor upload. */
         void SetUp() override
         {
 #ifdef HAVE_ROCM
-            int device_count = 0;
-            hipError_t err = hipGetDeviceCount(&device_count);
-            has_device_ = (err == hipSuccess && device_count > 0);
+            initializeROCmHardwareMetadata();
+            const auto &inventory = rocmHardwareMetadata();
+            has_device_ = inventory.size() != 0;
             if (has_device_)
             {
-                (void)hipSetDevice(0);
-                hipDeviceProp_t props;
-                if (hipGetDeviceProperties(&props, 0) == hipSuccess)
-                    device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
-                else
-                    device_name_ = "rocm:0";
+                const auto &facts = inventory.at(0);
+                device_name_ = facts.name + " (" + facts.isa_target + ")";
             }
 #else
             has_device_ = false;
@@ -1167,6 +1254,19 @@ namespace
         bool has_device_ = false;
         std::string device_name_;
     };
+
+    /** @brief A fresh filtered trainer publishes actual identity before preparing any tensor. */
+    TEST_F(NativeQuantisedSweepTest, NativeQ8MetadataAvailableBeforePreparation)
+    {
+        ASSERT_TRUE(has_device_) << "Native Q8 metadata preflight requires its device";
+        const auto &facts = rocmHardwareMetadata().at(0);
+        const auto actual = nativeQuantisedHardwareForDevice(0);
+        EXPECT_NO_THROW(actual.requireObserved());
+        EXPECT_EQ(actual.ordinal, facts.ordinal);
+        EXPECT_EQ(actual.architecture,
+            native_quantised::NativeQuantisedArchitecture::fromROCmISATarget(facts.isa_target));
+        EXPECT_EQ(device_name_, facts.name + " (" + facts.isa_target + ")");
+    }
 
     /** @brief Every source format proves its actual producer and captured bytes. */
     TEST_F(NativeQuantisedSweepTest, CapturedProducerIdentityAllFormats)
@@ -1482,7 +1582,8 @@ namespace
         std::map<std::pair<int, int>, std::set<int>> geometries;
         std::size_t geometry_count = 0;
         for (const auto &entry : generated::kROCmDensePrefillOverlayEntries)
-            if (geometries[{entry.n, entry.k}].insert(entry.m).second) ++geometry_count;
+            if (!(entry.codebook == 19 && entry.family == DensePrefillWeightFamily::NativeQuantised) &&
+                geometries[{entry.n, entry.k}].insert(entry.m).second) ++geometry_count;
         ASSERT_FALSE(geometries.empty());
         ASSERT_GE(GetParam(), 0);
         ASSERT_LT(GetParam(), kInstalledDensePrefillSourceGroups);
@@ -1532,6 +1633,42 @@ namespace
                 }
             }
         }
+        const auto actual_hardware = nativeQuantisedHardwareForDevice(0);
+        std::size_t native_cases = 0;
+        for (std::size_t format_index = static_cast<std::size_t>(GetParam());
+             format_index < NATIVE_QUANTISED_FORMATS.size(); format_index += kInstalledDensePrefillSourceGroups)
+        {
+            const auto &format = NATIVE_QUANTISED_FORMATS[format_index];
+            for (const auto &entry : generated::kROCmDensePrefillOverlayEntries)
+            {
+                if (entry.codebook != 19 || entry.family != DensePrefillWeightFamily::NativeQuantised ||
+                    !entry.architecture.observed()) continue;
+                auto weights = format.create(entry.n, entry.k);
+                const auto codebook = canonicalDeviceVnniCodebookId(
+                    requireNativeQuantisedInfo(weights.get(), "installed native Q8 source"));
+                if (codebook != 19) break;
+                const auto exact = selectDensePrefillExactConfig(codebook, entry.m, entry.n, entry.k,
+                    DensePrefillWeightFamily::NativeQuantised, &actual_hardware);
+                ASSERT_TRUE(exact);
+                const GEMMShape shape{"installed_native_q8", "measured", entry.n, entry.k};
+                PreparedROCmSweepExecution execution(shape, entry.m, weights.get(), {*selected}, 1,
+                    SweepDispatch::InstalledProduction, DensePrefillWeightFamily::NativeQuantised);
+                const auto result = execution.verifyCaptured(*selected);
+                EXPECT_EQ(result.observed_producer, exact->producer);
+                EXPECT_EQ(result.observed_n_tile, exact->n_tile);
+                EXPECT_EQ(result.observed_m_tile, exact->m_tile);
+                EXPECT_EQ(result.observed_min_blocks, exact->min_blocks);
+                EXPECT_EQ(result.observed_unroll, exact->unroll);
+                EXPECT_EQ(result.observed_full_tiles, exact->full_tiles);
+                EXPECT_EQ(result.local_memory_bytes_per_thread, 0u);
+                EXPECT_GT(result.max_active_blocks_per_sm, 0);
+                ASSERT_EQ(result.byte_mismatches_vs_auto, 0u);
+                ++native_cases;
+            }
+        }
+        // The existing source-group gate exercises each independently prepared
+        // alias. Absence of new native rows leaves the original gate unchanged.
+        RecordProperty("installed_native_q8_cases", native_cases);
         const std::size_t source_count =
             (NATIVE_QUANTISED_FORMATS.size() + kInstalledDensePrefillSourceGroups - 1u -
                 static_cast<std::size_t>(GetParam())) / kInstalledDensePrefillSourceGroups;
@@ -1550,9 +1687,39 @@ namespace
         if (!has_device_)
             GTEST_SKIP() << "No ROCm device available";
 
+        const auto preparation = getEnvString("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_PREPARED_FAMILY");
+        ASSERT_TRUE(preparation.empty() || preparation == "native_quantised")
+            << "Unknown explicit ROCm sweep prepared family";
+        const bool native_q8 = !preparation.empty();
+        const auto prepared_family = native_q8
+            ? std::optional{DensePrefillWeightFamily::NativeQuantised} : std::nullopt;
+        // These are immutable discovery facts, not a new runtime query or a
+        // marketing-name target. The child sees one HIP-selected ordinal zero.
+        std::string native_csv_suffix;
+        if (native_q8)
+        {
+            const auto &facts = rocmHardwareMetadata().at(0);
+            const auto actual = nativeQuantisedHardwareForDevice(0);
+            const auto target = native_quantised::nativeQuantisedArchitectureName(actual.architecture);
+            const auto expected = getEnvString("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_ARCHITECTURE");
+            if (expected.empty() || expected != target)
+                throw std::invalid_argument("native Q8 sweep architecture differs from its immutable plan");
+            std::string uuid;
+            constexpr char hex[] = "0123456789abcdef";
+            for (const auto byte : facts.uuid)
+            {
+                uuid += hex[byte >> 4];
+                uuid += hex[byte & 15];
+            }
+            const auto expected_uuid = getEnvString("LLAMINAR_ROCM_DENSE_PRODUCTION_PROFILE_EXPECTED_UUID");
+            if (!expected_uuid.empty() && expected_uuid != uuid)
+                throw std::invalid_argument("native Q8 profiler selected a different physical participant");
+            native_csv_suffix = ",native_quantised," + target + "," + uuid + "," +
+                facts.pci_address + "," + std::to_string(facts.ordinal);
+        }
         std::set<std::string> format_filters = getEnvCsvSet("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_FORMATS");
         if (format_filters.empty())
-            format_filters.insert("q4_0");
+            format_filters.insert(native_q8 ? "q8_0" : "q4_0");
         const std::set<std::string> shape_filters = getEnvCsvSet("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_SHAPES");
         const std::set<std::string> variant_filters = getEnvCsvSet("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS");
         const std::vector<int> m_values = getEnvCsvInts(
@@ -1571,13 +1738,43 @@ namespace
         const std::string timing_csv_path =
             getEnvString("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_TIMING_CSV");
 
+        const auto profiler_request = llaminar2::test::native_quantised_dispatch::profilerRequestId();
+        const auto profiler_candidate = llaminar2::test::native_quantised_dispatch::profilerEnvironment(
+            "LLAMINAR_ROCM_DENSE_PRODUCTION_PROFILE_CANDIDATE");
+        if (profiler_request.empty() != profiler_candidate.empty())
+            throw std::invalid_argument("ROCm dense profiling requires both request ID and exact candidate");
+        if (!profiler_request.empty())
+        {
+            if (!native_q8)
+                throw std::invalid_argument("this dense profiling extension owns native prepared Q8 only");
+            if (format_filters.size() != 1 || shape_filters.size() != 1 || m_values.size() != 1 ||
+                max_cases != 1 || getEnvString("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_FORMATS").empty())
+                throw std::invalid_argument("ROCm dense profiling requires one explicit format, shape, M and MAX_CASES=1");
+            const auto format = std::find_if(NATIVE_QUANTISED_FORMATS.begin(), NATIVE_QUANTISED_FORMATS.end(),
+                [&](const auto &entry) { return shouldRunName(format_filters, entry.name); });
+            const auto shape = std::find_if(GEMM_SHAPES.begin(), GEMM_SHAPES.end(),
+                [&](const auto &entry) { return shouldRunName(shape_filters, entry.name); });
+            if (format == NATIVE_QUANTISED_FORMATS.end() || shape == GEMM_SHAPES.end())
+                throw std::invalid_argument("ROCm dense profiler has an unknown source format or shape");
+            const auto variants = trainerVariantsForFormat(format->name, prepared_family);
+            const auto candidate = std::find_if(variants.begin(), variants.end(),
+                [&](const auto &entry) { return entry.name == profiler_candidate; });
+            if (candidate == variants.end())
+                throw std::invalid_argument("ROCm dense profiler candidate is absent or incompatible with its prepared format");
+            auto weights = format->create(static_cast<size_t>(shape->N), static_cast<size_t>(shape->K));
+            PreparedROCmSweepExecution execution(*shape, m_values.front(), weights.get(), {*candidate}, 1,
+                native_q8 ? SweepDispatch::InstalledProduction : SweepDispatch::GenericTournament, prepared_family);
+            execution.profileExactCandidate(*candidate, profiler_request, warmup_runs);
+            return;
+        }
+
         std::FILE *csv = nullptr;
         if (!csv_path.empty())
         {
             csv = std::fopen(csv_path.c_str(), "w");
             ASSERT_NE(csv, nullptr) << "Failed to open ROCm NativeQuantised sweep CSV: " << csv_path;
             std::fprintf(csv,
-                         "backend,phase,format,codebook,execution_codebook,shape,category,m,n,k,variant,min_us,mean_us,stddev_us,gflops,cosine,correctness_pass,byte_mismatches_vs_auto,first_byte_mismatch_vs_auto,is_best,observed_n_tile,observed_m_tile,observed_min_blocks,observed_unroll,observed_full_tiles,registers_per_thread,local_memory_bytes_per_thread,static_shared_memory_bytes,max_threads_per_block,max_active_blocks_per_sm,observed_producer,dynamic_shared_memory_bytes\n");
+                         "backend,phase,format,codebook,execution_codebook,shape,category,m,n,k,variant,min_us,mean_us,stddev_us,gflops,cosine,correctness_pass,byte_mismatches_vs_auto,first_byte_mismatch_vs_auto,is_best,observed_n_tile,observed_m_tile,observed_min_blocks,observed_unroll,observed_full_tiles,registers_per_thread,local_memory_bytes_per_thread,static_shared_memory_bytes,max_threads_per_block,max_active_blocks_per_sm,observed_producer,dynamic_shared_memory_bytes%s\n", native_q8 ? ",prepared_family,gpu_architecture,gpu_uuid,gpu_pci,native_ordinal" : "");
         }
 
         std::FILE *timing_csv = nullptr;
@@ -1590,7 +1787,7 @@ namespace
             std::fprintf(
                 timing_csv,
                 "backend,phase,format,codebook,execution_codebook,shape,m,n,k,variant,"
-                "sample_index,timed_replays,latency_us,latency_us_hex,captured_operations\n");
+                "sample_index,timed_replays,latency_us,latency_us_hex,captured_operations%s\n", native_q8 ? ",prepared_family,gpu_architecture,gpu_uuid,gpu_pci,native_ordinal" : "");
         }
 
         int executed_cases = 0;
@@ -1601,8 +1798,10 @@ namespace
             if (!shouldRunName(format_filters, format.name))
                 continue;
 
+            ASSERT_TRUE(!native_q8 || format.name == "Q8_0" || format.name == "Q8_1" || format.name == "Q8_K")
+                << "Native Q8 preparation requires an original Q8 source";
             const std::vector<VariantConfig> launchable_variants =
-                trainerVariantsForFormat(format.name);
+                trainerVariantsForFormat(format.name, prepared_family);
             std::vector<VariantConfig> selected_variants;
             std::copy_if(
                 launchable_variants.begin(),
@@ -1635,7 +1834,7 @@ namespace
                         M,
                         weights.get(),
                         selected_variants,
-                        bench_runs);
+                        bench_runs, native_q8 ? SweepDispatch::InstalledProduction : SweepDispatch::GenericTournament, prepared_family);
 
                     std::vector<BenchResult> rows;
                     rows.reserve(selected_variants.size());
@@ -1662,14 +1861,15 @@ namespace
                                 std::fprintf(
                                     timing_csv,
                                     "rocm,prefill,%s,%u,%u,%s,%d,%d,%d,%s,"
-                                    "%zu,1,%.9f,%a,%d\n",
+                                    "%zu,1,%.9f,%a,%d%s\n",
                                     format.name.c_str(),
                                     static_cast<unsigned>(codebook_id),
                                     static_cast<unsigned>(execution_codebook_id),
                                     shape.name.c_str(), M, shape.N, shape.K,
                                     variant.name.c_str(), sample_index,
                                     latency_us, latency_us,
-                                    llaminar2::test::kDensePrefillCapturedOperations);
+                                    llaminar2::test::kDensePrefillCapturedOperations,
+                                    native_csv_suffix.c_str());
                             }
                         }
                         rows.push_back(std::move(r));
@@ -1692,7 +1892,7 @@ namespace
                         if (csv)
                         {
                             std::fprintf(csv,
-                                         "rocm,prefill,%s,%u,%u,%s,%s,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.3f,%.6f,%d,%zu,%zu,%d,%d,%d,%d,%d,%d,%d,%zu,%zu,%d,%d,%s,%zu\n",
+                                         "rocm,prefill,%s,%u,%u,%s,%s,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.3f,%.6f,%d,%zu,%zu,%d,%d,%d,%d,%d,%d,%d,%zu,%zu,%d,%d,%s,%zu%s\n",
                                          format.name.c_str(),
                                          static_cast<unsigned>(codebook_id),
                                          static_cast<unsigned>(execution_codebook_id),
@@ -1722,7 +1922,8 @@ namespace
                                          r.max_threads_per_block,
                                          r.max_active_blocks_per_sm,
                                          vnniPrefillProducerName(r.observed_producer),
-                                         r.dynamic_shared_memory_bytes);
+                                         r.dynamic_shared_memory_bytes,
+                                         native_csv_suffix.c_str());
                             ++executed_rows;
                         }
                     }

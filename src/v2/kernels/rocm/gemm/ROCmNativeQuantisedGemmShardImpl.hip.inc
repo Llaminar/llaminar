@@ -57,6 +57,7 @@
 #include "ROCmNativeQuantisedDecodeEquivalentMath.h"
 #include "ROCmNativeQuantisedGemmShard.h"
 #include "ROCmDenseProductionPrefillOverlay.h"
+#include "ROCmNativeQuantisedArchitecture.h"
 
 #ifndef LLAMINAR_ROCM_NATIVE_QUANTISED_SHARD
 #error "ROCmNativeQuantisedGemmShardImpl.hip.inc requires a physical shard index"
@@ -3061,9 +3062,15 @@ static bool launch_native_quantised_gemm(
     // Diagnostic overrides above remain authoritative. Every unseen geometry
     // continues through the same total generic dispatch below; an admitted
     // measured producer that cannot launch is an error, never a second choice.
+    const auto actual_hardware = [&] {
+        if constexpr (FMT == NATIVE_QUANTISED_GEMM_Q8_0)
+            return llaminar2::rocm::nativeQuantisedHardwareForDevice(device_id);
+        else return llaminar2::native_quantised::NativeQuantisedGPUHardware{};
+    }();
     if (const auto exact = llaminar2::rocm::selectDensePrefillExactConfig(
             FMT == NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE ? uint8_t{4} : static_cast<uint8_t>(FMT), M, N, K,
-            llaminar2::rocm::DensePrefillWeightFamily::NativeQuantised))
+            llaminar2::rocm::DensePrefillWeightFamily::NativeQuantised,
+            FMT == NATIVE_QUANTISED_GEMM_Q8_0 ? &actual_hardware : nullptr))
     {
         switch (exact->producer)
         {

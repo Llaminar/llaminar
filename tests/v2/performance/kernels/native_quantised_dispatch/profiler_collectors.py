@@ -410,6 +410,9 @@ def _rocm_profile_variant(request: ProfilerRequest) -> str:
 def _profile_environment(request: ProfilerRequest, raw_dir: Path) -> dict[str, str]:
     """Build exact one-cell trainer filters from one authenticated request."""
 
+    if request.operation_kind == "ROCmNativeQ8DensePrefill":
+        from .native_q8_prefill_profiler import environment
+        return environment(request, raw_dir)
     environment = os.environ.copy()
     # Isolated one-candidate profiles are not timing tournaments.
     for name in ("LLAMINAR_NATIVE_QUANTISED_TOURNAMENT",
@@ -1014,7 +1017,16 @@ def _apply_device_placement(
         environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         environment["CUDA_VISIBLE_DEVICES"] = str(options.device_ordinal)
     elif options.backend == Backend.ROCM:
-        environment["ROCR_VISIBLE_DEVICES"] = str(options.device_ordinal)
+        if "LLAMINAR_ROCM_DENSE_PRODUCTION_PROFILE_CANDIDATE" in environment:
+            # Match the original dense collector visibility authority exactly.
+            environment.pop("ROCR_VISIBLE_DEVICES", None)
+            # The sealed original dense native-process receipt owns this
+            # visibility ordinal; its UUID is rechecked by the native owner.
+            if "HIP_VISIBLE_DEVICES" not in environment:
+                raise ValueError("native dense profiler lost its sealed visibility ordinal")
+            environment["CUDA_VISIBLE_DEVICES"] = ""
+        else:
+            environment["ROCR_VISIBLE_DEVICES"] = str(options.device_ordinal)
 
 
 def _trainer_arguments(request: ProfilerRequest) -> list[str]:
@@ -3598,6 +3610,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         track(request, result)
         _append_checkpoint_journal(output, requests, (result,))
+
+    if any(request.operation_kind == "ROCmNativeQ8DensePrefill" for request in pending) and args.device_lanes != 1:
+        raise ValueError("native Q8 dense profiling requires one isolated original physical lane")
+    if any(request.operation_kind == "ROCmNativeQ8DensePrefill" for request in pending) and not args.disable_gpu_process_batching:
+        raise ValueError("native Q8 dense profiles require --disable-gpu-process-batching; each request owns one original dense projection")
 
     if (
         backend in {Backend.CUDA, Backend.ROCM}

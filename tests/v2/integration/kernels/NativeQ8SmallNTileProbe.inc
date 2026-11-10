@@ -5,8 +5,9 @@
  * Included inside the original Q8 device fixture's anonymous namespace. Cold
  * diagnostic controls bind one physical candidate before capture and restore
  * immediately; replay reads no host selector. Fixed-M graphs share one admitted
- * serial workspace and stable tensors. Auto is the ordinary-prefill byte oracle,
- * not an invented serial-M1 arithmetic contract. No runtime policy is installed.
+ * serial workspace and stable tensors. The explicit NT64/MT32 launch is the
+ * byte oracle for installed Auto and the independent physical candidate, not
+ * an invented serial-M1 arithmetic contract. This fixture installs no policy.
  */
 #ifdef HAVE_ROCM
 /** @brief Installed policy and existing checked cooperative physical candidates. */
@@ -52,19 +53,25 @@ struct NativeQ8TileGraphs final {
  * @param k Original HC-down10240 or shared gate/up2560 reduction width.
  * @param timedRows Zero for twenty large/small dirty replays; otherwise64 or448.
  * @param comparison Existing NT64/NT128 or the single NT64 MT32/MT16 experiment.
+ * @param format Optional original Q8 registry source; null retains historical Q8_0 bytes.
  *
  * All source packing, allocation, byte observations and resource queries are
  * outside timed/captured execution. Timing is one retained prepared projection
  * pipeline per event interval, including its original activation quantizer.
  */
 void proveNativeQ8SmallNTiles(DeviceId device,int k,int timedRows=0,
-    NativeQ8TileComparison comparison=NativeQ8TileComparison::Columns) {
+    NativeQ8TileComparison comparison=NativeQ8TileComparison::Columns,
+    const test::QuantizedVerifierFormatCase* format=nullptr) {
     constexpr int n=320,large=448,small=64;
     require(comparison==NativeQ8TileComparison::Columns||comparison==NativeQ8TileComparison::Rows,
         "Native Q8 tile probe received an unknown physical comparison");
     const bool rowTiles=comparison==NativeQ8TileComparison::Rows;
     require(device.is_rocm()&&(k==2560||k==10240)&&(timedRows==0||timedRows==small||timedRows==large),
         "Native Q8 tile probe requires its original explicit ROCm shape");
+    require(!format || (format->device_execution_codebook_id==19 &&
+        (format->tensor_type==TensorType::Q8_0 || format->tensor_type==TensorType::Q8_1 ||
+         format->tensor_type==TensorType::Q8_K)),"Native Q8 probe requires an original Q8 source");
+    require(!timedRows || !format,"Native Q8 paired events retain the historical original source");
     const auto& initial=debugEnv().rocm;
     require(initial.native_quantised_mt<=0&&initial.native_quantised_unroll<0&&
         initial.native_quantised_min_blocks<=0&&!initial.native_quantised_force_n64&&
@@ -76,23 +83,43 @@ void proveNativeQ8SmallNTiles(DeviceId device,int k,int timedRows=0,
     auto& worker=GPUDeviceContextPool::instance().getContext(device);
     worker.submitAsync([&]{
         const auto& hardware=rocmHardwareMetadata().at(device.ordinal);
+        const auto actualHardware=rocm::nativeQuantisedHardwareForDevice(device.ordinal);
+        require(rocm::densePrefillExactOverlayEnabled(),"Native Q8 installed Auto lookup is disabled on its capture owner");
+        const char* sourceName=format?format->label:"Q8_0";
+        const auto sourceCodebook=format?format->source_codebook_id:std::uint8_t{19};
+        const bool sourceSuperblock=format&&format->source_is_superblock;
+        SCOPED_TRACE(::testing::Message()<<"requested_source="<<sourceName);
+
         std::ostringstream uuid;
         uuid<<std::hex<<std::setfill('0');for(const auto byte:hardware.uuid)uuid<<std::setw(2)<<unsigned(byte);
         std::cout<<"NATIVE_Q8_TILE_HARDWARE,"<<device.toString()<<','<<hardware.pci_address<<','
             <<hardware.isa_target<<','<<hardware.compute_units<<','<<hardware.native_wave_width<<','<<uuid.str()<<'\n';
         Storage s{device,backend,ExplicitGPUStream(worker.defaultStream()).get()};
-        auto raw=nativeWeights(n,k);Q8_0Tensor source({n,std::size_t(k)},raw);
-        auto prepared=test::makeGpuPreparedGemm(&source,device,
+        std::unique_ptr<TensorBase> source;
+        if(format){
+            test::requireQuantizedVerifierSourceShape(*format,n,k);
+            source=test::q8_all_formats::source(*format,n,k);
+        }else{
+            auto authored=nativeWeights(n,k);
+            source=std::make_unique<Q8_0Tensor>(std::vector<std::size_t>{n,std::size_t(k)},authored);
+        }
+        const auto raw=test::q8_all_formats::originalBytes(*source);
+        auto prepared=test::makeGpuPreparedGemm(source.get(),device,
             k==10240?"blk.0.hc_attn_down.weight":"blk.0.ffn_gate_shexp.weight",ModelContextId{803120});
         auto* kernel=prepared.kernel;require(kernel,"Native Q8 prepared engine missing");
         kernel->setGPUStream(s.stream);
         DeviceNativeQuantisedMatrixDesc original;
         require(kernel->exportNativeQuantisedMatrixDesc(original),"Native Q8 original source descriptor missing");
-        require(original.valid()&&original.source_identity_present&&original.codebook_id==19&&original.source_codebook_id==19&&
-            !original.source_is_superblock&&original.blocks_per_row==unsigned(k/32)&&original.n==n&&original.k==k,
-            "Native Q8 probe lost original Q8_0 prepared source identity");
-        authenticate(raw,s.download(static_cast<const std::uint8_t*>(original.payload),std::size_t(n)*k),
-            s.download(static_cast<const std::uint16_t*>(original.scales),std::size_t(n)*k/32),n,k);
+        require(original.valid()&&original.source_identity_present&&original.codebook_id==19&&
+            original.source_codebook_id==sourceCodebook&&original.source_is_superblock==sourceSuperblock&&
+            original.blocks_per_row==unsigned(k/32)&&original.n==n&&original.k==k,
+            "Native Q8 probe lost its independent original prepared source identity");
+        // Historical Q8_0 additionally owns an exact native payload/half-bit witness.
+        // Q8_1/Q8_K keep their actual original factories and preparation contracts;
+        // their distinct source tuples are never relabeled as source Q8_0.
+        if(sourceCodebook==19)
+            authenticate(raw,s.download(static_cast<const std::uint8_t*>(original.payload),std::size_t(n)*k),
+                s.download(static_cast<const std::uint16_t*>(original.scales),std::size_t(n)*k/32),n,k);
         ASSERT_FALSE(::testing::Test::HasFailure());
         FP32Tensor input({large+1,std::size_t(k)},DeviceId::cpu()),output({large+1,n},DeviceId::cpu());
         std::array<std::vector<float>,2> inputs;
@@ -114,13 +141,14 @@ void proveNativeQ8SmallNTiles(DeviceId device,int k,int timedRows=0,
         Workspace workspace(device,requirements);
         // Declared after every captured byte owner: ASSERT/exception unwind is safe.
         NativeQ8TileGraphs retained(s);
+        std::array<const void*,6> producerFunctions{};
         const std::array choices{NativeQ8TileProbe::Installed,NativeQ8TileProbe::NT64,
             rowTiles?NativeQ8TileProbe::NT64MT16:NativeQ8TileProbe::NT128};
         for(int rowCase=0;rowCase<2;++rowCase)for(int choice=0;choice<3;++choice){
             const int m=rowCase==0?large:small,index=rowCase*3+choice;
             NativeQ8ColdTileScope cold(choices[choice]);
             retained.stages[index]=std::make_unique<GEMMStage>(GEMMStage::Params{
-                .device_id=device,.A=&input,.B=&source,.C=&output,.m=m,.n=n,.k=k,.alpha=1,.beta=0,.transpose_B=false,
+                .device_id=device,.A=&input,.B=source.get(),.C=&output,.m=m,.n=n,.k=k,.alpha=1,.beta=0,.transpose_B=false,
                 .a_buffer_id=BufferId::NORMALIZED,.c_buffer_id=BufferId::GATE_PROJ,
                 .prepared_ref=prepared.ref,.prepared_store=prepared.store.get()});
             auto& stage=*retained.stages[index];stage.setGPUStream(s.stream);stage.bindWorkspace(workspace.value.get());
@@ -132,12 +160,24 @@ void proveNativeQ8SmallNTiles(DeviceId device,int k,int timedRows=0,
                 require(stage.execute(context.get()),"Native Q8 captured stage failed");recording.finish();}
             require(retained.graphs[index]->instantiate(),"Native Q8 graph instantiate failed");
             const auto launch=rocm::lastVNNIPrefillLaunch();
-            const int nt=choice==0?(m==large?128:64):((choice==1||rowTiles)?64:128);
-            const int mt=rowTiles&&choice==2?16:32;
-            require(launch&&launch->producer==rocm::VNNIPrefillProducer::NativeCooperative&&launch->execution_codebook==19&&
-                launch->n_tile==nt&&launch->m_tile==mt&&launch->min_blocks==1&&launch->unroll==2&&
-                !launch->full_tiles&&launch->function&&launch->block_threads==256,
+            const auto exact=choice==0?rocm::selectDensePrefillExactConfig(
+                19,m,n,k,rocm::DensePrefillWeightFamily::NativeQuantised,&actualHardware):
+                std::optional<rocm::DensePrefillExactConfig>{};
+            const auto expected=exact?*exact:rocm::DensePrefillExactConfig{
+                .n_tile=choice==0?(m==large?128:64):((choice==1||rowTiles)?64:128),
+                .m_tile=rowTiles&&choice==2?16:32,.min_blocks=1,.unroll=2,.full_tiles=false,
+                .producer=rocm::VNNIPrefillProducer::NativeCooperative};
+            const int nt=expected.n_tile,mt=expected.m_tile;
+            require(launch&&expected.producer==rocm::VNNIPrefillProducer::NativeCooperative&&
+                launch->producer==expected.producer&&launch->execution_codebook==19&&
+                launch->n_tile==nt&&launch->m_tile==mt&&launch->min_blocks==expected.min_blocks&&
+                launch->unroll==expected.unroll&&launch->full_tiles==expected.full_tiles&&
+                launch->function&&launch->block_threads==256,
                 "Native Q8 graph did not capture the requested physical cooperative producer");
+            producerFunctions[index]=launch->function;
+            if(rowTiles&&choice==2)
+                require(producerFunctions[rowCase*3+1]!=producerFunctions[index],
+                    "Native Q8 MT32 control and MT16 candidate must be distinct actual kernels");
             rocm::VNNIPrefillLaunchResources resources;
             require(rocm::inspectVNNIPrefillLaunch(*launch,resources),"Native Q8 physical resources unavailable");
             require(resources.local_memory_bytes_per_thread==0&&resources.max_active_blocks_per_sm>0,
@@ -158,11 +198,14 @@ void proveNativeQ8SmallNTiles(DeviceId device,int k,int timedRows=0,
             }
             require(producers==1,"Native Q8 retained graph must contain exactly one cooperative producer");
             std::cout<<(rowTiles?"NATIVE_Q8_ROW_TILE_GRAPH,":"NATIVE_Q8_TILE_GRAPH,")<<device.toString()<<','<<hardware.pci_address<<','<<hardware.isa_target<<','
-                <<m<<','<<n<<','<<k<<','<<choice<<','<<nt<<','<<mt<<",1,2,checked,"<<nodes.size()<<','
+                <<m<<','<<n<<','<<k<<','<<choice<<','<<nt<<','<<mt<<','<<expected.min_blocks<<','
+                <<expected.unroll<<','<<(expected.full_tiles?"full":"checked")<<','<<nodes.size()<<','
                 <<resources.registers_per_thread<<','<<resources.static_shared_memory_bytes<<','
                 <<resources.local_memory_bytes_per_thread<<','<<resources.max_active_blocks_per_sm<<','
                 <<resources.max_threads_per_block<<','<<launch->dynamic_shared_memory_bytes<<','
-                <<reinterpret_cast<std::uintptr_t>(launch->function)<<'\n';
+                <<reinterpret_cast<std::uintptr_t>(launch->function)<<",requested_source="<<sourceName
+                <<",source_codebook="<<unsigned(sourceCodebook)<<",source_superblock="<<sourceSuperblock
+                <<",installed_exact="<<bool(exact)<<'\n';
         }
         const auto owners=s.owners->size();
         auto poison=[&](float value){
@@ -181,10 +224,12 @@ void proveNativeQ8SmallNTiles(DeviceId device,int k,int timedRows=0,
             const float dirty=-7312.5f-float(replay);
             s.upload(static_cast<float*>(input.gpu_data_ptr()),inputs[(replay/2)%2]);
             std::vector<float> oracle;
-            for(int choice=0;choice<3;++choice){
+            // Keep the explicit original MT32 kernel authoritative even when
+            // installed Auto and the MT16 candidate become the same function.
+            for(const int choice:std::array{1,0,2}){
                 poison(dirty);require(retained.graphs[rowCase*3+choice]->launch(),"Native Q8 dirty replay failed");
                 auto actual=s.download(static_cast<const float*>(output.gpu_data_ptr()),output.numel());
-                if(choice==0){oracle=actual;for(std::size_t i=0;i<std::size_t(m)*n;++i)ASSERT_TRUE(std::isfinite(actual[i]));}
+                if(choice==1){oracle=actual;for(std::size_t i=0;i<std::size_t(m)*n;++i)ASSERT_TRUE(std::isfinite(actual[i]));}
                 else ASSERT_EQ(std::memcmp(actual.data(),oracle.data(),actual.size()*sizeof(float)),0)
                     <<"M="<<m<<" K="<<k<<" replay="<<replay<<" tile="<<choice;
                 for(std::size_t i=std::size_t(m)*n;i<actual.size();++i)
@@ -196,11 +241,16 @@ void proveNativeQ8SmallNTiles(DeviceId device,int k,int timedRows=0,
         require(kernel->exportNativeQuantisedMatrixDesc(after),"Native Q8 source vanished after reset histories");
         EXPECT_EQ(original.payload,after.payload);EXPECT_EQ(original.scales,after.scales);
         EXPECT_EQ(original.codebook_id,after.codebook_id);EXPECT_EQ(original.source_codebook_id,after.source_codebook_id);
-        ASSERT_EQ(std::memcmp(raw.data(),source.raw_data(),raw.size()),0);
+        EXPECT_EQ(original.source_is_superblock,after.source_is_superblock);
+        EXPECT_EQ(original.source_identity_present,after.source_identity_present);
+        ASSERT_EQ(std::memcmp(raw.data(),source->raw_data(),raw.size()),0);
         ASSERT_FALSE(::testing::Test::HasFailure());
         std::cout<<(rowTiles?"NATIVE_Q8_ROW_TILE_BYTE_ORACLE,":"NATIVE_Q8_TILE_BYTE_ORACLE,")
             <<device.toString()<<','<<k<<','<<(timedRows?4:20)
-            <<(rowTiles?",auto_nt64mt32_nt64mt16_dirty_large_small_guard,PASS\n":",auto_nt64_nt128_dirty_large_small_guard,PASS\n");
+            <<(rowTiles?",control_nt64mt32_installed_auto_nt64mt16_dirty_large_small_guard":
+                ",control_nt64_installed_auto_nt128_dirty_large_small_guard")
+            <<",requested_source="<<sourceName<<",source_codebook="<<unsigned(sourceCodebook)
+            <<",source_superblock="<<sourceSuperblock<<",PASS\n";
         if(timedRows){
             // Original exact-stream events observe ONE graph; setup/byte reads
             // and the other candidate cannot contaminate this event interval.

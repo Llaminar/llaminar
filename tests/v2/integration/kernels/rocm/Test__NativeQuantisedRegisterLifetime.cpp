@@ -2,10 +2,11 @@
  * @file Test__NativeQuantisedRegisterLifetime.cpp
  * @brief Captured all-format proof for register-bounded ROCm GEMM schedules.
  *
- * This deliberately small fixture links the actual public GEMM/GEMV dispatchers
- * and their production shards, not a reimplemented kernel or a model runner.
- * It can therefore diagnose a kernel change without rebuilding unrelated GPU
- * subsystems. Serial row replay is an oracle only; the candidate is one grouped
+ * This original fixture links the canonical production core and its public
+ * GEMM/GEMV dispatchers and shards. Its process-entry lifetime publishes the
+ * same immutable hardware authority consumed by exact architecture dispatch;
+ * it neither substitutes a local kernel clone nor invents device facts. Serial
+ * row replay is an oracle only; the candidate is one grouped
  * production launch. Every retained replay poisons its output and guard tail.
  * IQ2_S/IQ4_XS prepared fixtures retain source half bases and raw coefficient
  * words. Physical24 uses source-policy4 without reinterpreting either word.
@@ -14,6 +15,9 @@
 #include <hip/hip_runtime.h>
 
 #include "backends/rocm/ROCmRuntimeStartup.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "backends/GPUDeviceProcessLifetime.h"
+#include "utils/MPISessionOwner.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedGemmShard.h"
 #include "tensors/IQQuantTables.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
@@ -312,4 +316,22 @@ TEST(ROCmNativeQuantisedRegisterLifetime, CapturedAllFormatsMatchSerialRows)
                 verify(codebook, payload_bytes, m, n, k, scale_mode);
                 if (::testing::Test::HasFatalFailure()) return;
             }
+}
+
+/**
+ * @brief Own canonical native admission through the original fixture's cleanup.
+ * @param argc Original GoogleTest argument count.
+ * @param argv Original GoogleTest arguments, including unchanged filters.
+ * @return Original test result after native borrowers and graphs retire.
+ */
+int main(int argc, char **argv)
+{
+    if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
+        return *terminal;
+    ::testing::InitGoogleTest(&argc, argv);
+    if (::testing::GTEST_FLAG(list_tests)) return RUN_ALL_TESTS();
+    llaminar2::GPUDeviceProcessLifetime native_lifetime;
+    llaminar2::requireROCmRuntimeStartup();
+    llaminar2::initializeROCmHardwareMetadata();
+    return RUN_ALL_TESTS();
 }

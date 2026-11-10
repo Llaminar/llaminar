@@ -8,6 +8,7 @@
  * caller's existing generic policy continues to own every unmeasured geometry.
  */
 #include "ROCmDenseProductionPrefillOverlay.h"
+#include "ROCmDenseProductionPrefillOverlayGenerated.inc"
 #include <algorithm>
 #include <iterator>
 #include <stdexcept>
@@ -21,6 +22,12 @@ thread_local bool exact_enabled = true;
 /** @return Stable lexicographic identity used by generation and lookup. */
 constexpr auto key(const generated::ROCmDensePrefillOverlayEntry &entry) noexcept
 { return std::tuple(entry.codebook, entry.m, entry.n, entry.k, entry.family); }
+/** @return The new architecture-qualified producer domain; historical rows stay unobserved. */
+constexpr bool nativeQ8(const generated::ROCmDensePrefillOverlayEntry &entry) noexcept
+{ return entry.codebook == 19 && entry.family == DensePrefillWeightFamily::NativeQuantised; }
+/** @return Complete immutable identity without reinterpreting legacy observations. */
+constexpr auto identity(const generated::ROCmDensePrefillOverlayEntry &entry) noexcept
+{ return std::tuple_cat(key(entry), std::tuple(entry.architecture.scalars())); }
 /** @return Whether the canonical source catalog owns this execution decoder. */
 constexpr bool sourceOwned(std::uint8_t codebook) noexcept
 {
@@ -32,6 +39,13 @@ constexpr bool sourceOwned(std::uint8_t codebook) noexcept
 constexpr bool admitted(const generated::ROCmDensePrefillOverlayEntry &entry) noexcept
 {
     const auto &launch = entry.config;
+    // Only the previously empty native-Q8 domain gains architecture receipts.
+    // No architecture is invented for historical observations.
+    if (nativeQ8(entry)
+        ? (!entry.architecture.observed() || entry.architecture.backend !=
+            native_quantised::NativeQuantisedArchitectureBackend::ROCm ||
+           launch.producer != VNNIPrefillProducer::NativeCooperative)
+        : entry.architecture != native_quantised::NativeQuantisedArchitecture{}) return false;
     if (!sourceOwned(entry.codebook) ||
         !densePrefillWeightFamilyValid(entry.family) ||
         entry.m <= 0 || entry.n <= 0 || entry.k <= 0 || entry.k % 32 != 0 ||
@@ -70,27 +84,59 @@ consteval bool completeInventory()
 {
     constexpr auto &entries = generated::kROCmDensePrefillOverlayEntries;
     for (std::size_t index = 0; index < std::size(entries); ++index)
-        if (!admitted(entries[index]) || (index && !(key(entries[index - 1]) < key(entries[index])))) return false;
+        if (!admitted(entries[index]) || (index && !(identity(entries[index - 1]) < identity(entries[index])))) return false;
     return std::size(entries) != 0;
 }
 static_assert(completeInventory(), "ROCm ordinary-prefill overlay violates key or producer admission");
 }
 bool densePrefillExactOverlayEnabled() noexcept { return exact_enabled; }
 void setDensePrefillExactOverlayEnabled(bool enabled) noexcept { exact_enabled = enabled; }
-std::optional<DensePrefillExactConfig> selectDensePrefillExactConfig(
-    std::uint8_t codebook, int m, int n, int k, DensePrefillWeightFamily family)
+std::optional<DensePrefillExactConfig> selectDensePrefillExactConfigFromEntries(
+    std::span<const generated::ROCmDensePrefillOverlayEntry> entries,
+    std::uint8_t codebook, int m, int n, int k, DensePrefillWeightFamily family,
+    const native_quantised::NativeQuantisedGPUHardware *actual_hardware)
 {
     if (!densePrefillWeightFamilyValid(family))
         throw std::invalid_argument("Unknown ROCm dense prefill weight family");
     if (m <= 0 || n <= 0 || k <= 0) throw std::invalid_argument("ROCm dense prefill requires positive geometry");
     if (!exact_enabled) return std::nullopt;
     const auto requested = std::tuple(codebook, m, n, k, family);
-    const auto &entries = generated::kROCmDensePrefillOverlayEntries;
-    const auto found = std::lower_bound(std::begin(entries), std::end(entries), requested,
+    const auto first = std::lower_bound(entries.begin(), entries.end(), requested,
         [](const auto &entry, const auto &lookup) { return key(entry) < lookup; });
-    if (found == std::end(entries) || key(*found) != requested) return std::nullopt;
-    if (!densePrefillProducerMatchesFamily(family, found->config.producer))
-        throw std::logic_error("ROCm measured prefill producer disagrees with prepared weight family");
-    return found->config;
+    const auto last = std::upper_bound(first, entries.end(), requested,
+        [](const auto &lookup, const auto &entry) { return lookup < key(entry); });
+    if (first == last) return std::nullopt;
+    for (auto entry = first; entry != last; ++entry)
+        if (!admitted(*entry))
+            throw std::logic_error("ROCm measured prefill entry violates architecture or producer admission");
+    if (!nativeQ8(*first)) return first->config;
+    if (!actual_hardware) return std::nullopt;
+    actual_hardware->requireObserved();
+    if (actual_hardware->architecture.backend != native_quantised::NativeQuantisedArchitectureBackend::ROCm)
+        throw std::invalid_argument("ROCm dense prefill needs original ROCm hardware metadata");
+    const auto *selected = native_quantised::selectNativeQuantisedArchitectureEntry(
+        actual_hardware->architecture,
+        std::span<const generated::ROCmDensePrefillOverlayEntry>(&*first, static_cast<std::size_t>(last - first)),
+        [&](const auto &entry) {
+            // Source-declared Q8 cooperative LDS, BPT=2, double buffered:
+            // A/B int32 tiles + half scale plane + conservative small dummy
+            // arrays (four uint16[2][1], one int32[2][1]). Compilers may remove
+            // dummy storage; this bound cannot admit an oversized launch.
+            const auto &launch = entry.config;
+            const std::uint64_t lds = 128ull * (launch.m_tile + launch.n_tile) +
+                8ull * launch.n_tile + 24ull;
+            // Native preferred wave32 on gfx1100 does not contradict the
+            // separately compiled wave64 kernel. Signed dot4 availability is
+            // already enforced by the actual per-target compilation contract.
+            return actual_hardware->admits(256, lds);
+        });
+    return selected ? std::optional<DensePrefillExactConfig>{selected->config} : std::nullopt;
+}
+std::optional<DensePrefillExactConfig> selectDensePrefillExactConfig(
+    std::uint8_t codebook, int m, int n, int k, DensePrefillWeightFamily family,
+    const native_quantised::NativeQuantisedGPUHardware *actual_hardware)
+{
+    return selectDensePrefillExactConfigFromEntries(generated::kROCmDensePrefillOverlayEntries,
+        codebook, m, n, k, family, actual_hardware);
 }
 }

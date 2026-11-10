@@ -37,6 +37,8 @@
 #ifdef HAVE_ROCM
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"
+#include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
 #include "utils/DebugEnv.h"
 #endif
 #include "tensors/Tensors.h"
@@ -1256,13 +1258,21 @@ TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M448K10240TileEvents) {
 #endif
 
 #ifdef HAVE_ROCM
-/** @test The single NT64/MT16 candidate matches original Auto through dirty448/64 storage reuse. */
+/** @test Installed Auto and MT16 match explicit MT32 for each original Q8 source through dirty448/64 reuse. */
 TEST(Q8ResidualCorrectionDevice,ROCmNativeQ8N320RowTileByteResetK2560) {
  proveNativeQ8SmallNTiles(DeviceId::rocm(0),2560,0,NativeQ8TileComparison::Rows);
+ for(const char* name:{"Q8_1","Q8_K"}){
+  const auto& format=test::quantizedMoEVerifierFormat(name);
+  proveNativeQ8SmallNTiles(DeviceId::rocm(0),2560,0,NativeQ8TileComparison::Rows,&format);
+ }
 }
-/** @test HC-down retains original source/workspace bytes with the single new row tile. */
+/** @test HC-down retains every original Q8 source tuple and MT32 control through the same row histories. */
 TEST(Q8ResidualCorrectionDevice,ROCmNativeQ8N320RowTileByteResetK10240) {
  proveNativeQ8SmallNTiles(DeviceId::rocm(0),10240,0,NativeQ8TileComparison::Rows);
+ for(const char* name:{"Q8_1","Q8_K"}){
+  const auto& format=test::quantizedMoEVerifierFormat(name);
+  proveNativeQ8SmallNTiles(DeviceId::rocm(0),10240,0,NativeQ8TileComparison::Rows,&format);
+ }
 }
 /** @test One original source/M with balanced isolated MT32/MT16 graph event pairs. */
 TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M64K2560RowTileEvents) {
