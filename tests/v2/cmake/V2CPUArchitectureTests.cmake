@@ -465,6 +465,11 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONAttentionFloatingRows
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*FloatingOriginalCacheRowsRetainSerialBytes
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention ByteExact)
+    # The row programs that trust admitted geometry are private to the owning
+    # kernel (compile-time witness) and the integer width guard is fatal.
+    v2_add_core_free_test(V2_Integration_NEONAttentionAdmittedRowsBoundary
+        COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*PrivateIntegerRowsRejectUnprovenWidths
+        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention Regression)
     # Int32 accumulation is exact only under the typed Q16 reduction bound:
     # equality with int64 sums, closed-form worst cases and fatal rejection.
     v2_add_core_free_test(V2_Integration_NEONAttentionQ16Int32Bound

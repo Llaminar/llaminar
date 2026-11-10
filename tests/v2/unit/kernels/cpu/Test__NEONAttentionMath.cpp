@@ -20,11 +20,39 @@
 #include <cstring>
 #include <vector>
 
+namespace llaminar2::cpu::neon_attention
+{
+/** @brief Focused access to the private row programs' own fatal guards. */
+struct AdmittedRowsTestAccess
+{
+    /** @brief Run the private integer row program with an explicit width. */
+    static std::int32_t integerDotRows(const Q16ReductionBound&bound,const std::int16_t*query,const std::int16_t*key,int width)
+    { return AdmittedRows::integerDotRows<1>(bound,query,{key},width)[0]; }
+};
+} // namespace llaminar2::cpu::neon_attention
+
 namespace llaminar2::test
 {
 namespace
 {
 namespace native=cpu::neon_attention;
+
+/// Whether code outside the owning kernel can name a private floating row program.
+template<class Rows>concept ReachesFloatingRows=requires(const float*query,std::array<const float*,1>keys)
+{Rows::template dotRows<native::Storage::FP32,1>(query,keys,1);};
+/// Whether code outside the owning kernel can name the private weighted update.
+template<class Rows>concept ReachesUpdateRows=requires(float*output,std::array<const float*,1>values,std::array<float,1>weights)
+{Rows::template accumulateRows<native::Storage::FP32,1>(output,values,weights,1);};
+/// Whether code outside the owning kernel can name the private integer row program.
+template<class Rows>concept ReachesIntegerRows=requires(const cpu::Q16ReductionBound&bound,const std::int16_t*query,
+    std::array<const std::int16_t*,1>keys){Rows::template integerDotRows<1>(bound,query,keys,1);};
+/// Positive control: the checked public overload is reachable through the same form.
+template<class Rows>concept ReachesCheckedDot=requires(std::span<const float>query,std::array<std::span<const float>,1>keys)
+{Rows::template dot<native::Storage::FP32,1>(query,keys);};
+static_assert(ReachesCheckedDot<native::AdmittedRows>);
+// The row programs that trust admitted geometry are not part of the public surface.
+static_assert(!ReachesFloatingRows<native::AdmittedRows>&&!ReachesUpdateRows<native::AdmittedRows>&&
+    !ReachesIntegerRows<native::AdmittedRows>);
 using native::Storage;
 /** @brief Authenticate the complete compiler envelope before direct native leaf tests. */
 class NEONAttentionMath : public ::testing::Test
@@ -312,6 +340,20 @@ template<std::size_t Rows>void nonfiniteIsFatalBeforeWrites(std::span<float>nume
  * program. The numerator is shared with the death-test child, and a
  * write-before-reject negative control proves the witness sees child writes.
  */
+/** @test The private integer row program rejects a width beyond its bound's term count, and any negative width. */
+TEST_F(NEONAttentionMath, PrivateIntegerRowsRejectUnprovenWidths)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    const auto bound=cpu::Q16ReductionBound::forTerms(8);
+    std::vector<std::int16_t> query(16,1),key(16,1);
+    EXPECT_EQ(native::AdmittedRowsTestAccess::integerDotRows(bound,query.data(),key.data(),8),8);
+    EXPECT_EQ(native::AdmittedRowsTestAccess::integerDotRows(bound,query.data(),key.data(),0),0);
+    EXPECT_DEATH((void)native::AdmittedRowsTestAccess::integerDotRows(bound,query.data(),key.data(),9),
+        "reduction width outside its int32 term bound");
+    EXPECT_DEATH((void)native::AdmittedRowsTestAccess::integerDotRows(bound,query.data(),key.data(),-1),
+        "reduction width outside its int32 term bound");
+}
+
 TEST_F(NEONAttentionMath, NonfiniteWeightIsFatalBeforeAnySharedNumeratorWrite)
 {
     GTEST_FLAG_SET(death_test_style,"fast"); // The child must inherit the shared mapping.
