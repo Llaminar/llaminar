@@ -21,6 +21,7 @@
  */
 
 #include "MoELocalExpertStage.h"
+#include "../../../utils/OpenMPUtils.h"
 #include "../../moe/CanonicalMoERouteRecord.h"
 #include "../../moe/CPUExpertShardSourceSelection.h"
 
@@ -4255,6 +4256,7 @@ namespace llaminar2
                 input.live_entry_count >=
                     kParallelCanonicalPublicationEntries)
             {
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
                 for (std::int64_t entry = 0;
                      entry < static_cast<std::int64_t>(

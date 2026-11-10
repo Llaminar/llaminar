@@ -750,6 +750,7 @@ namespace llaminar2
             if (parallelize)
             {
                 bool protocol_ok = true;
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel shared(payload, protocol_ok)
                 {
                     for (size_t chunk_offset = 0;

@@ -3506,6 +3506,30 @@ add_v2_test(V2_Integration_HostEntryPreparation
     LABELS "V2;Integration;ProductionTestPreflight;Execution;Regression;DeviceFree"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
+# The OpenMP team-fork counter's actual-path stage publication: the real CPU
+# graph executor over exact-fork stages, with the off-default, exact-value,
+# repeat-step and publisher GPU-refusal contracts.
+add_executable(v2_unit_openmp_team_fork_evidence
+    unit/execution/local_execution/graph/Test__OpenMPTeamForkStageEvidence.cpp)
+target_include_directories(v2_unit_openmp_team_fork_evidence PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_openmp_team_fork_evidence
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_OpenMPTeamForkStageEvidence
+    COMMAND $<TARGET_FILE:v2_unit_openmp_team_fork_evidence>
+    LABELS "V2;Unit;DeviceGraphExecutor;Execution;OpenMP;PerfStats;Ownership;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_OpenMPTeamForkStageEvidence
+    COMMAND $<TARGET_FILE:v2_unit_openmp_team_fork_evidence>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;OpenMP;PerfStats;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPTeamForkStageEvidence)
+
 # Test: StageTimeline - GPU event-based timeline profiler regression tests
 add_executable(v2_unit_stage_timeline unit/execution/local_execution/graph/Test__StageTimeline.cpp)
 target_include_directories(v2_unit_stage_timeline PRIVATE 

@@ -10,6 +10,7 @@
  */
 
 #include "CPUBackend.h"
+#include "../utils/OpenMPUtils.h"
 #include "HostMemoryCapacity.h"
 #include "../utils/Logger.h"
 #include "../utils/HostPageSize.h"
@@ -205,6 +206,7 @@ namespace llaminar2
         {
             char *data = static_cast<char *>(ptr);
             const size_t page_size = hostPageBytes();
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < bytes; i += page_size)
             {

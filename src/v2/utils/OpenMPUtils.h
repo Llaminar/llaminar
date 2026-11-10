@@ -43,35 +43,115 @@ namespace llaminar::v2
 {
 
 /**
- * @brief Process-wide count of actual OpenMP team fork/join creations.
+ * @brief Process-wide count of every actual OpenMP team fork/join creation.
  *
- * Every site that really creates a team (the standalone fork branches of the
- * workshare macros below and the two decode-path raw pragmas of the flash
- * attention kernel) observes its fork through @ref noteOpenMPTeamFork, so the
- * decode work item can attribute wake-up and fork-join cost to a count instead
- * of an inference. Retained-team reuse adds nothing: no fork/join happens, and
- * the count must not claim one. One-time weight-preparation pragma sites are
- * outside execution and stay exempt; they must not re-enable raw forks in the
- * decode path.
+ * Every real fork in the process observes itself exactly once through
+ * @ref noteOpenMPTeamFork: the standalone fork branches of the workshare
+ * macros below, and every raw `#pragma omp parallel` site of the runtime
+ * inventory (a source-policy check holds that inventory exhaustively against
+ * this authority). A fork is a fork whether the source spelled it as a macro
+ * or a raw pragma, and the count must not depend on per-site discipline: new
+ * raw sites must either note themselves or enter the named exemption list
+ * under review. The NAMED exemptions (one-time work outside execution, each
+ * owned by its file, checked by the fork-note source policy):
+ * - app/MPIBootstrapPhase.cpp: one-time rank bootstrap affinity binding.
+ * - kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h, CPUPreparedWeightWriter.cpp,
+ *   kernels/cuda/gemm/CUDAWeightPacker.cpp, kernels/rocm/gemm/ROCmWeightPacker.cpp:
+ *   one-time weight preparation and publication.
+ * - loaders/MmapRegion.h, PreparedHalfWeights.h, WeightManager.cpp: one-time
+ *   model load and mmap population.
+ * - planning/PlanningMemoryBandwidthMeasurement.cpp: planning-time measurement.
+ * - execution/moe/MoEExpertWeightService.cpp: expert GEMM engine preparation
+ *   at graph build.
+ * - utils/OpenMPUtils.h itself: the noting macro authority.
  *
- * The increment is one relaxed fetch-add of an inline variable, so it adds no
- * allocation, lock or acquisition to the fork it describes (the fork itself
- * costs microseconds). Publication into PerfStats stays at owned boundaries:
- * the cached-forward decode step publishes the window delta as
+ * The increment is a relaxed fetch-add of an inline variable plus the current
+ * owner stack walk, so it adds no allocation, lock or acquisition to the fork
+ * it describes (the fork itself costs microseconds). Publication into
+ * PerfStats stays at owned boundaries (see OpenMPTeamForkEvidence.h): the
+ * cached-forward decode step publishes its window cell as
  * "openmp_team_forks_decode_step" (broad-collection gate), and the per-stage
- * CPU timing seam publishes "openmp_team_forks_stage" deltas under the
- * explicit stage-timing gate. The counter is monotonic and shared by test
- * shards, so every consumer reads deltas between snapshots, never absolutes.
+ * CPU timing seam publishes "openmp_team_forks_stage" cells under the
+ * explicit stage-timing gate. Every counter is monotonic and shared by test
+ * shards, so consumers read deltas between scopes and snapshots, never
+ * absolutes.
  */
 inline std::atomic<std::uint64_t> openMPTeamForkCount{0};
 
-/** @brief Observe one real team fork/join about to happen on the calling thread. */
+/**
+ * @brief One owner's fork accounting cell on the calling thread's owner stack.
+ *
+ * Attribution is owner-scoped, never process-global: concurrent executor
+ * scopes (tensor-parallel endpoints, NUMA device graphs, benchmark harnesses)
+ * count each other's forks only in the process total, never in their own
+ * cells, and the global total stays complete. The cell participates in a
+ * thread-local intrusive stack, so nested scopes on one thread each observe
+ * the same fork: a stage cell inside a decode-window cell sees the fork and
+ * so does the window. Threads that join a forked team as workers carry no
+ * owner (fresh thread-local state) and contribute nothing but the total,
+ * which matches the decode discipline that workers never fork.
+ */
+struct OpenMPTeamForkCell
+{
+    OpenMPTeamForkCell *next = nullptr; ///< Next enclosing owner on this thread.
+    std::atomic<std::uint64_t> forks{0}; ///< Forks observed while this owner was current.
+
+    OpenMPTeamForkCell() = default;
+    OpenMPTeamForkCell(const OpenMPTeamForkCell &) = delete;
+    OpenMPTeamForkCell &operator=(const OpenMPTeamForkCell &) = delete;
+};
+
+/** @brief The calling thread's innermost fork-accounting owner, or null outside every scope. */
+inline thread_local OpenMPTeamForkCell *openMPTeamForkOwnerStack = nullptr;
+
+/**
+ * @brief Observe one real team fork/join about to happen on the calling thread.
+ *
+ * Contributes to the process total and to every owner cell currently pushed
+ * on this thread's stack (typically one or two fetch-adds). A thread outside
+ * every scope contributes only the total.
+ */
 inline void noteOpenMPTeamFork() noexcept
 {
     openMPTeamForkCount.fetch_add(1, std::memory_order_relaxed);
+    for (OpenMPTeamForkCell *owner = openMPTeamForkOwnerStack; owner != nullptr; owner = owner->next)
+        owner->forks.fetch_add(1, std::memory_order_relaxed);
 }
 
-/** @return An opaque snapshot for consumers that bracket a scope with deltas. */
+/**
+ * @brief Attribute the fork/joins of one lexical scope to their owner.
+ *
+ * Construct the scope on the thread that executes the fork/join window (the
+ * CPU executor thread; GPU stages fork no OpenMP region and construct no
+ * scope). Concurrent scopes on different threads stay independent through
+ * their thread-local stacks, and a scope destructed before its outer scopes
+ * restores the stack exactly, so attribution survives nesting, overlap and
+ * early returns without any serialization of production execution.
+ */
+class OpenMPTeamForkScope final
+{
+public:
+    OpenMPTeamForkScope() : previous_(openMPTeamForkOwnerStack)
+    {
+        cell_.next = previous_;
+        openMPTeamForkOwnerStack = &cell_;
+    }
+    ~OpenMPTeamForkScope() { openMPTeamForkOwnerStack = previous_; }
+    OpenMPTeamForkScope(const OpenMPTeamForkScope &) = delete;
+    OpenMPTeamForkScope &operator=(const OpenMPTeamForkScope &) = delete;
+
+    /** @return The fork/join count observed while this owner was current. */
+    [[nodiscard]] std::uint64_t forks() const noexcept
+    {
+        return cell_.forks.load(std::memory_order_relaxed);
+    }
+
+private:
+    OpenMPTeamForkCell cell_;
+    OpenMPTeamForkCell *previous_;
+};
+
+/** @return The process-wide fork/join total; consumers outside a scope use deltas between reads. */
 [[nodiscard]] inline std::uint64_t openMPTeamForkSnapshot() noexcept
 {
     return openMPTeamForkCount.load(std::memory_order_relaxed);
