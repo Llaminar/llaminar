@@ -18,14 +18,17 @@ result plus the identity needed to decide whether a later result is comparable.
     ``GOMP_*``, ``KMP_*``, ``HSA_*``, ``NCCL_*``, ``RCCL_*``, ``LD_LIBRARY_PATH``,
     ``LD_PRELOAD`` and the GPU visibility variables) are recorded.
 
-    Output role. The fresh result destination is normalized to ``<result-json>``
-    only at typed output positions, never by substring replacement: an argv
-    element that IS the result path (or ``--option=`` followed by exactly it),
-    the value of each environment variable named with ``--result-env`` (which
-    must equal the result path), and, for ``llaminar-benchmark``,
-    ``runtime_configuration.configuration.benchmark_json_output_path`` (which
-    must equal the result path). The result path counts in its supplied,
-    absolute and resolved spellings. Every other occurrence stays verbatim.
+    Output roles. The fresh result destination is normalized to ``<result-json>``
+    only at DECLARED output positions, never by value or substring: the
+    command words named with ``--result-arg-index N`` (0 is the executable),
+    the values of options named with ``--result-arg-option OPT`` (``OPT=v`` or
+    ``OPT v``), the variables named with ``--result-env VAR``, and, for
+    ``llaminar-benchmark``, the typed field
+    ``runtime_configuration.configuration.benchmark_json_output_path``. Each
+    declared value must denote the result file physically: its ``realpath``
+    (symlinks resolved before ``..``, relative to the launch directory) must
+    equal the result's; otherwise the run is refused. Every undeclared word or
+    variable stays verbatim, even when it equals the result path.
     Declared inputs (``--input-file NAME=PATH``) keep their launch-visible path:
     path-to-target binding and target bytes are checked before and after.
 ``import``
@@ -241,7 +244,12 @@ def _check_workload(kind: str, workload: Any) -> None:
         state = _object(workload.get("runtime_state"), "workload.runtime_state")
         for key in ("architecture", "execution_path", "primary_device"):
             _text(state.get(key), f"workload.runtime_state.{key}")
-        _object(workload.get("runtime_configuration"), "workload.runtime_configuration")
+        envelope = _object(workload.get("runtime_configuration"), "workload.runtime_configuration")
+        _require(envelope.get("kind") == "llaminar.orchestration-config", "workload.runtime_configuration kind is unsupported")
+        _int(envelope.get("schema_version"), "workload.runtime_configuration.schema_version", 1)
+        configuration = _object(envelope.get("configuration"), "workload.runtime_configuration.configuration")
+        _require(configuration.get(OUTPUT_FIELD[-1]) in (RESULT_PLACEHOLDER, RESULT_PLACEHOLDER_IMPORT),
+                 "persisted benchmark_json_output_path must be a normalization placeholder")
     else:
         _text(workload.get("harness"), "workload.harness")
         _object(workload.get("parameters"), "workload.parameters")
@@ -291,6 +299,9 @@ def validate_document(document: Any) -> None:
         _require(document["build"]["build_type"] == "Release", "a bound document requires a Release build")
     if kind == "llaminar-benchmark":
         _hex64(_object(document.get("output"), "output").get("generated_token_ids_sha256"), "output digest")
+        expected = RESULT_PLACEHOLDER if document.get("launch") is not None else RESULT_PLACEHOLDER_IMPORT
+        _require(document["workload"]["runtime_configuration"]["configuration"][OUTPUT_FIELD[-1]] == expected,
+                 "benchmark_json_output_path placeholder does not match how the record was produced")
     _metrics(document.get("metrics"))
     if kind == "kernel-metrics" and document.get("observations") is not None:
         _object(document["observations"], "observations", allow_empty=True)
@@ -480,51 +491,86 @@ def _build_tree_closure(executable: Path, build_dir: Path) -> dict[str, str]:
     return {str(path.relative_to(build_dir)): _sha256_file(path) for path in sorted(paths)}
 
 
-def _result_spellings(result_arg: Path) -> set[str]:
-    """Supplied, absolute and resolved spellings of the result destination."""
+class ResultDestination:
+    """The result file in its raw supplied spelling plus its physical identity."""
 
-    return {str(result_arg), os.path.abspath(result_arg), str(result_arg.resolve())}
+    def __init__(self, raw: str) -> None:
+        _require(isinstance(raw, str) and bool(raw), "--result-json must be a non-empty path")
+        self.raw = raw
+        self.physical = os.path.realpath(raw)
+
+    def denotes(self, value: Any) -> bool:
+        """Physical identity: realpath resolves symlinks before '..', relative to the launch cwd."""
+
+        return isinstance(value, str) and bool(value) and os.path.realpath(value) == self.physical
 
 
-def _normalize_argv(arguments: Sequence[str], spellings: set[str]) -> list[str]:
-    """Replace only argv elements that ARE the result path, or --option= followed by exactly it."""
+def _normalize_argv(arguments: Sequence[str], destination: ResultDestination, indices: Sequence[int],
+                    options: Sequence[str]) -> list[str]:
+    """Replace only declared output positions; every other word stays verbatim.
 
-    normalized = []
-    for argument in arguments:
-        option, sep, value = argument.partition("=")
-        if argument in spellings:
-            normalized.append(RESULT_PLACEHOLDER)
-        elif sep and option.startswith("--") and value in spellings:
-            normalized.append(f"{option}={RESULT_PLACEHOLDER}")
+    ``arguments`` is the complete command with the executable at index 0.
+    """
+
+    normalized = list(arguments)
+    declared = set()
+    for index in indices:
+        _require(0 < index < len(arguments), f"--result-arg-index {index} is outside the command")
+        declared.add(index)
+    for index, word in enumerate(arguments):
+        for option in options:
+            if word.startswith(option + "="):
+                declared.add((index, option))
+            elif word == option:
+                _require(index + 1 < len(arguments), f"--result-arg-option {option} has no value")
+                declared.add(index + 1)
+    for entry in declared:
+        if isinstance(entry, tuple):
+            index, option = entry
+            _require(destination.denotes(arguments[index][len(option) + 1:]),
+                     f"{option} does not denote the result file")
+            normalized[index] = f"{option}={RESULT_PLACEHOLDER}"
         else:
-            normalized.append(argument)
+            _require(destination.denotes(arguments[entry]), f"command word {entry} does not denote the result file")
+            normalized[entry] = RESULT_PLACEHOLDER
+    for option in options:
+        _require(any(word == option or word.startswith(option + "=") for word in arguments),
+                 f"--result-arg-option {option} does not occur in the command")
     return normalized
 
 
-def _launch_environment(result_env: Sequence[str], spellings: set[str]) -> dict[str, str]:
+def _launch_environment(result_env: Sequence[str], destination: ResultDestination) -> dict[str, str]:
     """Recorded launch variables; only declared --result-env variables carry the placeholder."""
 
     env = {key: value for key, value in sorted(os.environ.items()) if key.startswith(ENV_PREFIXES) or key in ENV_EXACT}
     for name in result_env:
-        _require(os.environ.get(name) in spellings, f"--result-env {name} must equal the result path")
+        _require(destination.denotes(os.environ.get(name)), f"--result-env {name} does not denote the result file")
         env[name] = RESULT_PLACEHOLDER
     return env
 
 
-def _normalize_output_field(kind: str, raw: Any, spellings: set[str] | None) -> Any:
-    """Replace the benchmark's typed output-destination field; authenticated for run, marked for import."""
+def _benchmark_output_field(raw: Any) -> str:
+    """Validate the supported configuration envelope and return its typed output-path string."""
 
-    if kind != "llaminar-benchmark" or not isinstance(raw, Mapping):
+    raw = _object(raw, "benchmark document")
+    envelope = _object(raw.get("runtime_configuration"), "runtime_configuration")
+    _require(envelope.get("kind") == "llaminar.orchestration-config",
+             "runtime_configuration is not a llaminar.orchestration-config document")
+    _int(envelope.get("schema_version"), "runtime_configuration.schema_version", 1)
+    configuration = _object(envelope.get("configuration"), "runtime_configuration.configuration")
+    return _text(configuration.get(OUTPUT_FIELD[-1]), "runtime_configuration.configuration.benchmark_json_output_path")
+
+
+def _normalize_output_field(kind: str, raw: Any, destination: ResultDestination | None) -> Any:
+    """Replace the benchmark's typed output field: authenticated for run, marked unauthenticated for import."""
+
+    if kind != "llaminar-benchmark":
         return raw
-    configuration = (raw.get("runtime_configuration") or {}).get("configuration") if isinstance(
-        raw.get("runtime_configuration"), Mapping) else None
-    if not isinstance(configuration, Mapping) or OUTPUT_FIELD[-1] not in configuration:
-        return raw
-    value = configuration[OUTPUT_FIELD[-1]]
-    if spellings is None:
+    value = _benchmark_output_field(raw)
+    if destination is None:
         replacement = RESULT_PLACEHOLDER_IMPORT
     else:
-        _require(value in spellings, f"benchmark_json_output_path {value!r} is not the result destination")
+        _require(destination.denotes(value), f"benchmark_json_output_path {value!r} does not denote the result file")
         replacement = RESULT_PLACEHOLDER
     normalized = json.loads(json.dumps(raw))
     normalized["runtime_configuration"]["configuration"][OUTPUT_FIELD[-1]] = replacement
@@ -532,8 +578,8 @@ def _normalize_output_field(kind: str, raw: Any, spellings: set[str] | None) -> 
 
 
 def _assemble(kind: str, raw: Any, *, grade: str, source: dict, build: dict, inputs: Mapping[str, Any],
-              launch: dict | None, spellings: set[str] | None) -> dict[str, Any]:
-    workload, output, metrics, observations = extract(kind, _normalize_output_field(kind, raw, spellings))
+              launch: dict | None, destination: ResultDestination | None) -> dict[str, Any]:
+    workload, output, metrics, observations = extract(kind, _normalize_output_field(kind, raw, destination))
     document = {"schema": SCHEMA, "kind": kind, "grade": grade, "source": source, "build": build,
                 "host": host_identity(), "launch": launch, "workload": {**workload, "declared_inputs": dict(inputs)},
                 "output": output, "metrics": metrics, "observations": observations, "raw": raw}
@@ -541,8 +587,9 @@ def _assemble(kind: str, raw: Any, *, grade: str, source: dict, build: dict, inp
     return document
 
 
-def run(kind: str, build_dir: Path, result_json: Path, command: Sequence[str], *, source_dir: Path,
-        inputs: Sequence[str] = (), allow_dirty: bool = False, result_env: Sequence[str] = ()) -> dict[str, Any]:
+def run(kind: str, build_dir: Path, result_json: str, command: Sequence[str], *, source_dir: Path,
+        inputs: Sequence[str] = (), allow_dirty: bool = False, result_env: Sequence[str] = (),
+        result_arg_indices: Sequence[int] = (), result_arg_options: Sequence[str] = ()) -> dict[str, Any]:
     """Execute one measurement through one admitted executable and bind the result to it."""
 
     _require(sys.platform.startswith("linux"), "run is supported on Linux only (it requires ldd)")
@@ -552,11 +599,13 @@ def run(kind: str, build_dir: Path, result_json: Path, command: Sequence[str], *
     _require(found is not None, f"executable {command[0]!r} not found")
     executable = Path(found).resolve()
     _require(executable.is_relative_to(build_dir), f"executable {executable} is not inside --build-dir {build_dir}")
-    spellings = _result_spellings(result_json)
-    _require(not result_json.exists(), f"{result_json} already exists; a run must create its result")
+    destination = ResultDestination(result_json)
+    _require(not os.path.lexists(destination.physical), f"{result_json} already exists; a run must create its result")
     declared = _declared_inputs(inputs, kind)
     source, build = source_identity(source_dir, allow_dirty), build_identity(build_dir)
-    env = _launch_environment(result_env, spellings)
+    env = _launch_environment(result_env, destination)
+    argv_identity = _normalize_argv([str(executable.relative_to(build_dir)), *command[1:]], destination,
+                                    result_arg_indices, result_arg_options)
     inputs_before, binaries_before = _bind_inputs(declared), _build_tree_closure(executable, build_dir)
     argv = [str(executable), *command[1:]]
     started = time.time()
@@ -567,17 +616,18 @@ def run(kind: str, build_dir: Path, result_json: Path, command: Sequence[str], *
              "executable or build-tree library changed during the run")
     _require(_bind_inputs(declared) == inputs_before,
              "a declared input path was retargeted or its bytes changed during the run")
-    _require(result_json.is_file(), f"measuring command did not create {result_json}")
+    result_file = Path(destination.physical)
+    _require(result_file.is_file(), f"measuring command did not create {result_json}")
     grade = "bound" if build["build_type"] == "Release" and not source["dirty"] and not allow_dirty else "unbound"
     launch = {
-        "argv": [str(executable.relative_to(build_dir)), *_normalize_argv(command[1:], spellings)],
+        "argv": argv_identity,
         "env": env, "cwd": os.getcwd(),
         "cpu_affinity": sorted(os.sched_getaffinity(0)), "binaries": binaries_before,
         "loader_observation": "ldd initial resolution; dlopen-loaded libraries not observed",
-        "started_unix": started, "finished_unix": finished, "result_sha256": _sha256_file(result_json),
+        "started_unix": started, "finished_unix": finished, "result_sha256": _sha256_file(result_file),
     }
-    return _assemble(kind, load_json(result_json), grade=grade, source=source, build=build, inputs=inputs_before,
-                     launch=launch, spellings=spellings)
+    return _assemble(kind, load_json(result_file), grade=grade, source=source, build=build, inputs=inputs_before,
+                     launch=launch, destination=destination)
 
 
 def import_result(kind: str, input_path: Path, build_dir: Path, *, source_dir: Path, inputs: Sequence[str] = (),
@@ -586,7 +636,7 @@ def import_result(kind: str, input_path: Path, build_dir: Path, *, source_dir: P
 
     declared = _declared_inputs(inputs, kind)
     return _assemble(kind, load_json(input_path), grade="unbound", source=source_identity(source_dir, allow_dirty),
-                     build=build_identity(build_dir), inputs=_bind_inputs(declared), launch=None, spellings=None)
+                     build=build_identity(build_dir), inputs=_bind_inputs(declared), launch=None, destination=None)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -617,14 +667,30 @@ IDENTITY_FIELDS: dict[str, Callable[[Mapping[str, Any]], Any]] = {
 }
 
 
-def _relative_spread(metric: Mapping[str, Any]) -> float:
-    """Robust relative spread 1.4826 * MAD / median of positive samples."""
+def _median(values: Sequence[float]) -> float:
+    """Median without summing two large middle values (a/2 + b/2 cannot overflow)."""
+
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else ordered[middle - 1] / 2 + ordered[middle] / 2
+
+
+def _derived(value: float, what: str) -> float:
+    """Never publish an unrepresentable derived value."""
+
+    _require(math.isfinite(value), f"{what} is not representable for these inputs")
+    return value
+
+
+def _relative_spread(metric: Mapping[str, Any], name: str) -> float:
+    """Robust relative spread 1.4826 * MAD / median, computed on ratios to the median (range-safe)."""
 
     samples = metric.get("samples") or []
     if len(samples) < 2:
         return 0.0
-    median = statistics.median(samples)
-    return 1.4826 * statistics.median(abs(s - median) for s in samples) / median
+    median = _median(samples)
+    ratios = [_derived(sample / median, f"metric {name!r} sample ratio") for sample in samples]
+    return _derived(1.4826 * _median([abs(ratio - 1.0) for ratio in ratios]), f"metric {name!r} spread")
 
 
 def diff(baseline: Any, candidate: Any, threshold_pct: float, allowed_changes: Sequence[str] = ()) -> dict[str, Any]:
@@ -651,8 +717,13 @@ def diff(baseline: Any, candidate: Any, threshold_pct: float, allowed_changes: S
     for name in sorted(baseline["metrics"]):
         base, cand = baseline["metrics"][name], candidate["metrics"][name]
         _require(base["better"] == cand["better"] and base["unit"] == cand["unit"], f"metric {name!r} changed unit or direction")
-        change_pct = 100.0 * (cand["value"] - base["value"]) / base["value"]
-        tolerance_pct = max(threshold_pct, 200.0 * math.hypot(_relative_spread(base), _relative_spread(cand)))
+        # Divide before subtracting/multiplying: the ratio of two positive finite values
+        # stays representable where their difference may not.
+        ratio = _derived(cand["value"] / base["value"], f"metric {name!r} ratio")
+        change_pct = _derived((ratio - 1.0) * 100.0, f"metric {name!r} change")
+        tolerance_pct = _derived(max(threshold_pct, 200.0 * math.hypot(_relative_spread(base, name),
+                                                                        _relative_spread(cand, name))),
+                                 f"metric {name!r} tolerance")
         worse = change_pct < 0 if base["better"] == "higher" else change_pct > 0
         verdict = "within-tolerance" if abs(change_pct) <= tolerance_pct else ("regressed" if worse else "improved")
         rows.append({"metric": name, "unit": base["unit"], "baseline": base["value"], "candidate": cand["value"],
@@ -685,7 +756,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         p.add_argument("--input-file", action="append", default=[], metavar="NAME=PATH")
         p.add_argument("--allow-dirty", action="store_true", help="permit a dirty tree; the record is always unbound")
         if name == "run":
-            p.add_argument("--result-json", type=Path, required=True, help="file the command must create")
+            p.add_argument("--result-json", required=True, help="file the command must create (spelling preserved)")
+            p.add_argument("--result-arg-index", action="append", default=[], type=int, metavar="N",
+                           help="command word N (0 = executable) is the result path")
+            p.add_argument("--result-arg-option", action="append", default=[], metavar="OPT",
+                           help="the value of option OPT (OPT=v or OPT v) is the result path")
             p.add_argument("--result-env", action="append", default=[], metavar="VAR",
                            help="environment variable that carries the result path (typed output role)")
             p.add_argument("measure", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
@@ -703,7 +778,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.command == "run":
                 command = args.measure[1:] if args.measure[:1] == ["--"] else args.measure
                 document = run(args.kind, args.build_dir, args.result_json, command, source_dir=args.source_dir,
-                               inputs=args.input_file, allow_dirty=args.allow_dirty, result_env=args.result_env)
+                               inputs=args.input_file, allow_dirty=args.allow_dirty, result_env=args.result_env,
+                               result_arg_indices=args.result_arg_index, result_arg_options=args.result_arg_option)
             else:
                 document = import_result(args.kind, args.input, args.build_dir, source_dir=args.source_dir,
                                          inputs=args.input_file, allow_dirty=args.allow_dirty)
@@ -711,7 +787,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         report = diff(load_json(args.baseline), load_json(args.candidate), args.threshold_pct,
                       args.allow_identity_change)
-        print(json.dumps(report, indent=1)) if args.json else _print_diff(report)
+        print(json.dumps(report, indent=1, allow_nan=False)) if args.json else _print_diff(report)
         return 1 if report["regressions"] else 0
     except (BaselineError, OSError, ValueError) as error:
         print(f"perf_baseline: {error}", file=sys.stderr)

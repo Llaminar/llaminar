@@ -120,7 +120,8 @@ class PerfBaselineTest(unittest.TestCase):
                    build: Path | None = None, executable: Path | None = None, action: str = "",
                    model: Path | None = None, env_extra: dict | None = None, result_name: str | None = None,
                    relative: bool = False, result_env: str | None = None,
-                   extra_args: tuple[str, ...] = ()) -> tuple[subprocess.CompletedProcess[str], Path]:
+                   extra_args: tuple[str, ...] = (), result_options: tuple[str, ...] = (),
+                   cwd: Path | None = None) -> tuple[subprocess.CompletedProcess[str], Path]:
         build = build or self.release
         self.counter += 1
         payload_path = self.root / f"payload{self.counter}.json"
@@ -129,19 +130,19 @@ class PerfBaselineTest(unittest.TestCase):
         elif payload is not None:
             payload_path.write_text(json.dumps(payload))
         name = result_name or f"result{self.counter}.json"
-        result = Path(name) if relative else self.root / name
+        result = name if relative else str(self.root / name)  # raw spelling, e.g. "./a.json"
         output = self.root / f"baseline{self.counter}.json"
         env = dict(os.environ, PYTHONHOME=sys.base_prefix, PERF_PAYLOAD=str(payload_path), PERF_ACTION=action,
                    PERF_EXE=str(build / "py"), PERF_INPUT=str(model or self.model), **(env_extra or {}))
-        role = []
+        role = ["--result-arg-index", "2", *[f"--result-arg-option={o}" for o in result_options]]
         if result_env:
             env[result_env] = str(result)
-            role = ["--result-env", result_env]
+            role += ["--result-env", result_env]
         inputs = ["--input-file", f"model={model or self.model}"] if kind == "llaminar-benchmark" else []
         proc = subprocess.run([sys.executable, str(SCRIPT), "run", "--kind", kind, "--build-dir", str(build),
                                "--source-dir", str(self.source), "--output", str(output), "--result-json", str(result),
                                *role, *inputs, *extra, "--", str(executable or build / "py"), str(self.measure),
-                               str(result), *extra_args], capture_output=True, text=True, env=env, cwd=self.root)
+                               str(result), *extra_args], capture_output=True, text=True, env=env, cwd=cwd or self.root)
         return proc, output
 
     def import_record(self, document: dict | Path, *extra: str, kind: str = "llaminar-benchmark",
@@ -292,16 +293,17 @@ class PerfBaselineTest(unittest.TestCase):
     def test_fresh_result_destinations_do_not_split_identity(self) -> None:
         if not self.require_linux_run():
             return
-        for relative in (False, True):
-            with self.subTest(relative=relative):
+        for relative, prefix in ((False, ""), (True, ""), (True, "./")):
+            with self.subTest(relative=relative, prefix=prefix):
                 records = []
                 for _ in range(2):
                     self.counter += 1
-                    name = f"fresh{self.counter}.json"
+                    name = f"{prefix}fresh{self.counter}.json"
                     path = name if relative else str(self.root / name)
                     proc, record = self.run_record(benchmark_document(), relative=relative, result_name=name,
                                                    result_env="LLAMINAR_BENCH_JSON",
-                                                   extra_args=(f"--benchmark-json-output={path}",))
+                                                   extra_args=(f"--benchmark-json-output={path}",),
+                                                   result_options=("--benchmark-json-output",))
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     records.append(record)
                 for record in records:
@@ -340,6 +342,95 @@ class PerfBaselineTest(unittest.TestCase):
         proc, _ = self.run_record(benchmark_document(), "--result-env", "LLAMINAR_BENCH_JSON",
                                   env_extra={"LLAMINAR_BENCH_JSON": "/elsewhere.json"})
         self.assertEqual(proc.returncode, 2)
+
+    def test_output_positions_are_declared_and_physically_bound(self) -> None:
+        if not self.require_linux_run():
+            return
+        # Undeclared words stay verbatim even when they equal the result path.
+        proc, record = self.run_record(benchmark_document(), result_name="v.json",
+                                       extra_args=(f"--input={self.root / 'v.json'}", str(self.root / "v.json")))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        argv = json.loads(record.read_text())["launch"]["argv"]
+        self.assertEqual(argv[2], "<result-json>")
+        self.assertEqual(argv[3:], [f"--input={self.root / 'v.json'}", str(self.root / "v.json")])
+        # A declared option that does not occur in the command is refused.
+        self.assertEqual(self.run_record(benchmark_document(), result_options=("--absent-output",))[0].returncode, 2)
+        # Symlink before '..': lnk -> outside/sub, so lnk/../x.json is outside/x.json physically.
+        outside = self.root / "outside" / "sub"
+        outside.mkdir(parents=True)
+        (self.root / "lnk").symlink_to(outside)
+        proc, record = self.run_record(benchmark_document(), result_name="lnk/../pos.json", relative=True,
+                                       result_env="LLAMINAR_BENCH_JSON")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue((self.root / "outside" / "pos.json").is_file())
+        self.assertFalse((self.root / "pos.json").exists())
+        # Lexical alias: lnk/../neg.json reads like <root>/neg.json but is outside/neg.json.
+        proc, _ = self.run_record(benchmark_document(), "--result-env", "LLAMINAR_ALIAS", result_name="neg.json",
+                                  env_extra={"LLAMINAR_ALIAS": "lnk/../neg.json"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("does not denote the result file", proc.stderr)
+        proc, _ = self.run_record(benchmark_document(), result_name="neg2.json",
+                                  extra_args=("--out=lnk/../neg2.json",), result_options=("--out",))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("does not denote the result file", proc.stderr)
+
+    def test_benchmark_output_field_is_validated_before_normalization(self) -> None:
+        def broken(mutator) -> dict:
+            document = benchmark_document()
+            mutator(document)
+            return document
+
+        configuration = lambda d: d["runtime_configuration"]["configuration"]
+        cases = {
+            "absent field": broken(lambda d: configuration(d).pop("benchmark_json_output_path")),
+            "null field": broken(lambda d: configuration(d).update(benchmark_json_output_path=None)),
+            "list field": broken(lambda d: configuration(d).update(benchmark_json_output_path=[])),
+            "object field": broken(lambda d: configuration(d).update(benchmark_json_output_path={})),
+            "no configuration": broken(lambda d: d["runtime_configuration"].pop("configuration")),
+            "unsupported envelope": broken(lambda d: d["runtime_configuration"].update(kind="other")),
+        }
+        for name, document in cases.items():
+            with self.subTest(name, path="import"):
+                proc, output = self.import_record(document)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertFalse(output.exists())
+            if LINUX:
+                with self.subTest(name, path="run"):
+                    proc, output = self.run_record(document)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertFalse(output.exists())
+
+    def test_comparison_arithmetic_is_range_safe(self) -> None:
+        waivers = [arg for field in ("argv", "launch_env", "cwd", "cpu_affinity")
+                   for arg in ("--allow-identity-change", field)]
+
+        def record(value: float, samples: list[float] | None = None) -> Path:
+            return self.import_record(kernel_document(value, samples), kind="kernel-metrics")[1]
+
+        large, smaller = record(1e308), record(9e307)
+        for order, expected_change in (((large, smaller), -10.0), ((smaller, large), 11.11)):
+            report = self.diff(*order, *waivers, "--threshold-pct=20")
+            self.assertEqual(report.returncode, 0, report.stderr)
+            self.assertNotIn("Infinity", report.stdout)
+            row = json.loads(report.stdout)["metrics"][0]
+            self.assertAlmostEqual(row["change_pct"], expected_change, places=1)
+            self.assertEqual(row["verdict"], "within-tolerance")
+        even_a, even_b = record(1e308, [1e308, 1e308]), record(1e308, [1e308, 1e308])
+        for order in ((even_a, even_b), (even_b, even_a)):
+            report = self.diff(*order, *waivers)
+            self.assertEqual(report.returncode, 0, report.stderr)
+            self.assertEqual(json.loads(report.stdout)["metrics"][0]["tolerance_pct"], 2.0)
+        tiny, huge = record(1e-300), record(1e300)
+        for order in ((tiny, huge), (huge, tiny)):
+            report = self.diff(*order, *waivers)
+            if order[0] == tiny:
+                self.assertEqual(report.returncode, 2, "an unrepresentable ratio is refused, never published")
+                self.assertIn("not representable", report.stderr)
+            else:
+                self.assertIn(report.returncode, (0, 1), report.stderr)
+            self.assertNotIn("Infinity", report.stdout)
 
     def test_declared_input_binding(self) -> None:
         if not self.require_linux_run():
@@ -521,6 +612,14 @@ class PerfBaselineTest(unittest.TestCase):
             "bound without launch": (good_kernel, hostile(kernel, lambda d: d.update(grade="bound"))),
             "null runtime configuration": (good_bench, hostile(bench, set_path(["workload", "runtime_configuration"], None))),
             "missing model input": (good_bench, hostile(bench, set_path(["workload", "declared_inputs"], {}))),
+            "persisted raw output path": (good_bench, hostile(bench, set_path(
+                ["workload", "runtime_configuration", "configuration", "benchmark_json_output_path"], "/tmp/x.json"))),
+            "persisted list output path": (good_bench, hostile(bench, set_path(
+                ["workload", "runtime_configuration", "configuration", "benchmark_json_output_path"], []))),
+            "import with run placeholder": (good_bench, hostile(bench, set_path(
+                ["workload", "runtime_configuration", "configuration", "benchmark_json_output_path"], "<result-json>"))),
+            "unsupported persisted envelope": (good_bench, hostile(bench, set_path(
+                ["workload", "runtime_configuration", "kind"], "other"))),
             "wrong schema": (good_kernel, hostile(kernel, set_path(["schema"], "llaminar.perf-baseline.v3"))),
             "1e999 in observations": (good_kernel, hostile(kernel, lambda d: None,
                                                            text.replace("1.25", "1e999", 1))),
