@@ -140,3 +140,22 @@ ROUTES: (a) Main fix-back for the planner classification of
 output_hc_down.weight (or an explanation if the model needs a registration
 step); (b) meanwhile the .79 window proceeds with idea-21b (occupancy
 candidate, non-attached). Evidence: arm-sparks' probe logs at e8866ec04.
+
+### #71 progress (Main, 2026-11-10, ~20:58Z): baseline regression reproduced; fix in flight
+
+Focused device-free baseline regression reproduced ALL 9 Flash Next
+semantic roles as Unclassified (native ARM build;
+/tmp/qfn-planning-role-before.log). Root cause: PlanningRequestCostModel's
+shared planningOrdinaryWeightKind() predates Flash Next roles (Unclassified
+for ALL HC/indexer/PLE projection+norm/convolution roles + the immutable
+row table; output_hc_down is just the first encountered tensor). FIX in
+canonical work classification/ownership/request cost: typed terminal-vs-
+layer/entry use sites + a typed immutable row-gather consumer; a real-
+schema sparse Qwen4 source fixture exercising PMA candidate admission +
+finite costing across CPU/CUDA/ROCm; existing unknown-role rejection
+stays; NO UD registration/requantization workaround; the PMA/ngram error =
+a separate admission gate, not weakened. Lands on #43 (always-push) →
+**the combined candidate re-rebases onto the new tip** (the #71 fix touches
+NO CPU kernel/checker/budget/probe/envelope files → the register-gate
+receipts' native inputs are UNCHANGED → binding re-verification against the
+new tree; receipts expected to survive; reviewer confirms at re-re-pin).
