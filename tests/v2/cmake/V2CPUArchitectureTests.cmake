@@ -320,6 +320,10 @@ v2_add_core_free_test(V2_Integration_OpenMPWorkshareRetainedDepth
     COMMAND $<TARGET_FILE:v2_test_cpu_openmp_workshare>
         --gtest_filter=OpenMPWorkshare.StandalonePolicyIsUnchanged:OpenMPWorkshare.RetainedActiveTeamReusesExactTeam:OpenMPWorkshare.NestedSerializedTeamDepthIsStable:OpenMPWorkshare.CollapseFormsReuseRetainedTeam:OpenMPWorkshare.RepeatedRetainedCallsKeepConstantDepth:OpenMPWorkshare.ImmediateAfterReturnBeforeOuterJoin:OpenMPWorkshare.RetainedSingleExecutesExactlyOnce:OpenMPWorkshare.SingleNoWaitHasNoForcedBarrier:OpenMPWorkshare.RegionSyncAddsExplicitBarrierAfterNowaitWork:OpenMPWorkshare.LayerParallelReusesRetainedTeam:OpenMPWorkshare.CanonicalPlacementAuthority
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree OpenMP Workshare Ownership Regression)
+v2_add_core_free_test(V2_Integration_OpenMPTeamForkCounterContract
+    COMMAND $<TARGET_FILE:v2_test_cpu_openmp_workshare>
+        --gtest_filter=OpenMPWorkshare.TeamForkCounterCountsExactlyTheRealForks:OpenMPWorkshare.TeamForkCounterPublicationCostAndDefault
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree OpenMP Workshare Ownership Regression)
 add_executable(v2_test_cpu_rmsnorm_numeric_fatal
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPURMSNormNumericFatal.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RMSNormPrimitives.cpp")

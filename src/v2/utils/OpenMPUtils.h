@@ -36,8 +36,46 @@
 
 #include <omp.h>
 
+#include <atomic>
+#include <cstdint>
+
 namespace llaminar::v2
 {
+
+/**
+ * @brief Process-wide count of actual OpenMP team fork/join creations.
+ *
+ * Every site that really creates a team (the standalone fork branches of the
+ * workshare macros below and the two decode-path raw pragmas of the flash
+ * attention kernel) observes its fork through @ref noteOpenMPTeamFork, so the
+ * decode work item can attribute wake-up and fork-join cost to a count instead
+ * of an inference. Retained-team reuse adds nothing: no fork/join happens, and
+ * the count must not claim one. One-time weight-preparation pragma sites are
+ * outside execution and stay exempt; they must not re-enable raw forks in the
+ * decode path.
+ *
+ * The increment is one relaxed fetch-add of an inline variable, so it adds no
+ * allocation, lock or acquisition to the fork it describes (the fork itself
+ * costs microseconds). Publication into PerfStats stays at owned boundaries:
+ * the cached-forward decode step publishes the window delta as
+ * "openmp_team_forks_decode_step" (broad-collection gate), and the per-stage
+ * CPU timing seam publishes "openmp_team_forks_stage" deltas under the
+ * explicit stage-timing gate. The counter is monotonic and shared by test
+ * shards, so every consumer reads deltas between snapshots, never absolutes.
+ */
+inline std::atomic<std::uint64_t> openMPTeamForkCount{0};
+
+/** @brief Observe one real team fork/join about to happen on the calling thread. */
+inline void noteOpenMPTeamFork() noexcept
+{
+    openMPTeamForkCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+/** @return An opaque snapshot for consumers that bracket a scope with deltas. */
+[[nodiscard]] inline std::uint64_t openMPTeamForkSnapshot() noexcept
+{
+    return openMPTeamForkCount.load(std::memory_order_relaxed);
+}
 
 /** @brief Lexical placement of the current task relative to OpenMP teams. */
 enum class TeamPlacement
@@ -124,6 +162,7 @@ enum class TeamPlacement
         }                                          \
         else                                       \
         {                                          \
+            ::llaminar::v2::noteOpenMPTeamFork();  \
             _Pragma("omp parallel") { work_fn(); } \
         }                                          \
     } while (0)
@@ -155,6 +194,7 @@ enum class TeamPlacement
         }                                          \
         else                                       \
         {                                          \
+            ::llaminar::v2::noteOpenMPTeamFork();  \
             _Pragma("omp parallel") { work_fn(); } \
         }                                          \
     } while (0)
@@ -194,11 +234,13 @@ enum class TeamPlacement
         }                                                                      \
         else if (condition)                                                    \
         {                                                                      \
+            ::llaminar::v2::noteOpenMPTeamFork();                              \
             _Pragma("omp parallel") { work_fn(); }                             \
         }                                                                      \
         else                                                                   \
         {                                                                      \
             /* Serial: use 1-thread parallel so #pragma omp for still works */ \
+            ::llaminar::v2::noteOpenMPTeamFork();                              \
             _Pragma("omp parallel num_threads(1)") { work_fn(); }              \
         }                                                                      \
     } while (0)
@@ -366,6 +408,7 @@ enum class TeamPlacement
         }                                                                \
         else                                                             \
         {                                                                \
+            ::llaminar::v2::noteOpenMPTeamFork();                        \
             _Pragma("omp parallel") { body }                             \
         }                                                                \
     } while (0)

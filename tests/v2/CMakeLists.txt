@@ -3111,8 +3111,20 @@ add_v2_test(V2_Integration_OpenMPIdleSpinPolicy
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CPU;Bootstrap;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPIdleSpinPolicy)
+# The OpenMP team-fork counter's publication contract and self-cost evidence
+# are owned by the bootstrap fixture; the shared core-free workshare aliases in
+# V2CPUArchitectureTests.cmake carry the exact fork/join contract.
+add_v2_test(V2_Integration_OpenMPTeamForkCounterPublication
+    COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
+        --gtest_filter=Test__MPIBootstrap.OpenMPTeamForkCounterDefaultAndPublication
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;OpenMP;PerfStats;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPTeamForkCounterPublication)
 # Native capacity-ordered places keep the serial master and low worker ids
 # on fast cores even when OpenMP retires/recreates part of its worker pool.
+# Self-launched core-placed ranks bind libgomp's pool to capacity-ordered
+# physical cores: GB10's X925 cores, which run the serial master and static
+# partitions, would otherwise follow the A725 cores in CPU-id order.
 add_v2_test(V2_Integration_OpenMPCapacityOrderedCorePlaces
     COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
         --gtest_filter=Test__MPIBootstrap.CorePlacesFollowCapacityWithinTheRankMask:Test__MPIBootstrap.ClusterWorkersOrderFastCoresFirst
