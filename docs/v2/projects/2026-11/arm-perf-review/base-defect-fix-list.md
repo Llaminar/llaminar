@@ -53,3 +53,21 @@ future 64K ARM; x86 unaffected (hwloc path) for B5, 4K-normal for B1/B2/B6.
   load `ldr x,[xN],#imm` (analyzer register/footprint semantics) + positive/
   negative controls in the test shards + re-census at idea-31 S=4 showing Q6_K
   cells classify. Tracked in the R2 handover doc plus here.
+
+## B-fix 64K window RESULT (2026-11-10, DGX Grace 0db136607)
+
+- VERDICT: intended page-granularity fix WORKS on a real 64K host: 3/3 new
+  preflight tests PASS (HostPageSize + Owners + LiteralPolicy; 6-site literal
+  original failure confirmed); unmasked 52-set = 11 FLIPS / 0 new; 64K
+  sub-page probe = 4K DONTNEED EINVAL (kernel rejects; canaries survive —
+  no observed corruption on this kernel; pre-fix failures EINVAL-driven) +
+  host-aligned 64K ret=0 (fix works).
+- 3 REGRESSIONS (passing 2x pre-fix) = TEST EXPECTATION area (host-page
+  rounding): V2_Unit_MoEOverlayDeviceControllerTopology + V2_Integration_
+  CPUExpertShardExecution_PreparedNativeSourceAllFormatsAndSerialRowsReplay +
+  V2_Integration_CPUShardPreparedPackedRecords (:258) — recommend updating
+  those expectations to host-page rounding before merge (test-only; fix
+  correct). Owner: Main/base suite.
+- NOTE: page-owner tests on Docker need --cap-add SYS_NICE + seccomp=
+  unconfined (get_mempolicy EPERM otherwise) — separate from the page fix;
+  record in test/CI docs.
