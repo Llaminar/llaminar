@@ -410,3 +410,19 @@ After i8mm merge (same tile / post-merge):
   tournament contract entries unchanged at base.
 - Source ACK ≠ FF/INSTALLABLE/integration/merge grant. B9 = next, separate
   review (#165); #159 did not cover its grammar.
+
+### Tip moved again (2026-11-10, ~11:25Z): e5ee7f672 (173 commits) — gates RESEQUENCED
+
+- Main fixed the .79 span-ctor blocker and pushed immediately: CUDA + ROCm
+  rectangular fixtures use typed native_interleaved.unsealedGenerationBytes()
+  on the resized destination; fixture-only (two .inc lines), no production
+  change; publication-writer policy + diff checks pass.
+- Consequence: the stacks (df15aca96 / f265d2950, on 28ddbe253) are NOT
+  FF-able from the new head → they re-rebase onto the SETTLED tip (trivial;
+  the .inc fixtures don't overlap the stacks' files).
+- RESEQUENCED gates (avoid binding soon-dead SHAs per the reviewer's binding
+  rule): 870bb545e censuses (GNU + AppleClang) HELD; focused set at
+  df15aca96 finishes as content evidence; BOUND RUN next on .80; the .79
+  4-cell rerun at e5ee7f672 = the tip-settling event; Main declares
+  settlement → addon re-rebases → censuses + focused set run ONCE at the
+  final install/handover tip → FF.
