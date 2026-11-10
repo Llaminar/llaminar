@@ -2791,8 +2791,18 @@ TEST_F(Test__CUDAGemmParity, NativeQuantisedPrefillActiveRowsAllFormatsByteExact
     bool bk256_wide_seen = false;
     bool profiled_narrow_large_k_crossover_seen = false;
 
-    for (const auto &geometry :
-         nativeQuantisedPrefillAllFormatGeometryEquivalenceCases())
+    int device_sm_count = 0;
+    ASSERT_EQ(cudaDeviceGetAttribute(&device_sm_count, cudaDevAttrMultiProcessorCount,
+                                    gpu_device_.cuda_ordinal()), cudaSuccess);
+    ASSERT_GT(device_sm_count, 0);
+    auto geometries = nativeQuantisedPrefillAllFormatGeometryEquivalenceCases();
+    // A long K walk and at least 1.5 waves of 128x128 CTAs avoid the
+    // production heuristic's short-K and marginal-fill demotions on any GPU.
+    const int wide_tile_columns = std::max(14, (3 * device_sm_count + 7) / 8);
+    geometries.push_back({"full_wave_128x128_k2304", 128 * wide_tile_columns + 1,
+                          2304, nativeQuantisedPrefillBucketCasesForRows({511, 513})});
+
+    for (const auto &geometry : geometries)
     {
         SCOPED_TRACE(geometry.label);
         ASSERT_FALSE(geometry.row_cases.empty());
