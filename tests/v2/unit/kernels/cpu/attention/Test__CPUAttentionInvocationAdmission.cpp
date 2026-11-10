@@ -52,6 +52,13 @@ void rejects(const CPUAttentionInvocationRequest &request, const char *trace)
     EXPECT_FALSE(CPUAttentionInvocationAdmission::admit(request, &error).has_value()) << trace;
     EXPECT_FALSE(error.empty()) << trace;
 }
+/** @brief Expect rejection for exactly the named rule. */
+void rejectsFor(const CPUAttentionInvocationRequest &request, const char *rule, const char *trace)
+{
+    std::string error;
+    EXPECT_FALSE(CPUAttentionInvocationAdmission::admit(request, &error).has_value()) << trace;
+    EXPECT_NE(error.find(rule), std::string::npos) << trace << ": " << error;
+}
 } // namespace
 
 /** @test Exact extents and disjoint banks are admitted; the head width is retained. */
@@ -136,5 +143,70 @@ TEST(CPUAttentionInvocationAdmission, OutputAliasingIsRejected)
     request = fixture.request();
     request.output = {shared.data(), fixture.output.size() * sizeof(float)};
     request.value = {shared.data() + request.output.bytes, fixture.value.size() * sizeof(std::uint16_t)};
+    EXPECT_TRUE(CPUAttentionInvocationAdmission::admit(request).has_value());
+}
+
+/**
+ * @test The proof covers the row programs' own int arithmetic: the global head
+ * index, row strides and query-row x head task count must be representable.
+ */
+TEST(CPUAttentionInvocationAdmission, ConsumerIntArithmeticIsAdmitted)
+{
+    // Reviewer counterexample: 64-bit head mapping is in range (INT_MAX + 1 maps
+    // to K/V head 1), but the consumer forms head_start + head in int.
+    std::vector<float> query(2), output(2), key(2), value(2);
+    CPUAttentionInvocationRequest request{
+        .query = {query.data(), 8}, .output = {output.data(), 8},
+        .key = {key.data(), 8}, .value = {value.data(), 8},
+        .query_rows = 1, .kv_physical_rows = 1, .query_heads = 2, .kv_heads = 2, .head_dim = 1,
+        .head_start = std::numeric_limits<int>::max(), .gqa_n_rep = std::numeric_limits<int>::max(),
+        .key_row_bytes = 8, .value_row_bytes = 8,
+    };
+    rejectsFor(request, "int indices", "head_start + query_heads - 1 beyond int");
+    request.head_start = std::numeric_limits<int>::max() - 1; // Last head == INT_MAX: representable.
+    EXPECT_TRUE(CPUAttentionInvocationAdmission::admit(request).has_value());
+
+    // Strides and task counts beyond int, with banks the admission never reaches.
+    const int big = 1 << 16;
+    CPUAttentionInvocationRequest strides{
+        .query = {query.data(), std::numeric_limits<std::size_t>::max() / 4},
+        .output = {output.data(), std::numeric_limits<std::size_t>::max() / 4},
+        .key = {key.data(), 8}, .value = {value.data(), 8},
+        .query_rows = 1, .kv_physical_rows = 1, .query_heads = big, .kv_heads = 1, .head_dim = big - 1,
+        .key_row_bytes = 8, .value_row_bytes = 8,
+    };
+    rejectsFor(strides, "int indices", "query_heads * head_dim beyond int");
+    strides.query_heads = 1;
+    strides.kv_heads = big;
+    strides.gqa_n_rep = 1;
+    rejectsFor(strides, "int indices", "kv_heads * head_dim beyond int");
+    strides.kv_heads = 1;
+    strides.head_dim = 1;
+    strides.query_heads = big;
+    strides.query_rows = big;
+    strides.gqa_n_rep = big;
+    rejectsFor(strides, "int indices", "query_rows * query_heads beyond int");
+}
+
+/** @test A format with fixed per-row scratch admits its head width against that capacity. */
+TEST(CPUAttentionInvocationAdmission, FormatScratchCapacityIsAdmitted)
+{
+    constexpr int head_dim = 264;
+    std::vector<float> query(head_dim), output(head_dim), key(head_dim), value(head_dim);
+    CPUAttentionInvocationRequest request{
+        .query = {query.data(), head_dim * sizeof(float)}, .output = {output.data(), head_dim * sizeof(float)},
+        .key = {key.data(), head_dim * sizeof(float)}, .value = {value.data(), head_dim * sizeof(float)},
+        .query_rows = 1, .kv_physical_rows = 1, .query_heads = 1, .kv_heads = 1, .head_dim = head_dim,
+        .key_row_bytes = head_dim * sizeof(float), .value_row_bytes = head_dim * sizeof(float),
+    };
+    EXPECT_TRUE(CPUAttentionInvocationAdmission::admit(request).has_value()); // No fixed scratch.
+    request.scratch_head_dim = 256;                                           // Q16 query scratch.
+    rejectsFor(request, "admitted maximum", "head_dim beyond the format's scratch");
+    request.scratch_head_dim = -1;
+    rejectsFor(request, "admitted maximum", "negative scratch capacity");
+    request.head_dim = 256;
+    request.scratch_head_dim = 256;
+    request.query.bytes = request.output.bytes = 256 * sizeof(float);
+    request.key_row_bytes = request.value_row_bytes = 256 * sizeof(float);
     EXPECT_TRUE(CPUAttentionInvocationAdmission::admit(request).has_value());
 }

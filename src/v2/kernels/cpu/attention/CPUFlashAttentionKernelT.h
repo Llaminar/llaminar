@@ -591,6 +591,14 @@ namespace llaminar2
                 return false;
             }
 
+            // Admit the complete batch banks before the first slice runs: every
+            // slice inside its bank, and the whole output disjoint from all inputs.
+            const std::int64_t batch_rows = std::int64_t(batch_size) * seq_len;
+            if (batch_size <= 0 || batch_rows > std::numeric_limits<int>::max() ||
+                !admitInvocation(declaredRequest(Q, K, V, output, int(batch_rows), int(batch_rows), n_heads,
+                    n_kv_heads, head_dim, head_start, gqa_n_rep, sizeof(float))))
+                return false;
+
             const size_t q_stride = static_cast<size_t>(seq_len) * static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
             const size_t kv_stride = static_cast<size_t>(seq_len) * static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
             const float *mask = workspace_mask ? workspace_mask->data() : nullptr;
@@ -847,8 +855,6 @@ namespace llaminar2
                     float *O_ptr = O_base->mutable_data();
                     if (Q_ptr && O_ptr)
                     {
-                        if (!queryBanksCover(Q, output, seq_len, n_heads, head_dim))
-                            return false;
                         const int position_offset = (kv_len > seq_len)
                                                         ? (kv_len - seq_len)
                                                         : 0;
@@ -868,7 +874,9 @@ namespace llaminar2
                             head_start,
                             gqa_n_rep,
                             execution_policy,
-                            kv_logical_view);
+                            kv_logical_view,
+                            Q16QueryLayout::RowMajor,
+                            ActualQueryBanks{fp32BankBytes(Q), output->size_bytes()});
                     }
                 }
             }
@@ -1024,9 +1032,12 @@ namespace llaminar2
                 return false;
             }
             // Batched requests are stacked rows of the same geometry.
+            const std::int64_t batch_rows = std::int64_t(batch_size) * seq_len;
+            if (batch_size <= 0 || batch_rows > std::numeric_limits<int>::max())
+                return false;
             if (!admitTensorExtents(Q, K, V, output, Q_ptr, K_ptr, V_ptr, O_ptr,
-                    batch_size * seq_len,
-                    batch_size > 1 ? batch_size * seq_len : physicalKVRows(kv_logical_view, kv_len),
+                    int(batch_rows),
+                    batch_size > 1 ? int(batch_rows) : physicalKVRows(kv_logical_view, kv_len),
                     n_heads, n_kv_heads, head_dim, head_start, gqa_n_rep, sizeof(float)))
                 return false;
 
@@ -1144,22 +1155,63 @@ namespace llaminar2
                 static_cast<size_t>(head_dim);
             // Dense caches: admit each request's actual tensor extents; the
             // implementations admit their declared geometry themselves.
-            const auto admit_dense = [&](int request, const float *request_q, const float *request_output,
-                                         const ITensor *key, const void *key_data, const ITensor *value,
-                                         const void *value_data, int kv_len,
-                                         const attention::AttentionKVLogicalView &view, std::size_t element_bytes)
+            // Admit the whole batch before any request runs. Query/output cover
+            // every request slice; the complete output is disjoint from the query
+            // bank and from every request's K/V allocation; and each request whose
+            // K/V rows feed the shared row programs (dense FP32/FP16/BF16, Q16) is
+            // admitted in full. Q8_1, TQ and AQ8 requests keep their own K/V
+            // validation inside their implementations.
+            const std::size_t query_bank_bytes = fp32BankBytes(Q), output_bank_bytes = output->size_bytes();
+            if (query_stride > std::numeric_limits<std::size_t>::max() / sizeof(float) / std::size_t(request_count))
+                return false;
+            const std::size_t batch_bytes = query_stride * sizeof(float) * std::size_t(request_count);
+            const cpu::CPUAttentionBank written{out, batch_bytes};
+            bool batch_admitted = query_bank_bytes >= batch_bytes && output_bank_bytes >= batch_bytes &&
+                !cpu::CPUAttentionInvocationAdmission::overlaps(written, {q, batch_bytes});
+            for (int request = 0; batch_admitted && request < request_count; ++request)
             {
+                const ITensor *key = K_by_request[request], *value = V_by_request[request];
+                if (cpu::CPUAttentionInvocationAdmission::overlaps(written, {key->raw_data(), key->size_bytes()}) ||
+                    cpu::CPUAttentionInvocationAdmission::overlaps(written, {value->raw_data(), value->size_bytes()}))
+                {
+                    batch_admitted = false;
+                    break;
+                }
                 const std::size_t offset = static_cast<std::size_t>(request) * query_stride * sizeof(float);
-                if (Q->size_bytes() < offset || output->size_bytes() < offset)
-                    return false;
-                auto admission = declaredRequest(request_q, key_data, value_data, request_output, query_rows,
-                    physicalKVRows(view, kv_len), n_heads, n_kv_heads, head_dim, head_start, gqa_n_rep, element_bytes);
-                admission.query.bytes = Q->size_bytes() - offset;
-                admission.output.bytes = output->size_bytes() - offset;
-                admission.key.bytes = key->size_bytes();
-                admission.value.bytes = value->size_bytes();
-                return admitInvocation(admission);
-            };
+                const float *request_q = q + static_cast<std::size_t>(request) * query_stride;
+                const float *request_output = out + static_cast<std::size_t>(request) * query_stride;
+                const ActualQueryBanks slice{query_bank_bytes - offset, output_bank_bytes - offset};
+                const auto dense = [&](std::size_t element_bytes) {
+                    auto admission = declaredRequest(request_q, key->raw_data(), value->raw_data(), request_output,
+                        query_rows, physicalKVRows(kv_logical_views[request], kv_lens[request]), n_heads, n_kv_heads,
+                        head_dim, head_start, gqa_n_rep, element_bytes);
+                    admission.query.bytes = slice.query_bytes;
+                    admission.output.bytes = slice.output_bytes;
+                    admission.key.bytes = key->size_bytes();
+                    admission.value.bytes = value->size_bytes();
+                    return admitInvocation(admission);
+                };
+                if (key_type == TensorType::FP32 && value_type == TensorType::FP32)
+                    batch_admitted = dense(sizeof(float));
+                else if ((key_type == TensorType::FP16 && value_type == TensorType::FP16) ||
+                         (key_type == TensorType::BF16 && value_type == TensorType::BF16))
+                    batch_admitted = dense(sizeof(std::uint16_t));
+                else if (key_type == TensorType::Q16_1 && value_type == TensorType::Q16_1)
+                {
+                    const auto *key_q16 = dynamic_cast<const Q16_1Tensor *>(key);
+                    const auto *value_q16 = dynamic_cast<const Q16_1Tensor *>(value);
+                    const auto admission = key_q16 && value_q16
+                        ? q16Request(request_q, key_q16, value_q16, request_output, query_rows, n_heads,
+                              n_kv_heads, head_dim, head_start, gqa_n_rep, slice)
+                        : std::nullopt;
+                    batch_admitted = admission && admitInvocation(*admission);
+                }
+            }
+            if (!batch_admitted)
+            {
+                LOG_ERROR("[CPUFlashAttentionKernelT] Native request batch failed whole-batch admission");
+                return false;
+            }
             const auto run_requests = [&](auto &&launch_request)
             {
                 for (int request = 0; request < request_count; ++request)
@@ -1193,8 +1245,6 @@ namespace llaminar2
                         const auto *value = dynamic_cast<const FP32Tensor *>(
                             V_by_request[request]);
                         return key && value &&
-                            admit_dense(request, request_q, request_output, key, key->data(),
-                                value, value->data(), kv_len, view, sizeof(float)) &&
                             compute_flash_fp32(
                             request_q,
                             key->data(),
@@ -1230,8 +1280,6 @@ namespace llaminar2
                         const auto *value = dynamic_cast<const FP16Tensor *>(
                             V_by_request[request]);
                         return key && value &&
-                            admit_dense(request, request_q, request_output, key, key->typed_data(),
-                                value, value->typed_data(), kv_len, view, sizeof(std::uint16_t)) &&
                             compute_native16kv<
                             Native16BitKVFormat::FP16>(
                             request_q,
@@ -1267,8 +1315,6 @@ namespace llaminar2
                         const auto *value = dynamic_cast<const BF16Tensor *>(
                             V_by_request[request]);
                         return key && value &&
-                            admit_dense(request, request_q, request_output, key, key->typed_data(),
-                                value, value->typed_data(), kv_len, view, sizeof(std::uint16_t)) &&
                             compute_native16kv<
                             Native16BitKVFormat::BF16>(
                             request_q,
@@ -1416,6 +1462,8 @@ namespace llaminar2
                             return false;
                         const int position_offset =
                             std::max(0, kv_len - query_rows);
+                        const std::size_t offset =
+                            static_cast<std::size_t>(request) * query_stride * sizeof(float);
                         return compute_prefill_q16kv(
                             request_q,
                             key,
@@ -1432,7 +1480,9 @@ namespace llaminar2
                             head_start,
                             gqa_n_rep,
                             execution_policy,
-                            view);
+                            view,
+                            Q16QueryLayout::RowMajor,
+                            ActualQueryBanks{query_bank_bytes - offset, output_bank_bytes - offset});
                     });
             }
 #endif
@@ -1563,7 +1613,8 @@ namespace llaminar2
                     kv_logical_view,
                     head_major_q
                         ? Q16QueryLayout::HeadMajor
-                        : Q16QueryLayout::RowMajor);
+                        : Q16QueryLayout::RowMajor,
+                    ActualQueryBanks{fp32BankBytes(Q), output->size_bytes()});
                 if (success)
                 {
                     PerfStatsCollector::addCounter(
@@ -1726,18 +1777,46 @@ namespace llaminar2
             return admitInvocation(request);
         }
 
-        /**
-         * @brief Admit actual FP32 query/output allocations where the cache format admits its own banks.
-         * @return Whether both tensors cover @p query_rows rows of n_heads*head_dim values.
-         */
-        static bool queryBanksCover(const ITensor *Q, const ITensor *O, int query_rows, int n_heads, int head_dim)
+        /** @brief Actual FP32 query/output allocation extents a tensor entry point owns. */
+        struct ActualQueryBanks
         {
-            const std::size_t bytes = std::size_t(std::max(query_rows, 0)) * std::size_t(std::max(n_heads, 0)) *
-                std::size_t(std::max(head_dim, 0)) * sizeof(float);
-            if (Q->size_bytes() >= bytes && O->size_bytes() >= bytes)
-                return true;
-            LOG_ERROR("[CPUFlashAttentionKernelT] CPU attention query/output tensors do not cover their declared rows");
-            return false;
+            std::size_t query_bytes = 0;  ///< Bytes behind the FP32 query view.
+            std::size_t output_bytes = 0; ///< Bytes of the FP32 output allocation.
+        };
+
+        /** @return Bytes behind @p tensor's FP32 view: the allocation, or the dequantized view. */
+        static std::size_t fp32BankBytes(const ITensor *tensor)
+        {
+            return tensor->native_type() == TensorType::FP32 ? tensor->size_bytes() : tensor->numel() * sizeof(float);
+        }
+
+        /**
+         * @brief Complete admission request of a Q16 K/V invocation.
+         * @param actual Actual FP32 query/output extents; raw-pointer callers pass none
+         * and admit their declared geometry.
+         * @return The request (actual K/V allocations, Q16 row bytes, the Q16 query
+         * scratch capacity), or empty for a K/V row count beyond int.
+         */
+        static std::optional<cpu::CPUAttentionInvocationRequest> q16Request(const float *Q,
+            const Q16_1Tensor *K_q16, const Q16_1Tensor *V_q16, const float *output, int seq_len, int n_heads,
+            int n_kv_heads, int head_dim, int head_start, int gqa_n_rep, std::optional<ActualQueryBanks> actual)
+        {
+            if (K_q16->rows() > std::size_t(std::numeric_limits<int>::max()))
+                return std::nullopt;
+            const auto *k_raw = K_q16->raw_data(), *v_raw = V_q16->raw_data();
+            auto request = declaredRequest(Q, k_raw, v_raw, output, seq_len, int(K_q16->rows()),
+                n_heads, n_kv_heads, head_dim, head_start, gqa_n_rep, 1);
+            if (actual)
+            {
+                request.query.bytes = actual->query_bytes;
+                request.output.bytes = actual->output_bytes;
+            }
+            request.key = {k_raw, K_q16->size_bytes()};
+            request.value = {v_raw, V_q16->size_bytes()};
+            request.key_row_bytes = request.value_row_bytes =
+                K_q16->blocks_per_row() * q16_block_size_bytes(K_q16->q16_block_size());
+            request.scratch_head_dim = detail::kMaxI16RowStride;
+            return request;
         }
 
         /** @return Physical K/V rows a logical view can address for @p kv_len logical rows. */
@@ -1786,7 +1865,7 @@ namespace llaminar2
         static auto native_cache_dot(const float*query,
             const std::array<const cpu::neon_attention::Unit<Format>*,Rows>&keys,int count) noexcept
         {
-            return cpu::neon_attention::dotRows<Format,Rows>(query,keys,count);
+            return cpu::neon_attention::AdmittedRows::dotRows<Format,Rows>(query,keys,count);
         }
         /** @brief Stream admitted value rows through the increasing-row native FMA program.
          * @tparam Format Original physical value encoding; @tparam Rows Original row count.
@@ -1799,7 +1878,7 @@ namespace llaminar2
             const std::array<const cpu::neon_attention::Unit<Format>*,Rows>&values,
             const std::array<float,Rows>&weights,int count) noexcept
         {
-            cpu::neon_attention::accumulateRows<Format,Rows>(output,values,weights,count);
+            cpu::neon_attention::AdmittedRows::accumulateRows<Format,Rows>(output,values,weights,count);
         }
 #endif
         /** @brief Retain the native pointwise exponential program in bounded tails and summary rescaling.
@@ -3493,7 +3572,7 @@ namespace llaminar2
             case ISALevel::NEON:
             case ISALevel::NEONDotProd:
             {
-                return cpu::neon_attention::integerDotRows<1>(bound,a,{b},n)[0];
+                return cpu::neon_attention::AdmittedRows::integerDotRows<1>(bound,a,{b},n)[0];
             }
 #endif
             case ISALevel::Scalar:
@@ -3683,7 +3762,7 @@ namespace llaminar2
             case ISALevel::NEON:
             case ISALevel::NEONDotProd:
             {
-                const auto result=cpu::neon_attention::integerDotRows<2>(bound,q,{k0,k1},n);
+                const auto result=cpu::neon_attention::AdmittedRows::integerDotRows<2>(bound,q,{k0,k1},n);
                 out0=result[0];out1=result[1];return;
             }
 #endif
@@ -3844,7 +3923,7 @@ namespace llaminar2
             case ISALevel::NEON:
             case ISALevel::NEONDotProd:
             {
-                const auto result=cpu::neon_attention::integerDotRows<4>(bound,q,{k0,k1,k2,k3},n);
+                const auto result=cpu::neon_attention::AdmittedRows::integerDotRows<4>(bound,q,{k0,k1,k2,k3},n);
                 out0=result[0];out1=result[1];out2=result[2];out3=result[3];return;
             }
 #endif
@@ -5517,7 +5596,8 @@ namespace llaminar2
             int gqa_n_rep = 0,
             const attention::AttentionExecutionPolicy &execution_policy = {},
             const attention::AttentionKVLogicalView &kv_logical_view = {},
-            Q16QueryLayout query_layout = Q16QueryLayout::RowMajor)
+            Q16QueryLayout query_layout = Q16QueryLayout::RowMajor,
+            std::optional<ActualQueryBanks> actual_query_banks = std::nullopt)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -5572,14 +5652,9 @@ namespace llaminar2
             if (!k_raw || !v_raw)
                 return false;
             {
-                // The tensors own their actual allocation extents; queries and
-                // output keep the declared FP32 geometry of this entry point.
-                auto request = declaredRequest(Q, k_raw, v_raw, output, seq_len, int(K_q16->rows()),
-                    n_heads, n_kv_heads, head_dim, head_start, gqa_n_rep, 1);
-                request.key = {k_raw, K_q16->size_bytes()};
-                request.value = {v_raw, V_q16->size_bytes()};
-                request.key_row_bytes = request.value_row_bytes = blocks_per_kv_row * block_bytes;
-                if (K_q16->rows() > std::size_t(std::numeric_limits<int>::max()) || !admitInvocation(request))
+                const auto request = q16Request(Q, K_q16, V_q16, output, seq_len, n_heads, n_kv_heads,
+                    head_dim, head_start, gqa_n_rep, actual_query_banks);
+                if (!request || !admitInvocation(*request))
                     return false;
             }
 

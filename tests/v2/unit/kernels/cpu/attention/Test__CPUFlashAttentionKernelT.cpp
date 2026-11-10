@@ -1432,3 +1432,115 @@ TEST_F(Test__CPUFlashAttention_TP_GQA, InvocationAdmissionRejectsBeforeAnyWrite)
     for (std::size_t i = 0; i < q_size; ++i) ASSERT_EQ(O_tensor->data()[i], 123.0f);
     EXPECT_TRUE(call(n_heads, n_kv_heads, 0, 0, {}));
 }
+
+/**
+ * @test Whole-invocation admission at the owning public entries: raw batches,
+ * native request batches and Q16 tensor/verifier entries admit their complete
+ * actual banks before any request or slice runs. A rejected invocation leaves
+ * every output and input byte unchanged, including earlier requests' outputs.
+ */
+TEST_F(Test__CPUFlashAttention_TP_GQA, WholeInvocationAdmissionPrecedesEveryWrite)
+{
+    constexpr int seq_len = 2, kv_len = 8, n_heads = 2, n_kv_heads = 1, head_dim = 64;
+    const std::size_t q_size = std::size_t(seq_len) * n_heads * head_dim;
+    const std::size_t kv_size = std::size_t(kv_len) * n_kv_heads * head_dim;
+
+    // Raw batch: the output overlaps only the second slice's K rows.
+    {
+        constexpr int batch = 2;
+        const std::size_t batch_q = std::size_t(batch) * seq_len * n_heads * head_dim;
+        const std::size_t batch_kv = std::size_t(batch) * seq_len * n_kv_heads * head_dim;
+        std::vector<float> Q(batch_q), K(batch_kv + batch_q), V(batch_kv);
+        fill_random(Q.data(), Q.size());
+        fill_random(K.data(), K.size());
+        fill_random(V.data(), V.size());
+        const auto K_before = K;
+        float *aliased = K.data() + batch_kv / 2 + 16;
+        EXPECT_FALSE(kernel_.compute_batch(Q.data(), K.data(), V.data(), aliased, batch, seq_len, n_heads,
+            n_kv_heads, head_dim, true));
+        EXPECT_EQ(K, K_before);
+        std::vector<float> O(batch_q, 123.0f);
+        EXPECT_TRUE(kernel_.compute_batch(Q.data(), K.data(), V.data(), O.data(), batch, seq_len, n_heads,
+            n_kv_heads, head_dim, true));
+    }
+
+    TensorFactory factory(mpi_ctx_);
+    const auto fp32 = [&](std::size_t rows, std::size_t columns, float fill) {
+        auto tensor = factory.createFP32({rows, columns}, device_id_);
+        std::fill(tensor->mutable_data(), tensor->mutable_data() + rows * columns, fill);
+        return tensor;
+    };
+    const auto unchanged = [](const ITensor *tensor, float expected) {
+        const auto *values = dynamic_cast<const TensorBase *>(tensor)->data();
+        for (std::size_t i = 0; i < tensor->numel(); ++i)
+            if (values[i] != expected) return false;
+        return true;
+    };
+
+    // Native FP32 request batch: request 1's K allocation is short. Request 0
+    // is valid, so a per-request check would already have written its output.
+    {
+        constexpr int requests = 2;
+        auto Q = fp32(std::size_t(requests) * seq_len, std::size_t(n_heads) * head_dim, 0.25f);
+        auto O = fp32(std::size_t(requests) * seq_len, std::size_t(n_heads) * head_dim, 123.0f);
+        auto K0 = fp32(kv_len, std::size_t(n_kv_heads) * head_dim, 0.5f), V0 = fp32(kv_len, head_dim, 0.5f);
+        auto K1 = fp32(kv_len - 1, std::size_t(n_kv_heads) * head_dim, 0.5f), V1 = fp32(kv_len, head_dim, 0.5f);
+        const ITensor *keys[] = {K0.get(), K1.get()}, *values[] = {V0.get(), V1.get()};
+        const int kv_lens[] = {kv_len, kv_len};
+        const attention::AttentionKVLogicalView views[] = {{}, {}};
+        EXPECT_FALSE(kernel_.compute_request_batch_decode_equivalent(Q.get(), keys, values, kv_lens, O.get(),
+            requests, seq_len, n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {}, views));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+
+        // The whole output bank aliases request 1's V allocation.
+        auto shared = fp32(std::size_t(requests) * seq_len, std::size_t(n_heads) * head_dim, 123.0f);
+        auto K_full = fp32(kv_len, std::size_t(n_kv_heads) * head_dim, 0.5f);
+        const ITensor *alias_keys[] = {K0.get(), K_full.get()}, *alias_values[] = {V0.get(), shared.get()};
+        EXPECT_FALSE(kernel_.compute_request_batch_decode_equivalent(Q.get(), alias_keys, alias_values, kv_lens,
+            shared.get(), requests, seq_len, n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {},
+            views));
+        EXPECT_TRUE(unchanged(shared.get(), 123.0f));
+
+        // Positive control: the same batch with complete, disjoint banks runs.
+        const ITensor *good_keys[] = {K0.get(), K_full.get()}, *good_values[] = {V0.get(), V1.get()};
+        EXPECT_TRUE(kernel_.compute_request_batch_decode_equivalent(Q.get(), good_keys, good_values, kv_lens,
+            O.get(), requests, seq_len, n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {}, views));
+    }
+
+    // Q16 entries: undersized FP32 query/output allocations are rejected,
+    // although the declared geometry alone would have admitted them.
+    {
+        const auto q16 = [&] {
+            auto tensor = std::make_unique<Q16_1Tensor>(
+                std::vector<std::size_t>{std::size_t(kv_len), std::size_t(n_kv_heads) * head_dim},
+                Q16BlockSize::BLOCK_64);
+            std::vector<float> source(kv_size, 0.125f);
+            EXPECT_TRUE(tensor->copyFrom_fp32_fixed_scale(source.data(), 1.0f / 2048.0f, head_dim));
+            return tensor;
+        };
+        auto K = q16(), V = q16();
+        auto Q = fp32(seq_len, std::size_t(n_heads) * head_dim, 0.25f);
+        auto short_O = fp32(seq_len - 1, std::size_t(n_heads) * head_dim, 123.0f);
+        auto short_Q = fp32(seq_len - 1, std::size_t(n_heads) * head_dim, 0.25f);
+        auto O = fp32(seq_len, std::size_t(n_heads) * head_dim, 123.0f);
+        const auto tensor_call = [&](const ITensor *query, ITensor *out) {
+            return kernel_.compute_tensor(query, K.get(), V.get(), out, 1, seq_len, kv_len, n_heads, n_kv_heads,
+                head_dim, true, -1, nullptr, nullptr, &mpi_ctx_, -1, 0, n_heads, n_kv_heads, 0, {}, {});
+        };
+        EXPECT_FALSE(tensor_call(Q.get(), short_O.get()));
+        EXPECT_TRUE(unchanged(short_O.get(), 123.0f));
+        EXPECT_FALSE(tensor_call(short_Q.get(), O.get()));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+        const auto verifier_call = [&](const ITensor *query, ITensor *out) {
+            return kernel_.compute_verifier_rows_decode_equivalent(query, K.get(), V.get(), out, seq_len, kv_len,
+                n_heads, n_kv_heads, head_dim, true, -1, &mpi_ctx_, -1, 0, 0, {}, {});
+        };
+        EXPECT_FALSE(verifier_call(Q.get(), short_O.get()));
+        EXPECT_TRUE(unchanged(short_O.get(), 123.0f));
+        EXPECT_FALSE(verifier_call(short_Q.get(), O.get()));
+        EXPECT_TRUE(unchanged(O.get(), 123.0f));
+        // Positive controls with complete banks.
+        EXPECT_TRUE(tensor_call(Q.get(), O.get()));
+        EXPECT_TRUE(verifier_call(Q.get(), O.get()));
+    }
+}
