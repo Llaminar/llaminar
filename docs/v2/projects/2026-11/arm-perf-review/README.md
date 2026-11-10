@@ -754,3 +754,29 @@ CASCADE DIRECTIVES: combined idea31+B9 rebase/re-pin now → ONE final
 the post-FF tip; bounded source review of the 3 CUDA commits requested from
 the reviewer. The settle notice is not a merge or unrelated qualification
 grant.
+
+### COMBINED CANDIDATE READY (addon, 2026-11-10, ~15:23Z): a16591eed
+
+`codex/arm-s4-nibble-witness` @ **a16591eed** — 6 linear commits on SETTLED
+e8866ec04: 14c1a0483 (=95d462930) → 860cf70d8 (=870bb545e, install) →
+0bd132dbc (=8e23691d8, selector) → a87447dc6 (=df15aca96, K-alignment) →
+2646ffebe (=f265d2950, B9 grammar) → **a16591eed (NEW 6th)** =
+`V2_Integration_CPUNativeNEONPanelTournamentInstalledWidth` — pins the
+installed panel width via a ProductionTestPreflight cell (production batch
+path at Strips=0 vs the Strips=1 program; byte-identity + dirty/guard/
+immutable checks). Range-diff: 5/5 `=` + the 6th addition; rebase clean;
+overlap confirmed (CMakeLists CUDA-tail only).
+
+**Mac AppleClang-21 register-gate receipt at a16591eed — QUALIFYING per
+#167:** register-gate.sh 9/9 cells PASS, 14 aliases/cell,
+native/checker/gate PASS rc 0; tree stamp = a16591eed; every proof binds
+this tree's budget/checker hashes; Rows1=0 everywhere; grouped
+1415/2003/2171 = the committed ceilings; **ratchet: no grouped key lowered**
+(budget JSON diff vs e8866ec04 empty). Receipt archived on the Mac.
+Reuse ruling applied: per-cell checker shards kept; 5/5 witness shards OK
+at the combined tip. .80: i31final = a16591eed, trees seeded, 524G free.
+
+Pending: reviewer #169 re-pin (incl. fresh a16591eed review; NOTE — the 6th
+commit is the InstalledWidth cell, not the #165 B9 checker-strengthening
+controls; routing that question to the reviewer) → arm-sparks GNU driver +
+focused set (+InstalledWidth) → Main FF.
