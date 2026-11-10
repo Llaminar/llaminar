@@ -1419,3 +1419,12 @@ Merge-readiness package routes to the reviewer with that attribution.
   green gates; the hpb 5/5 logs are uninspected owner evidence — smoke/
   correctness alone cannot certify plan-v2.1 throughput/actual workers/
   FP/profiler identity. #175 + Flash-Next #177 HOLDs independent.
+- FRAMING CORRECTION (Main): the half-perf cell = **SOURCE-COMPLETE /
+  ADMISSION-HELD** — NOT gate-complete. The Linux canonical gates are RED
+  (Unit 16 + preflight 23 failures): red gates are not waived by name
+  attribution or base growth; a847's fixture fixes do not retroactively
+  qualify b512; 5/5 cells do not authenticate throughput/actual-workers/
+  FP/profiler identity. Decision: **focused economy/identity evidence
+  review BEFORE any acceptance**; no FF or .80 rerun booking yet; the
+  review follows #71/#177 row-policy correction priority; no new lane
+  execution implicitly approved. Receipts preserved.
