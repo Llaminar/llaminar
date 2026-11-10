@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Record and compare identity-bound performance baselines.
 
-A baseline document (schema ``llaminar.perf-baseline.v3``) is one measured
+A baseline document (schema ``llaminar.perf-baseline.v4``) is one measured
 result plus the identity needed to decide whether a later result is comparable.
 
 ``run`` (Linux only)
@@ -16,11 +16,23 @@ result plus the identity needed to decide whether a later result is comparable.
     ``--result-json``, which may not exist beforehand. Argv, working directory,
     CPU affinity and the launch environment (``LLAMINAR_*``, ``OMP_*``,
     ``GOMP_*``, ``KMP_*``, ``HSA_*``, ``NCCL_*``, ``RCCL_*``, ``LD_LIBRARY_PATH``,
-    ``LD_PRELOAD`` and the GPU visibility variables) are recorded; every
-    occurrence of the result path in argv or environment values is replaced by
-    ``<result-json>`` so that fresh per-run destinations do not split identity.
+    ``LD_PRELOAD`` and the GPU visibility variables) are recorded.
+
+    Output role. The fresh result destination is normalized to ``<result-json>``
+    only at typed output positions, never by substring replacement: an argv
+    element that IS the result path (or ``--option=`` followed by exactly it),
+    the value of each environment variable named with ``--result-env`` (which
+    must equal the result path), and, for ``llaminar-benchmark``,
+    ``runtime_configuration.configuration.benchmark_json_output_path`` (which
+    must equal the result path). The result path counts in its supplied,
+    absolute and resolved spellings. Every other occurrence stays verbatim.
+    Declared inputs (``--input-file NAME=PATH``) keep their launch-visible path:
+    path-to-target binding and target bytes are checked before and after.
 ``import``
-    Wraps an existing result; there is no launch record.
+    Wraps an existing result; there is no launch record. A benchmark's
+    ``benchmark_json_output_path`` is replaced by ``<unauthenticated-output>``:
+    the field is typed as the producer's output destination, but its value
+    cannot be authenticated for an import.
 
 Grades: ``bound`` only for a ``run`` from a clean tree, in a ``Release`` build,
 without ``--allow-dirty``; everything else is ``unbound``. ``bound`` is a local
@@ -66,14 +78,16 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-SCHEMA = "llaminar.perf-baseline.v3"
+SCHEMA = "llaminar.perf-baseline.v4"
 KINDS = ("llaminar-benchmark", "kernel-metrics")
 GRADES = ("bound", "unbound")
 ENV_PREFIXES = ("LLAMINAR_", "OMP_", "GOMP_", "KMP_", "HSA_", "NCCL_", "RCCL_")
 ENV_EXACT = ("LD_LIBRARY_PATH", "LD_PRELOAD", "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES",
              "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
 RESULT_PLACEHOLDER = "<result-json>"
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+RESULT_PLACEHOLDER_IMPORT = "<unauthenticated-output>"
+OUTPUT_FIELD = ("runtime_configuration", "configuration", "benchmark_json_output_path")
 
 
 class BaselineError(Exception):
@@ -84,13 +98,33 @@ def _reject_constant(name: str) -> None:
     raise BaselineError(f"non-finite JSON constant {name} is not allowed")
 
 
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise BaselineError(f"JSON number {text} is out of range")
+    return value
+
+
 def load_json(path: Path) -> Any:
-    """Parse strict JSON: NaN/Infinity literals are rejected."""
+    """Parse strict JSON: NaN/Infinity literals and out-of-range numbers (1e999) are rejected."""
 
     try:
-        return json.loads(path.read_text(), parse_constant=_reject_constant)
+        return json.loads(path.read_text(), parse_constant=_reject_constant, parse_float=_finite_float)
     except json.JSONDecodeError as error:
         raise BaselineError(f"{path} is not JSON: {error}") from error
+
+
+def _require_finite_tree(value: Any, where: str = "$") -> None:
+    """Reject any non-finite float anywhere in a document, not only in metrics."""
+
+    if isinstance(value, float):
+        _require(math.isfinite(value), f"{where} is not finite")
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            _require_finite_tree(item, f"{where}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _require_finite_tree(item, f"{where}[{index}]")
 
 
 def _sha256_file(path: Path) -> str:
@@ -133,7 +167,7 @@ def _positive(value: Any, what: str) -> float:
 
 
 def _hex64(value: Any, what: str) -> str:
-    _require(isinstance(value, str) and bool(HEX64.match(value)), f"{what} must be a SHA-256 hex digest")
+    _require(isinstance(value, str) and HEX64.fullmatch(value) is not None, f"{what} must be a SHA-256 hex digest")
     return value
 
 
@@ -178,14 +212,23 @@ def _check_host(host: Any) -> None:
         _text(host.get(key), f"host.{key}")
     _int(host.get("logical_cpus"), "host.logical_cpus", 1)
     _int(host.get("page_size"), "host.page_size", 1)
-    _require(isinstance(host.get("numa_nodes"), list), "host.numa_nodes must be a list")
+    nodes = host.get("numa_nodes")
+    _require(isinstance(nodes, list), "host.numa_nodes must be a list")
+    for index, node in enumerate(nodes):
+        node = _object(node, f"host.numa_nodes[{index}]")
+        _int(node.get("node"), f"host.numa_nodes[{index}].node")
+        _text(node.get("cpus"), f"host.numa_nodes[{index}].cpus", allow_empty=True)
+        _int(node.get("mem_total_kb"), f"host.numa_nodes[{index}].mem_total_kb")
 
 
 def _check_workload(kind: str, workload: Any) -> None:
     workload = _object(workload, "workload")
     inputs = _object(workload.get("declared_inputs"), "workload.declared_inputs", allow_empty=True)
-    for name, digest in inputs.items():
-        _hex64(digest, f"declared input {name!r}")
+    for name, binding in inputs.items():
+        binding = _object(binding, f"declared input {name!r}")
+        _text(binding.get("path"), f"declared input {name!r} path")
+        _text(binding.get("target"), f"declared input {name!r} target")
+        _hex64(binding.get("sha256"), f"declared input {name!r} sha256")
     if kind == "llaminar-benchmark":
         _require("model" in inputs, "a llaminar-benchmark record requires the declared input 'model'")
         prompt = _object(workload.get("prompt"), "workload.prompt")
@@ -212,8 +255,10 @@ def _check_launch(launch: Any) -> None:
     _require(all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()), "launch.env must map strings")
     _text(launch.get("cwd"), "launch.cwd")
     affinity = launch.get("cpu_affinity")
-    _require(isinstance(affinity, list) and bool(affinity) and all(isinstance(c, int) for c in affinity),
-             "launch.cpu_affinity must be a non-empty integer list")
+    _require(isinstance(affinity, list) and bool(affinity)
+             and all(isinstance(c, int) and not isinstance(c, bool) and c >= 0 for c in affinity)
+             and affinity == sorted(set(affinity)),
+             "launch.cpu_affinity must be a non-empty sorted list of unique non-negative CPU ids")
     binaries = _object(launch.get("binaries"), "launch.binaries")
     for name, digest in binaries.items():
         _hex64(digest, f"launch.binaries[{name!r}]")
@@ -227,6 +272,7 @@ def validate_document(document: Any) -> None:
     """Complete typed validation of a baseline document; every entry point uses it."""
 
     document = _object(document, "baseline document")
+    _require_finite_tree(document)
     _require(document.get("schema") == SCHEMA, f"expected schema {SCHEMA}")
     kind, grade = document.get("kind"), document.get("grade")
     _require(kind in KINDS and grade in GRADES, "document kind or grade is invalid")
@@ -330,6 +376,7 @@ def _numa_nodes() -> list[dict[str, Any]]:
                 for line in (node / "meminfo").read_text().splitlines():
                     if "MemTotal:" in line:
                         mem_kb = int(line.split(":", 1)[1].split()[0])
+            _require(mem_kb is not None, f"{node}/meminfo publishes no MemTotal")
             nodes.append({"node": int(node.name[4:]), "cpus": cpulist, "mem_total_kb": mem_kb})
     return nodes
 
@@ -386,19 +433,30 @@ def extract(kind: str, document: Any) -> tuple[dict[str, Any], Any, dict[str, An
     raise BaselineError(f"unknown kind {kind!r}; expected one of {KINDS}")
 
 
-def _declared_inputs(specs: Sequence[str]) -> dict[str, Path]:
-    inputs: dict[str, Path] = {}
+def _declared_inputs(specs: Sequence[str], kind: str) -> dict[str, str]:
+    """Parse NAME=PATH declarations, keeping the launch-visible path; the kind's required inputs are checked here."""
+
+    inputs: dict[str, str] = {}
     for spec in specs:
         name, sep, path = spec.partition("=")
         _require(bool(sep and name and path), f"--input-file expects NAME=PATH, got {spec!r}")
         _require(name not in inputs, f"--input-file {name!r} declared twice")
         _require(Path(path).is_file(), f"--input-file {name}: {path} is not a file")
-        inputs[name] = Path(path).resolve()
+        inputs[name] = path
+    if kind == "llaminar-benchmark":
+        _require("model" in inputs, "llaminar-benchmark requires --input-file model=PATH")
     return inputs
 
 
-def _digest_inputs(inputs: Mapping[str, Path]) -> dict[str, str]:
-    return {name: _sha256_file(path) for name, path in sorted(inputs.items())}
+def _bind_inputs(inputs: Mapping[str, str]) -> dict[str, dict[str, str]]:
+    """Observe each launch-visible path, the target it resolves to, and the target's bytes."""
+
+    bindings = {}
+    for name, path in sorted(inputs.items()):
+        target = Path(path).resolve()
+        _require(target.is_file(), f"--input-file {name}: {path} no longer resolves to a file")
+        bindings[name] = {"path": path, "target": str(target), "sha256": _sha256_file(target)}
+    return bindings
 
 
 def _build_tree_closure(executable: Path, build_dir: Path) -> dict[str, str]:
@@ -422,14 +480,60 @@ def _build_tree_closure(executable: Path, build_dir: Path) -> dict[str, str]:
     return {str(path.relative_to(build_dir)): _sha256_file(path) for path in sorted(paths)}
 
 
-def _launch_environment(result_path: str) -> dict[str, str]:
-    return {key: value.replace(result_path, RESULT_PLACEHOLDER) for key, value in sorted(os.environ.items())
-            if key.startswith(ENV_PREFIXES) or key in ENV_EXACT}
+def _result_spellings(result_arg: Path) -> set[str]:
+    """Supplied, absolute and resolved spellings of the result destination."""
+
+    return {str(result_arg), os.path.abspath(result_arg), str(result_arg.resolve())}
 
 
-def _assemble(kind: str, raw: Any, *, grade: str, source: dict, build: dict, inputs: Mapping[str, str],
-              launch: dict | None) -> dict[str, Any]:
-    workload, output, metrics, observations = extract(kind, raw)
+def _normalize_argv(arguments: Sequence[str], spellings: set[str]) -> list[str]:
+    """Replace only argv elements that ARE the result path, or --option= followed by exactly it."""
+
+    normalized = []
+    for argument in arguments:
+        option, sep, value = argument.partition("=")
+        if argument in spellings:
+            normalized.append(RESULT_PLACEHOLDER)
+        elif sep and option.startswith("--") and value in spellings:
+            normalized.append(f"{option}={RESULT_PLACEHOLDER}")
+        else:
+            normalized.append(argument)
+    return normalized
+
+
+def _launch_environment(result_env: Sequence[str], spellings: set[str]) -> dict[str, str]:
+    """Recorded launch variables; only declared --result-env variables carry the placeholder."""
+
+    env = {key: value for key, value in sorted(os.environ.items()) if key.startswith(ENV_PREFIXES) or key in ENV_EXACT}
+    for name in result_env:
+        _require(os.environ.get(name) in spellings, f"--result-env {name} must equal the result path")
+        env[name] = RESULT_PLACEHOLDER
+    return env
+
+
+def _normalize_output_field(kind: str, raw: Any, spellings: set[str] | None) -> Any:
+    """Replace the benchmark's typed output-destination field; authenticated for run, marked for import."""
+
+    if kind != "llaminar-benchmark" or not isinstance(raw, Mapping):
+        return raw
+    configuration = (raw.get("runtime_configuration") or {}).get("configuration") if isinstance(
+        raw.get("runtime_configuration"), Mapping) else None
+    if not isinstance(configuration, Mapping) or OUTPUT_FIELD[-1] not in configuration:
+        return raw
+    value = configuration[OUTPUT_FIELD[-1]]
+    if spellings is None:
+        replacement = RESULT_PLACEHOLDER_IMPORT
+    else:
+        _require(value in spellings, f"benchmark_json_output_path {value!r} is not the result destination")
+        replacement = RESULT_PLACEHOLDER
+    normalized = json.loads(json.dumps(raw))
+    normalized["runtime_configuration"]["configuration"][OUTPUT_FIELD[-1]] = replacement
+    return normalized
+
+
+def _assemble(kind: str, raw: Any, *, grade: str, source: dict, build: dict, inputs: Mapping[str, Any],
+              launch: dict | None, spellings: set[str] | None) -> dict[str, Any]:
+    workload, output, metrics, observations = extract(kind, _normalize_output_field(kind, raw, spellings))
     document = {"schema": SCHEMA, "kind": kind, "grade": grade, "source": source, "build": build,
                 "host": host_identity(), "launch": launch, "workload": {**workload, "declared_inputs": dict(inputs)},
                 "output": output, "metrics": metrics, "observations": observations, "raw": raw}
@@ -438,7 +542,7 @@ def _assemble(kind: str, raw: Any, *, grade: str, source: dict, build: dict, inp
 
 
 def run(kind: str, build_dir: Path, result_json: Path, command: Sequence[str], *, source_dir: Path,
-        inputs: Sequence[str] = (), allow_dirty: bool = False) -> dict[str, Any]:
+        inputs: Sequence[str] = (), allow_dirty: bool = False, result_env: Sequence[str] = ()) -> dict[str, Any]:
     """Execute one measurement through one admitted executable and bind the result to it."""
 
     _require(sys.platform.startswith("linux"), "run is supported on Linux only (it requires ldd)")
@@ -448,11 +552,12 @@ def run(kind: str, build_dir: Path, result_json: Path, command: Sequence[str], *
     _require(found is not None, f"executable {command[0]!r} not found")
     executable = Path(found).resolve()
     _require(executable.is_relative_to(build_dir), f"executable {executable} is not inside --build-dir {build_dir}")
-    result_json = result_json.resolve()
+    spellings = _result_spellings(result_json)
     _require(not result_json.exists(), f"{result_json} already exists; a run must create its result")
+    declared = _declared_inputs(inputs, kind)
     source, build = source_identity(source_dir, allow_dirty), build_identity(build_dir)
-    declared = _declared_inputs(inputs)
-    inputs_before, binaries_before = _digest_inputs(declared), _build_tree_closure(executable, build_dir)
+    env = _launch_environment(result_env, spellings)
+    inputs_before, binaries_before = _bind_inputs(declared), _build_tree_closure(executable, build_dir)
     argv = [str(executable), *command[1:]]
     started = time.time()
     completed = subprocess.run(argv)
@@ -460,27 +565,28 @@ def run(kind: str, build_dir: Path, result_json: Path, command: Sequence[str], *
     _require(completed.returncode == 0, f"measuring command exited {completed.returncode}")
     _require(_build_tree_closure(executable, build_dir) == binaries_before,
              "executable or build-tree library changed during the run")
-    _require(_digest_inputs(declared) == inputs_before, "a declared input file changed during the run")
+    _require(_bind_inputs(declared) == inputs_before,
+             "a declared input path was retargeted or its bytes changed during the run")
     _require(result_json.is_file(), f"measuring command did not create {result_json}")
     grade = "bound" if build["build_type"] == "Release" and not source["dirty"] and not allow_dirty else "unbound"
-    result = str(result_json)
     launch = {
-        "argv": [str(executable.relative_to(build_dir)), *(a.replace(result, RESULT_PLACEHOLDER) for a in command[1:])],
-        "env": _launch_environment(result), "cwd": os.getcwd(),
+        "argv": [str(executable.relative_to(build_dir)), *_normalize_argv(command[1:], spellings)],
+        "env": env, "cwd": os.getcwd(),
         "cpu_affinity": sorted(os.sched_getaffinity(0)), "binaries": binaries_before,
         "loader_observation": "ldd initial resolution; dlopen-loaded libraries not observed",
         "started_unix": started, "finished_unix": finished, "result_sha256": _sha256_file(result_json),
     }
     return _assemble(kind, load_json(result_json), grade=grade, source=source, build=build, inputs=inputs_before,
-                     launch=launch)
+                     launch=launch, spellings=spellings)
 
 
 def import_result(kind: str, input_path: Path, build_dir: Path, *, source_dir: Path, inputs: Sequence[str] = (),
                   allow_dirty: bool = False) -> dict[str, Any]:
     """Wrap an existing result; nothing binds it to this build or host, so it is always unbound."""
 
+    declared = _declared_inputs(inputs, kind)
     return _assemble(kind, load_json(input_path), grade="unbound", source=source_identity(source_dir, allow_dirty),
-                     build=build_identity(build_dir), inputs=_digest_inputs(_declared_inputs(inputs)), launch=None)
+                     build=build_identity(build_dir), inputs=_bind_inputs(declared), launch=None, spellings=None)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -493,7 +599,7 @@ def _launch_field(key: str) -> Callable[[Mapping[str, Any]], Any]:
 IDENTITY_FIELDS: dict[str, Callable[[Mapping[str, Any]], Any]] = {
     "kind": lambda b: b["kind"],
     "workload": lambda b: {k: v for k, v in b["workload"].items() if k != "declared_inputs"},
-    "declared_inputs": lambda b: b["workload"]["declared_inputs"],
+    "declared_inputs": lambda b: {name: binding["sha256"] for name, binding in b["workload"]["declared_inputs"].items()},
     "output": lambda b: b.get("output") if b["kind"] == "llaminar-benchmark" else "n/a",
     "argv": _launch_field("argv"),
     "launch_env": _launch_field("env"),
@@ -580,6 +686,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         p.add_argument("--allow-dirty", action="store_true", help="permit a dirty tree; the record is always unbound")
         if name == "run":
             p.add_argument("--result-json", type=Path, required=True, help="file the command must create")
+            p.add_argument("--result-env", action="append", default=[], metavar="VAR",
+                           help="environment variable that carries the result path (typed output role)")
             p.add_argument("measure", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
         else:
             p.add_argument("--input", type=Path, required=True)
@@ -595,7 +703,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.command == "run":
                 command = args.measure[1:] if args.measure[:1] == ["--"] else args.measure
                 document = run(args.kind, args.build_dir, args.result_json, command, source_dir=args.source_dir,
-                               inputs=args.input_file, allow_dirty=args.allow_dirty)
+                               inputs=args.input_file, allow_dirty=args.allow_dirty, result_env=args.result_env)
             else:
                 document = import_result(args.kind, args.input, args.build_dir, source_dir=args.source_dir,
                                          inputs=args.input_file, allow_dirty=args.allow_dirty)
@@ -605,7 +713,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                       args.allow_identity_change)
         print(json.dumps(report, indent=1)) if args.json else _print_diff(report)
         return 1 if report["regressions"] else 0
-    except (BaselineError, OSError) as error:
+    except (BaselineError, OSError, ValueError) as error:
         print(f"perf_baseline: {error}", file=sys.stderr)
         return 2
 

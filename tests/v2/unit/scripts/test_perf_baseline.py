@@ -33,6 +33,10 @@ LINUX = sys.platform.startswith("linux")
 
 MEASURE = """import os, shutil, sys
 action = os.environ.get("PERF_ACTION", "")
+if action == "mark-launched":
+    open(os.environ["PERF_MARK"], "w").write("launched")
+if action == "retarget-input":
+    link = os.environ["PERF_INPUT"]; os.remove(link); os.symlink(os.environ["PERF_OTHER"], link)
 if action == "replace-exe":
     exe = os.environ["PERF_EXE"]
     shutil.copy2(exe, exe + ".new"); open(exe + ".new", "ab").write(b"x"); os.replace(exe + ".new", exe)
@@ -41,7 +45,9 @@ if action == "check-argv0" and sys.orig_argv[0] != os.environ["PERF_EXE"]:
 if action == "touch-input":
     open(os.environ["PERF_INPUT"], "ab").write(b"x")
 if action != "nowrite":
-    shutil.copyfile(os.environ["PERF_PAYLOAD"], sys.argv[1])
+    # Real producers embed their output path; substitute the path exactly as passed.
+    text = open(os.environ["PERF_PAYLOAD"]).read().replace("__RESULT__", sys.argv[1])
+    open(sys.argv[1], "w").write(text)
 sys.exit(3 if action == "exit3" else 0)
 """
 
@@ -57,7 +63,11 @@ def benchmark_document(prefill: float = 400.0, decode: float = 20.0, *, temperat
         "decode_latency_ms": {"mean": 1000.0 / decode, "p50": 1000.0 / decode, "p90": 60.0, "samples": 256},
         "generated_token_ids": tokens if tokens is not None else [1, 2, 3],
         "runtime_state": {"architecture": "qwen35moe", "execution_path": "single", "primary_device": "cpu:0"},
-        "runtime_configuration": {"sampling": {"temperature": temperature, "seed": 42}, "mtp_enabled": False},
+        # Shape of BenchmarkRunner's serialized OrchestrationConfig document.
+        "runtime_configuration": {"kind": "llaminar.orchestration-config", "schema_version": 1, "configuration": {
+            "model_path": "models/model.gguf", "benchmark_json_output_path": "__RESULT__",
+            "temperature": temperature, "seed": 42, "n_predict": 256}},
+        "config": {"benchmark_json_output_path": "__RESULT__", "sampling": {"temperature": temperature}},
     }
 
 
@@ -108,7 +118,9 @@ class PerfBaselineTest(unittest.TestCase):
 
     def run_record(self, payload: dict | Path | None, *extra: str, kind: str = "llaminar-benchmark",
                    build: Path | None = None, executable: Path | None = None, action: str = "",
-                   model: Path | None = None, env_extra: dict | None = None) -> tuple[subprocess.CompletedProcess[str], Path]:
+                   model: Path | None = None, env_extra: dict | None = None, result_name: str | None = None,
+                   relative: bool = False, result_env: str | None = None,
+                   extra_args: tuple[str, ...] = ()) -> tuple[subprocess.CompletedProcess[str], Path]:
         build = build or self.release
         self.counter += 1
         payload_path = self.root / f"payload{self.counter}.json"
@@ -116,13 +128,20 @@ class PerfBaselineTest(unittest.TestCase):
             payload_path = payload
         elif payload is not None:
             payload_path.write_text(json.dumps(payload))
-        result, output = self.root / f"result{self.counter}.json", self.root / f"baseline{self.counter}.json"
+        name = result_name or f"result{self.counter}.json"
+        result = Path(name) if relative else self.root / name
+        output = self.root / f"baseline{self.counter}.json"
         env = dict(os.environ, PYTHONHOME=sys.base_prefix, PERF_PAYLOAD=str(payload_path), PERF_ACTION=action,
                    PERF_EXE=str(build / "py"), PERF_INPUT=str(model or self.model), **(env_extra or {}))
+        role = []
+        if result_env:
+            env[result_env] = str(result)
+            role = ["--result-env", result_env]
         inputs = ["--input-file", f"model={model or self.model}"] if kind == "llaminar-benchmark" else []
-        proc = self.cli("run", "--kind", kind, "--build-dir", str(build), "--source-dir", str(self.source),
-                        "--output", str(output), "--result-json", str(result), *inputs, *extra, "--",
-                        str(executable or build / "py"), str(self.measure), str(result), env=env)
+        proc = subprocess.run([sys.executable, str(SCRIPT), "run", "--kind", kind, "--build-dir", str(build),
+                               "--source-dir", str(self.source), "--output", str(output), "--result-json", str(result),
+                               *role, *inputs, *extra, "--", str(executable or build / "py"), str(self.measure),
+                               str(result), *extra_args], capture_output=True, text=True, env=env, cwd=self.root)
         return proc, output
 
     def import_record(self, document: dict | Path, *extra: str, kind: str = "llaminar-benchmark",
@@ -169,12 +188,14 @@ class PerfBaselineTest(unittest.TestCase):
         self.assertIn("py", launch["binaries"])
         self.assertTrue(launch["cpu_affinity"])
         self.assertIn("ldd", launch["loader_observation"])
-        self.assertEqual(len(document["workload"]["declared_inputs"]["model"]), 64)
+        self.assertEqual(len(document["workload"]["declared_inputs"]["model"]["sha256"]), 64)
         outside = self.root / "outside-link"
         outside.symlink_to(Path(sys.executable).resolve())
         moved = self.release / "escape"
         moved.symlink_to(outside)
-        self.assertEqual(self.run_record(benchmark_document(), executable=moved)[0].returncode, 2)
+        escaped = self.run_record(benchmark_document(), executable=moved)[0]
+        self.assertEqual(escaped.returncode, 2)
+        self.assertIn("not inside --build-dir", escaped.stderr)
 
     def test_run_refusals(self) -> None:
         if not self.require_linux_run():
@@ -192,9 +213,14 @@ class PerfBaselineTest(unittest.TestCase):
             "failed benchmark": self.run_record(benchmark_document(success=False)),
             "script is not a dynamic executable": self.run_record(benchmark_document(), executable=self.copy_script()),
         }
+        expected = {"interpreter outside build dir": "not inside --build-dir", "nonzero exit": "exited 3",
+                    "no result written": "did not create", "executable replaced during run": "changed during the run",
+                    "declared input changed during run": "retargeted or its bytes changed", "failed benchmark": "success",
+                    "script is not a dynamic executable": "ldd failed"}
         for name, (proc, _) in cases.items():
             with self.subTest(name):
                 self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn(expected[name], proc.stderr)
         payload = self.root / "p.json"
         payload.write_text(json.dumps(benchmark_document()))
         no_model = self.cli("run", "--kind", "llaminar-benchmark", "--build-dir", str(self.release), "--source-dir",
@@ -227,8 +253,9 @@ class PerfBaselineTest(unittest.TestCase):
     def copy_script(self) -> Path:
         script = self.release / "script-exe"
         # Writes a valid result, so only the ldd observation can reject it.
-        script.write_text(f"#!{sys.executable}\nimport os, shutil, sys\n"
-                          "shutil.copyfile(os.environ['PERF_PAYLOAD'], sys.argv[2])\n")
+        script.write_text(f"#!{sys.executable}\nimport os, sys\n"
+                          "open(sys.argv[2], 'w').write(open(os.environ['PERF_PAYLOAD']).read()"
+                          ".replace('__RESULT__', sys.argv[2]))\n")
         script.chmod(0o755)
         return script
 
@@ -255,9 +282,9 @@ class PerfBaselineTest(unittest.TestCase):
         a, b = json.loads(first.read_text()), json.loads(second.read_text())
         self.assertEqual((a["harness"], a["parameters"]), (b["harness"], b["parameters"]))
         self.assertNotEqual(a["metrics"], b["metrics"], "fixtures must differ in measured values")
-        env = {"LLAMINAR_CPU_DECODE_BW_JSON": "set-per-run"}
-        _, run_a = self.run_record(first, kind="kernel-metrics", env_extra=env)
-        _, run_b = self.run_record(second, kind="kernel-metrics", env_extra=env)
+        _, run_a = self.run_record(first, kind="kernel-metrics", result_env="LLAMINAR_CPU_DECODE_BW_JSON")
+        _, run_b = self.run_record(second, kind="kernel-metrics", result_env="LLAMINAR_CPU_DECODE_BW_JSON",
+                                   relative=True)
         report = self.diff(run_a, run_b)
         self.assertIn(report.returncode, (0, 1), report.stderr)
         self.assertEqual(json.loads(report.stdout)["waived_identity"], [])
@@ -265,23 +292,86 @@ class PerfBaselineTest(unittest.TestCase):
     def test_fresh_result_destinations_do_not_split_identity(self) -> None:
         if not self.require_linux_run():
             return
-        # Each run writes a different result path; the harness variable names it explicitly.
-        results = []
-        for _ in range(2):
-            self.counter += 1
-            result = self.root / f"fresh{self.counter}.json"
-            payload = self.root / f"fp{self.counter}.json"
-            payload.write_text(json.dumps(benchmark_document()))
-            output = self.root / f"fo{self.counter}.json"
-            env = dict(os.environ, PYTHONHOME=sys.base_prefix, PERF_PAYLOAD=str(payload),
-                       LLAMINAR_CPU_DECODE_BW_JSON=str(result))
-            proc = self.cli("run", "--kind", "llaminar-benchmark", "--build-dir", str(self.release), "--source-dir",
-                            str(self.source), "--output", str(output), "--result-json", str(result), "--input-file",
-                            f"model={self.model}", "--", str(self.release / "py"), str(self.measure), str(result), env=env)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            results.append(output)
-            self.assertEqual(json.loads(output.read_text())["launch"]["env"]["LLAMINAR_CPU_DECODE_BW_JSON"], "<result-json>")
-        self.assertEqual(self.diff(*results).returncode, 0, self.diff(*results).stderr)
+        for relative in (False, True):
+            with self.subTest(relative=relative):
+                records = []
+                for _ in range(2):
+                    self.counter += 1
+                    name = f"fresh{self.counter}.json"
+                    path = name if relative else str(self.root / name)
+                    proc, record = self.run_record(benchmark_document(), relative=relative, result_name=name,
+                                                   result_env="LLAMINAR_BENCH_JSON",
+                                                   extra_args=(f"--benchmark-json-output={path}",))
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    records.append(record)
+                for record in records:
+                    document = json.loads(record.read_text())
+                    self.assertEqual(document["launch"]["env"]["LLAMINAR_BENCH_JSON"], "<result-json>")
+                    self.assertEqual(document["workload"]["runtime_configuration"]["configuration"]
+                                     ["benchmark_json_output_path"], "<result-json>")
+                    self.assertEqual(document["launch"]["argv"][-2:],
+                                     ["<result-json>", "--benchmark-json-output=<result-json>"])
+                report = self.diff(*records)
+                self.assertEqual(report.returncode, 0, report.stderr)
+                self.assertEqual(json.loads(report.stdout)["waived_identity"], [])
+
+    def test_output_role_never_erases_other_identity(self) -> None:
+        if not self.require_linux_run():
+            return
+
+        a = self.run_record(benchmark_document(), result_name="a.json",
+                            env_extra={"LD_PRELOAD": str(self.root / "a.json.so")})[1]
+        b = self.run_record(benchmark_document(), result_name="b.json",
+                            env_extra={"LD_PRELOAD": str(self.root / "b.json.so")})[1]
+        refused = self.diff(a, b)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("launch_env", refused.stderr)
+        a = self.run_record(benchmark_document(), result_name="c.json", extra_args=(f"--extra={self.root}/c.json.cfg",))[1]
+        b = self.run_record(benchmark_document(), result_name="d.json", extra_args=(f"--extra={self.root}/d.json.cfg",))[1]
+        refused = self.diff(a, b)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("argv", refused.stderr)
+        a = self.run_record(benchmark_document(), result_name="e.json", env_extra={"LLAMINAR_OTHER": str(self.root / "e.json")})[1]
+        b = self.run_record(benchmark_document(), result_name="f.json", env_extra={"LLAMINAR_OTHER": str(self.root / "f.json")})[1]
+        self.assertEqual(self.diff(a, b).returncode, 2, "an undeclared variable keeps its value")
+        mismatched = benchmark_document()
+        mismatched["runtime_configuration"]["configuration"]["benchmark_json_output_path"] = "/elsewhere.json"
+        self.assertEqual(self.run_record(mismatched)[0].returncode, 2)
+        proc, _ = self.run_record(benchmark_document(), "--result-env", "LLAMINAR_BENCH_JSON",
+                                  env_extra={"LLAMINAR_BENCH_JSON": "/elsewhere.json"})
+        self.assertEqual(proc.returncode, 2)
+
+    def test_declared_input_binding(self) -> None:
+        if not self.require_linux_run():
+            return
+        other = self.root / "model-b.gguf"
+        other.write_bytes(b"GGUF-B")
+        link = self.root / "current.gguf"
+        link.symlink_to(self.model)
+        proc, _ = self.run_record(benchmark_document(), model=link, action="retarget-input",
+                                  env_extra={"PERF_OTHER": str(other)})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("retargeted", proc.stderr)
+        link.unlink()
+        link.symlink_to(self.model)
+        proc, output = self.run_record(benchmark_document(), model=link)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        binding = json.loads(output.read_text())["workload"]["declared_inputs"]["model"]
+        self.assertEqual(binding["path"], str(link))
+        self.assertEqual(binding["target"], str(self.model.resolve()))
+        marker = self.root / "launched"
+        payload = self.root / "pm.json"
+        payload.write_text(json.dumps(benchmark_document()))
+        no_model = subprocess.run(
+            [sys.executable, str(SCRIPT), "run", "--kind", "llaminar-benchmark", "--build-dir", str(self.release),
+             "--source-dir", str(self.source), "--output", str(self.root / "o.json"), "--result-json",
+             str(self.root / "r.json"), "--", str(self.release / "py"), str(self.measure), str(self.root / "r.json")],
+            capture_output=True, text=True, cwd=self.root,
+            env=dict(os.environ, PYTHONHOME=sys.base_prefix, PERF_PAYLOAD=str(payload), PERF_ACTION="mark-launched",
+                     PERF_MARK=str(marker)))
+        self.assertEqual(no_model.returncode, 2)
+        self.assertIn("model", no_model.stderr)
+        self.assertFalse(marker.exists(), "the required model declaration is checked before launch")
 
     def test_diff_verdicts(self) -> None:
         if not self.require_linux_run():
@@ -386,9 +476,18 @@ class PerfBaselineTest(unittest.TestCase):
         self.assertEqual(self.import_record(nan_text)[0].returncode, 2)
 
     def test_diff_cli_rejects_hostile_documents_in_both_orders(self) -> None:
-        _, good_kernel = self.import_record(kernel_document(10.0, [10.0, 10.1]), kind="kernel-metrics")
+        observed = kernel_document(10.0, [10.0, 10.1])
+        observed["observations"] = {"timings": [{"upper_median_us": 1.25}]}
+        _, good_kernel = self.import_record(observed, kind="kernel-metrics")
         _, good_bench = self.import_record(benchmark_document())
         kernel, bench = json.loads(good_kernel.read_text()), json.loads(good_bench.read_text())
+        # A typed launch on an unbound record, so persisted launch fields are validated too.
+        launched = copy.deepcopy(kernel)
+        launched["launch"] = {"argv": ["py", "<result-json>"], "env": {}, "cwd": "/w", "cpu_affinity": [0, 1],
+                              "binaries": {"py": "b" * 64}, "loader_observation": "ldd initial resolution",
+                              "started_unix": 1.0, "finished_unix": 2.0, "result_sha256": "c" * 64}
+        good_launched = self.root / "good-launched.json"
+        good_launched.write_text(json.dumps(launched))
 
         def hostile(base: dict, mutator, raw_text: str | None = None) -> Path:
             self.counter += 1
@@ -422,13 +521,30 @@ class PerfBaselineTest(unittest.TestCase):
             "bound without launch": (good_kernel, hostile(kernel, lambda d: d.update(grade="bound"))),
             "null runtime configuration": (good_bench, hostile(bench, set_path(["workload", "runtime_configuration"], None))),
             "missing model input": (good_bench, hostile(bench, set_path(["workload", "declared_inputs"], {}))),
-            "wrong schema": (good_kernel, hostile(kernel, set_path(["schema"], "llaminar.perf-baseline.v2"))),
+            "wrong schema": (good_kernel, hostile(kernel, set_path(["schema"], "llaminar.perf-baseline.v3"))),
+            "1e999 in observations": (good_kernel, hostile(kernel, lambda d: None,
+                                                           text.replace("1.25", "1e999", 1))),
+            "numa node null memory": (good_kernel, hostile(kernel, set_path(["host", "numa_nodes"],
+                                                                            [{"node": 0, "cpus": "0", "mem_total_kb": None}]))),
+            "numa node bool id": (good_kernel, hostile(kernel, set_path(["host", "numa_nodes"],
+                                                                        [{"node": True, "cpus": "0", "mem_total_kb": 1}]))),
+            "null logical cpus": (good_kernel, hostile(kernel, set_path(["host", "logical_cpus"], None))),
+            "declared digest with newline": (good_bench, hostile(bench, set_path(
+                ["workload", "declared_inputs", "model", "sha256"], "a" * 64 + "\n"))),
+            "bool cpu affinity": (good_launched, hostile(launched, set_path(["launch", "cpu_affinity"], [True]))),
+            "negative cpu affinity": (good_launched, hostile(launched, set_path(["launch", "cpu_affinity"], [-1]))),
+            "duplicate cpu affinity": (good_launched, hostile(launched, set_path(["launch", "cpu_affinity"], [1, 1]))),
+            "binary digest with newline": (good_launched, hostile(launched, set_path(["launch", "binaries"],
+                                                                                     {"py": "b" * 64 + "\n"}))),
+            "finished before started": (good_launched, hostile(launched, set_path(["launch", "finished_unix"], 0.5))),
         }
-        # Imports have no launch record; waive exactly those unknown fields so that each
-        # hostile document is rejected by validation itself, not by the identity refusal.
-        launch_waivers = [arg for field in ("argv", "launch_env", "cwd", "cpu_affinity")
-                          for arg in ("--allow-identity-change", field)]
-        for good in (good_kernel, good_bench):
+        # Waive every identity field so that each hostile document can only be rejected
+        # by validation itself, never by an identity refusal.
+        fields = ["argv", "backends", "build_type", "compiler", "cpu_affinity", "cpu_isa", "cwd", "cxx_flags",
+                  "declared_inputs", "host_cpu", "host_kernel", "host_page_size", "host_topology", "kind",
+                  "launch_env", "output", "workload"]
+        launch_waivers = [arg for field in fields for arg in ("--allow-identity-change", field)]
+        for good in (good_kernel, good_bench, good_launched):
             self.assertEqual(self.diff(good, good, *launch_waivers).returncode, 0, "valid pair must compare")
         for name, (good, path) in cases.items():
             with self.subTest(name):

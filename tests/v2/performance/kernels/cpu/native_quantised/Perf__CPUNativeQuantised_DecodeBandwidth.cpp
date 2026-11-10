@@ -28,7 +28,7 @@
  *   two middle samples for even n).
  * - **Authentication.** The serial one-worker reference is pre-filled with one
  *   NaN payload and must be completely finite afterwards (proof that every
- *   column was published). Every timed invocation starts from a different NaN
+ *   sentinel was replaced; a non-finite element is unpublished or invalid). Every timed invocation starts from a different NaN
  *   payload (written before the timer starts), and its complete output is
  *   compared byte for byte, after the timer stops, with that reference. This proves the timed launches equal
  *   the serial production arithmetic; it is not an independent reference
@@ -229,9 +229,10 @@ float timedSentinel()
 /**
  * @brief Prove the serial reference was completely published before its bytes are trusted.
  *
- * The synthetic weights and activations produce finite outputs, so every
- * reference element must be finite; an element still holding the NaN sentinel
- * (or any non-finite value) means the reference call did not write it.
+ * The synthetic weights and activations are expected to produce finite
+ * outputs. A non-finite element is either unpublished (still the NaN sentinel)
+ * or an invalid non-finite result; both reject the reference. A fully finite
+ * reference proves every sentinel was replaced.
  * @throws std::runtime_error When any reference element is not finite.
  */
 void requirePublishedReference(const std::vector<float> &reference, const std::string &context)
@@ -239,7 +240,7 @@ void requirePublishedReference(const std::vector<float> &reference, const std::s
     for (size_t column = 0; column < reference.size(); ++column)
         if (!std::isfinite(reference[column]))
             throw std::runtime_error(context + ": serial reference column " + std::to_string(column) +
-                                     " was not published");
+                                     " is non-finite (unpublished or invalid)");
 }
 
 /**
