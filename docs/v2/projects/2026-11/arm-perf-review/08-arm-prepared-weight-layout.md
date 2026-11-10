@@ -53,3 +53,22 @@ hash. Either:
   GB10 UMA admission with idea 2 to show real capacity gain. Unmeasured
   prepared-vs-GGUF resident ratios today: no complete ARM engine has loaded a
   real model yet.
+
+## PLAN APPROVED (2026-11-10, old addon lane; coordinator pickup in plans/idea-08-prepared-weight-layout-plan.md)
+
+Five decisions approved: split A (dead-byte elimination — the 128 B
+comp_int16 x86 section, never read by ARM signed-SDOT: 10.0% dead on
+NibbleLUT, 5.56% on ExpandedInt8) / B (ARM-native compact encodings, vqtbl
+in-register decode — biggest lever IQ3_S 9.5 vs 3.44 bpw, the 35B's
+format); ONE ABI/migration mechanism (prepared-layout version in
+cache/wire/BOM keys per CPU instruction family; mixed-version ranks fail
+fast at admission; re-prepare from GGUF, no byte converters); **Phase A
+GO NOW** (measurement-only, no ABI, ~1 lane-week: per-format BOM audit +
+diagnostic compact-decode tournament, non-installed/rule-166-declared,
+M=1 AND M=15); Phase B CONDITIONAL on engine decode ≥ +5% (A) / ≥ +15%
+projected 35B (B) + the M=4 ALU check + idea-16's attribution confirming
+weight-bandwidth binding; NO-GO criteria accepted. Sequenced after the
+register-gate coordinator lands (rule-166 hard gate from day one).
+TRACKER CORRECTION ACCEPTED: "no engine has loaded a real model" is stale
+— A1/35B/27B runs load real models; the resident BOM audit is runnable.
+.80 window: after the half-perf validation + idea-16 Phase A clear.
