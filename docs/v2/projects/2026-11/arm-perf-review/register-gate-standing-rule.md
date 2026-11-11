@@ -391,3 +391,18 @@ OpenMP-less Mac; hook documents the bypass). REMAINING = the full
 consolidated RG1–RG4 list — next successor commits on the same branch.
 HOLD unchanged; no FF/campaign/issue-58 closure until the focused ACK of
 the genuinely fixed source.
+
+### Main VERIFIES 3ce558a6b as genuine bounded progress (~09:28Z)
+
+Main independently: confirmed remote full 3ce558a6b9e130b63a763d3574fed48
+896a807fb; inspected the exact c002→3ce 3-file +17/−6 diff; read
+/tmp/rg-clean-3ce5-regression.log (Ran 12 in 68.078s OK). Verdict: GENUINE
+bounded progress — argv/selectors/envelope-hash/real-probe-TU +
+Path/expected-id/first-failure fixes ARE in the pin. The owner 12-OK log
+is marked WITH PROVENANCE: focused/intermediate evidence only — NOT whole
+closure/economy/native qualification. No full ACK request needed for this
+intermediate; ALL remaining RG1–RG4/task-77/issue-58 HOLD persists; one
+full Main campaign NOT started. c002 failure logs preserved separately.
+OPERATOR DIRECTIVE overlaid: GitHub-issue freeze — no new issues without
+operator direction; #57/#58 are the only live tracking issues (close on
+verified fix); the tracker is the primary ledger.
