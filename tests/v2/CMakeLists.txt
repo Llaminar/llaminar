@@ -19415,6 +19415,21 @@ add_v2_test(V2_Perf_CPUMoERouterVerifierRows
     TIMEOUT 120
 )
 
+# Performance diagnostic only: M=1 production single-token MoE FFN sequence
+# versus the grouped FFN transaction at a one-row route. Byte-exact arm gates,
+# unprofiled alternating paired timings, no production change implied.
+add_executable(v2_perf_cpu_moe_stt_transaction
+    performance/kernels/moe/Perf__CPUMoESingleTokenTransaction.cpp)
+target_include_directories(v2_perf_cpu_moe_stt_transaction PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(v2_perf_cpu_moe_stt_transaction PRIVATE cxx_std_20)
+target_link_libraries(v2_perf_cpu_moe_stt_transaction PRIVATE llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CPUMoESingleTokenTransaction
+    COMMAND $<TARGET_FILE:v2_perf_cpu_moe_stt_transaction>
+    LABELS "V2;Performance;MoE;CPU;DecodeEquivalent;ByteExact;Diagnostic"
+    NO_MODELS NO_MPI MPI_PROCS 1
+    TIMEOUT 300
+)
+
 # Performance diagnostic only: exact host maintenance candidate-search economy.
 # Its functional oracle lives in ExpertOverlayPreparedTransactionEconomy preflight.
 add_executable(v2_perf_prepared_expert_swap_search
