@@ -107,3 +107,35 @@ Full report archived: evidence/i16a-phase-a-report.md. TOP LINES:
    acceptance" may share the same mode ambiguity.
 5. B4 stays fenced to the operator. Prefill G1 = 12-token-prompt only,
    NOT tracker-comparable.
+
+### **CORRECTION (author, ~11:56Z) — verifier LM head is GROUPED, not per-row**
+
+Supersedes the "one full-vocab M=1 GEMV PER VERIFIER ROW" claim in the
+Phase A lines above (full correction appended to
+evidence/i16a-phase-a-report.md, commit 4c4d52687):
+- Decisive counter in the same MTP stats: `mtp
+  lm_head_grouped_decode_equivalent_verifier_prefill_rows count=264
+  value=1560` — the verifier LM head IS the grouped decode-equivalent
+  path: 264 grouped calls covering all 1560 rows (~2.4-2.8× amortization).
+- The 1560 stage_cpu LM_HEAD calls = **1296 DRAFT-step M=1 calls + 264
+  verifier grouped calls** (1296 = mtp draft_steps exactly). The real
+  per-row full-vocab cost is the DRAFT side, BY DESIGN
+  (Qwen35Graph::buildMTPGraph wires full_vocab_output at seq_len=1 — the
+  draft samples from the full distribution).
+- Corrected MTP-dyn per-token deltas (profiled): LM head +6.56 TOTAL =
+  draft full-vocab ≈ +2.95 (top MTP-specific kernel cost) + verifier
+  grouped ≈ −0.67 (grouped WINS); GDN recurrence +3.96 (≈1.0×); MoE +2.17
+  (≈1.76×); GDN projection −0.82; shared expert −1.14; net ≈ +11.9 ✓.
+- REFRAMED BREAKEVEN: blended amortization ≈1.9× vs rows/token 2.03 at
+  38.9% acceptance → loses; at 99% acceptance rows/token ≈1.06 → wins
+  with today's kernels. The acceptance collapse (rider) is the decisive
+  gate; kernel fixes change the breakeven, not the sign at 38.9%.
+- REFRAMED B-CANDIDATES: (A) grouped LM-head kernel ~20-22 GB/s at M≈6 vs
+  45 GB/s at M=1 → ~2× kernel headroom (needs microbench before any
+  claim; REPLACES the route-verifier-rows candidate — already taken);
+  (B) draft-side logits = B4-family CONTRACT nuance: top-k/shortlist is
+  exactness-safe under GREEDY verification, changes semantics under
+  STOCHASTIC — goes into the B4 contract proposal. idea-14's "5.7 ms per
+  verifier row" sentence needs re-reading (verifier rows were already
+  grouped; the unamortized full-vocab cost is the DRAFT per-step head —
+  27B dense draft economics apply there too).
