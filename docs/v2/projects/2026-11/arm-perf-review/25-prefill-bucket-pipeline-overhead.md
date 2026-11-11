@@ -289,3 +289,15 @@ route). Main will do ONLY local model-free repro/source inspection; needs
 the complete error rep to confirm. WARNED: the addon's final register
 campaign may need to ride a Main NARROW FIX; do NOT change
 placement/validation/env on .79 (no workaround).
+
+### OPERATOR DIRECTIVE (2026-11-11 ~01:05Z): "just install it if needed"
+
+The nsys image-change proposal no longer waits on approval — arm-sparks is
+authorized to install nsys directly into the GB10 lane image (uma3 or a
+successor tag). Sequence: install → `nsys --version` → MINIMAL attach smoke
+test on a trivial CUDA process. If the NVRM `refcntRequestReference_IMPL`
+attachment issue reproduces, STOP attach attempts and report the exact
+error (station driver issue — installing nsys cannot fix it); if the smoke
+test attaches cleanly, the profiler-safety HOLD lifts for nsys-specific
+use and idea 25's 15-min prefill trace rerun is UNBLOCKED (still scheduled
+after the B12 window to avoid host contention).
