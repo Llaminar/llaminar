@@ -125,6 +125,30 @@ namespace
                 throw std::runtime_error("Cannot publish native OpenMP place startup: "+std::string(std::strerror(errno)));
         }
 
+        /**
+         * @brief Count the launcher's co-resident ranks visible at original entry.
+         * @return Open MPI or MPICH/Hydra local rank count, or 1 when absent.
+         * @throws std::runtime_error for a present but malformed count.
+         * @details MPI is not initialized yet, so the launcher environment is
+         * the only pre-MPI evidence that sibling processes share this
+         * partition. A malformed value is rejected rather than guessed.
+         */
+        long coResidentLauncherRanks()
+        {
+            for(const char *name:{"OMPI_COMM_WORLD_LOCAL_SIZE","MPI_LOCALNRANKS"})
+            {
+                const char *raw=::getenv(name);
+                if(!raw)continue;
+                const std::string_view value(raw);
+                long count=0;
+                const auto parsed=std::from_chars(value.data(),value.data()+value.size(),count);
+                if(value.empty() || parsed.ec!=std::errc{} || parsed.ptr!=value.data()+value.size() || count<1)
+                    throw std::runtime_error(std::string("Malformed launcher local rank count ")+name);
+                return count;
+            }
+            return 1;
+        }
+
 
     /** @brief Process-entry transitions; none can be reentered after application work. */
     enum class EntryPhase { Unclaimed, Claimed, Ready, OtherPlacement };
@@ -336,7 +360,15 @@ namespace
         const bool authored_unbound=requested_binding &&
             ::strcasecmp(requested_binding,"false")==0;
         const bool automatic_binding=!authored_unbound;
-        const bool automatic=automatic_binding && (!requested || !*requested ||
+        // Canonical places describe one process owning its whole original
+        // partition. Co-resident launcher ranks without authored places share
+        // that partition, and each rank would bind its master to the same
+        // first place, time-slicing every rank on one core. Such an original
+        // entry keeps its native partition; a launcher or bootstrap that
+        // divides cores supplies explicit per-rank places instead.
+        const bool shared_launch_partition=coResidentLauncherRanks()>1 &&
+            !(receipt && receipt->process==static_cast<long>(::getpid()));
+        const bool automatic=automatic_binding && !shared_launch_partition && (!requested || !*requested ||
             std::string_view(requested)=="cores" ||
             (receipt && std::string_view(requested)==receipt->places));
         const bool current=receipt && receipt->process==static_cast<long>(::getpid());
