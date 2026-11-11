@@ -586,3 +586,11 @@ include dirs OMIT tests/v2 → fatal at
 Perf__CPUMoESingleTokenTransaction.cpp:72 (same for the compact target).
 Fix-back sent to addon2 (CMake include-dir fix); sparks resumes on their
 fix. NOT disk/fetch (86G free; SHA verified).
+
+### W2 FIX-BACK LANDED (addon2, ~22:28Z): a6aee9bac — include roots complete
+
+Both bench targets now carry the source root AND tests/v2 include roots
+(the STT target was missing tests/v2; the compact target was missing the
+src root). Root cause of the miss: local syntax checks invoked clang++
+with both -I paths manually, masking the CMake gap. Origin-verified;
+sparks resumes the W2 build on .79.
