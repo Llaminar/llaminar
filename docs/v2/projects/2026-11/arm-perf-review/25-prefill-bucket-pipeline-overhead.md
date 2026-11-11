@@ -333,3 +333,14 @@ unblocked" — idea-25's trace stays scheduled pending canonical
 diagnostics + operator scope. LESSON (recurring): process exit codes
 never certify driver state; only canonical host diagnostics bound to the
 exact window do.
+
+### Custody constraint (Main, ~04:54Z): no backdating receipts; retrospective ≠ canonical
+
+- Do NOT manufacture/backdate begin/finish receipts for the smoke already
+  run. The preserved raw host journal may be reviewed retrospectively for
+  BOUNDED FACTS but CANNOT be relabeled as a pre-existing canonical window.
+- If the required state/window was not recorded at the time: mark
+  UNQUALIFIED.
+- Any NEW smoke needs its own explicit booking + a REAL begin BEFORE the
+  attach and a finish AFTER — no implicit rerun / extra GPU work authorized
+  by the diagnostics request.
