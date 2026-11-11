@@ -353,3 +353,17 @@ no successor; HOLD unchanged. NEXT SESSION: start from Main's raw log
 coordinator consumption path / generated-tree assembly (stub writer
 exonerated). Successor commits carry Refs #58; commit-first +
 clean-checkout + per-file SHAs + raw log path.
+
+### PRECISION (Main, ~09:15Z): argv defect is the known blocker — writer NOT exonerated
+
+'stub-clobber/order theory disproved' ≠ 'stub writer exonerated'. Exact
+c002 writer STILL reads sys.argv[5]/[6]/[7]; the COMMAND supplies only
+build-dir + missing-artifact (two args) → most artifacts written, then
+IndexError BEFORE the proof.json write — matches the observed
+missing-json exactly (reviewer-177 finding, still open). NEXT-SESSION FIX
+ORDER: (1) argv mismatch (command supplies 3 args OR writer reads 2);
+(2) envelope_sha256 inclusion in the stub writer (required by
+publication); (3) only then, if a defect remains, the coordinator
+consumption path. No full-9 run needed. The rollover handoff file
+(issue58-handoff.md) must be AMENDED with this correction before
+rollover completes — the argv blocker is a known, named, first-fix item.
