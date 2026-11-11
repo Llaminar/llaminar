@@ -1815,3 +1815,32 @@ PROVEN → idea-25 trace bookable) → B1 focused check on .79 if disk fits
 after pruning superseded dirs (Release ≈10G + smoke ≈1G within 66G).
 .80 = Main's lease, untouched. Post-campaign .80 order locked: greedy
 rider → idea-08 BOM census + tournament → M=1 economy → Lane-2.
+
+### OPERATOR DECISION QUOTED (Main's request, ~20:47Z): campaign scope
+
+The operator's campaign-scope decision was given via the coordinator's
+structured question (~20:15Z), answer verbatim: **"Accept qualified-
+relative (Recommended)"** — selected for the question "The campaign at
+0924175d: 25 failures remain — ALL inherited/environment (0 new, 10
+collection-introduced fixed). Main holds the .80 lease and asks your
+scope decision..." That is the literal operator instruction record;
+Main's execution of it (lease return, inherited-dispatch) follows it.
+
+### LITERAL .80 SNAPSHOT 20:46:53Z (Main SSH read-only) — recorded
+
+(1) docker ps EMPTY — no greedy rider running yet. (2) **A2 EXPORTS
+LANDED:** host /home/factory/llaminar-i8mm/a2-bb893cd79/ (container
+/work/a2-bb893cd79/): a2-35b-mtp.{json,out}, a2-35b-nomtp.{json,out}
+(13:17-13:18); a2-27b-mtp.{json,out}, a2-27b-nomtp.{json,out} (13:50-
+13:53); plan35/plan27 {json,log}; a2-r3-serve.log + a2-r3-ready.txt
+(14:32); a2-cfg.log + a2-build.log; runner build/a2run27.sh. NOTE: the
+A2 riders ran at the bb893cd79 tree (dir name), not 880429059. Main has
+not authenticated these artifacts. (3) Campaign evidence retained:
+12675c956 (build-campaign-1267, campaign-1267-results, receipt + unit/
+integration-{host,exclusive,cuda-socket,rocm-socket} xml/log, cfg/build/
+driver/launch logs + exit.txt, source campaign-src-shared2 @ 0924175d);
+480 (campaign-480-results, build-campaign-480, main-campaign480-*);
+focused/diagnostic dirs (build-focused-ae76 [failed first candidate],
+build-focused-fix2, build-diag3, build-a1fix, build-a1fix2, build-shared1
++ their ctest logs/xml); mpi480-baseline.{log,xml}. Local copies:
+/tmp/llaminar-main-bb-linux-results/.
