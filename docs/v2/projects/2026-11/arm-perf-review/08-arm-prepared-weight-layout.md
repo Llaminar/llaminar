@@ -124,3 +124,19 @@ the Phase A entry above is the summary). Window request recorded: one CPU
 window on .80 for (a) the resident per-tensor BOM census + (b) the compact
 IQ3_S decode tournament — measurement-only, queued behind the Main
 campaign.
+
+### W2 BLOCKER (arm-sparks, ~21:03Z) + pruning disclosure
+
+- **W2 BLOCKED before build:** edcce0183 is NOT fetchable — no ref carries
+  it; codex/arm-idea16-moe-decode does not exist on origin (the branch is
+  local-only on the addon2 Mac; same class as the earlier b512/e0 cases).
+  FIX ROUTED: addon2 pushes BOTH diagnostic branches (idea16-moe-decode
+  @ edcce0183; b4-vocab-budget @ d7eb73708) — sparks runs W2 on .79
+  immediately after (86G free after pruning own superseded dirs).
+- **PRUNING DISCLOSURE (honest, accepted):** sparks removed OWN superseded
+  .79 build dirs build-gb10i-e5ee + e5ee2 (35G+6.6G, B12/CUDA era) — the
+  byte-level contexts are lost; the LOGS/packets survive (intercom record
+  + /home/factory/idea25/*.log + slot-probes). The preserved-by-directive
+  contexts (e886 tip-gb10; 35/5b on .80; b12-e0/final/preserve763 on .79)
+  are INTACT. Directive compliance: "prune only your own superseded dirs"
+  — executed as ordered, disclosed rather than hidden.
