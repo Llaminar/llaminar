@@ -1504,3 +1504,13 @@ regression + preflight registration) remains UNCOMMITTED until coherent →
 one exact SHA for the reviewer. Final campaign HOLD until Main's B12-fix
 SETTLED pin (post-B12 tip = the re-pin target; confirmed again). Source ACK
 #184 (763) received/noted.
+- (addon, ~00:34Z) codex/arm-s4-nibble-witness = **38ed21507** (FF over
+  2ff599ec0; formatting-only reflow of the RG-2 refusal patterns — no
+  behavior change; NO --parallel 1 anywhere; ordinary build/test
+  parallelism unrestricted — confirmed). Worktree clean at HEAD → the
+  committed script IS the current script (the pre-reflow digest a6861a71…
+  applies to the working variant only; the committed script's own digest
+  rides in each run's summary). #175 successor (checked-in coordinator
+  regression + preflight registration) next; exact SHA when coherent.
+  Reviewer re-check at the final pin (digest consistency between the
+  reviewed pre-reflow script and the committed one must be noted).
