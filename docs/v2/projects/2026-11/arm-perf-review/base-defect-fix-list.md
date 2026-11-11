@@ -406,3 +406,22 @@ Both under GOMP_SPINCOUNT=3000000 (test env default, MPIBootstrap.cpp:546),
 20T places=cores bind=close. Full logs: .79 /home/factory/idea25/
 b12-final/run1.log. .79 HELD for Main's next corrected pin; the tests-only
 runner (b12tests.sh, SHA-staged) is reusable as-is.
+
+### CORRECTION to the attempt-2 deep-dive (Main inspection of actual run1.log, ~01:54Z)
+
+Qualification RED confirmed (3 PASS / 2 FAIL), but my causal reads were
+wrong and are WITHDRAWN:
+- observed 14 IS present; ONLY 0–4 missing; 15–19 duplicated. First
+  mismatch = worker 15 → workers 0–14 INCLUDING master 19 MATCHED
+  expected → NOT evidence the old master restore persists (the
+  'polluted tail = stale restore' interpretation is retracted).
+- Inventory line: `MPI inventory_ranks=1 expected_ranks=1; workers 20` is
+  a SEPARATE field set; ALL printed tuples match → the 'unseen 1 vs 20
+  mismatch' claim is FALSE.
+- OPEN: the failed UNPRINTED predicate of CPUClusterPermanentMasterPlacement
+  (hwloc warning ≠ causal proof) needs capture; fresh diagnosis required
+  (binding/runtime/fixture/provenance) before the fix iteration. Main reads
+  metadata/source; binary + siblings/runtime binding evidence needed first.
+- .79 HOLD; no env/placement workarounds.
+LESSON: report what the log shows, not the pattern it suggests — diagnose
+from printed evidence only; suspected mechanisms wait for their predicate.
