@@ -12,6 +12,7 @@
  */
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
+#include "utils/ARMCPUFeatures.h"
 #include "../../utils/CPURouterKernelTestAdmission.h"
 #include <gtest/gtest.h>
 #include <omp.h>
@@ -268,6 +269,97 @@ TEST(CPUHalfOperands, NativeBF16RouterSerialRowsAndRetainedBank){
         for(int m:{31,63})proveBF16Router(m,k,workers);
     }
     proveBF16Router(3,2048,3);
+}
+/** @test K tails of 0..255 around the 256-lane stripe and non-multiple widths. */
+TEST(CPUHalfOperands, KTailBoundariesAllRowsMatchSerial){
+    for(int workers:{1,3})for(int m:{1,2,3,4})
+        for(int k:{255,256,257,300,511,512,513,767})proveLinear(m,k,workers);
+    // Repeated runs of one boundary geometry stay byte-identical.
+    proveLinear(2,257,3);
+    proveLinear(2,257,3);
+}
+/** @brief Test-owned exact binary16 widening and fixed-256-lane tree over chosen half words. */
+float canonicalHalfTree(const std::vector<uint16_t> &a_words,const std::vector<uint16_t> &b_words){
+    constexpr int lanes=256;
+    auto widen=[](uint16_t word){
+        const uint32_t sign=uint32_t(word & 0x8000u)<<16;
+        const uint32_t exponent=(word >> 10) & 0x1fu, mantissa=word & 0x3ffu;
+        uint32_t bits;
+        if(exponent==0)bits=sign | (mantissa<<13);
+        else if(exponent==31)bits=sign | 0x7f800000u | (mantissa<<13);
+        else bits=sign | ((exponent-15u+127u)<<23) | (mantissa<<13);
+        float out;std::memcpy(&out,&bits,sizeof(out));return out;
+    };
+    std::array<float,lanes> partials{};
+    for(size_t i=0;i<a_words.size();++i){
+        const size_t lane=i & size_t(lanes-1);
+        partials[lane]=std::fma(widen(a_words[i]),widen(b_words[i]),partials[lane]);
+    }
+    for(int stride=lanes/2;stride>0;stride>>=1)
+        for(int lane=0;lane<stride;++lane)
+            partials[size_t(lane)]=partials[size_t(lane)]+partials[size_t(lane+stride)];
+    return partials[0];
+}
+/** @test Adversarial half operands, RNE ties and overflow-to-Inf: leaf bytes equal the owned tree. */
+TEST(CPUHalfOperands, FmlalSpecialOperandsMatchOwnedTree){
+    // +-0, subnormals, min/max normals, +-Inf, quiet and payload NaNs.
+    const std::array<uint16_t,12> weight_words{{
+        0x0000,0x8000,0x0001,0x03FF,0x7C00,0xFC00,0x7E00,0x7C01,0x7BFF,0x0400,0x8001,0x3C00}};
+    // FP32 A values whose binary16 RNE words are hand-verified: ties, the
+    // overflow-to-Inf boundary and normals (the conversion table is the one
+    // HalfRNEBoundaryAndFP32Output pins).
+    const std::array<std::pair<float,uint16_t>,12> a_cases{{
+        {0.f,0x0000},{-0.f,0x8000},{0x1.8p-24f,0x0002},{0x1.4p-23f,0x0001},
+        {1.f+0x1p-11f,0x3C00},{1.f+3*0x1p-11f,0x3C01},{65520.f,0x7C00},
+        {65536.f,0x7C00},{-65536.f,0xFC00},{65519.f,0x7BFF},{2.f,0x4000},{-2.f,0xC000}}};
+    for(int k:{12,40,300}){
+        constexpr int N=3;
+        std::vector<uint16_t> words(size_t(N)*k),half(size_t(5)*k);
+        std::vector<float> source(size_t(5)*k);
+        for(int j=0;j<N;++j)for(int c=0;c<k;++c)
+            words[size_t(j)*k+c]=weight_words[size_t((j+c)%12)];
+        for(int row=0;row<5;++row)for(int c=0;c<k;++c){
+            half[size_t(row)*k+c]=a_cases[size_t((row+c)%12)].second;
+            source[size_t(row)*k+c]=a_cases[size_t((row+c)%12)].first;
+        }
+        FP16Tensor weight({size_t(N),size_t(k)},words);
+        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+        FP32Tensor input({size_t(5),size_t(k)}),half_as_fp32({size_t(5),size_t(k)}),output({size_t(5),size_t(N)});
+        std::copy(source.begin(),source.end(),input.mutable_data());
+        FP16Tensor half_input({size_t(5),size_t(k)},half);
+        // Expected bytes: the owned tree per row/column (alpha=1, beta=0, no bias).
+        std::vector<float> expected(size_t(5)*N);
+        for(int row=0;row<5;++row)for(int j=0;j<N;++j){
+            std::vector<uint16_t> a_words(static_cast<size_t>(k)),w_words(static_cast<size_t>(k));
+            for(int c=0;c<k;++c){
+                a_words[size_t(c)]=a_cases[size_t((row+c)%12)].second;
+                w_words[size_t(c)]=weight_words[size_t((j+c)%12)];
+            }
+            expected[size_t(row)*N+j]=canonicalHalfTree(a_words,w_words);
+        }
+        for(int repetition:{1,2}){
+            std::fill_n(output.mutable_data(),size_t(5)*N,-777.f);
+            ASSERT_TRUE(engine.multiply_tensor(&input,&output,5,N,k))<<"k="<<k<<" rep="<<repetition;
+            EXPECT_EQ(std::memcmp(output.data(),expected.data(),expected.size()*sizeof(float)),0)<<"fp32A k="<<k;
+            std::fill_n(output.mutable_data(),5*N,-777.f);
+            ASSERT_TRUE(engine.multiply_tensor(&half_input,&output,5,N,k))<<"half k="<<k<<" rep="<<repetition;
+            EXPECT_EQ(std::memcmp(output.data(),expected.data(),expected.size()*sizeof(float)),0)<<"halfA k="<<k;
+        }
+    }
+}
+/** @test The FMLAL leaf selection maps exactly onto the declared envelope. */
+TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
+    // The leaf is compiled exactly in the envelope that declares FP16FML; an
+    // envelope without it keeps the scalar schedule and never selects the
+    // leaf (the dispatch carries no NEON case without the guard).
+    EXPECT_EQ(fmlalLeafCompiledInEnvelope(),
+        (llaminar2::cpu::ARMCPUCapabilities::compiledEnvelopeFeatures() &
+         uint32_t(llaminar2::cpu::ARMCPUFeature::FP16FML))!=0);
+    // A compiled leaf requires the executing CPU to advertise FEAT_FHM; the
+    // dispatch admission fails fatally before any leaf instruction otherwise.
+    if(fmlalLeafCompiledInEnvelope())
+        EXPECT_TRUE(llaminar2::cpu::ARMCPUCapabilities::native().supports(
+            llaminar2::cpu::ARMCPUFeature::FP16FML));
 }
 /** @test Explicit preflight scaling sweep; excluded from the fast Unit alias. */
 TEST(CPUHalfOperands, EveryPositiveWorkerBudget){
