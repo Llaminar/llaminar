@@ -35,3 +35,23 @@ spill instructions, out of 16 per family):
 This is a real perf item: reduce/eliminate the grouped-tile spills (R4 ASIMD
 ~950) — C4 (wider panels, addon lane) touches the same tiles; coordinate when
 C4 lands.
+
+### B9-STRENGTHENING FOLD LANDED (station session, ~23:08Z): 108bce2e — 64/64 OK
+
+Independent station implementation of the B9 method (register-evidence
+classifier: post-index general load `ldr x,mem,imm` + unscaled halfword
+`ldurh w,mem` admitted in the tile-witness grammar; post-index beside a
+scaled offset/with writeback/from-register stays unclassifiable), commit
+108bce2eab8d9860a82456b7ff9aafe0a163f09e (tree d71a3615a; parent = exact
+tip 825fe8deb; 2 files, 31+/1−).
+VALIDATION (station-native, compiler-free, the registered cells' own
+commands): RED baseline 63 tests w/ exactly the 3 deferred controls
+failing → AFTER **analysis shard 64/64 OK** (the folded criterion) +
+binding shards 4/4 (25 tests); py_compile clean; no production/checker/
+registration/inventory change; no perf claims; hooksPath unset recorded.
+NOTE: f265d2950 (addon's B9 composition) not in the station object DB —
+independent implementation vs the branch's own 3 controls; reviewer can
+range-diff. Evidence: /home/tdsynnex/repo/llaminar-perf-b9/artifacts/
+b9-strengthening/ (baseline-red/ + after-method/ logs, receipt SHA256s);
+bundle ffbbb8a8… + patch 935c18a6…. PUSH authorized (FF from 825fe8deb
+only); branch cleanup for b9-strengthening = post-review.
