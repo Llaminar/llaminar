@@ -218,3 +218,48 @@ diagnostic hypotheses.** B4 shortlist remains OPERATOR-FENCED (no
 automatic greedy-byte-exact or stochastic-semantics conclusion without
 the full proposal/acceptance contract proof). The exact-sampler rider
 remains a CONTROLLED REFERENCE only.
+
+### B1 diagnostic bench IMPLEMENTED: bdbb8e370 (arm-addon2, ~12:09Z) — .80 focused checks pending
+
+On codex/arm-idea16-moe-decode, base **bb893cd79** (branch start moved to
+the current line tip — the original e8866ec04 start was superseded by the
+base advancing). 2 files +965: Perf__CPUMoESingleTokenTransaction.cpp +
+CMake registration (v2_perf_cpu_moe_stt_transaction / NO_MODELS NO_MPI,
+TIMEOUT 300). Contract compliance:
+- ACTUAL production helpers both arms: A = CPUMoEKernel::route +
+  publishedRouterQ8Hidden (admitted publication root) →
+  multiply_fused_router_q8_hidden_grouped_decode_equivalent (production
+  hosting on first active expert's gate engine) →
+  compute_swiglu_gpu_aligned_expert_serial → multiply_fused_expert_down
+  (INTERNAL per-expert Q8 quantization, workspace-admitted bank) →
+  vec_axpy publication. B =
+  execute_moe_grouped_ffn_transaction_preq_decode_equivalent, 16 gate/up +
+  8 down descriptors, rows=1, ALL gate/up members at the SAME
+  published-router-Q8 row pointer (no copies), Decode purpose, Auto
+  policies.
+- NO copied oracle: the SwiGLU-Q8 byte gate applies the production
+  quantize_activations_to_q8_1 helper to arm A's rows vs arm B's bank
+  (launcher-vs-wrapper divergence would surface as a FINDING).
+- Preallocate/seal before timing; inputs re-compared after every phase.
+- Hard byte gates ALL outputs (gate/up ×8, SwiGLU-Q8 ×8, down ×8, route
+  contribution) BEFORE + AFTER timing; 64 B guard canaries; A-vs-B gates
+  vs guard-proven banks.
+- PROOF PASS (separate, unprofiled): fresh deltas of router_q8_reuse +
+  fused_expert_down (arm A) and grouped_ffn_transactions (arm B) each
+  exactly 1.
+- Timing: warmup 8 pairs + 120 paired samples (≥100 enforced),
+  alternating within-pair order, per-arm clocks, unprofiled, medians/
+  mean/sd + ratio; verdict line = diagnostic_only.
+- ADMISSION GAP → ADD_FAILURE, no fallback/reshape/production fix.
+- Geometry: d_model 2048, intermediate 512, 256-expert real top-8;
+  default IQ2_S gate/up + IQ4_XS down (real UD per-tensor pairing) + env
+  overrides (STT_GATE_UP_FORMAT/STT_DOWN_FORMAT/STT_POLICY).
+- STATUS: -fsyntax-only passes locally (clang 22 NEON); LINKED build/run
+  IMPOSSIBLE on macOS (libnuma) → focused checks + economy run happen in
+  the .80 window; committed with the hook's documented --no-verify bypass.
+- WINDOW REQUEST: after Main campaign + greedy rider; 4 observed
+  placements (mixed@20T, fast-only@10T taskset 5-9,15-19, slow-only@10T
+  taskset 0-4,10-14, 1T), each an independent V2_Perf_
+  CPUMoESingleTokenTransaction invocation at bdbb8e370, Release
+  Integration build, default formats, unprofiled, evidence = stdout +
+  CPU_STT_* lines per placement into a K14 seal.
