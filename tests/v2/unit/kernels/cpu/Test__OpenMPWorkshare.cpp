@@ -844,9 +844,11 @@ namespace
                 for (std::uint64_t note = 0; note < notes; ++note)
                     noteOpenMPTeamFork();
                 worker_notes_done.store(true, std::memory_order_release);
-                // Verification and teardown happen only after the main thread
-                // stopped the clock and opened the verify gate: the timed
-                // window contains the notes and nothing else.
+                // Verification and teardown happen only after the main
+                // thread stopped the clock and opened the verify gate: the
+                // timed interval is the amortized concurrent wall time
+                // including the rendezvous, and this teardown still waits
+                // for that gate.
                 while (!verify_gate.load(std::memory_order_acquire))
                     std::this_thread::yield();
                 EXPECT_EQ(scope->forks(), notes);
@@ -888,6 +890,10 @@ namespace
         if (concurrent_threads)
         {
             EXPECT_EQ(main_owner->forks(), notes);
+            main_owner.reset(); // Destroyed on the thread that owns it.
+            // EXACT TLS STACK IDENTITY after the main owner's teardown.
+            EXPECT_EQ(llaminar::v2::openMPTeamForkOwnerStack, stack_at_entry)
+                << "the original owner stack must be restored exactly";
             worker.join(); // The worker verified and destroyed its own scope.
             result.process_delta = 2 * notes;
         }
@@ -940,8 +946,9 @@ namespace
             }
         }
         // Every configuration counts each fork exactly once in the total
-        // (the nested branch's figure includes its restoration probe and the
-        // post-teardown fork that proves the original stack is restored).
+        // (the nested branch's figure includes its restoration probe; the
+        // original stack restoration is proven by pointer identity, and the
+        // concurrent branch runs two measuring threads).
         EXPECT_EQ(openMPTeamForkSnapshot() - before, result.process_delta)
             << (concurrent_threads ? "concurrent" : "nested") << " owners, " << owners;
         return result;
