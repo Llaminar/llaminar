@@ -492,3 +492,21 @@ Precise source attribution:
   production defect (native OpenMP pool-lifetime / pool recreation at
   native places); (2) ClusterInventoryBootstrap = STALE FIXTURE premise
   (separate fix). No .79 rerun until the new focused pin.
+
+### B12 native ownership replacement pushed: 2a4d496fa (Main, ~02:36Z)
+
+`2a4d496fa5e5e8a770ac0850c3d299044d9ef58e` (#43188 above base; CLEAN/
+MERGEABLE). Design: RETIRES the manual pool bind; pre-MPI/OMP level-0
+native place publication via ONE initial same-PID/argv exec if the native
+order differs; strict versioned process receipt; opaque PID/TID tokens;
+the RUNTIME owns recreated workers. Master does only a startup restore to
+native-first — no per-region rebinding (survives pool resize by
+construction: spawn-time authority).
+Local focused evidence (author's own, pre-review): 4 aliases PASS; new
+master contract 20× PASS; actual threads/spread → native close initial
+exec contract PASS. Fixture `274` = source ACK #188; UnitClusterInventory
+PASS.
+STATUS: new native code SOURCE REVIEW PENDING; **no .79 run until review
+passes.** Future focused set grows by 1 → 6 (adds
+NativeCorePlacesPublicationContract); the full campaign remains Main's
+post-collection only.
