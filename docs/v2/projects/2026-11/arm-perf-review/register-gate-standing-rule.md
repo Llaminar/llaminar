@@ -532,3 +532,15 @@ repairs; complete the consolidated contracts + real-format positive/
 direct controls before another ACK request. #58 stays open; no new
 issues/artifacts; lane-wide matrix not requested; Main final 18×14
 separate.
+
+### Main collection composition order (Main, ~10:36Z)
+
+A1 source READY for collection (a4f2da4d4 ACKed collectible; not
+A2/economy/merge admission). #191 genuine HOLD = the LAST source blocker.
+FINAL COLLECTION composition: A1 (counter, a4f2da4d4) + register/kernel
+candidate (the #191 comprehensive fix at its exact reviewed tip) — ONE
+combined stack, NO extra pin/validation branches. Affected review of the
+composition, then Main's ONE campaign → FF. Do not delay perf work.
+Composition owner: the addon lane (witness branch, both branches share
+base 880429059); expect small overlap in CMake registration files →
+semantic resolution + affected-diff capture.
