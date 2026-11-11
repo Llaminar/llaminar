@@ -94,3 +94,18 @@ GPUAlignedExpert MoE) with BITWISE comparisons + counted traffic; D4
 verified receipts w/ strict stale/duplicate rejection; D5 production
 couplings (sampleMTPSerialEquivalentTargetRow; G tie-break = lowest ID);
 D6 portable/NEON TU split. Station W3 re-queues after the re-review.
+
+## SPEC v3 RE-VERDICT (~23:01Z): reviewer-211 findings CLOSED; 2 local §3 contradictions remain
+
+f26fd8ba verified: header/§9 sync, Mode-P may-change wording, historical
+protocol qualification, explicit selector separation — CLOSED.
+REMAINING (precise text/meaning fixes, no new gate):
+1. v1 backfill contradiction: backfilled policy contradicts the stale
+   "collapses to 1" sweep-limits paragraph — update the paragraph or drop
+   the backfill; both cannot be normative.
+2. Freshness ordering: (token, position, REQUEST generation) ledger
+   ordered "generation descending" is degenerate (one request = one
+   generation) — order by commit position/observation sequence
+   descending; generation = identity/staleness only; dedupe IDs before N.
+   Plus: v2 numeric range stays 1<=N<V.
+a42ac312b diagnostic re-review STARTED by the reviewer.
