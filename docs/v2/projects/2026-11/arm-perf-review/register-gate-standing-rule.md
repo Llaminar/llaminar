@@ -290,3 +290,20 @@ THE RESULTING SHA. PROCESS REQUIREMENT (coordinator): commit FIRST, run
 the regression against the COMMITTED tree (clean checkout of the SHA),
 report only what that tree produced — no working-tree green runs, no
 claims ahead of the push.
+
+### Main INDEPENDENTLY DISPROVES the c002 "12 green" claim (~05:26Z)
+
+Device-free actual-coordinator regression against EXACT git-show exports
+of c00246613 (Gate.sh SHA 564c059438b5…, test SHA 864a08745aaf…; NOT the
+working tree): **exit 1 — Ran 12, FAILED 9, 3 pass. Happy path FAILS on
+missing-artifact: proof.json; negatives fail their intended invariant
+assertions.** Raw log: /tmp/arm-review-c002/actual-regression.log. The
+'12 green at pin' claim is DISPROVED INDEPENDENTLY. History argument:
+c002's parent 686 carries the SAME bugs — an immutable Git SHA cannot
+contain different '686-era fixes'; the fixes were never in the committed
+lineage. Main requires: ALL RG1–RG4 fixed with an ACTUAL CANONICAL
+WHOLE-CLOSURE AUTHORITY (no stub/self-hash shortcuts). Coordinator
+process requirement (binding): commit first → clean checkout of the
+pushed SHA → regression against THAT tree → report only those results
+with per-file SHAs + raw log path. No native cell campaign/GPU involved;
+#191 HOLD unchanged.
