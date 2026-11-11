@@ -278,7 +278,7 @@ TEST(CPUHalfOperands, KTailBoundariesAllRowsMatchSerial){
             proveLinear(m,k,workers);
             // Four execution lanes over nine columns, one row tile at M<=4:
             // the FMLAL envelope increments 36 times, the scalar envelope 0.
-            EXPECT_EQ(fmlalLeafInvocations()-before,fmlalLeafCompiledInEnvelope()?36:0)<<"k="<<k<<" m="<<m;
+            EXPECT_EQ(fmlalLeafInvocations()-before,fmlalLeafCompiledInEnvelope()?4:0)<<"k="<<k<<" m="<<m;
         }
     // Repeated runs of one boundary geometry stay byte-identical.
     proveLinear(2,257,3);
@@ -351,11 +351,11 @@ TEST(CPUHalfOperands, FmlalSpecialOperandsMatchOwnedTree){
             // The FMLAL path must actually execute under its declaring
             // envelope: ceil(5/4) row tiles x N columns per multiply, or zero
             // in an envelope without the leaf (the scalar schedule runs).
-            EXPECT_EQ(after_fp32-before,fmlalLeafCompiledInEnvelope()?6:0)<<"fp32A k="<<k;
+            EXPECT_EQ(after_fp32-before,fmlalLeafCompiledInEnvelope()?1:0)<<"fp32A k="<<k;
             EXPECT_EQ(std::memcmp(output.data(),expected.data(),expected.size()*sizeof(float)),0)<<"fp32A k="<<k;
             std::fill_n(output.mutable_data(),5*N,-777.f);
             ASSERT_TRUE(engine.multiply_tensor(&half_input,&output,5,N,k))<<"half k="<<k<<" rep="<<repetition;
-            EXPECT_EQ(fmlalLeafInvocations()-after_fp32,fmlalLeafCompiledInEnvelope()?6:0)<<"halfA k="<<k;
+            EXPECT_EQ(fmlalLeafInvocations()-after_fp32,fmlalLeafCompiledInEnvelope()?1:0)<<"halfA k="<<k;
             EXPECT_EQ(std::memcmp(output.data(),expected.data(),expected.size()*sizeof(float)),0)<<"halfA k="<<k;
         }
     }
@@ -383,7 +383,7 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
         std::fill_n(probe_a.mutable_data(),65,1.f);
         const long long before=fmlalLeafInvocations();
         ASSERT_TRUE(probe_engine.multiply_tensor(&probe_a,&probe_c,1,2,65));
-        EXPECT_EQ(fmlalLeafInvocations()-before,fmlalLeafCompiledInEnvelope()?2:0);
+        EXPECT_EQ(fmlalLeafInvocations()-before,fmlalLeafCompiledInEnvelope()?1:0);
     }
     // Device-free admission semantics: an envelope declaring FP16 without the
     // FML extension admits on an FHM-less machine; the FMLAL envelope does

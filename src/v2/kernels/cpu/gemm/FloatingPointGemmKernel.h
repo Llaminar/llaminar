@@ -54,10 +54,11 @@ inline constexpr bool fmlalLeafCompiledInEnvelope() noexcept
 /**
  * @brief Test-visible selection probe: the FMLAL leaf's actual execution count.
  *
- * One relaxed increment per leaf invocation (one row tile times one output
- * column of the GPU-aligned schedule), so device-free contracts can prove the
- * FMLAL path — never a silent scalar fallback — executed under the declaring
- * envelope. Compiled only with the leaf; envelopes without it report zero.
+ * One relaxed increment per FMLAL dispatch — once per public multiply call,
+ * on the calling thread, outside the worksharing region — so device-free
+ * contracts can prove the FMLAL path — never a silent scalar fallback — ran
+ * under the declaring envelope, at zero cost inside the OpenMP team. Compiled
+ * only with the leaf; envelopes without it report zero.
  */
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
 inline std::atomic<unsigned long long> &fmlalLeafCounter() noexcept
@@ -1247,7 +1248,6 @@ namespace llaminar2
             static_assert(Rows >= 1 && Rows <= 4);
             static_assert(WeightType == TensorType::FP16,
                 "the FMLAL leaf serves FP16 weights; other storages keep the scalar schedule");
-            fmlalLeafCounter().fetch_add(1, std::memory_order_relaxed);
             constexpr int kLanes =
                 floating_expert_numerical_contract::kReductionLanes;
             constexpr int kVectorLanes = 16;
@@ -1798,8 +1798,11 @@ namespace llaminar2
                 // FP16FML; startup admission verifies the executing CPU
                 // advertises FEAT_FHM before any leaf instruction runs, so a
                 // mismatch fails fatally instead of faulting on an unimplemented
-                // instruction.
+                // instruction. The route probe counts once per dispatch, on the
+                // calling thread, outside the worksharing region — never per
+                // row tile or column inside the OpenMP team.
                 cpu::ARMCPUCapabilities::native().require(cpu::ARMCPUFeature::FP16FML);
+                fmlalLeafCounter().fetch_add(1, std::memory_order_relaxed);
                 return run_gpu_aligned_expert_fp32_matmul_neon<WeightType, HalfRNE, HalfStorage>(
                     A, B, C, M, N, K, alpha, beta, bias);
 #endif
