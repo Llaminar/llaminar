@@ -290,7 +290,13 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
                 main_owner.emplace(); // The measuring thread owns a cell too.
                 worker = std::thread([&]
                 {
-                    llaminar::v2::OpenMPTeamForkScope scope; // Built off the clock.
+                    // The worker asserts its OWN stack identity around its
+                    // own thread-affine scope lifecycle (built off the clock,
+                    // destroyed on this thread after the verify gate).
+                    const llaminar::v2::OpenMPTeamForkCell *worker_stack_at_entry =
+                        llaminar::v2::openMPTeamForkOwnerStack;
+                    std::optional<llaminar::v2::OpenMPTeamForkScope> scope;
+                    scope.emplace();
                     worker_ready.store(true, std::memory_order_release);
                     while (!start_gate.load(std::memory_order_acquire))
                         std::this_thread::yield();
@@ -299,7 +305,11 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
                     worker_notes_done.store(true, std::memory_order_release);
                     while (!verify_gate.load(std::memory_order_acquire))
                         std::this_thread::yield();
-                    EXPECT_EQ(scope.forks(), kMeasuredNotes);
+                    EXPECT_EQ(scope->forks(), kMeasuredNotes);
+                    scope.reset();
+                    EXPECT_EQ(llaminar::v2::openMPTeamForkOwnerStack,
+                              worker_stack_at_entry)
+                        << "the worker's owner stack must be restored exactly";
                 });
                 while (!worker_ready.load(std::memory_order_acquire))
                     std::this_thread::yield();
@@ -332,6 +342,10 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
             if (concurrent)
             {
                 EXPECT_EQ(main_owner->forks(), kMeasuredNotes);
+                main_owner.reset(); // Destroyed on the thread that owns it.
+                // EXACT TLS STACK IDENTITY after the main owner's teardown.
+                EXPECT_EQ(llaminar::v2::openMPTeamForkOwnerStack, stack_at_entry)
+                    << "the original owner stack must be restored exactly";
                 worker.join(); // Verified and destroyed on its own thread.
             }
             else
