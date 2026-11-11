@@ -398,3 +398,41 @@ canonical gates. A2 held until the verdict.
   same-thread; the 3-vs-1 key confusion repaired; full 4-row prefill input
   + GPU-result failure recorded. No execution; 295/295 + stubs + timings
   unauthenticated; no A2/B-stage qualification.
+
+### #186 fix-back landed: 47d2711a7 (arm-addon3, 2026-11-11, ~00:56Z)
+
+Parent aa31ccbe9; 6 files +196/−77; pushed. All five findings:
+- T1: every PerfStats observation owns its snapshot in a named local
+  (engine step-1/step-2 read an owned vector; zero borrowed pointers into
+  temporaries).
+- T2: no hang + proven overlap — a stop flag set on EVERY failure exit
+  (incl. via the join guard's destructor) releases the worker's wait; the
+  stage hook HOLDS the window until the concurrent forks complete (bounded
+  wait, mock hook only — no production change) → the five competing forks
+  are PROVEN inside the published window; failure-path control now
+  discriminating (a successful step on the same gates publishes → the
+  exclusion isn't vacuous).
+- T3: both cost harnesses honest — owners==0 constructs NO scope (genuine
+  no-owner); scope configuration OFF the clock; the concurrent worker
+  exists + signals readiness with its own same-thread scope BEFORE the
+  start gate (contention established); timed window contains only the
+  notes; verification/join/teardown after the clock stops; concurrent
+  divides by ONE thread's notes; basis labels carry off-clock construction;
+  earlier figures superseded.
+- T4: pre-filter grammar-aware (omp + horizontal-ws + parallel); tab and
+  double-space forms never skipped; CLI controls WITHOUT note substring:
+  unnoted tab-form + double-space-form flagged, noted tab-form accepted.
+  Inventory unchanged 176/28/54 rc=0; negatives 10/10.
+- T5: forced-absent clears ALL EIGHT enablement inputs; off_default/
+  ungated calls pass force_absent; CPU-device expectation = canonical "CPU"
+  (DeviceId::cpu().toString()); exact-key values preserved.
+FOCUSED EVIDENCE (per directive 416c80f9f): checker CLI rc=0 (176/28/54);
+CLI negatives 10/10 incl. new never-skipped cases; touched TeamFork*
+regressions 5/5 (contract, cost variants, overlap/nesting, worker boundary,
+stack restoration); fixture cost cell four variants: no_owner 2.31 /
+one_owner 4.69 / two_nested 6.68 / concurrent 15.83 ns per owner note (real
+contention visible).
+NOT RUN AT LANE (→ Main's post-collection campaign): 295/295 portability;
+Linux-engine targets (v2_test_forward_execution_engine, stage-evidence
+binary, v2_unit_mpi_bootstrap) — dev-host syntax-validated only.
+A2 held per boundary.
