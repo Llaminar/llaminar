@@ -3161,6 +3161,20 @@ add_v2_test(V2_Integration_CPUStartupAffinity
     TIMEOUT 60
 )
 
+# A different initial master place distinguishes stale temporary-mask restoration
+# without requiring heterogeneous hardware. Single-core hosts remain unqualified.
+if(V2_TEST_HOST_PHYSICAL_CORES GREATER_EQUAL 2)
+    add_v2_test(V2_Integration_CPUClusterPermanentMasterPlacement
+        COMMAND $<TARGET_FILE:v2_integration_cpu_startup_affinity>
+            --cluster-master-placement-contract
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;Bootstrap;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "OMP_PLACES=cores" "OMP_PROC_BIND=close" "OMP_DYNAMIC=false"
+            "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+            "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_CPU_CLUSTER_PLACEMENT_PREFLIGHT_TESTS V2_Integration_CPUClusterPermanentMasterPlacement)
+endif()
+
 # Fast synthetic receipt/ELF controls never load HIP or enter a native executable.
 add_test(NAME V2_Unit_HIPRuntimeBinding
     COMMAND ${Python3_EXECUTABLE}
@@ -29815,6 +29829,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CPUAttentionKeyQ8
     V2_Integration_CPUStartupAffinity
     V2_Integration_NUMAFirstTouchPlacementLifetime
+    ${V2_CPU_CLUSTER_PLACEMENT_PREFLIGHT_TESTS}
     V2_Integration_ClusterInventoryBootstrap
     V2_Integration_MPIBootstrapCallerAffinity
     V2_Integration_MPIBootstrapOpenMPPlacement
