@@ -337,3 +337,18 @@ CPUStartupAffinity, ClusterInventoryBootstrap, placement) 20x on the new
 contract — no inference/OMP-cap workaround/GPU. Main does not remote-
 execute without ownership; arm-sparks owns and returns commands/binary-
 core identities/CTest logs/exits/driver window.
+
+### B12 window scope correction (Main, 2026-11-11 ~00:48Z)
+
+The .79 model-free window's CTest step was corrected by Main BEFORE the
+launch: the broad '|Placement' regex could select unapproved models/other
+paths and '-E CUDA|ROCm' is not a NO_MODELS filter — REQUIRED EXACT test
+set: `^V2_(Unit_MPIBootstrap|Integration_(CPUStartupAffinity|ClusterInven
+toryBootstrap|MPIBootstrapOpenMPPlacement|CPUClusterPermanentMasterPlacement))$`;
+repeat = the NEW CONTRACT ONLY ×20. Build continued; no broad launch.
+Also: image name ≠ container identity (literal container ID + PID +
+progress-log content demanded); and the SOURCE VERIFIER reads
+**THREAD_SIBLINGS, not core_id** — the B12 packet's raw-coreid-aliasing
+explanation is UNSUPPORTED and corrected/withdrawn. Qualification closes
+only after Main inspects exact counts/no-skips/exits/binary+source
+binding.
