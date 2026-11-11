@@ -225,3 +225,41 @@ zero spills, budgets only down), tournament before/after. The Ops seam
 stays encoding-agnostic for the MXFP4 lane. NOTE: ideas 03/04/11 are
 ADDRESSED in the tracker (R1/R2 lands) — the Lane-2 "successor scope" was
 based on a stale index; the true residual is this idea-04 observation.
+
+### **MATERIAL CORRECTION + successor plan draft v1 (arm-addon, ~14:54Z)** — execution gated on the window
+
+Full plan: evidence/idea-04-successor-plan-draft-v1.md (also
+arm-addon-notes/idea-04-successor-plan.md). **MATERIAL CORRECTION,
+flagged prominently: the first interpretation guide's amplification claim
+was WRONG and is RETRACTED** (idea-04-m1-window-notes.md rewritten v2).
+The deeper source read shows **C4/R2 ALREADY implements candidate 2 for
+the production M=1 leaves**: activationBlocks+dotLane (register-fed
+vdotq_laneq_s32, no memory access) for nibble/expanded panels,
+activationGroup hoisted per group for Q6_K (8×4B = the payload exactly —
+NOT amplification), activation-scale conversion hoisted per block. **The
+production M=1 leaf reads each activation byte exactly ONCE at
+bb893cd79** — and the baseline Q8_K regression (measured 2026-11-07)
+PREDATES the C4 land (2026-11-10).
+
+PLAN: §0 what already exists (do-not-re-propose list with source lines);
+§1 residual surface A — the S=1 strip walk (ASIMD leaf, SMMLA row-pair
+tiles, shared-row tiles) where consume() still reloads per
+(row,block,group,COLUMN): block-outer/columns-inner restructure with the
+same dotLane seam, order-exact, weight stream linearized, register
+pressure ~7-8/32 q-regs live at Rows=1 ASIMD (no spill risk; SMMLA +4
+q-regs, witness budgets only-down); §2 residual B — Q6_K scalar→block
+load unification (marginal, L1 load-port only, only if Q6_K-specific);
+§3 oracle (serial reference byte-identical, PanelTailsMatchSerial +
+exact-batch preflights), tournament re-runs (installed native|expert
+contract, budgets only down), evidence ladder (M1 core-free → .80
+focused via coordinator → engine E2E A1 → handover); **§4 THE HONEST
+DECISION TREE** — regression gone → measured-and-negative, idea-04
+CLOSES, no speculative implementation; regression persists uniformly →
+reload hypothesis DISCONFIRMED for the production leaf, pivot by CSV
+shape (K-walk latency → partition-shape; weight-stream decline →
+layout/prefetch plan-first; knee cliff → scheduling owners ideas 05/26);
+Q6_K-only → §2; §5 sequencing.
+IMPLICATION: the M=1 window is now a DIAGNOSTIC of the baseline
+regression's cause, not an activation-reuse headroom probe — the
+headroom hypothesis was already implemented at bb. Window readout lands
+on the §4 tree.
