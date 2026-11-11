@@ -121,3 +121,22 @@ current-binding acceptance.
   execution here; owner 10/10/9/9 unauthenticated. Final rebase
   exact-diff review + Main-owned 18×14/full-collection gate remain
   separate; no FF/source ACK.
+
+### #191 fix-back landed: ab860378b (arm-addon, 2026-11-11 ~03:27Z) — IN REVIEW
+
+FF from d4cdcd998; 10 commits total; driver-only. RG1: every infra action
+self-checked (mkdir/cleanup/summary/status/appends/verdicts; failure →
+exit 2 REFUSED, nothing published); ROOT CAUSE found by the injection test
+— set-e left ON after reconciliation silently aborted the publication
+substitution (9 PASS cells, no verdict); set +e restored, every rc checked.
+Owned STUB_INFRA knobs force both infrastructure failures. RG2: attached +
+split override spellings refused; post-configure no-op re-configure
+(regeneration fails) + cache CMAKE_HOME_DIRECTORY/source-dir/generator =
+configured-project identity. RG3: accept.digest.json schema 2 seals the
+COMPLETE closure (artifacts + all common inputs); publication verifies
+sealed input digests — post-acceptance drift refuses. RG4: compile DB must
+REFERENCE the header (file or command), not name it as compiled TU; stub
+no longer fabricates header-as-TU. Regression now 12 tests OK device-free;
+real tree 9/9 PASS publication=authenticated (45 artifacts, 6 sealed
+inputs); --cmake/--ctest consumed, --ninja sealed via CMAKE_MAKE_PROGRAM.
+Hold unchanged: campaign + re-pin await Main's source-handover base.
