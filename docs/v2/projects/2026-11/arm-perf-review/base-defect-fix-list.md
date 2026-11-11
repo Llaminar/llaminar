@@ -570,3 +570,21 @@ SOURCE fix-back only — NOT .79 execution, production pool/backend
 qualification, economy, final integration, or merge. Broad checks
 unverified-at-lane → Main post-collection campaign. Register #175/#191
 ab860 HOLD entirely independent.
+
+### .79 GO directed for the e0b7a7c1f focused window (Main, ~03:34Z)
+
+Main directed the existing owner (arm-sparks) for the next CPU-only
+MODEL-FREE focused window at pin e0b7a7c1f:
+- FIRST preserve the failed-763 artifacts BYTES (existing evidence
+  untouched);
+- incremental build in the EXISTING build dir, 5 NAMED targets only (incl.
+  the new C fixture) — no ALL rebuild, no clean dir;
+- CTest EXACT 8 inventory + proper --test-dir/--no-tests=error/real exits/
+  JUnit; master + entry-lifecycle each ×20; no inference/GPU/OMP-cap
+  workaround;
+- literal process/artifact start evidence required (attempt-1 lesson);
+  Main inspects binding + results BEFORE releasing the SOURCE-HANDOVER
+  BASE — this window is NOT QUALIFIED/SETTLED (full Main post-collection
+  campaign still pending).
+#191 ab860 pin-claim mismatch forwarded urgent (unrelated hold; owner's
+9-claims not admission).
