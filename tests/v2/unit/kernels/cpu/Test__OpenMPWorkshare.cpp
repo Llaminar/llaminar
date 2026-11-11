@@ -799,64 +799,85 @@ namespace
 
     NoteCostRun measureNoteCost(std::uint64_t notes, int owners, bool concurrent_threads)
     {
-        NoteCostRun result;
+        // Off the clock: the exact scope configuration. owners==0 constructs
+        // NO scope (the no-owner figure must not secretly carry one); 1
+        // constructs one; 2 constructs two lexically nested scopes whose
+        // teardown is inner-first.
         const std::uint64_t before = openMPTeamForkSnapshot();
-        const auto start = std::chrono::steady_clock::now();
+        std::optional<OpenMPTeamForkScope> outer;
+        std::optional<OpenMPTeamForkScope> inner;
+        if (!concurrent_threads && owners >= 1)
+            outer.emplace();
+        if (!concurrent_threads && owners >= 2)
+            inner.emplace();
+
+        // Off the clock (concurrent): the worker exists, has built its own
+        // same-thread scope, and both sides have signalled readiness BEFORE
+        // the clock starts - so contention inside the timed window is
+        // established, not hoped for.
+        std::atomic<bool> worker_ready{false};
+        std::atomic<bool> main_ready{false};
+        std::atomic<bool> start_gate{false};
+        std::atomic<bool> worker_done{false};
+        std::thread worker;
         if (concurrent_threads)
         {
-            // Two threads, each with its own same-thread owner; the worker
-            // waits for the gate so both owners are live inside the timed
-            // window, and the timed window starts after the thread exists.
-            std::atomic<bool> gate{false};
-            std::atomic<bool> worker_done{false};
-            std::thread worker([&]
+            worker = std::thread([&]
             {
-                OpenMPTeamForkScope scope;
-                gate.store(true, std::memory_order_release);
+                OpenMPTeamForkScope scope; // Same-thread owner, built off the clock.
+                worker_ready.store(true, std::memory_order_release);
+                while (!start_gate.load(std::memory_order_acquire))
+                    std::this_thread::yield();
                 for (std::uint64_t note = 0; note < notes; ++note)
                     noteOpenMPTeamFork();
-                // The worker verifies its own cell on its own thread before
-                // its scope dies: the lifecycle is thread-affine end to end.
-                EXPECT_EQ(scope.forks(), notes);
                 worker_done.store(true, std::memory_order_release);
+                // Verification off the clock, on the owning thread, before the
+                // scope dies: the lifecycle is thread-affine end to end.
+                EXPECT_EQ(scope.forks(), notes);
             });
-            while (!gate.load(std::memory_order_acquire))
+        }
+        if (concurrent_threads)
+        {
+            main_ready.store(true, std::memory_order_release);
+            while (!worker_ready.load(std::memory_order_acquire))
                 std::this_thread::yield();
-            OpenMPTeamForkScope scope;
-            for (std::uint64_t note = 0; note < notes; ++note)
-                noteOpenMPTeamFork();
-            EXPECT_EQ(scope.forks(), notes);
+        }
+
+        // The timed window: notes only. Start after both owners (when any) are
+        // live and ready; stop before any verification, join or teardown.
+        const auto start = std::chrono::steady_clock::now();
+        if (concurrent_threads)
+            start_gate.store(true, std::memory_order_release);
+        for (std::uint64_t note = 0; note < notes; ++note)
+            noteOpenMPTeamFork();
+        if (concurrent_threads)
             while (!worker_done.load(std::memory_order_acquire))
                 std::this_thread::yield();
+        const auto stop = std::chrono::steady_clock::now();
+
+        // Off the clock: verification, join and teardown.
+        const auto elapsed_ns = static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start)
+                .count());
+        NoteCostRun result;
+        result.ns_per_note =
+            elapsed_ns / static_cast<double>(concurrent_threads ? notes : notes);
+        if (concurrent_threads)
+        {
             worker.join(); // The worker destroyed its own scope before this.
+            result.process_delta = 2 * notes;
         }
         else
         {
-            // Lexical nesting: the inner scope dies before the outer one, so
-            // the owner stack never points at freed storage. Each fork is
-            // attributed to every current owner cell (nested scopes both see
-            // the same fork), while the process total counts it once.
-            OpenMPTeamForkScope outer;
-            std::optional<OpenMPTeamForkScope> inner;
-            if (owners >= 2)
-                inner.emplace();
-            for (std::uint64_t note = 0; note < notes; ++note)
-                noteOpenMPTeamFork();
-            EXPECT_EQ(outer.forks(), notes) << "owners " << owners;
+            EXPECT_EQ(outer ? outer->forks() : notes, notes) << "owners " << owners;
             if (inner)
                 EXPECT_EQ(inner->forks(), notes) << "owners " << owners;
-            inner.reset(); // Enforced reverse teardown before the outer dies.
+            if (outer)
+                outer.reset(); // Enforced reverse teardown before anything dangles.
+            result.process_delta = notes;
         }
-        const auto elapsed_ns = static_cast<double>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start)
-                .count());
-        result.ns_per_note = elapsed_ns / static_cast<double>(notes);
-        // Every configuration counts each fork exactly once in the total; the
-        // concurrent configuration runs two measuring threads, so its total
-        // advance is two runs' worth.
-        const std::uint64_t expected_total = notes * (concurrent_threads ? 2u : 1u);
-        EXPECT_EQ(openMPTeamForkSnapshot() - before, expected_total)
+        // Every configuration counts each fork exactly once in the total.
+        EXPECT_EQ(openMPTeamForkSnapshot() - before, result.process_delta)
             << (concurrent_threads ? "concurrent" : "nested") << " owners, " << owners;
         return result;
     }
