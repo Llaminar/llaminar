@@ -525,3 +525,16 @@ pattern. Attempt-3 receipts archived (attempt3-onednn-lock/ incl. the
 exact v3 script). Expect a longer run (full OneDNN + core build, ccache
 cold, one CPU); incremental resume supported via the helper's
 configured/identity markers. Exit + JUnit + SHAs when it reports.
+
+### Station r5→r6: origin exact-string check resolved (transport detail)
+
+r5 failed on the helper's origin check = EXACT string compare; git
+normalized the clone's origin to 'https://github.com/uxlfoundation/
+oneDNN' (no .git) → llaminar_require_onednn_origin rejected. Fixed via
+git remote set-url with the .git suffix — objects/commit untouched
+(74d04752d @ v3.11.3); the helper's own origin check now authenticates
+directly. r5 receipts archived (attempt5-origin-spelling/). r6 in
+flight, PAST the origin check, helper configure/build underway in the
+writable worktree-local checkout. OneDNN + core build + two JUnit
+receipts on the one-CPU quota; incremental resume via the helper's
+markers if the watcher expires.
