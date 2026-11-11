@@ -268,3 +268,54 @@ Parent 0ce033b6c; 11 files +739/−296; pushed. One successor, all seven
   legitimately attributes).
 VALIDATION: portability 295/295; Linux targets stub-syntax-validated
 (runtime at the canonical gates). A2 held until the next verdict.
+
+### Reviewer verdict #183 successor — HOLD at 16d633c15; consolidated fix-back #185 (S1–S5)
+
+- **S1 [P2] scope lifetime:** both new cost cells store nested
+  OpenMPTeamForkScope in vector<unique_ptr> (Workshare:756;
+  MPIBootstrap:247) — vector destruction is NOT reverse/LIFO; forward
+  destruction frees the OUTER first, leaving TLS pointing at freed storage
+  after the inner destructor → subsequent notes can dereference freed
+  memory. FIX: lexical nesting or enforced reverse teardown + a
+  stack-restoration regression. ALSO engine:4798 constructs
+  concurrent_owner on the worker but destroys it on the parent —
+  violates the thread-affine scope lifecycle; construct/destroy inside the
+  worker; RAII-join even on ASSERT failure; use a rendezvous so overlap is
+  PROVEN, not scheduler-dependent.
+- **S2 [P2] deterministically wrong assertions:** engine summary_value
+  initializes value=-1 then EXPECT_EQ(record.value, value<0?value:record.value)
+  compares 3 to -1; stage PublisherRefuses:259 expects all stage records==1
+  although an earlier cpu_forks stage produced 3. Match exact keys/counts +
+  preserve prior observations. Prefill exclusion advertises 4 rows using
+  one-element tokens/positions — provide COMPLETE input extents. The GPU
+  test still ignores execute success — stage entry alone need not reach the
+  successful summary publication boundary.
+- **S3 [P2] R4 incomplete:** the stage ScopedForkEvidenceConfig is unchanged
+  (unconditionally UNSETS originals; null stage_timing preserves ambient
+  enablement); the engine guard restores 2 vars but off-default leaves
+  other enabling exports/profiling active; its ambient-restoration control
+  itself overwrites then unsets caller values. FIX: save/restore the
+  COMPLETE touched configuration; isolate ALL enablement inputs with
+  early-return-safe RAII; include actual prior-present/prior-absent
+  controls.
+- **S4 [P2] grammar still not fail-closed:** note binding still accepts
+  `if(false) noteOpenMPTeamFork();` immediately before a raw pragma, or TWO
+  notes on the same line — a NOTE substring is not proof of exactly one
+  unconditional statement; inline `void f(){ _Pragma("omp parallel") ... }`
+  is silently ignored by the anchored grammar; unsupported forms do not
+  fail closed. FIX: actual CLI controls + constrain/reject ambiguous
+  syntax; preserve the narrow exemption inventory.
+- **S5 [R7] concurrent timing is not per-owner:** the concurrent timing
+  worker constructs NO owner (only main has a scope) — dividing by 2N
+  including thread creation measures aggregate amortized throughput, not
+  per-owner note latency. FIX: each worker gets its own same-thread scope;
+  verify exact cell/process deltas; label the timing basis accurately (the
+  no-cost prior figures do NOT transfer). (Actionable evidence-repair; the
+  reviewer's illustrative severity R7.)
+- POSITIVE: summary accepts scope + publishes its count; stage requires the
+  explicit timing gate; context body lazy; main repeated-stage accumulation
+  corrected; engine/overlap/worker tests preflight-selected; retained-loop
+  test added; MPIBootstrap reload moved after the env guards. Boundary: the
+  TLS worker test proves EXCLUSION, not that all production raw worker
+  forks are impossible; inLexicalWorkshare governs macros, not raw pragmas.
+No execution; 295/295 + stubs + timings unauthenticated; no A2 acceptance.
