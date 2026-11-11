@@ -415,3 +415,41 @@ evidence comment (no final-collection claim). **#58 stays OPEN** until the
 focused whole-fix ACK + collection admission. NO new issues/consolidation/
 tracking artifacts from any session; the tracker is the primary ledger.
 Main source base 880 unchanged.
+
+### #191 Batches 2–4 landed (arm-addon, ~10:27Z) — tip 27f49497; IN REVIEW
+
+Chain 3ce558a6b → 2aefff514 → efecb95ef → 27f4949779fd1b40682fea0b6ef211f
+974485463; each FF, Refs #58, clean-checkout evidence (byte-identical vs
+FETCH_HEAD).
+- BATCH 2 (2aefff514) retention integrity + manifest-after-refusal:
+  source-digest-before-copy + copy re-digest (torn/diverted cp fatal,
+  'artifact-corrupted:<src>'); receipt mkdir verified; manifest written
+  ONLY after the accumulated-fail refusal (drift test asserts no manifest
+  on refusal); STUB_MUTATE_ARTIFACT = real post-check corruption control;
+  TWO REAL FS-failure controls with genuine EACCES (retention-fs: RO cell
+  dir → FAIL(retention:; manifest-fs: RO receipt → PermissionError,
+  gate=FAIL, no manifest). 15/15 OK. Gate.sh 0704b89a…, test b6676fbb…,
+  log /tmp/rg-clean-2aef-regression.log.
+- BATCH 3 (efecb95ef) tool sealing + cache authority: cmake/ctest/python
+  resolved ONCE from PATH, refused if unresolvable, digests in
+  receipt/tools.json, every invocation via sealed paths; identity
+  reconfigure judged by CACHE CONTENT (byte-identical CMakeCache.txt
+  required; STUB_CACHE_DRIFT real negative → FAIL(configured-identity));
+  CMAKE_CACHEFILE_DIR verified vs cell build dir; caller -C preload
+  refused; compile DB must contain the canonical probe TU; compilers from
+  cache join the sealed input closure at acceptance (mid-run toolchain
+  swap caught); owned --parallel 1; DEAD split -D loop removed (reviewer
+  dead-code finding resolved by deletion). 17/17 OK. Gate.sh f0f90995…,
+  test 10e53c42…, log /tmp/rg-clean-efec-regression.log.
+- BATCH 4 (27f49497) envelope proof binding: writer records sha256
+  bindings of proof.s/target.txt into proof.json; retention binds envelope
+  sources before copying; publication revalidates retained envelope bytes
+  vs the retained envelope proof; mutation control generalized to
+  build-relative paths. 18/18 OK. Gate.sh 43bf9a6d…, test b00bc6a0…,
+  log /tmp/rg-clean-v4-regression.log.
+- REMAINING (honest): SDK/transitive-dependency closure beyond compiler
+  binaries; whole-closure authority against ORIGINAL verifier output in
+  the production flow; reviewer inspection of the whole set. Contract now
+  18 tests.
+Sequencing: #191 focused ACK + collection admission → Lane-2 (ideas
+03/04/11) starts immediately on 880429059. HOLD unchanged.
