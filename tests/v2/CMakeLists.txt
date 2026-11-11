@@ -3130,11 +3130,9 @@ add_v2_test(V2_Integration_OpenMPForkEvidenceEnginePath
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;OpenMP;PerfStats;Execution;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPForkEvidenceEnginePath)
-# Native capacity-ordered places keep the serial master and low worker ids
-# on fast cores even when OpenMP retires/recreates part of its worker pool.
-# Self-launched core-placed ranks bind libgomp's pool to capacity-ordered
-# physical cores: GB10's X925 cores, which run the serial master and static
-# partitions, would otherwise follow the A725 cores in CPU-id order.
+# Capacity-ordered places keep the serial master and low worker ids on fast
+# cores: self-launched core-placed ranks bind libgomp's pool to the X925
+# cores first, not the A725 CPU-id order.
 add_v2_test(V2_Integration_OpenMPCapacityOrderedCorePlaces
     COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
         --gtest_filter=Test__MPIBootstrap.CorePlacesFollowCapacityWithinTheRankMask:Test__MPIBootstrap.ClusterWorkersOrderFastCoresFirst
