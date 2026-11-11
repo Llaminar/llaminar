@@ -73,3 +73,37 @@ LM head about 7 ms per row.
   B4 (LM head) = evidence + a written top-k/shortlist sampler-contract
   PROPOSAL, with the contract decision routed to the OPERATOR (semantics
   change). Expected wins are hypotheses until A.
+
+### **idea-16 Phase A COMPLETE — seal K14-I16A-880429059-20261111** (arm-addon2, ~11:54Z)
+
+Full report archived: evidence/i16a-phase-a-report.md. TOP LINES:
+1. **Headline (unprofiled, n=256 decode):** no-MTP **25.20/25.24 tok/s**
+   (+20% vs tracker head ref 20.95); MTP-dyn 18.53/18.49 (**−35% vs
+   28.51**) — MTP-dyn now LOSES ~27% at this anchor.
+2. **Phase A answers:** (a) M=1 routed-down pooling ALREADY ACTIVE
+   (router-Q8 bundle + pooled multi-input down fire every layer:
+   30600 = 40×765 counters); (b) verifier rows DO take the grouped FFN
+   transaction — in MTP-dyn the target graph runs ONLY as verifier
+   forwards (no separate main decode steps; call counts resolve exactly);
+   (c) GDN projection pooled but split into TWO subgroups/layer (qkv+z vs
+   tiny alpha/beta; mixed-codebook compatibility rule), ~30-34 GB/s =
+   mostly bandwidth-bound; (d) LM head bandwidth-bound ~45 GB/s — no
+   scheduling headroom, contract-level only (B4/operator); (e) shared
+   expert ~2× headroom, still two regions (B2 stands).
+3. **MTP-dyn regression decomposition (54.0 vs 39.7 ms/token):** per token
+   2.03 verifier rows; **LM head = one full-vocab M=1 GEMV PER VERIFIER
+   ROW (zero amortization, 20.1% of MTP-dyn decode)** although a grouped
+   decode-equivalent LM-head path EXISTS in LMHeadStage and the
+   decode-verifier route does not take it → **NEW TOP BYTE-NEUTRAL
+   B-CANDIDATE (ceiling ~6.5 ms/token)**; grouped GDN recurrence ~1.0×
+   amortization (idea-18 confirmed in production); MoE transaction ~1.8×.
+4. **PROTOCOL CAVEAT + rider request:** bench config carried temp 0.8 /
+   top_k 40 / top_p 0.9 / seed −1; acceptance 38.89% (depth-10
+   budget-limited, 5.91 rows/run) vs tracker-verified 99% at depth 7.
+   Greedy-vs-stochastic UNDECIDABLE from the seal (no token digests).
+   PROPOSED: ONE greedy-pinned MTP-dyn rider (temp 0 + explicit seed +
+   text signature) to settle mode-artifact vs real draft regression —
+   cheap, short .80 slot. Cross-idea flag: idea-14's 27B "52-65%
+   acceptance" may share the same mode ambiguity.
+5. B4 stays fenced to the operator. Prefill G1 = 12-token-prompt only,
+   NOT tracker-comparable.
