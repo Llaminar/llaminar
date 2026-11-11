@@ -922,3 +922,38 @@ Artifacts: /Users/floriankinder/llaminar-spark-results/
 A2-EXPORTS-BB893CD79-20261111/ (11 files). Anchors: riders @ bb893cd79
 (merged tip); Phase A seal 880429059. NO economy claims — structural
 attribution only.
+
+### GDN ROUTE DIAGNOSIS (addon3 code reading, ~23:27Z): initial hypothesis CORRECTED
+
+Predicate chain walked end-to-end from GDNProjectionStage::execute:
+1. corrected_qkv (TwoTermQ8): 27B's main GDN mixer QKV GETS TwoTermQ8
+   (gdnQKVPrecision grants it for the main GatedDeltaNet mixer with
+   flash_next geometry, policy ≠ SingleQ8) → qkv executes SEPARATELY
+   (multiply_q8_residual_corrected) → completed[0]=true → 1 fork.
+2. homogeneous_projection_kernels requires !corrected_qkv → FALSE on
+   27B → the {z,a,b} group goes through runFusedSubgroups (native pass,
+   then same-class).
+3. **"Per-projection replay is forbidden"**: any uncompleted projection
+   FAILS the engine — GDN can never emit a serial 4-fork fallback. GDN
+   either fuses (1-2 forks) or fails hard.
+
+**CONSEQUENCE: the 27B 4-fork once-per-step stage CANNOT be the GDN
+projection** (parsimonious GDN = 2 forks; 4 only under an exact
+native/FP16/FP32 pairwise-incompatible format mix). The 4-fork stage is
+a DIFFERENT stage — candidate: a tensor-transform stage group (the 174
+wired tensor sites: quantize/copy/convert around KV-cache/GDN state) or
+GDN-adjacent TwoTermQ8 correction (kernel-contract question). NEITHER
+confirmed — the named export is the gate.
+
+EXPORT FIX (routed to sparks): the A2 exports used FILTER=omp ONLY →
+gdn_projection_route records absent. The queued named-attribution
+export MUST run `LLAMINAR_PERF_STATS_FILTER=omp,kernel` + the
+full-records JSON — one pass resolves BOTH the 4-fork stage identity
+AND the exact GDN route (GDNProjectionStage publishes
+kernel/gdn_projection_route with route/m/k/projections/names/codebooks
+tags).
+
+Candidate fix shapes (pending confirmation): (a) tensor-transform group
+→ per-op pooling under the byte-neutrality discipline; (b) GDN-adjacent
+correction → qkv-correction fork joins the zab fused group only if the
+correction contract allows grouping (kernel-contract, not layout).
