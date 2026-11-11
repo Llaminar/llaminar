@@ -510,3 +510,20 @@ STATUS: new native code SOURCE REVIEW PENDING; **no .79 run until review
 passes.** Future focused set grows by 1 → 6 (adds
 NativeCorePlacesPublicationContract); the full campaign remains Main's
 post-collection only.
+
+### #189 source review IN PROGRESS — two real boundaries flagged in 2a4 (Main, ~02:41Z)
+
+NOT ACK. Reviewer-flagged boundaries:
+1. The current-PID receipt must be checked against an INDEPENDENT capacity
+   order (not self-receipt — a receipt the process wrote itself cannot
+   prove the order it claims).
+2. A public prepare-OMP level-0 / MPI-uninit path does NOT prove original
+   main-thread / startup / no-prior-runtime provenance.
+RESOLUTION IN PROGRESS: likely move the initial native prep into the
+original MPISessionOwner entry + private interface with main-thread/once/
+no-workers guard — not a public late-exec helper.
+STATUS: current 2a4 UNQUALIFIED despite the positive focused author
+checks. A .79 pass will make the SOURCE-HANDOVER BASE available for the
+collection (reusable focused 6 + 20×), but QUALIFIED/SETTLED for the
+collection still requires ONE Main-owned full campaign per the operator
+directive — never inferred from the focused B12 set.
