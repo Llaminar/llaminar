@@ -258,3 +258,14 @@ NEON_I8MM SHARED_CORE=ON, run BOTH Unit targets, JUnit into seal
 K14-B4-52FEC643, JUnit+tip to the reviewer together. .80 sequence: B1
 named-attribution export FIRST (~25 min, K14-B1ATTR-12675C956), then W3.
 Fallbacks: .79 after W2, or the station (device-free Unit work).
+
+### W3 RUN-SHEET CORRECTION (sparks, ~23:34Z): Integration build, not Release
+
+Correctness tests belong in an INTEGRATION NEON_I8MM build with
+SHARED_CORE=ON (assertions + symbols) — NOT Release (Release is for
+timing). Both TUs run with --no-tests=error; JUnit + exact tip/tree
+retained; reviewer re-reviews only after those results. Final .80
+sequence: (1) B1 attribution export (Release, measurement-only,
+omp+kernel filters) → (2) W3 (Integration 52fec643f, both TUs,
+JUnit seal). Coordinator run-sheet error caught by the executor —
+recorded as the correctness-vs-timing build-class discipline.
