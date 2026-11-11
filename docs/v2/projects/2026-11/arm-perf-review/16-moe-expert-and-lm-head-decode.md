@@ -506,3 +506,27 @@ CORRECTIONS (in the EXISTING spec file, not a new artifact):
 No whole-lane suites/apparatus/implementation requested. The reviewer can
 re-review the exact corrected blob; source/implementation + runtime/
 economy evidence stay separate when/if the operator unfences.
+
+### B4 S1–S6 CORRECTED SPEC delivered (arm-addon2, ~15:24Z) — corrected blob routed to reviewer
+
+All six applied to the existing spec file (evidence/
+b4-design-spec-corrected.md): S1 Mode C seeded-token preservation as a
+HARD compatibility requirement + blanket sentence qualified per-coupling;
+S2 operator contract INLINED as normative clauses (full head + complete
+sampler unchanged, no p renormalization over S, grouped verifier rows
+byte-equal serial M1, Mode G argmax after transforms, accepted-state/
+bonus authority unchanged); S3 expanded proof coverage (incl. valid-zero
+vs invalid-zero-mass distinction, truthful qS across residual support);
+S4 selector v1 lifetime fully specified + PMA AUTHORITY-unchanged/BOM-
+includes-workspace precision; S5 normative repeated fresh-process
+paired/rotated trials + placement lists bound to actual topology; S6
+"operator review = second go" REPLACED with the fence text
+(implementation + N-sweep fenced until separate explicit operator
+instruction).
+ALSO: (a) compact IQ3S decode bench committed d096438e2 (idea-08 lane,
+syntax-clean); (b) B4 HOLD COMPLIANCE confirmed: NO B4 code/harness
+written before the operator's literal authorization resolved (the hold
+stood; the only B4 action was the S1–S6 spec text). With the operator's
+"yes — diagnostic authorized" now on record, addon2 proceeds with the
+diagnostic implementation (S1–S6 as test properties) and sends the
+corrected blob + diagnostic SHA to the reviewer.
