@@ -54,7 +54,9 @@ namespace llaminar::v2
  * raw sites must either note themselves or enter the named exemption list
  * under review. The NAMED exemptions (one-time work outside execution, each
  * owned by its file, checked by the fork-note source policy):
- * - app/MPIBootstrapPhase.cpp: one-time rank bootstrap affinity binding.
+ * - app/MPIBootstrapPhase.cpp: one-time rank bootstrap affinity verification
+ *   (Main's B12 native-entry reown removed the binding fork this file used to
+ *   carry; NativeCPUPlacement owns placement without one).
  * - kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h, CPUPreparedWeightWriter.cpp,
  *   kernels/cuda/gemm/CUDAWeightPacker.cpp, kernels/rocm/gemm/ROCmWeightPacker.cpp:
  *   one-time weight preparation and publication.

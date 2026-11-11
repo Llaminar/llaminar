@@ -44,8 +44,6 @@ SUPPORTED_SUFFIXES = (".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".inc", ".inl"
 
 # Exact (file, enclosing function) -> reason. Never a generic exemption.
 EXEMPT_SITES: dict[tuple[str, str], str] = {
-    ("src/v2/app/MPIBootstrapPhase.cpp", "bindOpenMPWorkersFastestFirst"):
-        "one-time rank bootstrap affinity binding at process start",
     ("src/v2/app/MPIBootstrapPhase.cpp", "verifyStartupThreadAffinity"):
         "one-time rank bootstrap affinity verification at process start",
     ("src/v2/kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h", "repackNativeBlocksToInterleaved"):
