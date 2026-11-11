@@ -394,9 +394,12 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
             const auto cost_ns = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(cost_stop - cost_start)
                     .count());
+            // The restoration probe counts ONLY when its guard actually
+            // executes it (non-concurrent with an engaged outer); measure(0,
+            // false) skips the probe, so its total is exactly the notes.
             const std::uint64_t expected_total =
                 kMeasuredNotes * (concurrent ? 2u : 1u) +
-                (concurrent ? 0u : 1u); // Nested: the restoration probe.
+                (concurrent ? 0u : (outer ? 1u : 0u));
             EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - before, expected_total);
             return cost_ns / static_cast<double>(kMeasuredNotes);
         };
