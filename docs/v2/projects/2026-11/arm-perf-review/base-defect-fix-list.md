@@ -892,3 +892,18 @@ suite + full canonical under this EXPLICIT NARROW environment. No blanket
 140 closure or allocator/topology cause claim; remaining assertions still
 need triage. RUNBOOK: the get_mempolicy/move_pages path needs the exact
 arg-restricted profile (not broad seccomp=unconfined).
+
+### CB progress (lead, ~13:33Z): NUMA fixtures green, canonical refresh RUNNING
+
+Lead implemented 4 NUMA fixture corrections (test-only) + explicit
+preflight registration; **39/39 direct, 4/4 registered (Unit + 3
+preflight), 0 skips** — evidence
+lead-numa-suite-20261111T1314-r2. COMPLETE CANONICAL REFRESH NOW
+RUNNING (container 0554e50d78e0, cb-c1-canonical-20261111t1330, build.log
+growing; artifacts lead-canonical-refresh-20261111T1330) under the same
+query-only seccomp profile, pinned image, source/index/full runtime +
+dependency bindings; parent .git read-only bind fixes container worktree
+git visibility; compile DB export enabled, active Ninja preserved. No
+gate waiver/commits/pushes. Lead retains C1 source/build ownership until
+the run finishes; worker = read-only other-failure triage. GLM untouched;
+no new lanes/ARM resources. (No acknowledgment expected.)
