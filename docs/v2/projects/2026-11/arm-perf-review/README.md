@@ -1709,3 +1709,15 @@ Main's ONE post-merge ARM CPU campaign on exact bb893cd79 (MERGED tip):
   CTest, not hardcoded 295) — not sparks'; .80 not held for the Mac.
 - Executor: arm-sparks under the coordinator booking; launch when .80
   frees; ACK paths + planned start first.
+
+### MAC CAMPAIGN LEG LAUNCHED (Main, ~11:31Z)
+
+Main launched the Mac portability leg NOW via its owned monitor: isolated
+clean bb893cd79 detached checkout (/tmp/llaminar-main-bb-source; full
+Integration NEON AppleClang-21/libomp/GTest/active Ninja), unrestricted
+full build (-k 0) → complete portability CTest inventory / all tests with
+logs/JUnit, no subset/count hardcode. Results:
+/tmp/llaminar-main-bb-mac-results. ONE campaign leg — NOT lane
+qualification / 18-gate. .80 definitional already delivered (canonical
+full Unit/preflight); awaiting the planned slot ACK. Old scheduled prompt's
+#58-OPEN state ignored: #58 CLOSED NOGO — no apparatus work.
