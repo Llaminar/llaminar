@@ -719,3 +719,16 @@ read-back method that works:
   (1048576/1048577/1048577/2097152).
 - Coverage unchanged/honest: Workshare all four branches RUN (5/5);
   Bootstrap UNVERIFIED at lane (Linux binary, syntax-validated only).
+
+### Reviewer verdict on 95e1dcebb — HOLD (#187): expression reads destroyed optional (~10:21Z)
+
+Expression changed, but it tests `outer` AFTER `outer.reset()` (:372). At
+expected_total (:396) outer is DISENGAGED for every branch → owners1/2
+non-concurrent actually execute N+1 (probe ran) but expect N; no-owner
+repaired while BOTH owned cases now fail. The claimed audit table ignored
+teardown state. FIX: count probes when executed — local probe_count
+increment at the actual probe site, or capture immutable has_probe BEFORE
+teardown, or use the validated ownership configuration; do NOT infer past
+work from a destroyed optional. Correct branch totals: N, N+1, N+1, 2N.
+Other source closures retained; no execution or ACK/A2/economy
+authorization.
