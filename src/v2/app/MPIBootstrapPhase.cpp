@@ -584,14 +584,16 @@ namespace llaminar2
 
     void MPIBootstrapPhase::configureClusterRankThreads(const OrchestrationConfig &config)
     {
-        // Pre-exec core places can bind the initial thread before main. Derive
-        // the rank budget from its already-admitted partition, not just that
-        // first place, and restore the caller's exact original mask afterward.
-        const ScopedOpenMPPartitionAffinity admitted_partition;
+        // Observe the whole admitted partition, not the pre-main first place.
+        // Retire this temporary mask before installing permanent team placement:
+        // restoring an old master place afterward would overlap another worker.
         cpu_set_t affinity;
         CPU_ZERO(&affinity);
-        if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0)
-            throw std::runtime_error("Cannot read MPI rank affinity for cluster worker admission");
+        {
+            const ScopedOpenMPPartitionAffinity admitted_partition;
+            if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0)
+                throw std::runtime_error("Cannot read MPI rank affinity for cluster worker admission");
+        }
         std::map<int, int> physical_cores;
         for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
             if (CPU_ISSET(cpu, &affinity))
