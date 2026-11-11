@@ -410,3 +410,22 @@ contract spec for operator review. **NO implementation until an explicit
 second go.** Greedy-target staged first per the reviewer. Reviewer design
 input (e75b0b961) governs the spec. Owner: arm-addon2 (idea-16 lane).
 Fence state: DESIGN unfenced; IMPLEMENTATION + economy admission fenced.
+
+### B4 DESIGN SPEC DELIVERED (arm-addon2, ~14:02Z) — archived evidence/
+b4-draft-vocab-budget-design-spec.md; routed to operator for review.
+
+Design-only; fences restated (§9). Structure: 0) five consulted questions
+answered; 1) typed spec (DraftProposalPolicy{version, selector, draw_law,
+vocab_budget=Full|ShortlistLimit{N}} + separate VerifierCouplingPolicy
+axis; full = current full-draft + MTP enabled; N runtime descriptor data
+in one binary; no N=V→full aliasing; default full); 2) selected-row
+byte-proof spec (global IDs/full-K/IQ3_S/scales/reduction + per-clause
+minimum proofs); 3) selector identity (v1 prior verified target row
+ranking = HEURISTIC, not certified top-N; no full-logits top-N fake
+savings; q truthful); 4) per-mode coupling specs (G first, C existing
+seeded never silently replaced, P last; TV formula only in P); 5) sweep
+protocol DESIGN ONLY (full+64/128/256/512/1024/4096+N=1 diagnostic;
+cost per emitted token primary; 4 placements; hold-out prompts; no
+tuner); 6) one-build mechanics; 7) correctness coverage (63/65/127/129/
+V−1, zero/invalid/stale/zero-mass/ties/reset/prefix, no budget rounding,
+negatives must FAIL); 8) recommendation (G → C → P staged); 9) fences.
