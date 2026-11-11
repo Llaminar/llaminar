@@ -398,3 +398,15 @@ draw/coupling identity; stage greedy-target first, then the
 already-existing stochastic couplings as separately proved modes. NOT an
 implementation unfence; no N/economy result admitted. Existing focused
 tests + Main's post-merge campaign ownership unchanged.
+
+### **B4 DESIGN APPROVED (operator, ~14:05Z) — design-only, implementation still fenced**
+
+Operator approved: (1) the typed draft-vocabulary-budget DESIGN
+(DraftProposalPolicy { policy_version, selector, draw_law, vocab_budget };
+full | ShortlistLimit{checked_positive_N}; runtime parameter; one build);
+(2) the sweep protocol (full + 64/128/256/512/1024/4096; cost per emitted
+token; accepted-prefix length; production placements; IQ3_S); (3) the
+contract spec for operator review. **NO implementation until an explicit
+second go.** Greedy-target staged first per the reviewer. Reviewer design
+input (e75b0b961) governs the spec. Owner: arm-addon2 (idea-16 lane).
+Fence state: DESIGN unfenced; IMPLEMENTATION + economy admission fenced.
