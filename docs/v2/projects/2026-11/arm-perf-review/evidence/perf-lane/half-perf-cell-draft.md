@@ -259,3 +259,33 @@ arrive from arm-sparks.
    pointer claiming it was on the half-perf branch was wrong.
 Disposition unchanged: economy NOT ADMITTED / insufficient evidence;
 reviewer proceeds read-only once artifact paths arrive.
+
+### Lane-2 step 1: carry-verification GREEN at bb893cd79 (arm-addon, ~11:16Z)
+
+Detached /tmp/lane2 at bb893cd79 (clean); sanctioned macOS primitive path
+(cmake -S tests/v2/portability, CMake 4.3.1, AppleClang-21, Integration,
+NEON): 121/121 targets built. **18/18 focused cells PASS** (4.08 s):
+MetadataSeal (U+Int Coverage+Lifecycle), WeightView (U+I), NEONExecution
+(U+I), ProjectionBatch (U+I), NumericalContract (U+I), PreparedProjection
+(U+I), NEONAttentionMath (U+I), NEONAttentionQ16Int32Bound,
+CPUAttentionInvocationAdmission, PanelTailsMatchSerial. BONUS: the real
+register-gate probe executed during the build and PASSED ("64 native NEON
+tile programs: single-row spill nothing, grouped within budget") — the
+descoped tooling still functions at bb. X86 syntax sweep: MetadataSeal +
+AttentionInvocationAdmission pass -mavx512; PreparedProjection/
+NEONAttentionMath correctly #error under non-AArch64 (by-design ARM-only;
+x86 shared path = separate VNNI files). Per-file SHA-256s recorded
+(PublishedBytes 3ed210b8…, WeightView 4883f771…, PreparedProjection
+ad00ac6a…, ProjectionBatch 6fc68dad…, NEONAttentionMath ccd6e1db…,
+AttentionInvocationAdmission 664d31bb…). Raw logs:
+/tmp/lane2-carry-verification.log, /tmp/lane2-pt-build.log,
+/tmp/lane2-pt-cfg.log. ATTRIBUTION: owner evidence only (M1/
+AppleClang-21, portability project) — NOT the full Unit/preflight
+inventory; the .80/container gate remains Main's.
+STEP-2 WINDOW SPEC ready for the booking queue (after campaign/A2):
+M=1 decode economy window on .80 — encodings Q8_K/Q8_0/Q4_K (+Q6_K
+known-slow control), M=1, shapes 512×2048/2048×4096/17408×5120, threads
+1/2/4/8/10/12/16/20, ABBA 31 iters raw, OMP_PLACES=cores
+OMP_PROC_BIND=close, bb893cd79 Release NEON. Decision gate: the Q8_K
+10-thread regression signal + per-strip activation touch counts decide
+the load-once-per-block + lane-indexed-dot successor.
