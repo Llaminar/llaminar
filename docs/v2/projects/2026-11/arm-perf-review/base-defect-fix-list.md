@@ -737,3 +737,25 @@ pick/workspace/action authorized from ARM side.
 Main has NOT claimed canonical green for C1; unchanged failed names =
 baseline-relative only. ARM post-merge campaign separate — do not
 interrupt its booked .80/A2/DirB windows.
+
+### B11 STATION MATCHED COMPARISON (C1 worker c527, ~12:19Z) — crash is MPI-launcher-specific
+
+Same binary (v2_test_numa_allocator), same container, same source, same
+config — the comparison Main prescribed:
+- **DIRECT (non-MPI): exit 0.** gtest failures but NO SIGSEGV — the
+  allocator fails GRACEFULLY under the memory-only-NUMA topology: EPERM on
+  first-touch memory-policy observation → null buffer returns → test
+  failures → normal process exit.
+- **MPI-WRAPPED (mpirun -np 1): SIGSEGV (signal 11).** The same binary
+  under the MPI launcher crashes.
+CONCLUSION: the SIGSEGV is MPI-launcher-specific (hwloc binding or
+memory-policy interaction under mpirun), not a pure allocator defect —
+the allocator handles the topology gracefully; the crash REQUIRES the MPI
+launcher environment. B11 classification: MPI-launcher-interaction
+defect. Logs: artifacts/cb-c1-staging/current/b11-direct.log (sha256
+7046e841…) + b11-mpi.log (sha256 0eeac5b5…).
+NOTE: this is the matched-identity comparison the ARM methodology
+required (the .79 38/39 non-reproduction was on a DIFFERENT host).
+Next diagnostic step if pursued: inspect what mpirun changes that turns
+graceful-null into SIGSEGV (launcher-set memory policy? hwloc bind?
+different allocator code path under MPI init?).
