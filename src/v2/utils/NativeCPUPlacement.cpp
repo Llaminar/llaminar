@@ -23,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <strings.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -326,8 +327,18 @@ namespace
         const char *raw_receipt=::getenv(kNativeCorePlacesEnvironment);
         const auto receipt=raw_receipt ? std::optional{parseCorePlaceReceipt(raw_receipt)} : std::nullopt;
         const char *requested=::getenv("OMP_PLACES");
-        const bool automatic=!requested || !*requested || std::string_view(requested)=="cores" ||
-            (receipt && std::string_view(requested)==receipt->places);
+        // libgomp reports proc_bind=false both for an unset policy and for an
+        // authored OMP_PROC_BIND=false, so the original environment is the only
+        // truthful source of that intent. An authored unbound policy keeps its
+        // original native partition and receives no core-admission token;
+        // core-place requests retain the established canonical close binding.
+        const char *requested_binding=::getenv("OMP_PROC_BIND");
+        const bool authored_unbound=requested_binding &&
+            ::strcasecmp(requested_binding,"false")==0;
+        const bool automatic_binding=!authored_unbound;
+        const bool automatic=automatic_binding && (!requested || !*requested ||
+            std::string_view(requested)=="cores" ||
+            (receipt && std::string_view(requested)==receipt->places));
         const bool current=receipt && receipt->process==static_cast<long>(::getpid());
         if(current)
         {
