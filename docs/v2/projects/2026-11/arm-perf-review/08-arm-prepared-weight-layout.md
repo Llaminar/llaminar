@@ -118,3 +118,9 @@ REQUEST: one CPU window after the current queue clears (resident BOM
 census + tournament, measurement-only).** macOS cannot build v2 (libnuma).
 GO/NO-GO gates unchanged; Phase A supports weight-bandwidth binding (GDN
 ≈30-34 GB/s = lowest big stage; LM head 45; routed experts ~36).
+
+FULL REPORT ARCHIVED: evidence/idea08-phase-a-analysis.md (verbatim tables;
+the Phase A entry above is the summary). Window request recorded: one CPU
+window on .80 for (a) the resident per-tensor BOM census + (b) the compact
+IQ3_S decode tournament — measurement-only, queued behind the Main
+campaign.
