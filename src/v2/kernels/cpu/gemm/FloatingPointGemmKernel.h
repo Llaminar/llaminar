@@ -174,7 +174,11 @@ namespace llaminar2
             float value = alpha * dot;
             if (bias)
             {
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(__aarch64__)
+                // The AArch64 FP/SIMD register constraint is 'w' on both
+                // compilers; 'x' is an x86-only spelling AppleClang rejects.
+                asm volatile("" : "+w"(value));
+#elif defined(__GNUC__) || defined(__clang__)
                 asm volatile("" : "+x"(value));
 #else
                 volatile float rounded = value;
@@ -1249,6 +1253,25 @@ namespace llaminar2
             static_assert(Rows >= 1 && Rows <= 4);
             static_assert(WeightType == TensorType::FP16,
                 "the FMLAL leaf serves FP16 weights; other storages keep the scalar schedule");
+            // Conversion-contract admission (F3): the full blocks convert A
+            // with FCVTN/FCVTN2, whose rounding follows FPCR.RMode and whose
+            // subnormal handling follows FPCR.FZ/FZ16. The scalar tail and the
+            // scalar schedule use explicit bitwise RNE. Both are the same
+            // contract only under the process profile this leaf admits, so a
+            // worker running with any other profile fails fatally here rather
+            // than silently changing bytes. No global FPCR writes anywhere.
+            std::uint64_t fpcr;
+            asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+            constexpr std::uint64_t kRModeMask = 0x3ull << 22;
+            constexpr std::uint64_t kFZ = 0x1ull << 24;
+            constexpr std::uint64_t kFZ16 = 0x1ull << 26;
+            if ((fpcr & (kRModeMask | kFZ | kFZ16)) != 0)
+            {
+                LOG_ERROR("FloatingPointGemmKernel - FMLAL leaf requires the "
+                          "process FP profile RNE with FZ/FZ16 off; observed "
+                          "FPCR=0x" << std::hex << fpcr << std::dec);
+                std::abort();
+            }
             constexpr int kLanes =
                 floating_expert_numerical_contract::kReductionLanes;
             constexpr int kVectorLanes = 16;
@@ -1315,8 +1338,8 @@ namespace llaminar2
                                 vld1q_u16(weight_halves + weight_row +
                                           static_cast<std::size_t>(first_k) + 8));
                             // Lane i of accumulator block b carries tree lane
-                            // lane_tile + 16*b + i, whose chain is k = base +
-                            // lane_tile + 16*b + i and its successors at +256.
+                            // lane_tile + 4*b + i, whose chain is k = base +
+                            // lane_tile + 4*b + i and its successors at +256.
                             accumulators[row][0] = vfmlalq_low_f16(
                                 accumulators[row][0], activation_low, weight_low);
                             accumulators[row][1] = vfmlalq_high_f16(
@@ -1565,9 +1588,14 @@ namespace llaminar2
                         else
 #endif
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+                        // The FMLAL leaf's operand domain: FP16 weights with
+                        // half-rounded or physical-half A. <FP16, false,
+                        // false> keeps the mixed-policy scalar schedule (its
+                        // full blocks must not narrow unconverted FP32 A).
                         if constexpr ((ISA == ISALevel::NEON ||
                                        ISA == ISALevel::NEONDotProd) &&
-                                      WeightType == TensorType::FP16)
+                                      WeightType == TensorType::FP16 &&
+                                      (HalfRNE || HalfStorage))
                         {
                             const std::size_t weight_row =
                                 static_cast<std::size_t>(column) * K;
@@ -1799,11 +1827,16 @@ namespace llaminar2
                 // FP16FML; startup admission verifies the executing CPU
                 // advertises FEAT_FHM before any leaf instruction runs, so a
                 // mismatch fails fatally instead of faulting on an unimplemented
-                // instruction. The route probe counts once per dispatch, on the
-                // calling thread, outside the worksharing region — never per
-                // row tile or column inside the OpenMP team.
+                // instruction. The route probe counts one resolved FMLAL
+                // dispatch — FP16 weights in the leaf's operand domain with
+                // work that executes FMLAL vector lanes (K >= 16); FP32/BF16
+                // weights, empty work and tail-only runs never count. One
+                // relaxed add on the calling thread, outside the worksharing
+                // region.
                 cpu::ARMCPUCapabilities::native().require(cpu::ARMCPUFeature::FP16FML);
-                fmlalLeafCounter().fetch_add(1, std::memory_order_relaxed);
+                if constexpr (WeightType == TensorType::FP16 && (HalfRNE || HalfStorage))
+                    if (M > 0 && N > 0 && K >= 16)
+                        fmlalLeafCounter().fetch_add(1, std::memory_order_relaxed);
                 return run_gpu_aligned_expert_fp32_matmul_neon<WeightType, HalfRNE, HalfStorage>(
                     A, B, C, M, N, K, alpha, beta, bias);
 #endif

@@ -291,7 +291,18 @@ float canonicalHalfTree(const std::vector<uint16_t> &a_words,const std::vector<u
         const uint32_t sign=uint32_t(word & 0x8000u)<<16;
         const uint32_t exponent=(word >> 10) & 0x1fu, mantissa=word & 0x3ffu;
         uint32_t bits;
-        if(exponent==0)bits=sign | (mantissa<<13);
+        if(exponent==0){
+            if(mantissa==0)bits=sign;
+            else{
+                // Half subnormals normalize into binary32 normals:
+                // value = mantissa * 2^-24 = normalized * 2^(length-25).
+                const int leading=std::countl_zero(mantissa);
+                const int length=32-leading;
+                const uint32_t normalized=mantissa << (10-length);
+                const int binary32_exponent=102+length;
+                bits=sign | (uint32_t(binary32_exponent)<<23) | ((normalized & 0x1ffu)<<14);
+            }
+        }
         else if(exponent==31)bits=sign | 0x7f800000u | (mantissa<<13);
         else bits=sign | ((exponent-15u+127u)<<23) | (mantissa<<13);
         float out;std::memcpy(&out,&bits,sizeof(out));return out;
@@ -308,59 +319,88 @@ float canonicalHalfTree(const std::vector<uint16_t> &a_words,const std::vector<u
 }
 /** @test Adversarial half operands, RNE ties and overflow-to-Inf: leaf bytes equal the owned tree. */
 TEST(CPUHalfOperands, FmlalSpecialOperandsMatchOwnedTree){
-    // +-0, subnormals, min/max normals, +-Inf, quiet and payload NaNs.
-    const std::array<uint16_t,12> weight_words{{
+    // Isolated specials: K=256 gives every tree lane exactly one product, so
+    // one special per run isolates its class (finite baseline elsewhere).
+    // The oracle is the test-owned fixed-256-lane tree with test-owned exact
+    // widening; bytes must match, NaN payloads included.
+    const std::array<uint16_t,12> special_words{{
         0x0000,0x8000,0x0001,0x03FF,0x7C00,0xFC00,0x7E00,0x7C01,0x7BFF,0x0400,0x8001,0x3C00}};
-    // FP32 A values whose binary16 RNE words are hand-verified: ties, the
-    // overflow-to-Inf boundary and normals (the conversion table is the one
-    // HalfRNEBoundaryAndFP32Output pins).
-    const std::array<std::pair<float,uint16_t>,12> a_cases{{
-        {0.f,0x0000},{-0.f,0x8000},{0x1.8p-24f,0x0002},{0x1.4p-23f,0x0001},
-        {1.f+0x1p-11f,0x3C00},{1.f+3*0x1p-11f,0x3C01},{65520.f,0x7C00},
-        {65536.f,0x7C00},{-65536.f,0xFC00},{65519.f,0x7BFF},{2.f,0x4000},{-2.f,0xC000}}};
-    for(int k:{12,40,300}){
-        constexpr int N=3;
-        std::vector<uint16_t> words(size_t(N)*k),half(size_t(5)*k);
-        std::vector<float> source(size_t(5)*k);
-        for(int j=0;j<N;++j)for(int c=0;c<k;++c)
-            words[size_t(j)*k+c]=weight_words[size_t((j+c)%12)];
-        for(int row=0;row<5;++row)for(int c=0;c<k;++c){
-            half[size_t(row)*k+c]=a_cases[size_t((row+c)%12)].second;
-            source[size_t(row)*k+c]=a_cases[size_t((row+c)%12)].first;
-        }
-        FP16Tensor weight({size_t(N),size_t(k)},words);
-        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
-        FP32Tensor input({size_t(5),size_t(k)}),half_as_fp32({size_t(5),size_t(k)}),output({size_t(5),size_t(N)});
-        std::copy(source.begin(),source.end(),input.mutable_data());
-        FP16Tensor half_input({size_t(5),size_t(k)},half);
-        // Expected bytes: the owned tree per row/column (alpha=1, beta=0, no bias).
-        std::vector<float> expected(size_t(5)*N);
-        for(int row=0;row<5;++row)for(int j=0;j<N;++j){
-            std::vector<uint16_t> a_words(static_cast<size_t>(k)),w_words(static_cast<size_t>(k));
-            for(int c=0;c<k;++c){
-                a_words[size_t(c)]=a_cases[size_t((row+c)%12)].second;
-                w_words[size_t(c)]=weight_words[size_t((j+c)%12)];
-            }
-            expected[size_t(row)*N+j]=canonicalHalfTree(a_words,w_words);
-        }
-        for(int repetition:{1,2}){
-            std::fill_n(output.mutable_data(),size_t(5)*N,-777.f);
+    constexpr int K=256;
+    for(int repetition:{1,2}){
+        // Weight-side specials: A is exact 1.0 in both storage forms.
+        for(uint16_t special:special_words){
+            std::vector<uint16_t> words(size_t(K),0x3C00),half(size_t(K),0x3C00);
+            words[size_t(repetition-1)]=special;
+            std::vector<float> source(size_t(K),1.f);
+            FP16Tensor weight({size_t(1),size_t(K)},words);
+            Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+            FP32Tensor input({size_t(1),size_t(K)}),output({size_t(1),size_t(1)});
+            std::copy(source.begin(),source.end(),input.mutable_data());
+            FP16Tensor half_input({size_t(1),size_t(K)},half);
+            std::vector<uint16_t> a_words(size_t(K),0x3C00),w_words=words;
+            const float expected=canonicalHalfTree(a_words,w_words);
             const long long before=fmlalLeafInvocations();
-            ASSERT_TRUE(engine.multiply_tensor(&input,&output,5,N,k))<<"k="<<k<<" rep="<<repetition;
-            const long long after_fp32=fmlalLeafInvocations();
-            // The FMLAL path must actually execute under its declaring
-            // envelope: ceil(5/4) row tiles x N columns per multiply, or zero
-            // in an envelope without the leaf (the scalar schedule runs).
-            EXPECT_EQ(after_fp32-before,fmlalLeafCompiledInEnvelope()?1:0)<<"fp32A k="<<k;
-            EXPECT_EQ(std::memcmp(output.data(),expected.data(),expected.size()*sizeof(float)),0)<<"fp32A k="<<k;
-            std::fill_n(output.mutable_data(),5*N,-777.f);
-            ASSERT_TRUE(engine.multiply_tensor(&half_input,&output,5,N,k))<<"half k="<<k<<" rep="<<repetition;
-            EXPECT_EQ(fmlalLeafInvocations()-after_fp32,fmlalLeafCompiledInEnvelope()?1:0)<<"halfA k="<<k;
-            EXPECT_EQ(std::memcmp(output.data(),expected.data(),expected.size()*sizeof(float)),0)<<"halfA k="<<k;
+            std::fill_n(output.mutable_data(),1,-777.f);
+            ASSERT_TRUE(engine.multiply_tensor(&input,&output,1,1,K))<<"W="<<special;
+            EXPECT_EQ(fmlalLeafInvocations()-before,fmlalLeafCompiledInEnvelope()?1:0)<<"W="<<special;
+            EXPECT_EQ(std::memcmp(output.data(),&expected,sizeof(float)),0)<<"fp32A W="<<special;
+            std::fill_n(output.mutable_data(),1,-777.f);
+            ASSERT_TRUE(engine.multiply_tensor(&half_input,&output,1,1,K))<<"W="<<special;
+            EXPECT_EQ(std::memcmp(output.data(),&expected,sizeof(float)),0)<<"halfA W="<<special;
+        }
+        // A-side specials through the HalfStorage path, and FP32-A RNE
+        // ties/overflow through the conversion contract.
+        for(uint16_t special:special_words){
+            std::vector<uint16_t> words(size_t(K),0x3C00),half(size_t(K),0x3C00);
+            half[size_t(repetition-1)]=special;
+            std::vector<float> source(size_t(K),1.f);
+            FP16Tensor weight({size_t(1),size_t(K)},words);
+            Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+            FP32Tensor input({size_t(1),size_t(K)}),output({size_t(1),size_t(1)});
+            std::copy(source.begin(),source.end(),input.mutable_data());
+            FP16Tensor half_input({size_t(1),size_t(K)},half);
+            std::vector<uint16_t> a_words=half,w_words(size_t(K),0x3C00);
+            const float expected=canonicalHalfTree(a_words,w_words);
+            std::fill_n(output.mutable_data(),1,-777.f);
+            ASSERT_TRUE(engine.multiply_tensor(&half_input,&output,1,1,K))<<"A="<<special;
+            EXPECT_EQ(std::memcmp(output.data(),&expected,sizeof(float)),0)<<"halfA A="<<special;
+        }
+        // FP32-A conversion discriminators: RNE ties and the overflow-to-Inf
+        // boundary, isolated per run (the hand table is the one
+        // HalfRNEBoundaryAndFP32Output pins, with its corrected ties).
+        const std::array<std::pair<float,uint16_t>,6> a_cases{{
+            {0x1.8p-24f,0x0002},{0x1.4p-23f,0x0002},{1.f+0x1p-11f,0x3C00},
+            {1.f+3*0x1p-11f,0x3C02},{65520.f,0x7C00},{65519.f,0x7BFF}}};
+        for(auto [value,word]:a_cases){
+            std::vector<uint16_t> words(size_t(K),0x3C00);
+            words[size_t(repetition-1)]=word;
+            std::vector<float> source(size_t(K),0.f);
+            source[size_t(repetition-1)]=value;
+            FP16Tensor weight({size_t(1),size_t(K)},words);
+            Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+            FP32Tensor input({size_t(1),size_t(K)}),output({size_t(1),size_t(1)});
+            std::copy(source.begin(),source.end(),input.mutable_data());
+            std::vector<uint16_t> a_words(size_t(K),0x0000),w_words=words;
+            a_words[size_t(repetition-1)]=word;
+            const float expected=canonicalHalfTree(a_words,w_words);
+            std::fill_n(output.mutable_data(),1,-777.f);
+            ASSERT_TRUE(engine.multiply_tensor(&input,&output,1,1,K))<<"A="<<word;
+            EXPECT_EQ(std::memcmp(output.data(),&expected,sizeof(float)),0)<<"fp32A A="<<word;
         }
     }
 }
-/** @test The FMLAL leaf selection maps exactly onto the declared envelope. */
+/** @test The mixed-policy boundary (F,F is not FMLAL): unconverted FP32 A at
+ *        the K=16 stripe keeps its extra precision end to end. */
+TEST(CPUHalfOperands, MixedPolicyKeepsUnroundedFP32AtK16){
+    FP16Tensor weight({size_t(1),size_t(16)},std::vector<uint16_t>(16,0x3C00));
+    Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+    FP32Tensor input({size_t(1),size_t(16)}),output({size_t(1),size_t(1)});
+    std::vector<float> source(16,0.f);
+    source[0]=1.f+0x1p-12f;
+    std::copy(source.begin(),source.end(),input.mutable_data());
+    ASSERT_TRUE(engine.multiply_tensor(&input,&output,1,1,16));
+    EXPECT_EQ(output.data()[0],1.f+0x1p-12f);
+}
 TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
     // The leaf is compiled exactly in the envelope that declares FP16FML; an
     // envelope without it keeps the scalar schedule and never selects the
