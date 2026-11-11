@@ -371,3 +371,30 @@ model/inference, ~2-3 min)** — satisfies the operator's non-inference
 authorization AND the tool's harness shape. Conditions: real begin
 BEFORE/finish AFTER; STOP if llaminar2 needs a model to start; full
 identity capture; honest two-part reporting; booking recorded.
+
+### **Dir-B trace SEALED: K14-IDEA25-Q38-TRACE-CPU4096-20261111** (arm-sparks, ~15:30Z) — at bb893cd79
+
+Both runs exit=0 (a = PERF_STATS CSV/JSON + GPU_STAGE_TIMING, b = CSV);
+prefill/decode ≈ 24.14 / 9.40 tok/s (2154-token filler). Per-bucket
+structure (q38-a-perf.csv, 22087 rows/1004 timers; summary in
+per-bucket.txt):
+- CPU-single path → NO CUDA prefill graph buckets (prefill_graph_launch/
+  replay counters absent BY DESIGN); granularity = per-layer stage timers:
+  prefill host wall 37.46 s (forward_cache_hit_total/execute).
+- **native_quantised_grouped_ffn_transaction (MoE FFN) per-layer mean
+  135,895 µs DOMINATES:** full-row layers (17,920 route rows, layers
+  0-47) ≈ 250-259 ms each; tail layers (180 rows) ≈ 6 ms → ~40× cheaper →
+  the prefill sits ~entirely in the early full-row FFN layers (consistent
+  with idea-21/25's MoE-FFN dominance).
+- Per-layer sub-stages: ordered_topk_accumulation 1,278 µs;
+  router_q8_expert_major_gather 634; route_schedule_and_bundle_validation
+  399; publication_prepare 115 (µs).
+- Non-MoE: GEMM_FP32 1,855; EMBEDDING 447; KV_APPEND 219; KV_CONV_Q16_1
+  157; RMS_NORM 132; ROPE 78 (µs).
+- **NO per-chunk host-launch gap artifacts (CPU path = stage-synchronous)
+  — the idea-25 gap question resolves on this path as "no bucket gap;
+  layer-stage-synchronous."**
+Seal: /Users/floriankinder/llaminar-spark-results/
+K14-IDEA25-Q38-TRACE-CPU4096-20261111 (q38-a/b-perf.csv, a/b.out,
+plan.json, SUMMARY.md, per-bucket.txt). CPU/changed-context structure
+evidence (NOT CUDA/8192; GPU runtime trace remains ungated).
