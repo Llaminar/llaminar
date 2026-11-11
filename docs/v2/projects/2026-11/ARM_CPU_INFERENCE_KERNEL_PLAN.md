@@ -1,6 +1,6 @@
 # Native ARM CPU inference: implementation, numerical proof and tuning plan
 
-Created: 2026-11-04; frontier updated 2026-11-10.
+Created: 2026-11-04; frontier updated 2026-11-11.
 Base: `feat/qfn-ngram-continuation` at `2948b1e49`. Working branch
 `codex/qfn-ngram-continuation-arm64`, published as `feat/arm64-native-kernels`
 in PR #43. Push each commit immediately; record pending validation separately.
@@ -12,7 +12,7 @@ path, finished by a Release `Perf__` scaling round. Detailed historical
 evidence (K-series snapshots, seals, falsification controls) lives in
 [the evidence record](ARM_CPU_KERNEL_IMPLEMENTATION_EVIDENCE.md).
 
-### Maintenance frontier — 2026-11-10
+### Maintenance frontier — 2026-11-11
 
 - Engine #71: `58dcdaff5` classifies Flash Next source roles through the shared
   typed work authority and gives native-row lookup its PLE decoder-layer owner.
@@ -47,6 +47,26 @@ evidence (K-series snapshots, seals, falsification controls) lives in
   and optimized dispatch are unchanged; the arithmetic comparison is
   metamorphic and does not newly certify fused-ticket publication or economy.
 
+- B12 startup closure at `e0b7a7c1f`: original-entry native OpenMP places
+  replace one-time manual worker affinities, which do not survive pool shrink
+  and regrowth. Preparation is private to the authenticated process owner,
+  guarded by original main-thread/once/no-worker/no-active-MPI admission; current
+  receipts must independently match canonical capacity order. The stale
+  single-rank NUMA fixture is separately corrected to actual observed locality.
+  Source ACK #189/#190 and focused GNU14/NEON Integration checks pass. Main
+  independently verifies the capable-host exact eight-test inventory/JUnit,
+  source/binary metadata and both lifecycle logs: **400 passes each**, an owner
+  harness overrun of the requested 20, not a performance measurement. The
+  original failed-763 bytes and failed harnesses remain retained. Partial
+  compile-database and epoch-mixed packet claims are explicitly excluded; see
+  [the bounded evidence](ARM_CPU_KERNEL_IMPLEMENTATION_EVIDENCE.md#native-openmp-entry-and-pool-lifecycle--2026-11-11).
+  This releases a **source-handover base**, not full-backend inference,
+  economy, register qualification or a qualified/SETTLED collection.
+- Qualification cadence: lanes provide focused related-change evidence and an
+  explicit unverified list. Main owns one complete campaign on the final
+  collection tip. The installed register obligation remains 18 cells × 14
+  canonical aliases with current bound programs; predecessor receipts do not
+  compose. Register-coordinator #175/#191 and A1/A2 holds remain independent.
 - The rebase onto `2948b1e49` is published. Full CPU-only ARM NEON Integration
   compilation passed at `e5ee7f672`, after compiler OOM-killed parity objects
   were resumed without changing build settings. Focused MPI/OpenMP/NUMA checks
