@@ -172,3 +172,19 @@ SCOPE: DESIGN FAITHFULNESS ONLY — no production-unfence, N-sweep,
 execution, or economy grant; diagnostic authorization unchanged.
 a42 diagnostic = SOURCE HOLD A1-A5 (repair round 2 in flight); FMLAL =
 SOURCE HOLD F1-F5 (repair tip 0b53fa7a4 in validation).
+
+## DIAGNOSTIC ROUND-3 TIP (~23:10Z): 3002d37cc — routed for A1-A5 re-review
+
+codex/arm-b4-vocab-budget @ 3002d37cc (parent a42ac312b; 2 files
++328/-169). A1: CommittedTokenRecencySelector v1 final-named w/ frontier
++ epoch maintained (all rejections EXECUTE + asserted), dedup/freshness/
+cap/backfill aligned, epoch rebinding tested. A2: per-arm traffic
+accounting, not_hardware_traffic=1 label, aggregate 227 asserted. A3:
+wrong-CORRECTION negative with fixed p+draw (deviation DETECTED);
+invalid-PMF rejected by draw-side validation. A4: fully-dyadic Mode P
+fixtures → exact 64³ proof; endpoint fixture restored via production
+clamped thresholds. A5: second geometry actually evaluated; even-N
+backfill branch exercised; V-1/ragged covered; header boundaries
+explicit (G harness-level corrected). Portable TU ± __ARM_NEON verified.
+NOTE: a brief TU clobber during patching was recovered from the
+committed a42ac312b blob (committed diff = authoritative).
