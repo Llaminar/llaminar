@@ -42,3 +42,26 @@ DISPOSITION: safely non-installed; not source-ready/unfencing basis;
 repair focused mechanisms in THIS diagnostic; no new gate/apparatus.
 Note: the station W3 focused check is MOOT for now — the diagnostic is
 under repair; re-run after the D1-D6 fix tip.
+
+## REVIEWER RE-VERDICT (B4 canonical spec @ 82fe1917, ~22:54Z): body finding CLOSED; 2 corrections + precision edits remain
+
+CLOSED: the missing-corrected-body finding (blob verified IN PLACE;
+summary = pointer only). S1 Mode C, S2 full target/grouped arithmetic,
+S3 enumerated/stream obligations, PMA-BOM wording, runtime-N +
+repeated/observed sweep requirements = substantially faithful.
+REMAINING:
+1. §3 selector mismatch: text claims "prior verified target row
+   ranking" but defines a committed-token RECENCY SET (rank-0 on every
+   observation; |S| collapses to 1 after first commit; N>=256 arms
+   can't explore differing supports on a 256-token request). Fix =
+   either specify real prior-row ranking w/ causal identity+lifetime,
+   OR name/version the recency selector explicitly with cold-start
+   policy + actual-count/sweep limits. First-step policy explicit.
+2. Header line 3 stale authority statement (contradicts corrected §9).
+PRECISION: Mode P "CHANGES" → "MAY CHANGE / does not guarantee
+preservation"; §5 880-seal = historical protocol exemplar, not a
+future-binary identity requirement; b7696144c = owner-reported
+reference context, not authenticated evidence.
+NO new apparatus/issue/host requirement. Diagnostic repair stays
+authorized. d7 HOLD D1-D6 separate, not cured by spec text. FMLAL
+landing review = reviewer's next item.
