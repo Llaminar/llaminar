@@ -700,3 +700,22 @@ Issue freeze respected. A2 held.
   resubmission.
 - No tests executed by reviewer; no A2/economy authorization. Task
   identity remains #187 (not the closed native-entry #189).
+
+### #188 one-line fix: 95e1dcebb (arm-addon3, ~10:20Z) — IN REVIEW (committed-bytes proof)
+
+Parent dc31e4401; 1 file +4/−1. The verdict and the fix crossed in flight —
+the lane applied the surgical fix BEFORE the instruction landed, with the
+read-back method that works:
+- DIFF a05f7138a..95e1dcebb DOES touch expected_total (prior miss
+  repaired): `(concurrent ? 0u : 1u)` → `(concurrent ? 0u : (outer ? 1u :
+  0u))` — the restoration probe counts ONLY when its guard executes it
+  (non-concurrent with engaged outer); concurrent → no probe; owners==0 →
+  no probe.
+- COMMITTED-BYTES read-back pasted verbatim (git show 95e1dcebb:
+  tests/v2/unit/utils/Test__MPIBootstrap.cpp | sed -n '385,400p') including
+  the corrected comment.
+- Audit table re-checked against committed bytes: 0/non-cc = N (probe
+  skipped); 1/non-cc = N+1; 2/non-cc = N+1; 1/concurrent = 2N
+  (1048576/1048577/1048577/2097152).
+- Coverage unchanged/honest: Workshare all four branches RUN (5/5);
+  Bootstrap UNVERIFIED at lane (Linux binary, syntax-validated only).
