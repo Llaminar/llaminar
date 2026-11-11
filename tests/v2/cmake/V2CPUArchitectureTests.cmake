@@ -322,7 +322,7 @@ v2_add_core_free_test(V2_Integration_OpenMPWorkshareRetainedDepth
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree OpenMP Workshare Ownership Regression)
 v2_add_core_free_test(V2_Integration_OpenMPTeamForkCounterContract
     COMMAND $<TARGET_FILE:v2_test_cpu_openmp_workshare>
-        --gtest_filter=OpenMPWorkshare.TeamForkCounterCountsExactlyTheRealForks:OpenMPWorkshare.TeamForkCounterPublicationCostAndDefault
+        --gtest_filter=OpenMPWorkshare.TeamForkCounterCountsExactlyTheRealForks:OpenMPWorkshare.TeamForkCounterPublicationCostAndDefault:OpenMPWorkshare.TeamForkScopeAttributesExactlyUnderOverlapAndNesting:OpenMPWorkshare.TeamForkWorkerContextForksNeverReachOwnerCells
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree OpenMP Workshare Ownership Regression)
 v2_add_core_free_test(V2_Integration_OpenMPForkNoteSourcePolicy
     COMMAND "${Python3_EXECUTABLE}" -B

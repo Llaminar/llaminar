@@ -32,7 +32,9 @@
 #include <fstream>
 #include <unistd.h>
 #include <optional>
+#include <thread>
 #include <chrono>
+#include <memory>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -230,43 +232,76 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
         EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - before, 2u);
     }
 
-    // Evidence configuration: both families selected, publication shape held.
-    const ScopedLaunchEnvironment filter("LLAMINAR_PERF_STATS_FILTER", "omp");
-    const ScopedLaunchEnvironment summary("LLAMINAR_PERF_STATS_SUMMARY", "1");
-    mutableDebugEnv().reload();
-    PerfStatsCollector::reloadConfigurationFromEnvironment();
-    EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled(
-        "omp", "openmp_team_forks_decode_step"));
-    EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled(
-        "omp", "openmp_team_forks_stage"));
+    // Self-cost evidence, under the ownership configurations production runs:
+    // no owner, the one owner a window/stage holds, the two nested owners, and
+    // two concurrent owners. Each variant is amortized over a million notes,
+    // recorded in the collector and logged, and bounded generously (the fork
+    // it describes costs microseconds, so the observation must never
+    // approach that scale).
+    {
+        // The evidence configuration lives in this inner scope so BOTH RAII
+        // guards complete BEFORE the final reload below: a reload that ran
+        // while the live guards could still mutate the environment would
+        // leave the authorities describing a configuration nobody set.
+        const ScopedLaunchEnvironment filter("LLAMINAR_PERF_STATS_FILTER", "omp");
+        const ScopedLaunchEnvironment summary("LLAMINAR_PERF_STATS_SUMMARY", "1");
+        mutableDebugEnv().reload();
+        PerfStatsCollector::reloadConfigurationFromEnvironment();
+        EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled(
+            "omp", "openmp_team_forks_decode_step"));
+        EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled(
+            "omp", "openmp_team_forks_stage"));
 
-    // Self-cost evidence: amortized ns per note over a million observations,
-    // recorded in the collector and logged. Asserted only against a bound
-    // generous against a loaded shared runner; the fork it describes costs
-    // microseconds, so the observation must never approach that scale.
-    constexpr std::uint64_t kMeasuredNotes = 1u << 20;
-    const std::uint64_t cost_before = llaminar::v2::openMPTeamForkSnapshot();
-    const auto cost_start = std::chrono::steady_clock::now();
-    for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
-        llaminar::v2::noteOpenMPTeamFork();
-    const auto cost_ns = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - cost_start)
-            .count());
-    EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - cost_before, kMeasuredNotes);
-    const double ns_per_note =
-        static_cast<double>(cost_ns) / static_cast<double>(kMeasuredNotes);
-    PerfStatsCollector::addCounter(
-        "omp", "openmp_team_fork_note_self_cost", ns_per_note, "evidence",
-        "host", {{"basis", std::to_string(kMeasuredNotes) + "_invocations"}});
-    std::cout << "[evidence] openmp_team_fork_note_self_cost=" << ns_per_note
-              << " ns/invocation over " << kMeasuredNotes << " invocations"
-              << std::endl;
-    EXPECT_LT(ns_per_note, 100.0);
-
-    // The evidence configuration ends here: both RAII guards restored the
-    // caller's environment values, and the configuration authorities reload
-    // from the restored environment so no export selection outlives the test.
+        constexpr std::uint64_t kMeasuredNotes = 1u << 20;
+        const auto measure = [&](int owners, bool concurrent) -> double
+        {
+            std::vector<std::unique_ptr<llaminar::v2::OpenMPTeamForkScope>> scopes;
+            for (int owner = 0; owner < owners; ++owner)
+                scopes.push_back(std::make_unique<llaminar::v2::OpenMPTeamForkScope>());
+            const auto cost_start = std::chrono::steady_clock::now();
+            if (concurrent)
+            {
+                std::thread worker([&]
+                {
+                    for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
+                        llaminar::v2::noteOpenMPTeamFork();
+                });
+                for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
+                    llaminar::v2::noteOpenMPTeamFork();
+                worker.join();
+            }
+            else
+            {
+                for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
+                    llaminar::v2::noteOpenMPTeamFork();
+            }
+            const auto cost_ns = static_cast<double>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - cost_start)
+                    .count());
+            return cost_ns / static_cast<double>(concurrent ? 2 * kMeasuredNotes : kMeasuredNotes);
+        };
+        const std::pair<const char *, double> variants[] = {
+            {"no_owner", measure(0, false)},
+            {"one_owner", measure(1, false)},
+            {"two_nested_owners", measure(2, false)},
+            {"concurrent_two_threads", measure(1, true)}};
+        for (const auto &[label, ns_per_note] : variants)
+        {
+            PerfStatsCollector::addCounter(
+                "omp", std::string("openmp_team_fork_note_self_cost_") + label,
+                ns_per_note, "evidence", "host",
+                {{"basis", std::to_string(kMeasuredNotes) + "_invocations_per_measuring_thread"}});
+            std::cout << "[evidence] openmp_team_fork_note_self_cost_" << label << "="
+                      << ns_per_note << " ns/invocation over " << kMeasuredNotes
+                      << " invocations per measuring thread" << std::endl;
+            EXPECT_LT(ns_per_note, 100.0) << label;
+        }
+    }
+    // The evidence configuration has ended: the guards restored the caller's
+    // environment values, and this reload runs AFTER their destruction, so
+    // the authorities describe exactly the restored environment and no export
+    // selection outlives the test.
     mutableDebugEnv().reload();
     PerfStatsCollector::reloadConfigurationFromEnvironment();
     PerfStatsCollector::reset();
