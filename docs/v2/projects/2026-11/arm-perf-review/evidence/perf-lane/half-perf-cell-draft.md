@@ -579,3 +579,26 @@ byte-identity of the symlink targets confirmed by SHA before linking;
 if NOT identical, STOP and report.
 r7 launched with OneDNN reuse: configure + core build + canonical
 V2_Unit_CPUHalfOperands + the four P1 cells with JUnit.
+
+### Station r7→r8: legacy-path audit + generalized transport APPROVED
+
+r7: both symlinked targets resolved, configure ran to completion (4.1s),
+generate failed on ONE more legacy path (tests/v2/CMakeLists.txt:4821 →
+app/MPIProcessSession.cpp). FULL AUDIT: 27 ${CMAKE_SOURCE_DIR} source
+references in tests/v2/CMakeLists.txt, 25 missing in a fresh worktree
+(app/, backends/, kernels/, collective/, execution/, models/ legacy
+roots) — EVERY one has an identical tracked counterpart at
+src/v2/<same path> (audit receipt kept).
+v7 transport (APPROVED): for each missing reference, symlink to the
+identical tracked in-tree file; REFUSES (exit 91) any reference without
+an existing counterpart; exit 92 on any dirty target; SHA256-records
+every target in legacy-transport.txt; removes all symlinks + created
+dirs on EVERY exit path. No CMakeLists edit; nothing fabricated.
+SCOPE HONESTY: generate-only plumbing — the P1 target's TUs are all
+current src/v2 tracked sources; the legacy-referenced targets are never
+built/run in the station worktree. Cross-host caveat archived: if .80's
+long-lived checkout holds STALE pre-migration files at those legacy
+paths, its legacy-referenced targets would compile different bytes —
+irrelevant to the P1 cells, noted for future cross-host audits.
+r8 in flight with OneDNN reuse: configure + core build + canonical
+V2_Unit_CPUHalfOperands + four P1 cells with JUnit.
