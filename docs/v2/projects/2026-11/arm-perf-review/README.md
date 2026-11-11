@@ -1749,3 +1749,17 @@ PENDING the booked slot. PR status updating hash-free.
 3. **idea-14 27B rider: APPROVED after the 35B result** — one matching
    rider (same controlled-reference protocol) once the 35B greedy rider
    settles the sampling-mode question.
+
+### .80 CAMPAIGN LEASE TRANSFERRED TO MAIN (coordinator, ~14:35Z)
+
+Binary question expired without a compliant answer → **Main holds the
+exclusive .80 campaign lease** (conditional idle verified by direct read
+14:30Z: dockerps empty). FACT: the sparks 480 focused attempt #3 PASSED
+4/4 at 14:23:30 (attempts 1/2 = wrong cmake --build target syntax; the
+17-step build + 4 passes valid — logs copied by Main). Main is preparing
+the canonical FULL 480 continuation on the existing fresh 480 contexts
+(BB preserved), new non-existing output. ALL .80 ACTORS: no launch/write/
+build until Main hands the lease back in writing; sparks quiesce ACK
+requested; queued items (greedy rider, M=1 window, B1 focused checks,
+Lane-2 window) locked behind the campaign. No new experiment/qual
+model.
