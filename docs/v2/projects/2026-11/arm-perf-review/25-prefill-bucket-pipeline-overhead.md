@@ -344,3 +344,30 @@ exact window do.
 - Any NEW smoke needs its own explicit booking + a REAL begin BEFORE the
   attach and a finish AFTER — no implicit rerun / extra GPU work authorized
   by the diagnostics request.
+
+### NSYS wrapped smoke result #2 (arm-sparks, ~15:30Z) — two-part honest read; server-shaped retry APPROVED
+
+(a) **NSYS ATTACH = CLEAN (2nd confirmation):** nsys profile -o
+smoke-final ./va → NSYS=0, report generated (smoke-final.nsys-rep),
+refcnt/NVRM/error grep = 0 hits. The NVRM attachment issue does NOT
+reproduce with nsys on this host.
+(b) **CANONICAL DRIVER WINDOW = NOT CERTIFIED:** gpu_driver_diagnostics
+begin = 0 (REQUIRED SYSLOG+DAC_READ_SEARCH caps + root — without them
+#begin fails "require readable /dev/kmsg and CAP_SYSLOG"; with them
+#begin=0; state + records.jsonl 3029B + collector.log created), but
+**finish FAILED (exit 1): "Kernel log cursor lost or ambiguous: ring
+wrapped/cleared; cannot certify cell"** — the tool's cursor could not
+close over the 2-second toy window (.79 kernel ring state did not sustain
+journal→snapshot continuity). NO kernel-driver finding recorded; the
+failure = the tool's certification of ITS interval, not a driver problem.
+CUSTODY-EXACT READING: nsys attachment = candidate evidence CLEAN (not a
+HOLD-lift by itself — candidate-only per the downgrade precedent);
+canonical certification NOT achieved (this invocation/scope).
+DIAGNOSED CAUSE: harness-shape mismatch — the tool brackets SERVER
+LIFETIMES (Main's plan74 windows certified COMPLETE/PASS as server-shaped).
+**APPROVED (coordinator): option (2) — the same wrapped smoke around a
+MINIMAL SERVER-SHAPED process (llaminar2 oneshot startup+teardown, NO
+model/inference, ~2-3 min)** — satisfies the operator's non-inference
+authorization AND the tool's harness shape. Conditions: real begin
+BEFORE/finish AFTER; STOP if llaminar2 needs a model to start; full
+identity capture; honest two-part reporting; booking recorded.
