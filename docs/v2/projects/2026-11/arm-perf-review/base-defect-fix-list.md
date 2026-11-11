@@ -955,3 +955,20 @@ new /work/campaign-480-results).
 Inherited/env classification unchanged; operator scope decision pending
 (dispatched by coordinator: fix-forward (1); (2) routed to addon3 (A1
 owner); (3) routed to addon (ShmemSpin ARM owner)).
+
+### CAMPAIGN480 FIX-FORWARD CONTINUED (Main, ~17:40Z): 12675c956 pushed + NEW canonical campaign
+
+**Main pushed 12675c956:** shared mpirun partition fix (ROOT CAUSE of
+ShmemSpin NP4/NP8: all co-resident ranks pinned to CPU19 by the B12
+native entry under mpirun with no authored OpenMP places). SAME commit
+also fixes the MPIBootstrapEnvironmentPolicy fixture broken by the
+earlier ebbeee230 getenv-allowlist change (caught by a FULL MPI-label
+A/B vs the merged baseline; DISCLOSED). Focused 18/18 pass; MPI label:
+only differences vs baseline = MPIProcessAffinity fixed + that fixture.
+**NEW Main canonical campaign at pushed tree 0924175d STARTED 17:40:13Z**
+(CID 30a7014e67a0…, host PID 2631094, fresh build-campaign-1267 +
+campaign-1267-results). Lease still Main. Remaining expected failures =
+the inherited/env list; operator scope decision still requested
+(coordinator disposition: fix-forward what the collection introduced;
+report inherited classes to their owners — standing unless the operator
+overrides).
