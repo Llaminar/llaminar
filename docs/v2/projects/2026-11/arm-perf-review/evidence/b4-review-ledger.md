@@ -121,3 +121,14 @@ from reviewed f26fd8ba. DECLARED: addon2's raw body carried the §9
 revert AGAIN (second recurrence of the assembly artifact) — kept the
 reviewed §9. Reviewer re-verdict pending; a42 diagnostic re-review
 running.
+
+### §9 RECURRENCE ROOT-CAUSED (addon2, ~23:02Z)
+
+The local working draft (/tmp/i16a/b4-design-spec.md) never received the
+§9 correction (applied only at the tracker canonical location) — every
+subsequent assembly from the local draft re-carried the stale §9. Local
+draft now synced; applied §3 verified as authored; 10137aa3 = spec of
+record. **PROGRAM LESSON: when a correction is applied at the canonical
+location, synchronize the AUTHOR's local working copy in the same cycle —
+a diverged shadow draft silently reverts applied fixes on every future
+assembly (shadow-copy divergence, the label-vs-body class).**
