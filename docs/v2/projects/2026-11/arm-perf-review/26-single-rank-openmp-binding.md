@@ -319,3 +319,41 @@ VALIDATION: portability 295/295; Linux targets stub-syntax-validated
   TLS worker test proves EXCLUSION, not that all production raw worker
   forks are impossible; inLexicalWorkshare governs macros, not raw pragmas.
 No execution; 295/295 + stubs + timings unauthenticated; no A2 acceptance.
+
+### #185 fix-back landed: aa31ccbe9 (arm-addon3, 2026-11-11, ~00:49Z)
+
+Parent 16d633c15; 7 files +422/−82; pushed. All five findings in one
+successor:
+- S1 scope lifecycle: cost harness = LEXICAL nesting + explicit
+  inner.reset() before the outer dies; the engine concurrent owner lives
+  entirely on its worker thread (built/used/destroyed there; parent joins
+  via a guard even on early failure); forks start only after the stage
+  hook marks the window live (overlap PROVEN). NEW regression
+  TeamForkScopeStackRestoredAfterReverseTeardown (CounterContract preflight
+  filter).
+- S2 deterministic: engine summary keyed exactly (capture == 3; repeat =
+  accumulator 6/count-2 on the same key); stage refusal = exact keys (prior
+  cpu_forks 3 untouched; gpu_entry ABSENT; cpu_entry exactly 1 on CPU:0; no
+  CUDA:0 records); prefill exclusion = COMPLETE extents (4 rows/tokens/pos);
+  GPU refusal asserts the EXECUTION RESULT (mock GPU decode must reach a
+  successful summary boundary; seam execution-count proves the path).
+- S3 complete isolation: BOTH guards save/restore the EXACT prior value of
+  EVERY enablement input (summary/filter/table/JSON/CSV/legacy profiling/
+  both stage-timing families); null FORCES absence; prior-present AND
+  prior-absent controls in both fixtures.
+- S4 fail-closed grammar: a note = EXACTLY one unconditional canonical
+  statement on its own line; conditional/doubled/embedded rejected; any
+  'omp parallel' the anchored grammar doesn't match (inline _Pragma after
+  code, continuations, other spellings) = ITSELF a violation; the file
+  pre-filter = plain substring probe (unsupported forms can never pass
+  unread — the previous CLI hole, re-proven by a control). Three new CLI
+  controls green; real-tree inventory unchanged (176/28/54, rc=0).
+- S5 honest basis: every measuring thread builds its OWN same-thread scope;
+  timed window excludes thread creation/teardown; per-run cell+process
+  delta verification (outer/inner/concurrent == N, total == N or 2N);
+  concurrent divides by ONE thread's notes; labeled "per-owner latency with
+  the production owner walk; earlier no-walk figures do not transfer".
+  Dev-host: ~4.5 (none) / 4.5-5 (one) / 6.9 (two nested) / 5.2 (concurrent)
+  ns per owner note.
+VALIDATION: portability 295/295; Linux stub-syntax; runtime at the
+canonical gates. A2 held until the verdict.
