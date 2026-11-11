@@ -8,6 +8,9 @@
  * by canonical single-CPU generation cells. Each child verifies the complete
  * physical-core team before any model or accelerator allocation is possible,
  * including that every close team occupies the fastest physical cores first.
+ * A separate placement contract starts the caller on a different admitted core
+ * before cluster configuration, proving temporary admission cannot overwrite
+ * the permanent master placement when its scope retires.
  *
  * The custom entry owns one lexical native GPU lifetime without probing a
  * device. Native workers/caches retire before process exit and MPI finalization.
@@ -17,6 +20,7 @@
 #include "utils/MPISessionOwner.h"
 #include "app/MPIBootstrapPhase.h"
 #include "config/OrchestrationConfigParser.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <mpi.h>
 #include <omp.h>
@@ -145,6 +149,67 @@ namespace
     }
 
     /**
+     * @brief Prove rank admission preserves the permanent team placement after scope retirement.
+     * @return Zero only when every full/narrow/repeated team retains its original admitted places.
+     * @details Starting the caller on the last capacity-ordered place makes restoration of a
+     *          stale caller mask distinguishable even on homogeneous physical cores. No model,
+     *          MPI launch or accelerator is needed; the production cluster configurator owns
+     *          the final placement and the test never repairs its result.
+     */
+    int checkClusterMasterPlacement()
+    {
+        cpu_set_t partition;
+        CPU_ZERO(&partition);
+        {
+            const ScopedOpenMPPartitionAffinity admitted_partition;
+            if (sched_getaffinity(0,sizeof(partition),&partition)!=0)
+                throw std::runtime_error("Cannot observe the admitted test partition");
+        }
+        std::vector<int> allowed;
+        for (int cpu=0;cpu<CPU_SETSIZE;++cpu)
+            if (CPU_ISSET(cpu,&partition))allowed.push_back(cpu);
+        const auto places=MPIBootstrapPhase::capacityOrderedCorePlaces(allowed);
+        if (places.size()<2)
+            throw std::runtime_error("Cluster master placement contract requires two physical core places");
+        const int physical=static_cast<int>(places.size());
+        for (const int requested:{0,physical,(physical+1)/2,1})
+        {
+            cpu_set_t initial;
+            CPU_ZERO(&initial);
+            for (const int cpu:places.back())CPU_SET(cpu,&initial);
+            if (sched_setaffinity(0,sizeof(initial),&initial)!=0)
+                throw std::runtime_error("Cannot install the test caller's admitted starting place");
+            OrchestrationConfig config;
+            config.n_threads=requested;
+            MPIBootstrapPhase::configureClusterRankThreads(config);
+            const int team=requested>0?requested:physical;
+            if (omp_get_max_threads()!=team)
+                throw std::runtime_error("Cluster admission changed the original physical worker budget");
+            for (const int width:{team,(team+1)/2,1,team})
+            {
+                std::vector<int> observed(static_cast<size_t>(width),-1);
+#pragma omp parallel num_threads(width)
+                observed[omp_get_thread_num()]=sched_getcpu();
+                for (int worker=0;worker<width;++worker)
+                {
+                    const auto &expected=places[static_cast<size_t>(worker)];
+                    if (std::find(expected.begin(),expected.end(),observed[worker])==expected.end())
+                    {
+                        std::cerr<<"Cluster permanent placement changed: requested="<<requested
+                                 <<" width="<<width<<" worker="<<worker<<" cpu="<<observed[worker]
+                                 <<" expected_first_cpu="<<expected.front()<<" observed=";
+                        for (const int cpu:observed)std::cerr<<cpu<<',';
+                        std::cerr<<std::endl;
+                        return 1;
+                    }
+                }
+            }
+        }
+        std::cout<<"PASS cluster permanent master and repeated team placement"<<std::endl;
+        return 0;
+    }
+
+    /**
      * @brief Run the real parser/bootstrap and check the resulting MPI worker team.
      * @param argc Argument count passed through MPI bootstrap unchanged.
      * @param argv Arguments naming one device and one MPI rank.
@@ -198,6 +263,8 @@ int main(int argc, char **argv)
 
     try
     {
+        if (argc==2 && std::string(argv[1])=="--cluster-master-placement-contract")
+            return checkClusterMasterPlacement();
         if (argc > 1)
             return probe(argc, argv);
         bool passed = checkSelector(argv[0], "localhost:-1:cpu:0");

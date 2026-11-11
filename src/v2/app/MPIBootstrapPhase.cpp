@@ -10,6 +10,8 @@
  * unresolved locality never disables the default full-team MPI binding.
  * Rank worker admission restores the caller's exact incoming affinity even
  * when an initially unbound OpenMP runtime needs no temporary partition mask.
+ * A bound runtime instead retains the master's permanent capacity-ordered
+ * place; its temporary partition scope retires before team binding.
  */
 
 #include "app/MPIBootstrapPhase.h"
@@ -22,6 +24,7 @@
 #include "utils/ScopedCallerThreadAffinity.h"
 #include "utils/ScopedOpenMPPartitionAffinity.h"
 #include <omp.h>
+#include <optional>
 #include <sched.h>
 #include <iostream>
 #include <algorithm>
@@ -589,20 +592,24 @@ namespace llaminar2
 
     void MPIBootstrapPhase::configureClusterRankThreads(const OrchestrationConfig &config)
     {
-        // Team binding below also runs on the calling OpenMP master. Own its
-        // restoration independently of whether partition admission changes a
-        // mask: OMP_PROC_BIND=false leaves that scope's installed flag clear.
-        // Existing pool workers retain their singleton bindings; subsequent
-        // native control children inherit the caller's original rank mask.
-        const ScopedCallerThreadAffinity preserve_caller;
-        // Pre-exec core places can bind the initial thread before main. Derive
-        // the rank budget from its already-admitted partition, not just that
-        // first place, and restore the caller's exact original mask afterward.
-        const ScopedOpenMPPartitionAffinity admitted_partition;
+        // Team binding below also runs on the calling OpenMP master. An unbound
+        // runtime (OMP_PROC_BIND=false) has no master place: binding narrows the
+        // caller to a singleton, so restore its exact incoming rank mask and let
+        // native control children inherit it. A bound runtime owns a permanent
+        // capacity-ordered master place instead; restoring its stale pre-main
+        // place afterward would overlap another worker, so it is retained.
+        std::optional<ScopedCallerThreadAffinity> preserve_caller;
+        if (omp_get_proc_bind() == omp_proc_bind_false)
+            preserve_caller.emplace();
+        // Observe the whole admitted partition, not the pre-main first place.
+        // Retire this temporary mask before installing permanent team placement.
         cpu_set_t affinity;
         CPU_ZERO(&affinity);
-        if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0)
-            throw std::runtime_error("Cannot read MPI rank affinity for cluster worker admission");
+        {
+            const ScopedOpenMPPartitionAffinity admitted_partition;
+            if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0)
+                throw std::runtime_error("Cannot read MPI rank affinity for cluster worker admission");
+        }
         std::map<int, int> physical_cores;
         for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
             if (CPU_ISSET(cpu, &affinity))
