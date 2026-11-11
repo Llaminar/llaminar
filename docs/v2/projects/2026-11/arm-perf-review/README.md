@@ -1661,3 +1661,17 @@ CORRECTIONS:
    campaign when the collection completes → FF → close #58.
 4. Coordinator duty: keep every session holding a current task; escalate
    stalls instead of gating them.
+
+### Post-merge campaign slot plan (arm-sparks, ~11:18Z)
+
+Counter collection MERGED (bb893cd79 on feat/arm64-native-kernels, PR #43
+204 commits). Main's ONE post-merge campaign being staged: .80 frees
+≈11:50-12:00Z (Phase A matrix + K14-I16A seal + A2 riders); .79 frees
+≈11:55-12:05Z (bb rebuild + Dir-B trace). Sparks recommends .80 first
+(warmer ccache, 429G free vs .79's ~66G — the campaign build ≈25-35G at
+SHARED_CORE=ON fits .80 comfortably; .79 keeps only the trace build).
+Inventory: g++-14/GNU 14.2.0, image llaminar-arm-engine-sdk-py:e0d6d34e7
+(.80) / SDK-cu13 (.79), NEON_I8MM, fresh build-campaign-bb dir, ccache
+warm. LAUNCH = first host free AND Main's campaign definition (exact
+CTest invocations/labels/parallelism) — whichever is later. Mac
+portability receipt needs a Mac-side executor assignment by Main.
