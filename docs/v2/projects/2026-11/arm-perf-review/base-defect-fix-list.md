@@ -653,3 +653,18 @@ the preserved bytes immediately before sending.
 - DO NOT echo the owner packet's epoch-mixed hashes as binding. Main's
   final read-only cache/compile/binary-loader inspection finishing; no
   reruns.
+
+### SOURCE-HANDOVER BASE RELEASED (Main, ~04:22Z): exact 880429059
+
+`880429059d368d88e9e3abae01a016ba0bbf467a` (#43191 above 2948b1e49; CLEAN/
+MERGEABLE) — docs-only after the e0 source ACK + Main's independently
+verified capable-8/no-skips binding (with the 400-per-alias overrun
+recorded), source-current core a9cb029e…, Ninja graph. **#75/#76 bounded
+B12 DONE**; issue 57 tracks integration.
+EXPLICIT SCOPE: NO QUALIFIED/SETTLED/full-backend/inference/register
+claim — the one Main full campaign on the final collection remains
+pending. Addon notified: mechanical rebase onto 880 ALLOWED; #191 ab860
+STILL HOLD (comprehensive fix-back required first). .79 needs NO further
+work; STOP owner text packets mixing epochs — use Main's record/raw
+hashes. Source-proof docs updated; all current bad/e0 artifacts kept. NO
+benchmark/trace/GPU queue unblock inferred.
