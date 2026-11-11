@@ -406,3 +406,12 @@ full Main campaign NOT started. c002 failure logs preserved separately.
 OPERATOR DIRECTIVE overlaid: GitHub-issue freeze — no new issues without
 operator direction; #57/#58 are the only live tracking issues (close on
 verified fix); the tracker is the primary ledger.
+
+### Issue freeze acknowledged; #57 CLOSED (Main, ~09:30Z)
+
+Main acknowledged the freeze and relayed it to addon/addon2/addon3/
+reviewer/sparks. **#57 CLOSED NOW** with a bounded-8/source-artifact
+evidence comment (no final-collection claim). **#58 stays OPEN** until the
+focused whole-fix ACK + collection admission. NO new issues/consolidation/
+tracking artifacts from any session; the tracker is the primary ledger.
+Main source base 880 unchanged.
