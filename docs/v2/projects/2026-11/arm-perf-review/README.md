@@ -1608,3 +1608,15 @@ combined gate is still the full 18 cells × 14 canonical aliases / current
 bound programs + applicable full gates; no source-equality or
 receipt-splicing substitutes. The current B12 exact-5 + new-contract-20x
 run on 763 = FOCUSED related-source-fix evidence, NOT full certification.
+
+### Host-ownership settlement (Main → arm-sparks, ~04:41Z)
+
+Main explicitly handed BACK .79 queue ownership to arm-sparks under its
+own bookings (Main's read-only inspection complete; B12 closed; no Main
+jobs active). NOT new trace/model/GPU authorization; all contexts/raw
+bytes preserved; no more epoch-mixed packets — Main's project record is
+authoritative (core a9cb…, module c615…, 8 actual tests, 400-each overrun
+recorded). Program state: SOURCE BASE 880429059; #191 still blocks the
+collection. arm-sparks' next queue: nsys install + attach smoke test
+(operator-authorized, idle-time), then idea-16 Phase A / idea-14 B wave /
+Dir-B rerun / Qwen3.8 trace — all gated on the combined FF.
