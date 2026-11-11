@@ -1675,3 +1675,37 @@ Inventory: g++-14/GNU 14.2.0, image llaminar-arm-engine-sdk-py:e0d6d34e7
 warm. LAUNCH = first host free AND Main's campaign definition (exact
 CTest invocations/labels/parallelism) — whichever is later. Mac
 portability receipt needs a Mac-side executor assignment by Main.
+
+### MAIN CAMPAIGN DEFINITION published (~11:23Z) — post-merge, model-free, on bb
+
+Main's ONE post-merge ARM CPU campaign on exact bb893cd79 (MERGED tip):
+- .80 locked at next free slot (~11:50-12:00Z); A2/idea16 bookings preserved.
+- Fresh checkout with usable in-container git metadata; no corpora/LFS.
+- Fresh Integration build; e0/763/35/5b contexts PRESERVED. GNU14.2,
+  NEON_I8MM, SHARED_CORE=ON (actual option name), compile DB export,
+  HAVE_CUDA=OFF/HAVE_ROCM=OFF (omitted backends recorded NOT QUALIFIED).
+  Active Ninja resolved once via CMAKE_MAKE_PROGRAM:FILEPATH; cmake
+  --build only; no ad-hoc OMP/NUMA/capacity workarounds.
+- PRIMARY UNMODIFIED AUTHORITY: scripts/ci/run_production_prerequisites.py
+  --build-dir --output (complete ^V2_Unit_ namespace + ProductionTest
+  Preflight inventory; full Unit then canonical preflight resource lanes;
+  receipt/log/JUnit retained; Unit parallelism = full real affinity 20;
+  no focused-panel flag/regex subset/prior receipt/no parallel caps/no
+  repeats/no second suite).
+- Pre-build: cmake --build --parallel --target llaminar2 v2_unit_gate
+  v2_production_test_preflight_gate -- -k 0 (real exit preserved).
+- Coverage assertions from ACTUAL discovered/JUnit inventory:
+  V2_Unit_MPIBootstrap (incl. cost body), V2_Unit_OpenMPTeamForkStage
+  Evidence, V2_Integration_OpenMPTeamFork{CounterContract,CounterPubli
+  cation}, V2_Integration_OpenMPForkEvidenceEnginePath. Owners:
+  v2_unit_mpi_bootstrap, v2_test_forward_execution_engine,
+  v2_unit_openmp_team_fork_evidence + shared workshare.
+- Save all identities + CTest JSON + canonical prerequisites JSON/log/JUnit.
+  Zero selected/skips/missing ≠ pass; failures reported honestly, FIXED
+  FORWARD (no weakening/skipping/rewriting).
+- Release context preserved; app built only for booked measurements — NOT
+  a second campaign. No additional models/profiler work.
+- MAC portability: Main runs locally as the SAME campaign leg (count from
+  CTest, not hardcoded 295) — not sparks'; .80 not held for the Mac.
+- Executor: arm-sparks under the coordinator booking; launch when .80
+  frees; ACK paths + planned start first.
