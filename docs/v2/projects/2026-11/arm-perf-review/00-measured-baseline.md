@@ -201,3 +201,15 @@ carried temp 0.8/top_k 40/top_p 0.9/seed −1; acceptance 38.89% vs
 tracker-verified 99% @ depth 7; greedy-vs-stochastic undecidable from the
 seal — greedy-pinned rider proposed). Full attribution:
 evidence/i16a-phase-a-report.md.
+
+### CORRECTION to the ledger note above (Main, ~11:56Z)
+
+The "+20% vs 20.95" framing is WITHDRAWN: 20.95 is an UNPAIRED OLDER
+tracker reference — the latest PAIRED PR CPU reference is **25.71**, so
+the fresh no-MTP 25.20/25.24 is approximately AT the paired reference
+(no causal +20% stack claim). Likewise the MTP-dyn −35% and the 38.89%-
+vs-99% acceptance comparison are PROTOCOL-CONFOUNDED until the approved
+greedy-pinned rider runs (temp 0 + seed 42, same Phase-A binary/policy,
+controlled greedy reference). Fresh numbers stand as OBSERVATIONS; no
+gains attributed to CUDA spills or any specific cause without paired
+comparisons. (Main ruling, relayed verbatim to arm-addon2.)
