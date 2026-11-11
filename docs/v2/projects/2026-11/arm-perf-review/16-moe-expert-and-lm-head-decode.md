@@ -429,3 +429,11 @@ cost per emitted token primary; 4 placements; hold-out prompts; no
 tuner); 6) one-build mechanics; 7) correctness coverage (63/65/127/129/
 V−1, zero/invalid/stale/zero-mass/ties/reset/prefix, no budget rounding,
 negatives must FAIL); 8) recommendation (G → C → P staged); 9) fences.
+
+### B4 SPEC APPROVED FINAL (operator, ~14:05Z)
+
+The B4 draft-vocabulary-budget design spec is the FINAL design record
+(evidence/b4-draft-vocab-budget-design-spec.md). Implementation = a
+separate later go (after the B1 diagnostic, the greedy rider, and the
+campaign queue clear). No work until then. Fences: design-only; no N-sweep
+run; no economy admission; no tuner/gate apparatus; tracker-only.
