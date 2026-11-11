@@ -51,6 +51,24 @@ inline constexpr bool fmlalLeafCompiledInEnvelope() noexcept
 #endif
 }
 
+#include <oneapi/dnnl/dnnl.hpp>
+#include <atomic>
+#include <cstdint>
+#include <stdexcept>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <unordered_map>
+#include <type_traits>
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+#include <arm_neon.h>
+#include <atomic>
+#include "utils/ARMCPUFeatures.h"
+#endif
+#include "../../FloatingActivationOperandPrecision.h"
 /**
  * @brief Test-visible selection probe: the FMLAL leaf's actual execution count.
  *
@@ -74,23 +92,6 @@ inline unsigned long long fmlalLeafInvocations() noexcept
 inline constexpr unsigned long long fmlalLeafInvocations() noexcept { return 0; }
 #endif
 
-#include <oneapi/dnnl/dnnl.hpp>
-#include <cstdint>
-#include <stdexcept>
-#include <vector>
-#include <algorithm>
-#include <cmath>
-#include <cstring>
-#include <limits>
-#include <memory>
-#include <unordered_map>
-#include <type_traits>
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
-#include <arm_neon.h>
-#include <atomic>
-#include "utils/ARMCPUFeatures.h"
-#endif
-#include "../../FloatingActivationOperandPrecision.h"
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
