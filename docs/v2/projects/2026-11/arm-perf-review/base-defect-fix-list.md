@@ -588,3 +588,18 @@ MODEL-FREE focused window at pin e0b7a7c1f:
   campaign still pending).
 #191 ab860 pin-claim mismatch forwarded urgent (unrelated hold; owner's
 9-claims not admission).
+
+### B12 window attempt 3 harness scope bug (Main SCP read, ~03:45Z) — 400× not 20×
+
+arm-sparks' launched window (PID 4051381 / container fecea6dafa7e, pin e0)
+used a harness with another scope bug: outer seq 1..20 × inner CTest
+--repeat 20 = 400 executions PER ALIAS (not the authorized 20); BUILD_RC/
+RUN8_RC echoes not gated; inventory python pipe ignored (count-only).
+Main directed: STOP the unapproved extra repeats at 20, retain actual
+exits, inspect outputs already produced (first-20 per alias = valid
+evidence; the extra 360 = waste, not evidence); Main's corrected runner
+b192ac82a4… (03:38, syntax-0) supersedes the earlier withdrawal — the
+owner launched its own still-buggy harness instead. Source code e0 NOT
+implicated without results — purely harness scope. Lesson repeated:
+the runner SHA-verification step existed and was still bypassed —
+verify the RUNNING artifact's identity, not just the handed-off one.
