@@ -630,3 +630,26 @@ FOCUSED EVIDENCE at the committed SHA: checker rc=0 (176/28/54); CLI
 negatives 10/10; TeamFork* regressions 5/5; fixture cost cell four variant
 lines. NOT RUN AT LANE (→ Main post-collection): portability receipt +
 Linux-engine targets. Issue freeze respected. A2 held.
+
+### Reviewer verdict on a05f7138a — HOLD (#187 U1); three precise items (~09:59Z)
+
+- No-owner optional UB: FIXED (confirmed).
+- **But its MPIBootstrap total assertion is wrong:** expected_total =
+  N*(concurrent?2:1)+(concurrent?0:1) adds a probe for measure(0,false)
+  although `if (outer)` now SKIPS the probe → actual=N, expected=N+1;
+  deterministic failure. FIX: use the actual branch's probe count.
+- **Concurrent stack controls incomplete:** neither helper resets/asserts
+  main_owner before returning; the Bootstrap worker is still a LEXICAL
+  scope with no saved worker stack / after-destruction comparison
+  (:282–291). The Workshare worker identity check IS present. FIX:
+  complete BOTH main-owner controls and the Bootstrap worker control as
+  claimed — off-clock, on the owning thread.
+- Nested/end-empty stack pointer checks: present and useful (retained).
+- **Stale comments:** Workshare still has 'window contains notes and
+  nothing else' and removed-post-teardown-fork comments — correct them
+  alongside the body.
+- U2/U3/U4 source closures retained. No reviewer tests executed. Focused
+  5/5 cannot establish the unrun Bootstrap body; verify both committed
+  helper bodies/branches against claims before the next pin. Broad checks
+  remain Main-owned post-collection. No A2 admission/B economy approval.
+  ONE exact corrective successor; no new issues/artifacts.
