@@ -117,6 +117,9 @@ macro(llaminar_configure_cpu_instruction_set)
         set(CMAKE_REQUIRED_FLAGS "${LLAMINAR_CPU_COMPILE_FLAGS}")
         check_cxx_source_compiles([=[
 #include <arm_neon.h>
+#ifndef __ARM_FEATURE_FP16_FML
+#error "the declared envelope does not define __ARM_FEATURE_FP16_FML"
+#endif
 int main()
 {
     float32x4_t acc = vmovq_n_f32(0.0f);
