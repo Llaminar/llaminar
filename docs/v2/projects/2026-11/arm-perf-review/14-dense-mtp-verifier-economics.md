@@ -196,3 +196,36 @@ the FIRST post-SETTLED .80 window, anchored at Main's settled tip; bounded
 fixed-depth controls stay only-if-negative. Post-SETTLED execution order
 confirmed: combined idea-31+B9 FF → Bundle-1 FF → Qwen3.8-UD trace → GPU
 windows (ideas 19/14/18) → half-perf cell → native FMLAL leaf.
+
+### 27B GREEDY-RIDER PROTOCOL SHEET (arm-addon3 draft, ~14:53Z) — operator-approved, contingent
+
+Purpose: settle the dense-MTP economics question on the current base with
+a controlled greedy reference — the base/version-sensitive MTP flip
+(5.455-5.545 dyn vs 5.28 off on the new base; 43.4% acceptance at depth=10)
+is protocol-confounded (bench config carried temp 0.8/top_k 40/top_p 0.9/
+seed −1).
+- **ARTIFACT (27B open item resolved to tracker extent):** Qwen3.6-27B-
+  MTP-Q4_K_S.gguf (the unsloth MTP repack = the tracker's 27B baseline
+  identity; the plain Qwen3.6-27B-Q4_K_S.gguf is OUT of scope). Byte
+  sha256 + on-disk path CAPTURED AT STAGING; if the K14/R1 gate dirs hold
+  an original 27B staging sha256, that supersedes the at-staging capture
+  (arm-sparks checks its artifact index first). Binary = the campaign
+  binary at bb893cd79 (identity recorded).
+- **FIXED (identical to the 35B controlled-reference shape):** GGUF
+  bytes; prompt bytes; −c 8192; 256-output policy; cache-reset; placement
+  (20 cores, capacity-ordered); build + policy identities; host identity.
+- **CHANGED: ONLY sampler intent** — temp 0 + explicit seed 42. No seed
+  search.
+- **RECORDED:** RESOLVED actual sampler (post-engine-resolution, never
+  just requested flags); MTP counters (acceptance + depth-controller);
+  text signature (hash of generated text = the controlled greedy
+  reference); tok/s; stage timings.
+- **PROPOSED: TWO transactions** (the 27B economics question is
+  intrinsically a MODE PAIR): T1 = MTP dynamic; T2 = same file/flags with
+  --no-mtp — sampler pinned in both. FLAGGED for approval since it extends
+  the 35B one-transaction shape (else T2 becomes a separate follow-up
+  sheet).
+- **CONTINGENCY:** execution waits for the 35B greedy result + a campaign
+  slot. No execution before either.
+STATUS: draft for the tracker; awaiting (a) the T1/T2 two-transaction
+approval call, (b) the 35B greedy result, (c) a slot.
