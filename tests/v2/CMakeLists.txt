@@ -7614,21 +7614,41 @@ add_v2_test(V2_Unit_DeviceIndexCPUKernels
 
 # Diagnostic only: idea-16 B4 draft-vocabulary-budget mechanism validator.
 # Non-installed namespace; no production routing/sampler/verifier change is
-# implied or granted. Device-free: the byte proof runs the real production
-# IQ3_S head kernel, the coupling properties are enumerated tiny-vocab
-# harnesses (S1-S6 corrected spec clauses as the test-property list).
+# implied or granted. Portable half (policy/selector/couplings, all
+# architectures); the NEON head byte proof registers under the ARM
+# boundary as its own target.
 add_executable(v2_test_draft_vocab_budget unit/kernels/cpu/Test__CPUDraftVocabularyBudget.cpp)
 target_link_libraries(v2_test_draft_vocab_budget
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
+target_include_directories(v2_test_draft_vocab_budget PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR})
 add_v2_test(V2_Unit_CPUDraftVocabularyBudget
     COMMAND $<TARGET_FILE:v2_test_draft_vocab_budget>
-    LABELS "V2;Unit;CPU;NativeQuantised;Diagnostic;ByteExact;Draft"
+    LABELS "V2;Unit;CPU;Diagnostic;Draft;Policy;Portable"
     MPI_PROCS 1
     TIMEOUT 120
 )
+if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
+    add_executable(v2_test_draft_vocab_budget_head unit/kernels/cpu/Test__CPUDraftVocabularyBudgetHead.cpp)
+    target_link_libraries(v2_test_draft_vocab_budget_head
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    target_include_directories(v2_test_draft_vocab_budget_head PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    add_v2_test(V2_Unit_CPUDraftVocabularyBudgetHead
+        COMMAND $<TARGET_FILE:v2_test_draft_vocab_budget_head>
+        LABELS "V2;Unit;CPU;NativeQuantised;ARM;Diagnostic;ByteExact;Draft"
+        MPI_PROCS 1
+        TIMEOUT 120
+    )
+endif()
 
 # Test: KernelFactory centralized kernel dispatch
 add_executable(v2_test_kernel_factory unit/kernels/Test__KernelFactory.cpp)
