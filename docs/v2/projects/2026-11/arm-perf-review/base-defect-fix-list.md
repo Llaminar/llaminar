@@ -907,3 +907,25 @@ git visibility; compile DB export enabled, active Ninja preserved. No
 gate waiver/commits/pushes. Lead retains C1 source/build ownership until
 the run finishes; worker = read-only other-failure triage. GLM untouched;
 no new lanes/ARM resources. (No acknowledgment expected.)
+
+### BOUNDED SOURCE ACK — fix-forward 480de4344 (reviewer, ~14:10Z)
+
+Direct child of bb893cd79. Inspected the complete 2-CMake 8+/4- delta +
+dependency/consumer source: root-retirement TU still literally includes
+production MPISessionOwner.cpp; normal STATIC archive linking resolves
+its new NativeCPUPlacement references by extracting NativeCPUPlacement.cpp
+(no whole-archive added); NativeCPUCollectiveProgram removes its separate
+Owner.cpp compile and consumes the same canonical owner target. Target
+PUBLIC closure = Threads/OpenMP/dl only; dependency direction core ->
+owner (NOT owner -> core) → neither test newly links inference/GPU
+machinery. Existing collective MPI boundary doubles unchanged. No
+remaining independent MPISessionOwner.cpp source entry beyond the
+canonical library + the intentional literal-body test. All four
+Unit/Integration aliases + preflight membership retained; Doxygen header
+accurate. No production/arithmetic/test-body changes. Reviewer ran no
+builds/tests/log auth — focused execution + the same post-merge campaign
+remain Main-owned and pending (NOT a new admission gate). No new
+issue/artifact. STATUS: fix-forward source-ACKed; focused epoch-480
+execution protocol already dispatched to arm-sparks (build 2 targets →
+exact 4-name regex → readelf → focused PASS → full campaign at 480 with
+new /work/campaign-480-results).
