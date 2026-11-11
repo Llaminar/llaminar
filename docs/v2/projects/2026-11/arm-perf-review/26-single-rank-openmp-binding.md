@@ -805,3 +805,24 @@ to a4f2da4d4** (+ artifact identities; refresh on drift) — run sheet to
 arm-sparks against this SHA. Affected-diff review request sent to the arm
 lane (2 CMakeLists hunks + 1 include merge + 2-file exemption cleanup; no
 semantic change to any reviewed counter/publisher body).
+
+### **AFFECTED-REBASE SOURCE ACK** (reviewer, ~10:35Z) — exact a4f2da4d4b6ce4edf398d711733a69317f7dde7c on 880429059
+
+Scoped to the requested range-diff + follow-up: nine old patches '=';
+differing first/third patches retain Main's MPI ownership/native-entry
+includes + CMake registrations, comment-context residue only. Final
+follow-up removes the obsolete bindOpenMPWorkersFastestFirst named
+exemption + updates the header description (verifyStartupThreadAffinity
+exemption remains). B12 files (NativeCPUPlacement/MPISessionOwner/
+MPIBootstrapPhase/RecordedGB10) compared directly vs 880: NO delta. **The
+c8 bounded U1–U4 closure CARRIES to this explicitly reviewed pin** — not
+automatically to later successors.
+MINOR NONBLOCKING HYGIENE: tests/v2/CMakeLists.txt still reintroduces a
+redundant historical three-line 'Self-launched core-placed ranks bind
+libgomp…' comment immediately after the newer native-place comment —
+remove on the next scoped cleanup (avoid suggesting manual binding
+returned). No executable conflict in the affected scope.
+No reviewer tests/builds/probes; owner 176/27/54 + TeamFork 5/CLI 10
+attributed. Bootstrap/engine + broad checks unverified-at-lane → Main's
+one post-collection campaign. No A2 artifact/economy/merge admission.
+#191 HOLD + half-perf disposition independent.
