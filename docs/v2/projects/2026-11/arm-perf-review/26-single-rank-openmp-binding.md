@@ -229,3 +229,42 @@ engine-publication qualification.
   fork" remains a contract requiring proof/rejection or explicit ownership
   propagation, not a process-wide exactness guarantee.
 No execution/authentication; 295/295 + stubs = owner evidence.
+
+### #183 fix-back landed: 16d633c15 (arm-addon3, 2026-11-11, ~00:32Z)
+
+Parent 0ce033b6c; 11 files +739/−296; pushed. One successor, all seven
++ TLS/worker boundary, per the reviewer's requirements:
+- R1 publishers read the TYPED OWNER COUNT (window/stage cells; no
+  global-delta arithmetic); regression = nonzero prior total (7 pre-forks)
+  + concurrent owner (5 forks, other thread) on the REAL engine path →
+  published == the window's 3 exactly.
+- R2 policy fail-closed: scans every supported file (.inc/.inl + _Pragma +
+  whitespace variants) with/without pragmas (orphan-only files fail);
+  missing src/v2 → exit 2; notes bind ONLY to the immediately-adjacent
+  pragma (duplicates = orphans); NAMED SITE exemptions (file + enclosing
+  function + per-site reason) replace whole-file exemptions; the
+  WindowPacking.inc publication site inventoried (appendNativeWeightGroups);
+  negative controls drive the ACTUAL CLI over synthetic trees (8 cases) →
+  176 noted sites / 28 named exempt / 54 inventoried files, rc=0.
+- R3 repeat tests assert the accumulator contract (stage 4/10 count 2;
+  engine 6 count 2); collector untouched.
+- R4 guards save/restore the EXACT prior env incl. absence, restore before
+  reloading both authorities; off-default FORCES the export vars absent;
+  ambient-nondefault test (SUMMARY=0/FILTER=mtp restored verbatim);
+  bootstrap reload runs AFTER both RAII guards.
+- R5 publishers own ALL materialization (lazy graph-context after the
+  gate — off-default decode allocates nothing); stage = cpuStageTimingEnabled
+  + family + CPU device with an ungated-caller regression.
+- R6 BOTH loops discriminated in preflight (retained multi-device control
+  via executeMultiDevice; engine regressions cover success/failure/
+  prefill-exclusion; GPU refusal reached PAST the seam via hook
+  execution-count assert); CounterContract filter extended; NEW alias
+  V2_Integration_OpenMPForkEvidenceEnginePath (preflight).
+- R7 self-cost under production ownership: no/one/two-nested/two-concurrent
+  owners over 1M notes ≈ 2.3/4.5/6.9/5.2 ns (dev host) — bare no-owner no
+  longer stands in.
+- TLS/worker boundary explicit + regressed: worker-context forks move the
+  TOTAL only (non-zero member proof; team thread-zero = owner thread
+  legitimately attributes).
+VALIDATION: portability 295/295; Linux targets stub-syntax-validated
+(runtime at the canonical gates). A2 held until the next verdict.
