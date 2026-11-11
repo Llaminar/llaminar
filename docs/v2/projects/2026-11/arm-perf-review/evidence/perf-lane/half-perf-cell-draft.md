@@ -383,3 +383,21 @@ first: FMLAL decode design, register budget, byte-auth oracle,
 integration point in CPUNativeNEONPreparedProjection; base = rebase
 half-perf branch onto bb893cd79 or fresh branch — lane's call, stated
 in the plan).
+
+### OPERATOR AUTHORIZATION RECORD (coordinator relay to Main, ~15:30Z demand satisfied)
+
+Main demanded the literal operator instruction (text/timestamp/scope) for
+the FMLAL leaf implementation. THE LITERAL TEXT, verbatim: **"But I allow
+implementation if you want to"** — received from the operator
+approximately 15:25Z (between the reviewer's 15:20:36Z attribution
+correction and the coordinator's 15:30Z acceptance dispatches; operator
+messages carry no broker id in this interface — the position in the
+sequence is the record). SCOPE: the half-perf FMLAL leaf implementation —
+the operator's grant responds directly to the coordinator's disposition
+explanation (NOT ADMITTED / candidate unimplemented / queued request
+only) and the addon lane's signal-gated idleness. RECONCILIATION with
+reviewer204's v2.1 sequence (both hold, different axes): CODE
+implementation proceeds now (addon lane, plan-first, syntax-only until a
+window, NO economy claims); the BASELINE/EVIDENCE step precedes ADMISSION
+— the implementation carries no economy grant and the v2.1 order is
+intact for evidence. Reviewer verdicts the leaf when it lands.
