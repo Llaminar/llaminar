@@ -472,3 +472,23 @@ All 20 CPUs captured from the .79 HOST sysfs:
 - Evidence files: local /tmp/qfn75-openmp-roster.log (pool-resize
   experiment); /tmp/qfn75-final/cpu-metadata (host snapshot).
 - No remote CPU job, model, or placement change performed.
+
+### ClusterInventoryBootstrap ATTRIBUTED (Main, ~02:12Z) — fixture premise defect, not production
+
+Precise source attribution:
+- The test UNCONDITIONALLY expects one-rank `cpu.numa_node == -1` — the
+  old ARM premise (83f828).
+- BASE `0a57040f` changed `discoverClusterInventory` (lines 259–266) to
+  honor ACTUAL NUMA even for one bound rank.
+- .79 logs actual NUMA 0 → the fixture's whole-host predicate is FALSE
+  while all printed tuples match. This is the unprinted-predicate mystery
+  resolved: the failing assertion is the stale `-1` expectation.
+- The bound-locality contract is ALREADY proven by the existing
+  UnitSingleRankObservedNUMAAdmitsOnlyLocalGPUOwnership.
+- FIX: the fixture will independently capture the actual pre-discovery
+  NUMA and compare EXACTLY — production NOT weakened, the hwloc warning
+  NOT ignored.
+- B12 decomposition is now: (1) CPUClusterPermanentMasterPlacement = REAL
+  production defect (native OpenMP pool-lifetime / pool recreation at
+  native places); (2) ClusterInventoryBootstrap = STALE FIXTURE premise
+  (separate fix). No .79 rerun until the new focused pin.
