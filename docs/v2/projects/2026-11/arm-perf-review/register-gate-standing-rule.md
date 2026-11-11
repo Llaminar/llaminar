@@ -30,3 +30,46 @@ Commit the named change to the existing budget authority and verify the complete
 No such amendment may waive single-row zero, structural completeness, binding/freshness, required coverage or another correctness/economy contract. No skip, anonymous reserve, parser blind spot, copied receipt or generic override is an escape hatch. Checker repairs require their focused controls and the existing complete checker gates before requalification.
 
 The tracker records this standing rule, evidence references and explicit decisions. It is not a second measurement engine or live threshold ledger. Passing this gate does not replace any other production admission gate.
+
+### #175 successor complete: d4cdcd998 (arm-addon, 2026-11-11 ~02:43Z)
+
+`codex/arm-s4-nibble-witness` @ d4cdcd998 on origin (9 commits on e8866ec04:
+5 re-pinned patches + InstalledWidth pin + #169 fix-back + comment fix +
+2ff599ec0 reconciler hardening + 38ed21507 reflow + d4cdcd998 =
+coordinator regression/registration).
+
+**d4cdcd998** closes the #175 successor (checked-in device-free coordinator
+regression + preflight registration):
+1. `test_cpu_native_tile_register_gate.py` drives the ACTUAL shell
+   coordinator end-to-end against a synthetic candidate tree (stub CMake
+   registers the same 14 CTest alias names as echo tests; two proof
+   targets as controlled stubs; real checker/budget + canned production
+   header → reconciliation/retention/publication run for real).
+   - Positive: 9-cell happy path → gate=PASS, publication=authenticated,
+     manifest + per-cell accept digests.
+   - Negatives (one failure class each, #174): coordinator-owned setting
+     refusal (both spellings, exit 2, nothing created); stale receipt dir
+     replaced (no masquerade); stub build failure → FAIL(build); stub
+     ctest failure → FAIL(ctest); unregistered alias → FAIL(not-passed);
+     missing retained artifact → FAIL(missing/retention); malformed proof
+     → FAIL(reconcile-crashed), never PASS-with-empty-identity; wrong
+     proof identity → FAIL(reconcile); MID-RUN DRIFT (alias mutates the
+     shared production header through the same python -c command ctest
+     runs) → PUBLICATION REFUSED ("production header changed under the
+     epoch").
+2. Coordinator hardening (driver-only): per-cell accept.digest.json
+   verified at publication before the manifest; compile_commands entries
+   must reference the candidate header; refusal-pattern reflow.
+3. Preflight registration: V2_(Unit|Integration)_CPUNativeTileRegisterGate
+   Coordinator (core-free device-free; Integration one in
+   ProductionTestPreflight) via the existing metadata-suite loop.
+
+FOCUSED EVIDENCE (AppleClang-21): regression 10/10 (~62s device-free);
+hardened coordinator on the real tree 9/9 PASS publication=authenticated
+45-digest manifest; CMake syntax sanity.
+UNVERIFIED-AT-LANE (→ Main's single full campaign): 18×14 canonical
+receipts at the final pin; portability matrix; full preflight; Integration
+execution of the new registration on Linux/GNU-14.
+NEXT: await Main's post-B12 placement-fix tip → mechanical re-rebase →
+reviewer exact-source ACK at the final pin → NO FF until Main's 18×14
+current-binding acceptance.
