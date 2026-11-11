@@ -153,7 +153,10 @@ TEST(CPUISAProfile, NativeARMCapabilitiesHaveOneAuthority)
     EXPECT_NO_THROW(ARMCPUCapabilities::requireEnvelope(i8mm_envelope, i8mm_envelope));
     EXPECT_NO_THROW(ARMCPUCapabilities::requireEnvelope(i8mm_envelope, bits({ARMCPUFeature::ASIMD})));
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-    EXPECT_EQ(ARMCPUCapabilities::compiledEnvelopeFeatures(), i8mm_envelope);
+    // The declared I8MM envelope carries the FP16 FML long multiply-add of
+    // the half-operand leaf.
+    EXPECT_EQ(ARMCPUCapabilities::compiledEnvelopeFeatures(),
+              i8mm_envelope | bits({ARMCPUFeature::FP16FML}));
 #elif defined(__ARM_FEATURE_DOTPROD)
     EXPECT_EQ(ARMCPUCapabilities::compiledEnvelopeFeatures(), bits({ARMCPUFeature::ASIMD, ARMCPUFeature::DotProd}));
 #endif
