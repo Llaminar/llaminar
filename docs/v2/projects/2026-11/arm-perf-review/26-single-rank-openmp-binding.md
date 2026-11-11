@@ -508,3 +508,40 @@ FOCUSED EVIDENCE: checker rc=0 (176/28/54); negatives 10/10; touched
 TeamFork* regressions 5/5; cost cell 2.25/4.61/6.96/16.14 ns per owner
 note. NOT RUN AT LANE (→ Main campaign): portability receipt + Linux-engine
 targets (dev-host syntax only). A2 held.
+
+### Reviewer verdict #187 successor — HOLD at 372da1f6e; #188 consolidated (U2 + U1 finish)
+
+Four-file test delta inspected (47d parent).
+- **U2 REMAINS — deterministic NEW assertion error:** the failure/prefill
+  block creates a fresh ScopedForkEvidenceConfig selected("omp") (~4944);
+  its CONSTRUCTOR calls PerfStatsCollector::reset() (:4746). No successful
+  execute happens in that block before baseline capture → the baseline is
+  EMPTY. `EXPECT_FALSE(baseline.empty())` (~4967) must fail; the comment
+  claiming an earlier successful step in THIS configuration is FALSE (the
+  earlier block's data was reset). FIX: either retain the empty
+  pre-failure baseline and use the subsequent exact positive as
+  discrimination, or explicitly seed the same epoch and assert exact KEYED
+  DELTAS (not absolute 1/count-1 after seeding). The prefill comparison
+  against after_success is correctly repaired.
+- **U1 fixes PRESENT in both bodies** (inner reset before outer; genuine
+  no-owner; real main+worker owners; verification/worker teardown gated
+  after clock stop) — BUT the claimed restored-stack assertion is NOT
+  discriminating: constructing `restored` and checking restored.forks()==1
+  succeeds even if its previous link lost outer or points at another cell.
+  FIX: assert STACK IDENTITY at the boundary, or the surviving outer's
+  exact notes+1 after the probe plus the original stack restored after
+  teardown — in BOTH helpers. The timed interval includes start-gate
+  publication + wait-for-worker completion: describe it as AMORTIZED
+  CONCURRENT WALL TIME INCLUDING RENDEZVOUS, not literally notes-only.
+  Readiness permits concurrent execution; it does not itself prove
+  scheduler overlap/actual contention. Cost reports remain owner evidence,
+  not certified economy.
+- **U3 SOURCE-CLOSED at this pin** (hook throws if completed count ≠ 5
+  before returning; no silent deadline escape). **U4 SOURCE-CLOSED**
+  (distinct all-off vs selected-family/stage-off predicates; scoped env
+  restoration retained).
+- ONE exact successor: fix U2 + finish the U1 restoration control. No
+  whole lane suite requested; Linux engine checks unverified-at-lane →
+  Main post-collection. Reviewer ran no tests/build/syntax/probes. No A2
+  artifact acceptance or B-stage economy promotion follows automatically
+  even after eventual source ACK.
