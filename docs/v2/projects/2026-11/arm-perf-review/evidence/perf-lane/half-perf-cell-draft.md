@@ -309,3 +309,40 @@ arm-sparks BEHIND the Main campaign — preferred slot .80 post-campaign
 (disk-safe); alternative .79 post-trace only if the Release build fits
 the 66G budget (sparks' disk call). Model-inference window: protected
 from interruption once started.
+
+### HALF-PERF ARTIFACT BUNDLE (arm-sparks read-only, ~15:19Z) — FMLAL leaf does NOT exist
+
+(1) **MATCHED TIMING SAMPLES: NONE exist** — no per-cell matched baseline/
+candidate timing samples were ever captured (the b512-era validations =
+5/5 ctest cell PASS 0.16-0.55s each = REGISTRATION/protocol checks, not
+matched economy samples). The reviewer was right.
+(2) BINARY/BUILD IDENTITIES (all at .80 build/int-b512e25a, tree
+b512e25a): llaminar2 = 33804e49…, libllaminar2_core.so = de9c1225…,
+v2_perf_cpu_half_operand_projection = 83e1efab…; hpb-* logs: hpb-cells.log
+(1824 B) + hpb-unit.log (10.6 MB) + hpb-pre.log (1.2 MB) + hp-b512.status;
+register-gate receipts build/rg-717b2bfe6/{build,receipt}/ (9 cells) +
+rg-717b.log.
+(3) **FMLAL NATIVE LEAF: DOES NOT EXIST** — grep of the b512/1ea082118/
+a847db3286 history for fmlal/vfmlal in src/v2/kernels/cpu/gemm/ = **0
+hits** (CPUNativeNEONPreparedProjection.h at 1ea082118 = 0 fmlal). Beyond
+the half-cell oracle/FP tests, a NATIVE FMLAL leaf candidate was NEVER
+IMPLEMENTED → **the half-perf economy disposition = IMPLEMENTATION-FIRST**
+(the reviewer's "implement the leaf first" branch), not evidence-first.
+(4) Command/FP/team records: the 5/5 cells = the ctest invocations in
+hpb-cells.log; FP path = FP16-codegen tests; no separate team record files.
+
+### DISPOSITION UPDATE (coordinator, ~15:20Z): half-perf = IMPLEMENTATION-FIRST
+
+The bundle settles the reviewer's gate question: **no FMLAL leaf candidate
+exists in the branch history** and no matched economy samples exist → the
+half-perf item moves from "insufficient evidence" to **IMPLEMENTATION-FIRST:
+the FMLAL leaf must be implemented (per the half-perf plan v2.1 contract)
+before any economy claim is possible.** Route: the implementation belongs
+to the half-perf lane (addon2's half-perf lineage or the addon lane —
+coordinator to assign with the plan v2.1 contract + the M=1 window's
+diagnostic outcome as input). NOT urgent: queued behind the active
+campaign + the measurement cascade; the item stays in the ledger with its
+status updated. The reviewer's disposition request is answered: the bundle
+is the verdict input — implementation-first, with the tracked artifact
+identities (llaminar2 33804e49…, core de9c1225…, perf binary 83e1efab…)
+as the historical context.
