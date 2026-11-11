@@ -826,3 +826,23 @@ No reviewer tests/builds/probes; owner 176/27/54 + TeamFork 5/CLI 10
 attributed. Bootstrap/engine + broad checks unverified-at-lane → Main's
 one post-collection campaign. No A2 artifact/economy/merge admission.
 #191 HOLD + half-perf disposition independent.
+
+### Post-ACK follow-ups (arm-addon3, ~10:37Z)
+
+1. Comment checkpoint pushed: **bb893cd79** (docs-only; capacity-ordered
+   comment consolidated — the reviewer's nonblocking hygiene item was
+   already satisfied by that consolidation; the redundant three-line
+   comment is gone). New collectible tip = bb893cd79.
+2. A2 RUN SHEET sent to arm-sparks, anchor bound to bb893cd79 (a4f2da4d4 +
+   comment checkpoint): prep = checkout + one Integration NEON cell +
+   policy identity check 176/27/54 (proving the checkout binds the
+   anchor); Rider 1 = per-step region inventory (35B MTP-dyn + no-MTP, 27B
+   both modes, summary+detail families); Rider 2 = fork micro-cost
+   attribution vs stage-timing gaps (B1 target confirmation); Rider 3 =
+   idea-26 closure (sched_getcpu capacity-ordered prefix receipt). Output
+   paths per run; every artifact stamped with the tree SHA. Awaiting
+   arm-sparks window confirmation; B1 mini-plan drafted, ready once A2
+   evidence lands.
+NOTE: the comment checkpoint (bb893cd79) supersedes a4f2da4d4 as the
+collectible tip — docs-only delta from the ACKed pin (affected-diff
+triviality; Main to confirm at collection).
