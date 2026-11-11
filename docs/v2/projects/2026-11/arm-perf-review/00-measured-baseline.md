@@ -189,3 +189,15 @@ Remaining opportunity ranking (by expected impact):
 6. Smaller: idea 3 (metadata hoist), 4 (column panel reuse), 11
    (validation hoist), 22 (FA2 tournament tail p95 8.9%), 23 (HC auto-plan),
    28 (IQ4_XS M=1 regression).
+
+### Ledger note (Phase A G1 data point, seal K14-I16A-880429059-20261111)
+
+idea-16 Phase A G1 (unprofiled, n=256 decode, .80 @ 880429059): **35B
+no-MTP 25.20/25.24 tok/s = +20% vs the tracker head reference (20.95)**
+— the accumulated improvement stack (spin policy, workshare pooling,
+binding, spill elimination) visible in a single measurement. MTP-dyn
+18.53/18.49 (−35% vs 28.51 head ref) is MODE-UNVERIFIED (bench config
+carried temp 0.8/top_k 40/top_p 0.9/seed −1; acceptance 38.89% vs
+tracker-verified 99% @ depth 7; greedy-vs-stochastic undecidable from the
+seal — greedy-pinned rider proposed). Full attribution:
+evidence/i16a-phase-a-report.md.
