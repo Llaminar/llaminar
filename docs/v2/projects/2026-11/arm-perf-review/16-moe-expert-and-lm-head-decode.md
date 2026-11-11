@@ -189,3 +189,32 @@ the full written plan only if B ≤ A within noise on the production
 placement; a regression closes B1 with numbers recorded. If the
 transaction does NOT admit the M=1 shared-router-Q8 shape: that admission
 gap is a FINDING to report (not fixed inside the bench).
+
+### **B1 DIAGNOSTIC IMPLEMENTATION APPROVED** (Main, ~12:01Z) — contract recorded
+
+Main approved implementing the DIAGNOSTIC B1 microbench + harness focused
+checks, booked as ONE CPU economy window AFTER Main campaign + approved
+greedy rider (via coordinator/sparks). NOT approval of production
+routing/kernel/sampler changes. CONTRACT:
+- Actual production A helpers/publication/transaction B — NO copied
+  SwiGLU/Q8 oracle, NO forced ineligible path; preallocate/seal ALL
+  inputs/workspace BEFORE timing.
+- Hard byte gates on ALL gate/up, SwiGLU-Q8, down, route outputs; prove
+  both intended paths ran + live extents + inactive guards.
+- Warmup + ≥100 ALTERNATING PAIRED A/B samples; production geometry/
+  formats; the 4 observed physical placements; identical actual thread/
+  OMP/policy context; UNPROFILED timings; separate attribution counters.
+- If M=1 B cannot admit the actual shared-router-Q8 shape: report the
+  GAP — no fallback/bench-production fix.
+- Regression OR no signal → close/retain the finding WITH NUMBERS, not
+  justify a production change; B≤A within noise = NONREGRESSION, not an
+  optimization win (production economy claim needs repeatable benefit
+  beyond noise). No lane-wide qualification/new issues/tracking artifacts.
+LM-HEAD CORRECTION ACK: verifier already grouped (264/1560); old
+route-bug claim withdrawn; draft single-row causal dependency retained.
+**45 vs 20 GB/s alone does NOT prove 'no scheduling headroom' or '2×
+available headroom' (different reuse/work denominators) — treat as
+diagnostic hypotheses.** B4 shortlist remains OPERATOR-FENCED (no
+automatic greedy-byte-exact or stochastic-semantics conclusion without
+the full proposal/acceptance contract proof). The exact-sampler rider
+remains a CONTROLLED REFERENCE only.
