@@ -577,3 +577,12 @@ differences). IMPLICATION FOR PHASE B RANKING: if the metric confound
 holds, the TOP candidate may be a DEPTH-POLICY/controller fix (idea-14
 adjacent, policy-only, no kernel change) — and B-candidate economics
 should be re-measured at the recovered acceptance before ranking.
+
+### B1 FOCUSED-CHECK BLOCKER (arm-sparks, ~22:26Z): missing include path in the addon2 branch
+
+W2 on .79: edcce0183 verified-fetched; Release CPU-only build progressed
+to 736/764 then FAILED — the STT header exists in-tree but the target's
+include dirs OMIT tests/v2 → fatal at
+Perf__CPUMoESingleTokenTransaction.cpp:72 (same for the compact target).
+Fix-back sent to addon2 (CMake include-dir fix); sparks resumes on their
+fix. NOT disk/fetch (86G free; SHA verified).
