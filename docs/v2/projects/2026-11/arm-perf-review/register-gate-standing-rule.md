@@ -453,3 +453,30 @@ FETCH_HEAD).
   18 tests.
 Sequencing: #191 focused ACK + collection admission → Lane-2 (ideas
 03/04/11) starts immediately on 880429059. HOLD unchanged.
+
+### Lane's residual position (arm-addon, ~10:27Z) — input to the reviewer's governing verdict
+
+Review target stays pinned at 27f49497 (lane will NOT push during
+inspection). Lane's argued position, for the reviewer to rule on:
+1. **SDK/transitive dependency closure → residual, not block**, with a
+   concrete closing path: proof.deps/proof.pre.deps are ALREADY retained
+   and sealed per cell — a sharply-scoped successor can parse the
+   retained deps at accept time, digest every listed file into
+   accept.digest inputs, and let publication revalidate them (transitive
+   closure becomes real, no new infrastructure). Proposed as an immediate
+   ADD-ON after the reviewer's verdict on 27f49497 (additive; doesn't
+   move the review target) — or in-round if the reviewer prefers.
+2. **Whole-closure authority vs original verifier output → residual by
+   threat-model reasoning:** in this gate there is no verifier output
+   outside the run — the checker executes inside the cell and its outputs
+   ARE the retained artifacts; every retained byte is now triple-bound
+   (proof.json binding + accept.digest sealed closure + pre-copy source
+   digest + copy-digest equality) and revalidated at publication against
+   post-accept drift, with real EACCES controls proving the failure
+   paths. An authority EXTERNAL to the run exists only as the standing
+   rule's final word (canonical bound proof via configured build/CTest
+   aliases — the .80 receipt). Wiring an external attestor INTO the
+   publication chain would be a design change = new finding, not a
+   residual of #191.
+Lane's net: neither residual blocks admission; #1 cheaply closable.
+REVIEWER'S VERDICT GOVERNS.
