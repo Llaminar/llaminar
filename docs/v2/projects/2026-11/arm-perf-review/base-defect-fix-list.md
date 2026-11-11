@@ -972,3 +972,24 @@ the inherited/env list; operator scope decision still requested
 (coordinator disposition: fix-forward what the collection introduced;
 report inherited classes to their owners — standing unless the operator
 overrides).
+
+### CAMPAIGN 12675c956 RESULT (Main, ~18:13Z): 25 fail (was 35), 0 NEW, 10 FIXED — collection clean, tip not fully green
+
+Container main-campaign-1267 exit 8 at 18:12:26Z; receipt rc8, 3421
+tests, identical inventory to 480, 0 skips. **FIXED (10):**
+Static_NoDirectGetenv, HostServiceDebugEnvAuthority, MPIProcessAffinity
+U/I, OpenMPTeamForkStageEvidence U/I, OpenMPForkEvidenceEnginePath,
+ForwardExecutionEngine, ShmemSpin NP4/NP8. **NEW failures: none.**
+**REMAINING 25 = exactly the inherited/env set already reported** (MTP
+NUMA fixtures ×3, NativeSourceFinalRetirement ×3, registration_selected
+fixture projects ×7, ROCm trainer fixtures ×4, dispatch registry, trainer
+stream wait, MoE scan, DevelopPRGate, ModelKLD ×2 docker, CPURootedGather
+2-socket). Raw /tmp/llaminar-main-bb-linux-results/campaign1267/.
+Collection NOT qualified (tip not fully green); operator decision pending
+on base-defect scope. Lease: Main done executing, holding until the
+operator decides.
+DISPOSITION FRAME (coordinator): the collection introduced ZERO new
+failures and fixed its own 10; the 25 inherited = base defects the
+campaign was designed to SURFACE (the triage is concrete: exact tests +
+lineage + base commits). Under merge-then-qualify, inherited defects are
+fixed on Main in subsequent work, not inside this collection.
