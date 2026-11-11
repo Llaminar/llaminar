@@ -732,3 +732,17 @@ teardown, or use the validated ownership configuration; do NOT infer past
 work from a destroyed optional. Correct branch totals: N, N+1, N+1, 2N.
 Other source closures retained; no execution or ACK/A2/economy
 authorization.
+
+### #190 one-line residual: c8ffde408 (arm-addon3, ~10:22Z) — IN REVIEW (counter-at-site)
+
+Parent 95e1dcebb; 1 file +8/−5. Fix crossed in flight with the verdict —
+the reviewer's preferred shape exactly: local probe_count incremented AT
+the actual probe site (inside the if(outer) guard, after the attribution
+assertion: `++probe_count;`); expected_total = `kMeasuredNotes *
+(concurrent ? 2u : 1u) + probe_count` — the destroyed optional is never
+consulted. AUDIT ROWS recomputed FROM THE COMMITTED EXPRESSION:
+measure(0,false)=N; (1,false)=N+1; (2,false)=N+1; (1,concurrent)=2N —
+all four match the required totals. All other closures retained (U2/U3/U4
++ stack-identity/controls from a05). Focused evidence at the committed
+SHA: Workshare 5/5 (body unchanged); checker rc=0. Bootstrap UNVERIFIED
+at lane (honest). Committed-bytes read-back in the handover.
