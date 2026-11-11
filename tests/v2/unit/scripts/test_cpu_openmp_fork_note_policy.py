@@ -134,6 +134,37 @@ class OpenMPForkNotePolicyCliTest(unittest.TestCase):
         self.assertEqual(len(violations(err)), 1)
         self.assertIn("no adjacent pragma", err)
 
+    def test_conditional_note_is_rejected(self) -> None:
+        self.write("src/v2/conditional.cpp",
+                   "void kernel(float *out) {\n"
+                   "    if (out != nullptr) ::llaminar::v2::noteOpenMPTeamFork();\n"
+                   "#pragma omp parallel for\n"
+                   "    for (int i = 0; i < n; ++i) out[i] = 0.0f;\n"
+                   "}\n")
+        code, out, err = run_cli(self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("not one unconditional canonical statement", err)
+
+    def test_two_notes_on_one_line_are_rejected(self) -> None:
+        self.write("src/v2/doubled.cpp",
+                   "void kernel(float *out) {\n"
+                   "    ::llaminar::v2::noteOpenMPTeamFork(); ::llaminar::v2::noteOpenMPTeamFork();\n"
+                   "#pragma omp parallel for\n"
+                   "    for (int i = 0; i < n; ++i) out[i] = 0.0f;\n"
+                   "}\n")
+        code, out, err = run_cli(self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("not one unconditional canonical statement", err)
+
+    def test_inline_unsupported_form_fails_closed(self) -> None:
+        self.write("src/v2/inline_pragma.cpp",
+                   "void kernel(float *out) {\n"
+                   "    int x = 1; _Pragma(\"omp parallel for\") for (int i = 0; i < n; ++i) out[i] = x;\n"
+                   "}\n")
+        code, out, err = run_cli(self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("unsupported OpenMP parallel form", err)
+
     def test_site_exemptions_are_never_generic(self) -> None:
         self.assertTrue(all(reason.strip() for reason in
                             __import__("check_cpu_openmp_fork_note_policy").EXEMPT_SITES.values()))
