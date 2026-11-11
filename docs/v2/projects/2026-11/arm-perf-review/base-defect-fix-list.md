@@ -1046,3 +1046,17 @@ ARM-SIDE NOTE: the removed C2 artifacts were already dispositioned (C2
 closed; the coordinator-held C2 state was the frozen snapshot — the
 branch lives with C1). The B10/B11 evidence chains (b-fix-* dirs) are the
 ARM-relevant part — INTACT at the consolidated path.
+
+### CROSS-PROGRAM (CB/C1, operator-confirmed): the 2-socket cell is HARDWARE-BLOCKED
+
+V2_Integration_CPURootedGatherParallelCopyReplay (requires MPI 2 +
+valid CPUExpertSocketMembership(endpoints, 2) = 2 actual physical
+socket workers): **operator-confirmed NO eligible 2-socket host exists
+in the known fleet** (Mac/GB10×2/GB300/WSL all single-socket; WSL
+flattens NUMA besides); the stale factory-host candidate is RETRACTED.
+**Status: HARDWARE-BLOCKED / unqualified, pending host — NOT
+accepted/passed.** The C1 complete-green commit/push rule is unchanged;
+NO inherited-failure waiver authorized. Recorded in the arm-perf
+tracker as a cross-program fact so any future fleet expansion (a
+2-socket machine) picks this cell up first. CB lead continues other
+concrete fixes; no host probes/jobs requested.
