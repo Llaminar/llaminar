@@ -14884,6 +14884,16 @@ add_v2_test(V2_Integration_PrefixPostOpenFailureRetiresSlotHandoff
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PrefixPostOpenFailureRetiresSlotHandoff)
 
+# Fatal corruption death regressions: payload in a retired bank is a fatal
+# precondition (std::abort) for all five production entrypoints.
+add_v2_test(V2_Integration_ServingSlotHandoffDeathRegressions
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffDeathRegressions.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ServingSlotHandoff;DeathRegression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSlotHandoffDeathRegressions)
+
 add_v2_test(V2_Integration_PrefixMetadataOnlyRestoreSummary
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_prefill_flow>
         --gtest_filter=Test__PrefixCachePrefillFlow.MetadataOnlyLookupReportsRestoredMTPSections

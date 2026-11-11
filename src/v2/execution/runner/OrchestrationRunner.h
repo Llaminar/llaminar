@@ -2076,17 +2076,16 @@ namespace llaminar2
         }
 
         /**
-         * @brief Publish a lease-bearing condition into the slot bank for
-         *        lease-lifetime evidence (read-only observation through the
-         *        const accessor after this call).
+         * @brief Inject corrupt slot-handoff state (payload in a retired bank)
+         *        for death-test coverage of the five production entrypoints.
+         *        This is a narrow fault-injection fixture, not mutable bank
+         *        exposure: the test calls this, then exercises an entrypoint
+         *        and expects the fatal precondition.
          */
-        void publishLeaseBearingConditionForTest(
-            DeviceResidentLogicalSequenceStateHandle resident_handle) noexcept
+        void injectCorruptSlotHandoffStateForTest() noexcept
         {
-            slot_handoff_.openFor(++serving_slot_generation_);
+            slot_handoff_.retired = true;
             slot_handoff_.prefill_logits_ready_ = true;
-            slot_handoff_.ready_mtp_condition_ = ReadyMTPCondition::hostVisible(
-                42, SamplingParams{}, std::move(resident_handle));
         }
 
     private:

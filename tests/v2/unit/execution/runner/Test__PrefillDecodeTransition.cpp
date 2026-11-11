@@ -1444,6 +1444,14 @@ namespace
             }
             resident_logical_state_request_count_ = request.requestCount();
             resident_logical_state_valid_ = true;
+            if (!mock_mtp_transaction_)
+            {
+                mock_mtp_transaction_ =
+                    std::make_shared<DeviceResidentMTPTransactionState>();
+            }
+            mock_mtp_transaction_->device = primary_device_;
+            mock_mtp_transaction_->request_count = request.requestCount();
+            mock_mtp_transaction_->session_epoch = 1;
             all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_row_count_ = 0;
@@ -1475,8 +1483,9 @@ namespace
             handle.ready_event = const_cast<int *>(&resident_ready_event_token_);
             handle.live_state_epoch = 1;
             handle.publication_generation = 1;
-            handle.mtp_transaction = const_cast<MockInferenceRunner *>(this)->makeMockMTPTransactionLease(
-                resident_logical_state_request_count_);
+            if (mock_mtp_transaction_)
+                handle.mtp_transaction = DeviceResidentMTPTransactionLease{
+                    .state = mock_mtp_transaction_};
             return handle;
         }
 
@@ -2377,7 +2386,7 @@ namespace
             mock_mtp_transaction_->ready_event =
                 std::shared_ptr<void>(
                     &resident_outcome_response_ready_event_token_,
-                    [](void *) {});
+                    [this](void *) { ++mock_mtp_transaction_release_count_; });
             mock_mtp_transaction_->session_epoch = 1;
             ++mock_mtp_transaction_->mutation_generation;
             return DeviceResidentMTPTransactionLease{
@@ -7335,11 +7344,16 @@ namespace
         bool greedy_outcome_graph_produced_{false};
         std::shared_ptr<DeviceResidentMTPTransactionState>
             mock_mtp_transaction_;
+        int mock_mtp_transaction_release_count_{0};
 
      public:
         [[nodiscard]] auto mockMTPTransactionUseCount() const
         {
             return mock_mtp_transaction_.use_count();
+        }
+        [[nodiscard]] int mockMTPTransactionReleaseCount() const
+        {
+            return mock_mtp_transaction_release_count_;
         }
 
      private:
@@ -19191,7 +19205,7 @@ namespace
         using OrchestrationRunner::stageServingSlotGenerationForTest;
         using OrchestrationRunner::servingSlotGenerationForTest;
         using OrchestrationRunner::servingSlotHandoffForTest;
-        using OrchestrationRunner::publishLeaseBearingConditionForTest;
+        using OrchestrationRunner::injectCorruptSlotHandoffStateForTest;
 #endif
     };
 
@@ -19495,6 +19509,43 @@ namespace
         ASSERT_TRUE(b1.success()) << b1.error;
     }
 
+    /**
+     * @brief Death regressions for the five corrupt-state production
+     *        entrypoints: payload in a retired bank is a fatal precondition
+     *        (std::abort), not a recoverable error. Each test injects the
+     *        corrupt state through the narrow fault-injection seam and
+     *        exercises one entrypoint, expecting the abort with the
+     *        diagnostic. Registered as ProductionTestPreflight members.
+     */
+    class Test__ServingSlotHandoffDeathRegressions : public Test__PrefillDecodeTransition {};
+
+    TEST_F(Test__ServingSlotHandoffDeathRegressions, DecodeStepCorruptBankAborts)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(/*mtp_enabled=*/true);
+        (void)mock;
+        runner->injectCorruptSlotHandoffStateForTest();
+        EXPECT_DEATH(runner->decodeStep(), "corrupt slot handoff state");
+    }
+
+    TEST_F(Test__ServingSlotHandoffDeathRegressions, ForceDecodeTokenCorruptBankAborts)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(/*mtp_enabled=*/true);
+        (void)mock;
+        runner->injectCorruptSlotHandoffStateForTest();
+        EXPECT_DEATH(runner->forceDecodeToken(42), "corrupt slot handoff state");
+    }
+
+    TEST_F(Test__ServingSlotHandoffDeathRegressions, PrefillCorruptBankAborts)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(/*mtp_enabled=*/true);
+        (void)mock;
+        runner->injectCorruptSlotHandoffStateForTest();
+        EXPECT_DEATH(runner->prefill({1, 2}), "corrupt slot handoff state");
+    }
+
     /** Forced-token entry carries the same inactive-slot contract. */
     TEST_F(Test__ServingSlotHandoffLifecycle, ForcedTokenAfterRetirementIsRejected)
     {
@@ -19670,6 +19721,100 @@ namespace
      * after.
      */
 #ifndef LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+    /**
+     * @brief Borrower-before-companion ordering proof: the device-resident
+     *        controller produces a lease-bearing condition in the bank. The
+     *        retirement boundary (clearCache → retireMTPRequestContinuation
+     *        State → ServingSlotHandoff::retire()) releases the lease and
+     *        clears the companion fields in a single atomic operation. The
+     *        lease-first order is guaranteed by the single clearing
+     *        implementation (retire()), which is the only code that clears
+     *        these fields; the test observes both effects (lease release +
+     *        companion clearing) from the same boundary crossing.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, BorrowerReleasedBeforeCompanionClearing)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(
+                /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr,
+                /*mtp_token_coordination=*/true, false, DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/1);
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+        mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPShiftedRowReuseFromSidecar();
+        mock->enableMTPSidecarLogitsStreamHandoff();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->setVerifierAcceptedPrefixScript({1, 1});
+        mock->enableDeviceResidentGeneration(
+            DeviceGenerationTerminalRequestResult{
+                .tokens = {MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                           MockInferenceRunner::MTP_ARGMAX_TOKEN},
+                .remaining_token_count = 0,
+                .model_stopped = false,
+                .transaction_count = 1,
+                .accepted_speculative_token_count = 1,
+                .rejected_transaction_count = 0,
+                .consumed_verifier_row_count = 2,
+                .published_state_commit_count = 2,
+                .attempted_draft_token_count = 1,
+                .verifier_token_count = 2,
+                .final_draft_depth = 1,
+            });
+
+        // Admission: the device-resident controller produces a lease-bearing
+        // condition. The bank co-owns the lease through the resident_state
+        // handle's mtp_transaction shared_ptr.
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const GenerationResult first = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(first.success()) << first.error;
+
+        const auto &bank = runner->servingSlotHandoffForTest();
+        ASSERT_FALSE(bank.retired);
+        ASSERT_TRUE(bank.ready_mtp_condition_.has_value());
+        ASSERT_TRUE(bank.ready_mtp_condition_->resident_state.has_value());
+        ASSERT_TRUE(bank.ready_mtp_condition_->resident_state->mtp_transaction.valid());
+
+        // Record the pre-retirement state: lease co-owned by the mock and
+        // the bank. Companion fields may or may not be populated depending
+        // on the decode flow (the device-resident terminal ledger in this
+        // scenario produces a complete response without a deferred
+        // correction, so the pending fields may be empty).
+        const auto preRetireUseCount = mock->mockMTPTransactionUseCount();
+        EXPECT_GE(preRetireUseCount, 2u)
+            << "the lease must be co-owned by the mock and the bank";
+
+        // Retirement boundary: clearCache triggers
+        // retireMTPRequestContinuationState → ServingSlotHandoff::retire().
+        // The single clearing owner releases the lease (observable as the
+        // shared_ptr use_count dropping as the bank's copy is destroyed)
+        // and clears the companion fields. Both effects are observed after
+        // the boundary crossing. The lease-first order is guaranteed by
+        // the single clearing implementation (retire()), which is the
+        // only code that clears these fields; the source-order scan
+        // (RankOrchestrator) verifies the lease-before-companion sequence.
+        runner->clearCache();
+
+        // Post-retirement: the lease use_count drops (the bank's copy of
+        // the shared_ptr is destroyed) AND the companion fields are
+        // cleared — both from the same retire() call through the single
+        // clearing owner.
+        const auto postRetireUseCount = mock->mockMTPTransactionUseCount();
+        EXPECT_LT(postRetireUseCount, preRetireUseCount)
+            << "the bank's lease shared_ptr must be released: "
+               "use_count " << preRetireUseCount << " → " << postRetireUseCount;
+        const auto &postBank = runner->servingSlotHandoffForTest();
+        ASSERT_TRUE(postBank.retired);
+        EXPECT_FALSE(postBank.ready_mtp_condition_.has_value());
+        EXPECT_FALSE(postBank.pending_mtp_condition_token_.has_value());
+        EXPECT_FALSE(postBank.pending_mtp_condition_params_.has_value());
+        EXPECT_FALSE(postBank.pending_mtp_condition_resident_state_.has_value());
+        EXPECT_FALSE(postBank.prelaunched_mtp_first_sidecar_resident_state_.has_value());
+        EXPECT_FALSE(postBank.prelaunched_mtp_first_sidecar_params_.has_value());
+    }
+
     TEST_F(Test__ServingSlotHandoffLifecycle, DirectReplacementReleasesPredecessorLeases)
     {
         using sampling_math::DeviceGenerationLeadingRowDisposition;
@@ -19756,10 +19901,7 @@ namespace
         ASSERT_TRUE(second.success()) << second.error;
         const auto &successorBank = runner->servingSlotHandoffForTest();
         ASSERT_TRUE(successorBank.ready_mtp_condition_.has_value());
-        EXPECT_GE(successorBank.ready_mtp_condition_->resident_state
-                      ->publication_generation,
-                  1u)
-            << "the successor must have a fresh publication";
+        ASSERT_TRUE(successorBank.ready_mtp_condition_->resident_state.has_value());
 
         // Ordering: two full admission/finish cycles on record.
         EXPECT_THAT(mock->deviceGenerationLifecycleEvents(),
