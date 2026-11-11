@@ -1802,3 +1802,16 @@ claim that old BB flags match or C1-restricted-profile qualification
 (old BB perms not reconstructed). No host driver/OMP changes or waived
 tests. .79 lease NOT needed by Main — its booking continues through
 arm-sparks under prior permissions.
+
+### .79 QUEUE LOCKED (sparks, ~15:02Z)
+
+Dir-B trace runs NOW on .79 (build-bb Release @ bb893cd79 BIN-OK; two
+authoring fixes in; ~35 min; seal + per-bucket table on completion).
+Then: half-perf artifact bundle (read-only; includes the FMLAL
+native-leaf-existence answer from the tree grep) → nsys wrapped smoke
+(5-min, operator-approved, custody rules: REAL begin before attach,
+finish after, full identity capture — clean capture = nsys attachment
+PROVEN → idea-25 trace bookable) → B1 focused check on .79 if disk fits
+after pruning superseded dirs (Release ≈10G + smoke ≈1G within 66G).
+.80 = Main's lease, untouched. Post-campaign .80 order locked: greedy
+rider → idea-08 BOM census + tournament → M=1 economy → Lane-2.
