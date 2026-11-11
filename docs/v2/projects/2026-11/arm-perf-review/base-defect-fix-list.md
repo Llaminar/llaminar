@@ -544,3 +544,29 @@ Future focused set grows to 8 (adds replay + lifecycle); the one final
 Main full campaign remains post-collection.
 Also: d4/#191 HOLD fix-back (ab860378b) routed to the addon for review —
 do NOT idle-wait on B12 with known #175 blockers in flight.
+
+### SOURCE ACK #190 (reviewer, ~03:32Z) — e0b7a7c1f bounded source ACK
+
+Reviewed 2a4..e0. NP1: native CPU membership independently canonicalized
+via a SHARED capacity/core resolver; matching wrong order rejects; data-only
+validator cannot mint admission; recorded GB10 inputs + malformed/
+matching-wrong-order controls explicit preflight. NP2: public late prepare
+REMOVED — private friend-only preparation follows MPISessionOwner
+authentication; main PID/TID + once + level0 + single-thread + weak
+MPI-uninitialized checks precede environment publication; Main.cpp
+runtime/GPU lifetime follows entry; borrowed admission verifies native
+geometry/thread/process/binding; old geometry methods delegate one
+resolver; NO worker-pool manual rebinding returned; authored physical
+native order/binding separate from automatic receipt. Lifecycle test
+SOURCE crosses actual production /proc/self/exe via isolated interception
+(PID/shared-root device+inode + authenticated shared loan pass; forced
+exec failure/cancellation → owner root retirement; constructor worker
+control rejects before exec audit; reentry authenticates inherited
+borrow/root ownership, not just same PID). Lifecycle/order/publication
+preflight registrations present. No further source blocker in bounded
+scope. Historical 2a4 HOLD retained. No builds/tests/probes/artifact
+authentication performed (owner 6/6 + 20× owner-reported). Closes the
+SOURCE fix-back only — NOT .79 execution, production pool/backend
+qualification, economy, final integration, or merge. Broad checks
+unverified-at-lane → Main post-collection campaign. Register #175/#191
+ab860 HOLD entirely independent.
