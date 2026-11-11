@@ -804,6 +804,12 @@ namespace
         // constructs one; 2 constructs two lexically nested scopes whose
         // teardown is inner-first and asserted as restored before returning.
         const std::uint64_t before = openMPTeamForkSnapshot();
+        // The ORIGINAL owner-stack pointer, saved before any scope exists:
+        // restoration is proven by POINTER IDENTITY against it, never by
+        // global-total arithmetic (the total advances once per fork whatever
+        // the stack holds).
+        const llaminar::v2::OpenMPTeamForkCell *stack_at_entry =
+            llaminar::v2::openMPTeamForkOwnerStack;
         std::optional<OpenMPTeamForkScope> outer;
         std::optional<OpenMPTeamForkScope> inner;
         if (!concurrent_threads && owners >= 1)
@@ -826,7 +832,12 @@ namespace
             main_owner.emplace(); // The measuring thread owns a cell too.
             worker = std::thread([&]
             {
-                OpenMPTeamForkScope scope; // Same-thread owner, built off the clock.
+                // The worker asserts its OWN stack identity around its own
+                // thread-affine scope lifecycle.
+                const llaminar::v2::OpenMPTeamForkCell *worker_stack_at_entry =
+                    llaminar::v2::openMPTeamForkOwnerStack;
+                std::optional<OpenMPTeamForkScope> scope; // Built off the clock.
+                scope.emplace();
                 worker_ready.store(true, std::memory_order_release);
                 while (!start_gate.load(std::memory_order_acquire))
                     std::this_thread::yield();
@@ -838,14 +849,23 @@ namespace
                 // window contains the notes and nothing else.
                 while (!verify_gate.load(std::memory_order_acquire))
                     std::this_thread::yield();
-                EXPECT_EQ(scope.forks(), notes);
+                EXPECT_EQ(scope->forks(), notes);
+                scope.reset();
+                EXPECT_EQ(llaminar::v2::openMPTeamForkOwnerStack,
+                          worker_stack_at_entry)
+                    << "the worker's owner stack must be restored exactly";
             });
             while (!worker_ready.load(std::memory_order_acquire))
                 std::this_thread::yield();
         }
 
-        // The timed window: notes only. Start after both owners (when any) are
-        // live and ready; stop before any verification, join or teardown.
+        // The timed interval is the AMORTIZED CONCURRENT WALL TIME INCLUDING
+        // RENDEZVOUS: it opens with the start-gate publication and closes
+        // after the competing owner's completion is observed. Readiness gates
+        // permit concurrency; they do not prove scheduler overlap, so the
+        // interval is honestly labeled as wall time including the rendezvous,
+        // never as a literal notes-only span. Verification, join and teardown
+        // still happen after the clock stops.
         const auto start = std::chrono::steady_clock::now();
         if (concurrent_threads)
             start_gate.store(true, std::memory_order_release);
@@ -901,6 +921,11 @@ namespace
                         << "the probe must walk restored AND the surviving outer";
                 }
                 outer.reset();
+                // EXACT TLS STACK IDENTITY after the teardown: the owner
+                // stack pointer must be the ORIGINAL saved pointer, byte for
+                // byte - a stale or extra link would fail here.
+                EXPECT_EQ(llaminar::v2::openMPTeamForkOwnerStack, stack_at_entry)
+                    << "the original owner stack must be restored exactly";
                 result.process_delta = notes + 1; // Notes plus the probe.
             }
             else
@@ -908,17 +933,11 @@ namespace
                 // owners==0: nothing was alive, so the stack is already the
                 // restored original and there is nothing to tear down.
                 inner.reset();
+                // EXACT TLS STACK IDENTITY for the empty configuration too.
+                EXPECT_EQ(llaminar::v2::openMPTeamForkOwnerStack, stack_at_entry)
+                    << "the original owner stack must be restored exactly";
                 result.process_delta = notes;
             }
-            // The ORIGINAL stack is restored after the teardown: a fork now
-            // must attribute to nothing (the total is its only witness).
-            const std::uint64_t after_teardown = openMPTeamForkSnapshot();
-            {
-                auto local_idle = [] {};
-                OMP_WORKSHARE_REGION(local_idle);
-            }
-            EXPECT_EQ(openMPTeamForkSnapshot() - after_teardown, 1u);
-            result.process_delta += 1; // The post-teardown fork.
         }
         // Every configuration counts each fork exactly once in the total
         // (the nested branch's figure includes its restoration probe and the
