@@ -30,7 +30,7 @@ class MPIBootstrapEnvironmentPolicy(unittest.TestCase):
         # Preserve the canonical legacy exceptions so this fixture also checks
         # the guard's real stale-exception validation, instead of bypassing it.
         for name in ("src/v2/app/RuntimeInitPhase.cpp", "src/v2/utils/CPUFeatures.h",
-                     "src/v2/utils/DebugEnv.h"):
+                     "src/v2/utils/NativeCPUPlacement.cpp", "src/v2/utils/DebugEnv.h"):
             self.write(name, 'const char *legacy = std::getenv("LEGACY");\n')
 
     def write(self, name, body):
