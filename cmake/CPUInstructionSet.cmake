@@ -41,45 +41,29 @@ function(llaminar_cpu_instruction_set processor requested flags_output definitio
             set(flags "-mcpu=generic -march=armv8-a+simd")
             set(dotprod 0)
             set(i8mm 0)
+            set(llaminar_fp16fml 0)
         elseif(isa STREQUAL "NEON_DOTPROD")
             set(flags "-mcpu=generic -march=armv8-a+simd+dotprod")
             set(dotprod 1)
             set(i8mm 0)
+            set(llaminar_fp16fml 0)
         elseif(isa STREQUAL "NEON_I8MM")
-            set(flags "-mcpu=generic -march=armv8-a+simd+dotprod+i8mm")
+            # The I8MM envelope explicitly declares the FP16 FML long
+            # multiply-add extension: the half-operand native leaf is part of
+            # this envelope's contract, and no other envelope carries it. The
+            # assemblability of the declared extension is verified where a
+            # compiler exists (llaminar_configure_cpu_instruction_set); this
+            # pure resolver only composes the declared contract.
+            set(flags "-mcpu=generic -march=armv8-a+simd+dotprod+i8mm+fp16fml")
             set(dotprod 1)
             set(i8mm 1)
+            set(llaminar_fp16fml 1)
         else()
             message(FATAL_ERROR "CPU ISA '${requested}' is incompatible with AArch64 target '${processor}'; use NEON, NEON_DOTPROD or NEON_I8MM")
         endif()
-        # The FMLAL half-operand leaf needs the ARMv8.2 FP16 fused multiply-add
-        # extension. Probe the toolchain with the extension appended to the
-        # envelope's -march token (the evidence checkers admit extension
-        # suffixes); a toolchain that cannot assemble it keeps the envelope
-        # unchanged and the scalar half-operand dispatch intact.
-        set(llaminar_fp16fml 0)
-        include(CheckCXXSourceCompiles)
-        set(CMAKE_REQUIRED_QUIET ON)
-        string(REGEX REPLACE "-march=[^ ]+" "\\0+fp16fml" llaminar_fp16fml_flags "${flags}")
-        set(CMAKE_REQUIRED_FLAGS "${llaminar_fp16fml_flags}")
-        check_cxx_source_compiles([=[
-#include <arm_neon.h>
-int main()
-{
-    float32x4_t acc = vmovq_n_f32(0.0f);
-    float16x8_t a = vreinterpretq_f16_u16(vmovq_n_u16(1u));
-    float16x8_t b = vreinterpretq_f16_u16(vmovq_n_u16(2u));
-    acc = vfmlalq_low_f16(acc, a, b);
-    acc = vfmlalq_high_f16(acc, a, b);
-    return vgetq_lane_f32(acc, 0) == 0.0f ? 0 : 1;
-}
-]=]
-            llaminar_fp16fml_compiles)
-        unset(CMAKE_REQUIRED_FLAGS)
-        if(llaminar_fp16fml_compiles)
-            set(flags "${llaminar_fp16fml_flags}")
-            set(llaminar_fp16fml 1)
-        endif()
+        # The FMLAL probe is scoped to the NEON_I8MM envelope above; the
+        # baseline NEON and DotProd envelopes keep their declared -march
+        # tokens unchanged so no binary silently requires FEAT_FHM.
         set(definitions LLAMINAR_COMPILED_WITH_AVX2=0 LLAMINAR_COMPILED_WITH_AVX512=0
             LLAMINAR_COMPILED_WITH_NEON=1 LLAMINAR_COMPILED_WITH_NEON_DOTPROD=${dotprod}
             LLAMINAR_COMPILED_WITH_NEON_I8MM=${i8mm}
@@ -123,6 +107,32 @@ macro(llaminar_configure_cpu_instruction_set)
     string(TOUPPER "${LLAMINAR_CPU_ISA}" LLAMINAR_CPU_ISA_UPPER)
     llaminar_cpu_instruction_set("${LLAMINAR_CPU_TARGET_PROCESSOR}" "${LLAMINAR_CPU_ISA}"
         LLAMINAR_CPU_COMPILE_FLAGS LLAMINAR_CPU_COMPILE_DEFINITIONS)
+    # The I8MM envelope declares the FP16 FML extension; verify the real
+    # toolchain assembles the declared contract where a compiler exists. A
+    # toolchain that cannot assemble it is a configure error for this
+    # envelope, never a silent downgrade, and no other envelope is probed.
+    if(LLAMINAR_CPU_ISA_UPPER STREQUAL "NEON_I8MM")
+        include(CheckCXXSourceCompiles)
+        set(CMAKE_REQUIRED_QUIET ON)
+        set(CMAKE_REQUIRED_FLAGS "${LLAMINAR_CPU_COMPILE_FLAGS}")
+        check_cxx_source_compiles([=[
+#include <arm_neon.h>
+int main()
+{
+    float32x4_t acc = vmovq_n_f32(0.0f);
+    float16x8_t a = vreinterpretq_f16_u16(vmovq_n_u16(1u));
+    float16x8_t b = vreinterpretq_f16_u16(vmovq_n_u16(2u));
+    acc = vfmlalq_low_f16(acc, a, b);
+    acc = vfmlalq_high_f16(acc, a, b);
+    return vgetq_lane_f32(acc, 0) == 0.0f ? 0 : 1;
+}
+]=]
+            llaminar_fp16fml_compiles)
+        unset(CMAKE_REQUIRED_FLAGS)
+        if(NOT llaminar_fp16fml_compiles)
+            message(FATAL_ERROR "CPU ISA 'NEON_I8MM' requires the FP16FML extension (+fp16fml); the toolchain cannot assemble the declared envelope")
+        endif()
+    endif()
     add_compile_definitions(${LLAMINAR_CPU_COMPILE_DEFINITIONS})
     string(APPEND CMAKE_CXX_FLAGS " ${LLAMINAR_CPU_COMPILE_FLAGS}")
     string(APPEND CMAKE_C_FLAGS " ${LLAMINAR_CPU_COMPILE_FLAGS}")

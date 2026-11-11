@@ -33,6 +33,24 @@
 #error "OneDNN support is required for FloatingPointGemmKernel"
 #endif
 
+/**
+ * @brief Whether this translation unit's envelope compiles the FMLAL half
+ *        operand leaf (the NEON_I8MM envelope declares FP16FML).
+ *
+ * Device-free contracts assert the selection mapping against this predicate:
+ * an envelope without it dispatches the scalar schedule and never selects the
+ * leaf; an envelope with it requires the executing CPU to advertise FEAT_FHM
+ * before the leaf runs.
+ */
+inline constexpr bool fmlalLeafCompiledInEnvelope() noexcept
+{
+#if defined(LLAMINAR_COMPILED_WITH_FP16FML)
+    return LLAMINAR_COMPILED_WITH_FP16FML != 0;
+#else
+    return false;
+#endif
+}
+
 #include <oneapi/dnnl/dnnl.hpp>
 #include <cstdint>
 #include <stdexcept>
@@ -46,6 +64,7 @@
 #include <type_traits>
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
 #include <arm_neon.h>
+#include "utils/ARMCPUFeatures.h"
 #endif
 #include "../../FloatingActivationOperandPrecision.h"
 
@@ -1180,6 +1199,14 @@ namespace llaminar2
         * order and the 256 partials reduce through the fixed tree unchanged.
         * Weights stream as halves without a widening pass.
         *
+        * Rounding controls, stated explicitly: FPCR.FZ16 does not participate
+        * — the FP16 operands are consumed exactly (binary16 subnormals widen
+        * to normal binary32 values, so no half-precision flush can change a
+        * product), and the accumulation is binary32 arithmetic governed by
+        * FPCR.FZ, the same control the scalar std::fma contract runs under.
+        * Default process state (FZ off, RNE) gives identical bytes on both
+        * paths.
+        *
         * @param activations Admitted A operand (FP32 or physical half rows).
         * @param weights Weight row base (column-major K-contiguous rows).
         * @param weight_row First K element of this output column's weight row.
@@ -1738,6 +1765,12 @@ namespace llaminar2
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
             case ISALevel::NEON:
             case ISALevel::NEONDotProd:
+                // The FMLAL leaf exists only in the envelope that declares
+                // FP16FML; startup admission verifies the executing CPU
+                // advertises FEAT_FHM before any leaf instruction runs, so a
+                // mismatch fails fatally instead of faulting on an unimplemented
+                // instruction.
+                ARMCPUCapabilities::native().require(ARMCPUFeature::FP16FML);
                 return run_gpu_aligned_expert_fp32_matmul_neon<WeightType, HalfRNE, HalfStorage>(
                     A, B, C, M, N, K, alpha, beta, bias);
 #endif
