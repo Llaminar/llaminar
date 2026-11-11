@@ -4083,10 +4083,11 @@ namespace llaminar2
         device_generation_admission_.reset();
         if (slot_handoff_.hasPayload() && slot_handoff_.retired)
         {
-            return setError(
-                "Corrupt serving-slot handoff: payload present in a bank "
-                "already consumed by its retirement boundary; refusing to "
-                "open a new bank over unretired state");
+            std::fprintf(stderr,
+                "[FATAL] OrchestrationRunner admission: corrupt slot handoff "
+                "state — payload in a retired bank. Refusing to open a new "
+                "bank over unretired state.\n");
+            std::abort();
         }
         if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
         {
@@ -5010,10 +5011,11 @@ namespace llaminar2
         prefix_request_summary_ = {};
         if (slot_handoff_.hasPayload() && slot_handoff_.retired)
         {
-            return setError(
-                "Corrupt serving-slot handoff: payload present in a bank "
-                "already consumed by its retirement boundary; refusing to "
-                "open a new bank over unretired state");
+            std::fprintf(stderr,
+                "[FATAL] OrchestrationRunner admission: corrupt slot handoff "
+                "state — payload in a retired bank. Refusing to open a new "
+                "bank over unretired state.\n");
+            std::abort();
         }
         if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
         {
@@ -8818,12 +8820,11 @@ namespace llaminar2
         {
             if (slot_handoff_.hasPayload())
             {
-                result.error =
-                    "Corrupt serving-slot handoff: payload present in a bank "
-                    "already consumed by its retirement boundary; refusing to "
-                    "consume or auto-repair foreign request state";
-                LOG_ERROR("[OrchestrationRunner] decodeStepMTP refused corrupt slot handoff state");
-                return result;
+                std::fprintf(stderr,
+                    "[FATAL] OrchestrationRunner decodeStepMTP: corrupt slot "
+                    "handoff state — payload in a retired bank. "
+                    "Refusing to consume or auto-repair foreign request state.\n");
+                std::abort();
             }
             result.error =
                 "decodeStepMTP() requires an admitted request: the serving "
@@ -15410,12 +15411,11 @@ namespace llaminar2
         {
             if (slot_handoff_.hasPayload())
             {
-                result.error =
-                    "Corrupt serving-slot handoff: payload present in a bank "
-                    "already consumed by its retirement boundary; refusing to "
-                    "consume or auto-repair foreign request state";
-                LOG_ERROR("[OrchestrationRunner] decodeStep refused corrupt slot handoff state");
-                return result;
+                std::fprintf(stderr,
+                    "[FATAL] OrchestrationRunner decodeStep: corrupt slot "
+                    "handoff state — payload in a retired bank. "
+                    "Refusing to consume or auto-repair foreign request state.\n");
+                std::abort();
             }
             result.error =
                 "decodeStep() requires an admitted request: the serving slot "
@@ -16154,12 +16154,11 @@ namespace llaminar2
         {
             if (slot_handoff_.hasPayload())
             {
-                result.error =
-                    "Corrupt serving-slot handoff: payload present in a bank "
-                    "already consumed by its retirement boundary; refusing to "
-                    "consume or auto-repair foreign request state";
-                LOG_ERROR("[OrchestrationRunner] forceDecodeToken refused corrupt slot handoff state");
-                return result;
+                std::fprintf(stderr,
+                    "[FATAL] OrchestrationRunner forceDecodeToken: corrupt slot "
+                    "handoff state — payload in a retired bank. "
+                    "Refusing to consume or auto-repair foreign request state.\n");
+                std::abort();
             }
             result.error =
                 "forceDecodeToken() requires an admitted request: the serving "

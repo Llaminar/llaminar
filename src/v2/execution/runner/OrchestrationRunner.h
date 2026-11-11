@@ -2069,10 +2069,24 @@ namespace llaminar2
             return serving_slot_generation_;
         }
 
-        /** Read-only observation of the slot bank for lease-lifetime evidence. */
+        /** Read-only observation of the slot bank state for lifecycle evidence. */
         [[nodiscard]] const ServingSlotHandoff &servingSlotHandoffForTest() const noexcept
         {
             return slot_handoff_;
+        }
+
+        /**
+         * @brief Publish a lease-bearing condition into the slot bank for
+         *        lease-lifetime evidence (read-only observation through the
+         *        const accessor after this call).
+         */
+        void publishLeaseBearingConditionForTest(
+            DeviceResidentLogicalSequenceStateHandle resident_handle) noexcept
+        {
+            slot_handoff_.openFor(++serving_slot_generation_);
+            slot_handoff_.prefill_logits_ready_ = true;
+            slot_handoff_.ready_mtp_condition_ = ReadyMTPCondition::hostVisible(
+                42, SamplingParams{}, std::move(resident_handle));
         }
 
     private:

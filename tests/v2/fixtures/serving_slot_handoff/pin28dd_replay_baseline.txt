@@ -1,5 +1,5 @@
 # format: 1
-# reference-source: 28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source; runner/test blobs identical to the base tree; seam-dependent tests compiled out at base via LLAMINAR_CB_HANDOFF_BASE_CAPTURE, recorded here)
+# reference-source: 28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source; production runner blobs identical to base tree; the staged harness differs by the declared BASE_CAPTURE exclusion only)
 # reference-capture-host: dgx-station (tdsynnex, aarch64 Neoverse-V2, 64K pages)
 # reference-build: Integration/SHARED_CORE=ON/NEON_I8MM/HAVE_CUDA=OFF/HAVE_ROCM=OFF/gcc-14/cmake4.0.3/ninja1.13/image:sha256:b3a70cb060bb... (base-source build_v2_refcap)
 # reference-harness-blob: 141f61751c13602acdb4711988851edfb2321ad1
