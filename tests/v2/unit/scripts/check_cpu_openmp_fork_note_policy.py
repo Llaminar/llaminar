@@ -189,11 +189,13 @@ def main() -> int:
             continue
         relative = str(path.relative_to(args.repo_root))
         raw = path.read_text(encoding="utf-8", errors="replace")
-        # The pre-filter is a plain substring probe on purpose: a file that
-        # mentions a parallel fork in ANY form - including the unsupported
-        # inline spellings the anchored grammar rejects - must reach scan(),
-        # or an unsupported form could silently pass unread.
-        if "omp parallel" not in raw and NOTE not in raw:
+        # The pre-filter must never discard a file the grammar would judge: a
+        # plain "omp parallel" substring probe misses the supported
+        # whitespace forms (`#pragma omp\tparallel`, `#pragma omp  parallel`,
+        # `_Pragma("omp  parallel...")`) and would skip them unread. Probe
+        # with the fork MENTION grammar (omp + horizontal whitespace +
+        # parallel) instead; scan() then applies the strict anchored rules.
+        if not re.search(r"omp[ \t]+parallel", raw) and NOTE not in raw:
             continue
         files += 1
         file_violations, file_noted, file_exempted = scan(relative, raw)

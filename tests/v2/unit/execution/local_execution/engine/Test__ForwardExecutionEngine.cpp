@@ -4821,18 +4821,29 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         host.graph_stage_count = 1;
         constexpr int kForksPerStage = 3;
         std::atomic<bool> window_live{false};
+        std::atomic<bool> stop{false};
         std::atomic<int> concurrent_forks{0};
         std::atomic<bool> concurrent_done{false};
         // The concurrent owner lives entirely on the worker thread (constructed
-        // and destroyed there; the parent only joins), and its forks start only
-        // after the stage hook marks the engine window live - the overlap with
-        // the published window is proven, not scheduler luck. The join guard
-        // makes an early assertion failure still join before touching state.
+        // and destroyed there; the parent only joins), and its forks run only
+        // after the stage hook marks the engine window live. The hook then
+        // HOLDS the window until the concurrent forks complete - the five
+        // competing forks are proven inside the published window, without any
+        // production change (the rendezvous lives in the mock stage hook).
+        // Every failure exit releases the worker: a stop flag set on scope
+        // exit means the join guard can never hang, whatever the engine did.
         std::thread concurrent([&]
         {
             llaminar::v2::OpenMPTeamForkScope concurrent_owner;
-            while (!window_live.load(std::memory_order_acquire))
+            while (!window_live.load(std::memory_order_acquire) &&
+                   !stop.load(std::memory_order_acquire))
                 std::this_thread::yield();
+            if (stop.load(std::memory_order_acquire) &&
+                !window_live.load(std::memory_order_acquire))
+            {
+                concurrent_done.store(true, std::memory_order_release);
+                return;
+            }
             for (int fork = 0; fork < 5; ++fork)
             {
                 OMP_WORKSHARE_REGION(idle);
@@ -4843,17 +4854,28 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         struct JoinGuard
         {
             std::thread &thread;
-            ~JoinGuard() { if (thread.joinable()) thread.join(); }
-        } join_guard{concurrent};
+            std::atomic<bool> &stop;
+            ~JoinGuard() { stop.store(true, std::memory_order_release);
+                           if (thread.joinable()) thread.join(); }
+        } join_guard{concurrent, stop};
         host.graph_stage_factories = {
-            [&window_live](const std::string &name, DeviceId device)
+            [&window_live, &concurrent_done, &stop](const std::string &name, DeviceId device)
             {
                 auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
                     ComputeStageType::GEMM, name, device);
-                stage->setOnExecute([&window_live](IDeviceContext *)
+                stage->setOnExecute([&](IDeviceContext *)
                 {
                     auto work = [] {};
                     window_live.store(true, std::memory_order_release);
+                    // Hold the window until the concurrent forks are done (a
+                    // bounded wait: the worker always completes once the gate
+                    // is open, and a lost race must not hang the engine).
+                    const auto hold_until = std::chrono::steady_clock::now() +
+                                            std::chrono::seconds(10);
+                    while (!concurrent_done.load(std::memory_order_acquire) &&
+                           !stop.load(std::memory_order_acquire) &&
+                           std::chrono::steady_clock::now() < hold_until)
+                        std::this_thread::yield();
                     OMP_WORKSHARE_REGION(work);
                     OMP_WORKSHARE_REGION(work);
                     OMP_WORKSHARE_REGION(work);
@@ -4865,24 +4887,26 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         auto input = makeTestInput(1, 1, DeviceId::cpu(), tokens.data(), positions.data());
         input.execution_phase = ForwardExecutionPhase::Decode;
         ForwardOutput output{};
-        ASSERT_TRUE(engine.execute(input, output, host));
+        const bool first_executed = engine.execute(input, output, host);
+        if (!first_executed)
+            stop.store(true, std::memory_order_release);
+        ASSERT_TRUE(first_executed);
         while (!concurrent_done.load(std::memory_order_acquire))
             std::this_thread::yield();
-        ASSERT_EQ(concurrent_forks.load(), 5);
+        ASSERT_EQ(concurrent_forks.load(), 5)
+            << "the concurrent forks must have run inside the held window";
 
         // The published value is keyed and exact: the capture-step record
         // (used_graph_replay=false) carries exactly the window's own three
         // forks, immune to the prior total and to the concurrent owner whose
-        // five forks were live inside the same window.
-        const auto summary_records = [](const std::vector<PerfStatRecord> &records)
-        {
-            std::vector<const PerfStatRecord *> found;
-            for (const auto &record : records)
-                if (record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily)
-                    found.push_back(&record);
-            return found;
-        };
-        const auto first_records = summary_records(PerfStatsCollector::snapshot({"omp"}));
+        // five forks were proven live inside the same window. The snapshot is
+        // an OWNED local: no observation borrows pointers into a temporary.
+        const std::vector<PerfStatRecord> first_snapshot =
+            PerfStatsCollector::snapshot({"omp"});
+        std::vector<const PerfStatRecord *> first_records;
+        for (const auto &record : first_snapshot)
+            if (record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily)
+                first_records.push_back(&record);
         ASSERT_FALSE(first_records.empty());
         for (const auto *record : first_records)
             EXPECT_EQ(record->value, static_cast<double>(kForksPerStage))
@@ -4891,12 +4915,18 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         // The accumulator contract across a repeated step: the second decode
         // adds its cell to the same keyed record (3 -> 6, count 1 -> 2) when
         // the key is identical, and never resets it.
-        ASSERT_TRUE(engine.execute(input, output, host));
-        for (const auto *record : summary_records(PerfStatsCollector::snapshot({"omp"})))
-        {
-            EXPECT_EQ(record->value, 2.0 * kForksPerStage);
-            EXPECT_EQ(record->count, 2u);
-        }
+        const bool second_executed = engine.execute(input, output, host);
+        if (!second_executed)
+            stop.store(true, std::memory_order_release);
+        ASSERT_TRUE(second_executed);
+        const std::vector<PerfStatRecord> second_snapshot =
+            PerfStatsCollector::snapshot({"omp"});
+        for (const auto &record : second_snapshot)
+            if (record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily)
+            {
+                EXPECT_EQ(record.value, 2.0 * kForksPerStage);
+                EXPECT_EQ(record.count, 2u);
+            }
     }
 
     // Success/failure/prefill exclusions: a failed step and a prefill step
@@ -4923,6 +4953,28 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         EXPECT_FALSE(engine.execute(input, output, host));
         EXPECT_TRUE(PerfStatsCollector::snapshot({"omp"}).empty())
             << "a failed step publishes no count rather than a partial one";
+
+        // A SUCCESSFUL decode on the same gates publishes exactly once, so
+        // the failure exclusion is discriminating rather than vacuous.
+        host.graph_stage_factories = {
+            [](const std::string &name, DeviceId device)
+            {
+                auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+                    ComputeStageType::GEMM, name, device);
+                stage->setOnExecute([](IDeviceContext *)
+                {
+                    auto work = [] {};
+                    OMP_WORKSHARE_REGION(work);
+                });
+                return std::unique_ptr<IComputeStage>(std::move(stage));
+            }};
+        ForwardOutput success_output{};
+        ASSERT_TRUE(engine.execute(input, success_output, host));
+        bool published = false;
+        for (const auto &record : PerfStatsCollector::snapshot({"omp"}))
+            if (record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily)
+                published = true;
+        EXPECT_TRUE(published) << "a successful step on the same gates must publish";
 
         // Prefill exclusion: the same selected gates, a prefill phase with
         // COMPLETE input extents (four rows, four tokens, four positions).
