@@ -103,3 +103,28 @@ controls meaningful. No production/budget/inventory delta.
 DISPOSITION: station 64/64 stays attributed (the controls omit the
 failing invariant — green does not transfer f265's ACK); fix = port
 invariant + controls; B4 round-5 unchanged (Linux/JUnit handoff).
+
+### B9 FROZEN (Main scoping accepted, ~23:53Z): register-gate apparatus under the NOGO
+
+Main's reading: the B9 file IS the register-evidence checker
+(CPUNativeTileRegisterEvidence.py) = register-gate apparatus under the
+operator's NOGO scope (#166/#167/#191 descoped) → Main will NOT apply
+B9 to PR #43 without literal operator authorization text, even after a
+clean verdict.
+ACTIONS TAKEN: station instructed to STOP (no overlap-invariant port);
+the reviewer's HOLD verdict stands as FINAL; codex/arm-b9-strengthening
+@ 108bce2e stays pushed as FROZEN UNMERGED TOOLING (the #58 precedent).
+COORDINATOR ERROR OWNED: the B9 fold was dispatched from the standing
+queue list without re-checking its scope against the register-gate
+NOGO — the scope-check is now a standing part of the dispatch step for
+anything touching the register-evidence checker. No further
+station/reviewer time on B9 unless the operator provides literal
+authorization.
+
+### PR #43 REBASE IN FLIGHT (Main): new base d1fd0a077
+
+Main is rebasing PR #43 onto d1fd0a077 (operator asked Main to resolve
+upstream conflicts); force-push once validated; new tip to be announced.
+Lane branches on the old lineage (FMLAL 0b53fa7a4, B4 52fec643f, idea16
+a6aee9bac) rebase at handover per the anchor-refresh rule; coordinator
+routes the new base when announced.
