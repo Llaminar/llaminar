@@ -1010,3 +1010,17 @@ Post-fix validation: NP4 0.43s, NP8 0.64s, campaign passing.
 FMLAL leaf: addon RESUMED implementation (fresh branch
 codex/arm-fmlal-half-leaf off bb893cd79; plan approved; syntax-only
 locally; .80 legs deferred).
+
+### CB CANONICAL REFRESH RESULT (CB lead audit report, ~20:41Z): exit 8, gate failed
+
+cb-c1-canonical-20261111t1330 (0554e50d) exited 8 at 13:47:55Z (~18 min
+runtime); receipt: 3415 tests, gate FAILED. Receipt/XML/logs:
+cb-c1/artifacts/cb-c1-staging/lead-canonical-refresh-20261111T1330/
+qualification/prerequisites.json. Interpretation: the refresh ran under
+the narrowed seccomp profile (lead's query-only + arg-restricted
+move_pages allow) with the two authorized test-backports applied; the
+remaining failures = the inherited set from Main's base-fix inventory
+(minus the backport-fixed aliases). Next: CB lead triages the remaining
+classes against Main's inventory (concrete fixes vs environment
+preconditions — the seccomp attribution already resolved one class).
+CB-program work; ARM side informational only.
