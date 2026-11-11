@@ -493,3 +493,35 @@ VALIDATION #4: GRANTED on .80 (Main, ~35 min, Integration NEON_I8MM,
 fresh source/build, no models). STATION CO-VALIDATION dispatched in
 parallel (P1 focused cells natively, cross-host byte-identity agreement
 = the deliverable).
+
+### Station FMLAL co-validation: OneDNN lock CORRECTION + worktree-local fix (r5 in flight)
+
+CORRECTION of the earlier OneDNN note: the lock blocker DID reproduce
+(r3 failed at cmake/OneDNNBuild.cmake:160 via llaminar_prepare_onednn,
+fresh configure, GPU languages OFF). Root cause of the r2 confusion:
+r2's log was a CACHE-REUSE reconfigure on the r1-poisoned build dir —
+its cache carried USE_ONEDNN=OFF from r1's fallback, so OneDNN was
+SKIPPED, never satisfied. Structural for station containers:
+FloatingPointGemmKernel.h hard-requires OneDNN (#ifndef HAVE_ONEDNN
+#error → USE_ONDNN=OFF cannot build this tree at all); the canonical
+helper builds OneDNN INSIDE external/onednn under a file lock — the
+SHARED external mount is read-only with no completed install, so the
+lock can never be created there.
+FIX (script v5, watcher r5 in flight): the container mounts the
+WORKTREE'S OWN external/ instead of the shared one — provisioned
+host-side with a pinned shallow clone of the helper's exact ref (oneDNN
+v3.11.3 = 74d04752d9eaefff6a9ff62466c4d20b155e5bca, origin URL = the
+helper's ONEDNN_GIT_URL; vendor/ tracked content present; shared
+external/ untouched, no longer mounted). The canonical helper still
+performs its own origin check, schema=3 identity, lock, build,
+install-surface checks and digest — entirely inside the writable
+worktree-local checkout. CMAKE_BUILD_PARALLEL_LEVEL=2 bounds the helper
+build on the one-CPU quota. Provision inventory (all hash-verified):
+pcre2 10.49 + utf8proc 2.11.3 (tarball SHA256s == pinned URL_HASH), ftxui
+v5.0.0 = cdf28903a7781f97ba94d30b79c3a4b0c97ccce7, libfort v0.4.2 =
+b1c32b67511f4612996b287a1ef4a9df012521d2, onednn v3.11.3 = 74d04752d.
+Dependency versions unchanged — local transport only, same approved
+pattern. Attempt-3 receipts archived (attempt3-onednn-lock/ incl. the
+exact v3 script). Expect a longer run (full OneDNN + core build, ccache
+cold, one CPU); incremental resume supported via the helper's
+configured/identity markers. Exit + JUnit + SHAs when it reports.
