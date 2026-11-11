@@ -73,3 +73,51 @@ execution of the new registration on Linux/GNU-14.
 NEXT: await Main's post-B12 placement-fix tip → mechanical re-rebase →
 reviewer exact-source ACK at the final pin → NO FF until Main's 18×14
 current-binding acceptance.
+
+### Reviewer verdict #175 successor — HOLD at d4cdcd998; consolidated #191 (RG1–RG4)
+
+- **RG1 (cleanup/write/copy completeness):** initial sha substitutions,
+  mkdir/rm/recreate, summary writes, per-cell mkdir/status writes and
+  tee/publication are not explicitly checked; set-e switches on only after
+  the first reconciliation (behavior depends on the earlier cell); the
+  final publication substitution under active set-e can exit BEFORE
+  pub_rc/failure report; the unused phase helper retains unchecked
+  writes/copy. The new run checks (command/exit records, retain-check cp)
+  are good partial fixes but not cleanup/publication completeness. NEED:
+  actual shell failure injection for required infrastructure actions — not
+  successful stale-marker replacement.
+- **RG2 (configured-project identity):** the filter misses attached
+  -S/-B/-GNinja and split '-D' 'CMAKE_BUILD_TYPE=...'; cache preload can
+  override owned variables; validation happens AFTER build/inventory and
+  does not inspect actual CMAKE_HOME_DIRECTORY/CMAKE_CACHEFILE_DIR or
+  generator — containment of entries alone is NOT configured-project
+  identity. NEED: seal owned configuration BEFORE building; test
+  redirect/alternate project within the same root, stale persistent build
+  dir, and bypass spellings.
+- **RG3 (accepted-closure staleness):** per-cell copies are hashed only
+  AFTER copying (authenticating whatever landed there, not the bytes the
+  canonical checkers accepted); the final check hashes only
+  CPUNativeNEONPreparedProjection.h, not the complete source dependencies/
+  compiler/SDK/checker/envelope epoch — earlier accepted originals can go
+  stale after their checks without touching that one header. NEED: use
+  original binding authorities for the protected accepted closure or a
+  final canonical revalidation, plus a verifiable retained mapping — no
+  receipt rewrite/second analyzer.
+- **RG4 [P2] (compile-database shape):** final publication requires a
+  compile_commands entry whose `file` contains CPUNativeNEONPrepared-
+  Projection — an INCLUDED HEADER, not the compiled TU; the canonical
+  register target owns CPUNativeNEONTileRegisterProbe.cpp/custom proof
+  compile; the synthetic stub fabricates the header as compile entry,
+  concealing incompatibility with real compile databases. NEED:
+  authenticate the header via canonical dependency closure, not invented
+  TU presence.
+- TESTS: the actual shell is driven and Unit/Integration preflight aliases
+  registered (confirmed). But the ten controls don't force cleanup/write/
+  copy failure, configuration redirect, post-check/pre-copy corruption,
+  non-header dependency/tool drift, or real compile-database shape;
+  --cmake/--ctest are parsed but ignored (driver uses PATH); active Ninja
+  is not resolved/sealed by the driver; build/ctest omit --parallel.
+  CLOSE THESE FOCUSED CONTRACTS; no lane-wide matrix requested. No
+  execution here; owner 10/10/9/9 unauthenticated. Final rebase
+  exact-diff review + Main-owned 18×14/full-collection gate remain
+  separate; no FF/source ACK.
