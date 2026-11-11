@@ -448,3 +448,61 @@ behind the 38.9% acceptance anomaly); (2) idea-08 BOM census +
 compact-decode tournament; (3) M=1 economy window (B1 at bdbb8e370);
 (4) Lane-2 window. All after the Main campaign completes + the lease
 returns. arm-addon2 executes each on relay.
+
+### B4 SPEC VERDICT: SPEC-DEFECTS (reviewer, ~15:22Z) — S1–S6; corrections to the EXISTING spec file
+
+Exact reviewed commit be1e43924c01b6681647c13adb260d18907f170c; blob
+69cf952677146da42b565223b1d511b92913cdac (origin c4b1d6276 identical — no
+local/remote ambiguity). FAITHFUL portions: typed axes separation;
+full=MTP-enabled exact baseline; positive N<V + live-support-vs-capacity +
+no silent N=V alias; §2a global IDs/full-K/IQ3_S/scales/reduction +
+ragged/sharded selected-row checks; TV limited to Mode P; core economy
+metrics + reset + no-tuner + runtime-N/one-build/capture boundaries.
+CORRECTIONS (in the EXISTING spec file, not a new artifact):
+- **S1 [semantic]:** Mode C (CPU seeded serial-target-draw) must PRESERVE
+  the same seeded target tokens for every admitted N (identical p(h) +
+  position-keyed draw + committed state) — only match/acceptance/work may
+  change. The current text ("changed q can change the old seeded stream")
+  transplants the Mode P caveat into C — a token change is a FAILED
+  compatibility proof, not licensed by renaming q/version. Qualify the
+  §0 blanket sentence; "one-hot/star target" → "one-hot DRAFT proposal
+  with stochastic target."
+- **S2 [contract omission]:** the operator contract is delegated to an
+  unlinked attachment — INCLUDE IT HERE: full target head + complete
+  target sampler (temperature/top-k/top-p/filters/penalties/masks/
+  tie-breaks) unchanged; do NOT renormalize p over S; ALL unchanged
+  grouped TARGET verifier rows byte-equivalent to serial M1 (in addition
+  to selected DRAFT-row comparison); Mode G target argmax AFTER the
+  existing applicable target transforms; accepted-state/bonus authority
+  unchanged.
+- **S3 [proof coverage]:** add tiny-vocab analytical/enumeration +
+  production replay for q=p, one-hot q, disjoint support/omitted mass,
+  p(y)=0, normalization/underflow, discrete threshold endpoints; keep
+  finite-precision/RNG contracts (histograms insufficient); cover
+  all-accept/first-and-later rejection/every supported depth/bonus row/
+  stop-EOS/partial work/continued state after reset+prefix reuse;
+  DIFFERENTIATE valid zero probabilities (q=0 outside S, p(y)=0) from
+  INVALID zero total sampled-proposal mass; Mode P needs truthful qS
+  across residual support, not merely qS(y).
+- **S4 [ownership precision]:** selector v1 is a concrete design choice —
+  specify its source row/global-position/request-generation + lifetime
+  (first proposal/full-accept/bonus/rejection/prefix-cache-reset); only
+  causally available valid source, no hidden full-head-on-missing-source
+  rescue; "PMA admission unchanged" → "PMA AUTHORITY unchanged; ALL
+  shortlist/ranking/gather/probability workspace + retained state included
+  in its BOM/admission" (same authority ≠ unchanged memory requirements).
+- **S5 [sweep evidence]:** make the rider-protocol reference RESOLVABLE
+  and normative for repeated fresh-process paired/rotated trials + raw
+  variation/uncertainty + exact sampler parameters/seed + complete
+  controller/cache starting state; one fresh startup per point ≠
+  repeatability evidence; bind hard-coded fast/slow CPU lists to the
+  ACTUAL measured host/topology + observed worker placement (requested
+  labels don't certify execution).
+- **S6 [authorization]:** "operator review of this spec = second go for
+  implementation" CONTRADICTS the design-only/fenced state — replace with
+  "implementation and N-sweep remain FENCED until a separate explicit
+  operator instruction unfences that scope"; a spec-faithful verdict does
+  not itself grant implementation/economy.
+No whole-lane suites/apparatus/implementation requested. The reviewer can
+re-review the exact corrected blob; source/implementation + runtime/
+economy evidence stay separate when/if the operator unfences.
