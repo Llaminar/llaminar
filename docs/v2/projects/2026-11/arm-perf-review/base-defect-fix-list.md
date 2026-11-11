@@ -370,3 +370,21 @@ HARNESS FAILED. Lesson (program-wide): executed-script identity must be
 verified (hash/echo of the actual file) BEFORE claims of "corrections
 applied" — a status claim about a script must reference the artifact that
 ran.
+
+### B12 window attempt 2 RESULT (arm-sparks, 2026-11-11 ~01:47Z): 763 does NOT clear .79
+
+Corrected tests-only runner (Main's handback executed): inventory EXACTLY 5
+(0 skips); RUN1 = 3 PASS / 2 FAIL:
+- PASS: CPUStartupAffinity, MPIBootstrap, MPIBootstrapOpenMPPlacement.
+- FAIL: **CPUClusterPermanentMasterPlacement** (0.02s) and
+  **ClusterInventoryBootstrap** (2.20s; hwloc "failed to bind memory" +
+  "FAIL rank=0 … workers=20 affinity=ok" — worker-count/bind-memory
+  mismatch).
+- New-contract 20× repeat broke at REP1 rc=8 (no clean 20).
+Artifacts: .79 /home/factory/idea25/b12-final/ (inventory.json/names,
+run1.log, repeat20.log/summary) + the failed attempt-1 harness preserved.
+CONCLUSION: the 763 fix does NOT yet clear the .79 real-host window — the
+permanent-master contract fails on the applied route at 5b→763, and
+ClusterInventory shows a worker-count/bind-memory mismatch. Over to Main
+for the fix iteration; arm-sparks HOLDS .79 (no reruns) until the next
+corrected pin.
