@@ -2,9 +2,10 @@
  * @file MPIBootstrapPhase.h
  * @brief Pre-MPI topology planning, NUMA resolution, and MPI self-launch
  *
- * Extracted from Main.cpp: anonymous namespace helpers and the pre-MPI
- * bootstrap block that detects topology, resolves NUMA nodes, and
- * self-launches via mpirun if not already in an MPI context.
+ * Native OpenMP places are admitted before MPI and model state exists. Their
+ * order belongs to the runtime, so replacement workers retain the same physical
+ * ownership after team resizing. Bootstrap preserves each rank's own partition
+ * and original argv rather than projecting launcher-local CPU ids onto peers.
  */
 
 #pragma once
@@ -14,11 +15,44 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace llaminar2
 {
 
     class DeviceManager;
+
+    /**
+     * @brief Immutable admission of this caller's native physical-core place order.
+     *
+     * Only bootstrap can construct it after validating the actual OpenMP runtime.
+     * A rank cannot configure workers from an unprepared or foreign-thread token.
+     */
+    class NativeOpenMPCorePlaces final
+    {
+        friend class MPIBootstrapPhase;
+    public:
+        NativeOpenMPCorePlaces(const NativeOpenMPCorePlaces&)=delete;
+        NativeOpenMPCorePlaces& operator=(const NativeOpenMPCorePlaces&)=delete;
+        /** @return Borrowed immutable native geometry, valid for this admission's lifetime. */
+        const std::vector<std::vector<int>>& places() const & noexcept { return places_; }
+        const std::vector<std::vector<int>>& places() const && = delete;
+    private:
+        /**
+         * @brief Seal a validated native snapshot to its original process/thread.
+         * @param places Runtime-owned physical-core place order.
+         * @param encoding Canonical environment representation of that order.
+         * @param process Original native process identity.
+         * @param thread Original rank-admission thread identity.
+         */
+        NativeOpenMPCorePlaces(std::vector<std::vector<int>> places,std::string encoding,
+                              long process,long thread)
+            : places_(std::move(places)),encoding_(std::move(encoding)),process_(process),thread_(thread) {}
+        std::vector<std::vector<int>> places_; ///< Actual native order, one physical core per place.
+        std::string encoding_; ///< Canonical explicit OMP_PLACES publication.
+        long process_; ///< Original process, never a process-retirement authority.
+        long thread_; ///< Original rank-admission caller.
+    };
 
     /** Discovery requirements derived from parsed device declarations, not names. */
     enum class BootstrapDeviceIntent
@@ -132,19 +166,17 @@ namespace llaminar2
         static std::vector<std::vector<int>> capacityOrderedCorePlaces(
             const std::vector<int> &allowed_cpus, const std::string &sysfs_root = "/sys/devices/system/cpu");
         /**
-         * @brief Bind the persistent OpenMP worker pool to capacity-ordered core places.
-         * @throws std::runtime_error If the rank mask is unreadable/empty or a binding fails.
-         * @details The single authority for every OMP_PLACES=cores /
-         * OMP_PROC_BIND=close rank. libgomp has no runtime place setter and
-         * orders places by CPU id, so on GB10 workers 0-4, which include the
-         * serial master, would otherwise run on A725 cores. One region of one
-         * thread per place binds pool thread t, whose close-binding place is t,
-         * to place t. Any later close team of w threads therefore occupies the
-         * w fastest cores. The admitted set is this thread's mask joined
-         * with libgomp's place list, which libgomp derived from the rank mask
-         * before binding the initial thread; it is never widened further.
+         * @brief Admit native capacity-ordered places before MPI/model initialization.
+         * @param argc Original application argument count.
+         * @param argv Original application arguments, preserved across native startup exec.
+         * @return An immutable token for this caller's verified native places.
+         * @throws std::runtime_error for stale publication, active MPI, invalid places or failed exec.
+         * @details A runtime needing another place order starts the same executable with the
+         * explicit rank-local list before any execution state is admitted. The runtime then
+         * owns every worker, including workers recreated after smaller teams. Reentry verifies
+         * one versioned process-local receipt; it never retries an incompatible publication.
          */
-        static void bindOpenMPWorkersFastestFirst();
+        static NativeOpenMPCorePlaces prepareNativeCorePlaces(int argc,char *argv[]);
         /** @return Whether current thread affinity meets the requested socket/core policy. */
         static bool verifyStartupThreadAffinity(int required_numa,
                                                 bool require_physical_only,
@@ -166,9 +198,11 @@ namespace llaminar2
         /**
          * @brief Size a hostfile-launched rank's worker team from actual affinity.
          * @param config User thread override, otherwise discovered physical cores.
-         * @throws std::runtime_error when physical rank affinity is unavailable.
+         * @param places Native place admission for this exact process/thread.
+         * @throws std::runtime_error when physical rank affinity or native admission is invalid.
          */
-        static void configureClusterRankThreads(const OrchestrationConfig &config);
+        static void configureClusterRankThreads(const OrchestrationConfig &config,
+                                               const NativeOpenMPCorePlaces &places);
 
         /**
          * @brief Apply an explicit thread request before canonical inventory publication.
@@ -183,6 +217,15 @@ namespace llaminar2
 
         /** @brief Print the already initialized device inventory for diagnostics. */
         static void listDevices();
+
+    private:
+        /**
+         * @brief Restore the admission caller to the first already-native core place.
+         * @param places This caller's sealed native runtime geometry.
+         * @throws std::runtime_error for foreign/stale admission or failed affinity publication.
+         * @details No worker pool is manually rebound: native OpenMP owns its complete lifecycle.
+         */
+        static void bindNativeCoreMaster(const NativeOpenMPCorePlaces &places);
     };
 
 } // namespace llaminar2

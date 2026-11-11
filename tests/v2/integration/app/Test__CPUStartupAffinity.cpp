@@ -150,25 +150,16 @@ namespace
 
     /**
      * @brief Prove rank admission preserves the permanent team placement after scope retirement.
+     * @param admission This caller's native place publication before worker admission.
      * @return Zero only when every full/narrow/repeated team retains its original admitted places.
      * @details Starting the caller on the last capacity-ordered place makes restoration of a
      *          stale caller mask distinguishable even on homogeneous physical cores. No model,
      *          MPI launch or accelerator is needed; the production cluster configurator owns
      *          the final placement and the test never repairs its result.
      */
-    int checkClusterMasterPlacement()
+    int checkClusterMasterPlacement(const NativeOpenMPCorePlaces &admission)
     {
-        cpu_set_t partition;
-        CPU_ZERO(&partition);
-        {
-            const ScopedOpenMPPartitionAffinity admitted_partition;
-            if (sched_getaffinity(0,sizeof(partition),&partition)!=0)
-                throw std::runtime_error("Cannot observe the admitted test partition");
-        }
-        std::vector<int> allowed;
-        for (int cpu=0;cpu<CPU_SETSIZE;++cpu)
-            if (CPU_ISSET(cpu,&partition))allowed.push_back(cpu);
-        const auto places=MPIBootstrapPhase::capacityOrderedCorePlaces(allowed);
+        const auto &places=admission.places();
         if (places.size()<2)
             throw std::runtime_error("Cluster master placement contract requires two physical core places");
         const int physical=static_cast<int>(places.size());
@@ -181,22 +172,35 @@ namespace
                 throw std::runtime_error("Cannot install the test caller's admitted starting place");
             OrchestrationConfig config;
             config.n_threads=requested;
-            MPIBootstrapPhase::configureClusterRankThreads(config);
+            MPIBootstrapPhase::configureClusterRankThreads(config,admission);
             const int team=requested>0?requested:physical;
             if (omp_get_max_threads()!=team)
                 throw std::runtime_error("Cluster admission changed the original physical worker budget");
+            int phase=0;
             for (const int width:{team,(team+1)/2,1,team})
             {
+                ++phase;
                 std::vector<int> observed(static_cast<size_t>(width),-1);
+                std::vector<cpu_set_t> masks(static_cast<size_t>(width));
+                std::vector<int> mask_errors(static_cast<size_t>(width));
 #pragma omp parallel num_threads(width)
-                observed[omp_get_thread_num()]=sched_getcpu();
+                {
+                    const int worker=omp_get_thread_num();
+                    observed[worker]=sched_getcpu();
+                    CPU_ZERO(&masks[worker]);
+                    mask_errors[worker]=sched_getaffinity(0,sizeof(cpu_set_t),&masks[worker]);
+                }
                 for (int worker=0;worker<width;++worker)
                 {
                     const auto &expected=places[static_cast<size_t>(worker)];
-                    if (std::find(expected.begin(),expected.end(),observed[worker])==expected.end())
+                    cpu_set_t expected_mask;
+                    CPU_ZERO(&expected_mask);
+                    for(const int cpu:expected)CPU_SET(cpu,&expected_mask);
+                    if (mask_errors[worker]!=0 || !CPU_EQUAL(&masks[worker],&expected_mask) ||
+                        std::find(expected.begin(),expected.end(),observed[worker])==expected.end())
                     {
                         std::cerr<<"Cluster permanent placement changed: requested="<<requested
-                                 <<" width="<<width<<" worker="<<worker<<" cpu="<<observed[worker]
+                                 <<" phase="<<phase<<" width="<<width<<" worker="<<worker<<" cpu="<<observed[worker]
                                  <<" expected_first_cpu="<<expected.front()<<" observed=";
                         for (const int cpu:observed)std::cerr<<cpu<<',';
                         std::cerr<<std::endl;
@@ -264,7 +268,10 @@ int main(int argc, char **argv)
     try
     {
         if (argc==2 && std::string(argv[1])=="--cluster-master-placement-contract")
-            return checkClusterMasterPlacement();
+        {
+            const auto admission=MPIBootstrapPhase::prepareNativeCorePlaces(argc,argv);
+            return checkClusterMasterPlacement(admission);
+        }
         if (argc > 1)
             return probe(argc, argv);
         bool passed = checkSelector(argv[0], "localhost:-1:cpu:0");
