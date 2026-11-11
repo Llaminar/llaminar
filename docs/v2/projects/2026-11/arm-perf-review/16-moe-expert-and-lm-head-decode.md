@@ -139,3 +139,53 @@ evidence/i16a-phase-a-report.md, commit 4c4d52687):
   verifier row" sentence needs re-reading (verifier rows were already
   grouped; the unamortized full-vocab cost is the DRAFT per-step head —
   27B dense draft economics apply there too).
+
+### LM-head route/source audit @ bb893cd79 (arm-addon2, ~11:57Z — approved autonomous, NO fix claims)
+
+1. **Row purpose/count:** 1560 LM_HEAD calls = 1296 draft-step M=1 calls +
+   264 verifier GROUPED calls (`lm_head_grouped_decode_equivalent_verifier
+   _prefill_rows` 264/1560 — the verifier already uses the grouped path;
+   the earlier per-row claim corrected).
+2. **Consumer live extent:** draft logits = one fp32 row in MTP_LOGITS per
+   draft step → draft token sampler (1296 samples); verifier terminal
+   logits: 264 rows × 993280 B retained for the next main distribution
+   (267 current_main_logits_publications).
+3. **Why grouped isn't selected on the draft side (code fact):**
+   Qwen35Graph::buildMTPGraph enforces seq_len=1 for normal draft
+   execution; the sidecar wires full_vocab_output = output.logits with
+   compute_all_positions=true; the grouped predicate
+   (force_decode_equivalent_lm_head_verifier_prefill) requires
+   total_tokens > 1 — false at seq_len=1. STRUCTURALLY nothing to group:
+   draft step t+1 consumes the token sampled at step t (sequential
+   dependency) → the M=1 full-vocab GEMV per draft step (~4.25-4.9 ms;
+   ≈13-15% of MTP-dyn decode as HYPOTHESIS) is inherent to the current
+   draft-sampling loop contract. The M=1 kernel is already ~45 GB/s — no
+   scheduling headroom at M=1.
+4. **Fix-space (B4/operator discussion only):** (a) GREEDY verification —
+   draft proposal mechanism doesn't affect output exactness (a
+   shortlist/proxy trades acceptance RATE, not correctness); (b)
+   STOCHASTIC — the draft distribution enters accept/reject math → any
+   approximation is a semantics change. Any fix proves serial-row byte
+   equivalence + actual economy. No rider beyond the approved greedy one.
+
+### B1 microbench DESIGN (design only — no implementation until Main admits)
+
+New test Perf__CPUMoESingleTokenTransaction.cpp beside
+Perf__CPUMoERouterVerifierRows; production geometry (d_model 2048, 256
+experts, top_k 8, intermediate 512 → 16 gate/up members 512×2048 sharing
+one router Q8 row + 8 down members 2048×512), M=1; IQ3_S (production) +
+Q4_K + Q8_0. Arm A (production oracle, public APIs): router Q8
+publication → multiply_fused_router_q8_hidden_grouped_decode_equivalent
+→ per-expert serial SwiGLU + per-expert Q8 quantization as
+multiply_fused_expert_down does → multiply_fused_expert_down → publish/
+axpy. Arm B: same descriptors through
+execute_moe_grouped_ffn_transaction_preq_decode_equivalent as a 1-row
+expert-major route. BYTE GATES (hard fail): gate/up outputs, SwiGLU-Q8
+bank, down outputs, route contributions — A vs B byte-identical. Timing:
+≥100 timed iters after warmup; mixed@20T, fast-only@10T (taskset
+5-9,15-19), slow-only@10T, 1T; bundle-only/down-only/transaction-total vs
+A-total; region-entry counters recorded. ECONOMY RULE: B1 admitted for
+the full written plan only if B ≤ A within noise on the production
+placement; a regression closes B1 with numbers recorded. If the
+transaction does NOT admit the M=1 shared-router-Q8 shape: that admission
+gap is a FINDING to report (not fixed inside the bench).
