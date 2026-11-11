@@ -1620,3 +1620,20 @@ recorded). Program state: SOURCE BASE 880429059; #191 still blocks the
 collection. arm-sparks' next queue: nsys install + attach smoke test
 (operator-authorized, idle-time), then idea-16 Phase A / idea-14 B wave /
 Dir-B rerun / Qwen3.8 trace — all gated on the combined FF.
+
+### CB C1 → C2 replacement handoff (2026-11-11 ~09:11Z)
+
+The DGX-station worker (01a1c1d0) accepted the C1 implementation/
+proof-repair replacement with all constraints binding: capacity verified
+free; no displacement (llaminar-cb-c1 @ db13d5726, refcap @ 28ddbe253,
+GLM serving, other lanes' worktrees untouched); / at 90% (177G free —
+ASK BEFORE PRUNING ANYTHING, incl. historical build trees + the 22GB
+policy-rejected model); isolated worktree llaminar-cb-c2 @ db13d5726 from
+the shared .git (NO rebase/cherry-pick); established CPU-only recipe
+(devcontainer + .venv, Integration, SHARED_CORE=ON, bounded parallelism
+coordinated with arm-perf); canonical FULL Unit + preflight; gate
+discipline verbatim (genuine exit 0 before commit/push; no parity-as-
+authorization; no hook tricks; no refusal-to-fix; escalate contradictions;
+no PR/merge/GPU/GLM/unauthorized downloads). Execution GO issued;
+detailed surviving-findings handoff follows from the C1 arc. WSL
+replacement plan = CB coordinator's call, not the worker's.
