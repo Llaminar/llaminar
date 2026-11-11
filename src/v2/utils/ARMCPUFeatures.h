@@ -39,6 +39,7 @@ namespace llaminar2::cpu
         FP16Arithmetic = 1u << 2,
         BF16Arithmetic = 1u << 3,
         IntegerMatMul = 1u << 4,
+        FP16FML = 1u << 5,
     };
 
     /** @brief Process-wide immutable native ISA observation with checked feature queries. */
@@ -72,6 +73,7 @@ namespace llaminar2::cpu
             case ARMCPUFeature::FP16Arithmetic:
             case ARMCPUFeature::BF16Arithmetic:
             case ARMCPUFeature::IntegerMatMul:
+            case ARMCPUFeature::FP16FML:
                 return (features_ & static_cast<std::uint32_t>(feature)) != 0;
             }
             throw std::invalid_argument("Unknown native ARM CPU instruction feature");
@@ -101,6 +103,9 @@ namespace llaminar2::cpu
 #if defined(__ARM_FEATURE_DOTPROD)
             features |= static_cast<std::uint32_t>(ARMCPUFeature::DotProd);
 #endif
+#if defined(__ARM_FEATURE_FP16FML)
+            features |= static_cast<std::uint32_t>(ARMCPUFeature::FP16FML);
+#endif
 #if defined(__ARM_FEATURE_MATMUL_INT8)
             features |= static_cast<std::uint32_t>(ARMCPUFeature::IntegerMatMul);
 #endif
@@ -118,7 +123,8 @@ namespace llaminar2::cpu
         static void requireEnvelope(std::uint32_t observed, std::uint32_t envelope)
         {
             for (const auto feature : {ARMCPUFeature::ASIMD, ARMCPUFeature::DotProd, ARMCPUFeature::FP16Arithmetic,
-                                       ARMCPUFeature::BF16Arithmetic, ARMCPUFeature::IntegerMatMul})
+                                       ARMCPUFeature::BF16Arithmetic, ARMCPUFeature::IntegerMatMul,
+                                       ARMCPUFeature::FP16FML})
             {
                 const auto bit = static_cast<std::uint32_t>(feature);
                 if ((envelope & bit) != 0 && (observed & bit) == 0)
@@ -149,6 +155,7 @@ namespace llaminar2::cpu
             case ARMCPUFeature::FP16Arithmetic: return "FP16 arithmetic";
             case ARMCPUFeature::BF16Arithmetic: return "BF16 arithmetic";
             case ARMCPUFeature::IntegerMatMul: return "I8MM";
+            case ARMCPUFeature::FP16FML: return "FP16 FML";
             }
             throw std::invalid_argument("Unknown native ARM CPU instruction feature");
         }
@@ -207,6 +214,10 @@ namespace llaminar2::cpu
             add(ARMCPUFeature::FP16Arithmetic, optionalFeature("hw.optional.arm.FEAT_FP16"));
             add(ARMCPUFeature::BF16Arithmetic, optionalFeature("hw.optional.arm.FEAT_BF16"));
             add(ARMCPUFeature::IntegerMatMul, optionalFeature("hw.optional.arm.FEAT_I8MM"));
+            // Darwin does not expose FEAT_FHM as a separate key; Apple's
+            // FEAT_FP16 implementations carry the FML long multiply-add
+            // extension, so the FP16 arithmetic observation covers it.
+            add(ARMCPUFeature::FP16FML, optionalFeature("hw.optional.arm.FEAT_FP16"));
 #elif defined(__linux__)
             errno = 0;
             const unsigned long hwcap = getauxval(AT_HWCAP);
@@ -219,6 +230,9 @@ namespace llaminar2::cpu
 #if defined(HWCAP_FPHP) && defined(HWCAP_ASIMDHP)
             add(ARMCPUFeature::FP16Arithmetic,
                 (hwcap & (HWCAP_FPHP | HWCAP_ASIMDHP)) == (HWCAP_FPHP | HWCAP_ASIMDHP));
+#endif
+#ifdef HWCAP_ASIMDFHM
+            add(ARMCPUFeature::FP16FML, (hwcap & HWCAP_ASIMDFHM) != 0);
 #endif
 #if defined(HWCAP2_BF16) || defined(HWCAP2_I8MM)
             errno = 0;
