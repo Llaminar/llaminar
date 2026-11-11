@@ -807,3 +807,15 @@ non-reproduction stands as a DIFFERENT-HOST observation (the defect may
 be Station-topology-specific). Next: site inspection (EPERM→null→SIGSEGV
 path — where does the null dereference happen under the Station
 topology?), then fix-or-classify.
+
+### CLASSIFICATION CORRECTION (CB lead, ~12:22Z) — B11 category = crash-site OPEN
+
+"BOTH 139 rules out MPI necessity" is TRUE, but it does NOT establish
+'allocator-level defect on 64K/memory-only topology' — THAT
+CLASSIFICATION IS WITHDRAWN. Correct category: **crash site / root cause
+OPEN — unchecked-null TEST fixture vs allocator vs permission handling.**
+Already identified: Test__NUMAAllocator.cpp ~601 range-writes NUMABuffer
+without a validity assertion, matching the last direct-log test. NEED:
+backtrace + the actual failed allocation path. Do not propagate a stronger
+cause than the evidence. 'Default affinity/permissions' and truncated
+hashes are not full binding by themselves.
