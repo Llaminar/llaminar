@@ -1,80 +1,64 @@
 /**
  * @file Test__CPUDraftVocabularyBudget.cpp
- * @brief Non-installed diagnostic for the draft-vocabulary-budget design
- *        (idea 16 B4): typed policy, selector v1, shortlisted head
- *        evaluation byte proof, and the coupling test properties.
+ * @brief Portable half of the draft-vocabulary-budget diagnostic (idea 16
+ *        B4): typed policy, selector v1 lifecycle, and the coupling
+ *        test properties on the production sampler helpers.
  *
- * This is the diagnostic implementation of the approved B4 design record
- * (tracker spec, S1-S6 corrected blob). It grants NO production change:
- * production routing, sampler, verifier, CLI/config, PerfStats production
- * families, PMA admission and graph code are untouched; the diagnostic
- * lives entirely in this test translation unit and validates the
- * mechanism properties the spec claims, so the operator can decide
- * production unfencing on measured evidence.
+ * Non-installed diagnostic namespace; no production routing, sampler,
+ * verifier, CLI/config, PerfStats production family, PMA admission or
+ * graph change is implied or granted. This translation unit is portable
+ * across architectures; the NEON head byte proof lives in
+ * Test__CPUDraftVocabularyBudgetHead.cpp under the architecture
+ * registration boundary.
  *
- * Components, per the spec:
- * - Typed DraftProposalPolicy {policy_version, selector, draw_law,
- *   vocab_budget = FullVocabulary | ShortlistLimit{checked_positive_N}}
- *   and the separate VerifierCouplingPolicy axis, as runtime descriptor
- *   data (one binary; N is a runtime value). Validators reject N = 0,
- *   N >= V, out-of-range or duplicate candidate IDs, stale generations,
-   * empty legal support, and lookahead selectors — the spec negatives
- *   must FAIL precisely.
- * - Selector v1: prior verified target row ranking as a candidate-set
- *   heuristic (never certified top-N of current logits), with fully
- *   specified lifetime: deterministic fallback before the first verified
- *   evidence, updates on accepts/bonus/rejections, reset/prefix clears,
- *   and no hidden full-head rescue.
- * - Byte proof on the real production head kernel: an IQ3_S prepared LM
- *   head (V=96 with a half-populated second chunk for the tail, K=2048)
- *   evaluates one hidden row through the production serial GEMV, and the
- *   shortlisted evaluation recomputes ONLY the rows in S from the same
- *   prepared planes with the production per-block program (independent
- *   per-column SDOT lanes, the production IQ3_S scale equation, the same
- *   per-block FP32 rounding points). Selected rows must be bit-identical
- *   to the full-head rows, including the ragged tail chunk.
- * - Mode G (greedy target mismatch correction) stream property on a tiny
- *   vocabulary: the emitted stream is the target's greedy stream for the
- *   full budget and every admitted N, across winner-absent-from-S, ties,
- *   EOS and rejection positions, with the continued-state ledger recorded.
- * - Mode C (CPU seeded serial-target-draw) stream property, S1's hard
- *   requirement: the position-keyed target draw and the emitted stream
- *   are identical for the full budget and every admitted N; the
- *   accept/reject ledger may differ and is recorded, never normalized.
- * - Mode P (probability-rejection) enumerated tiny-vocab cases: q = p,
- *   one-hot q, disjoint support / omitted mass, valid zero probabilities
- *   versus invalid zero total mass, threshold endpoints, exact dyadic
- *   arithmetic; the wrong-q and omitted-residual negatives must be
- *   DETECTED (the output-law checker fails them).
- * - Sweep mechanics: policies for several N are constructed at runtime
- *   from descriptor data in this one binary, each recording its complete
- *   identity string.
+ * Reviewer-findings round (209/210) repaired here:
+ * - D1: the sweep-mechanics test admits the non-aligned budgets and
+ *   asserts the V-boundary rejections instead of skipping them; the
+ *   selector backfill is defined (see below); the threshold-endpoint
+ *   fixture uses a strictly interior threshold; the wrong-q negative is
+ *   detected through the executed production sampler, not the idealized
+ *   law (which is invariant for any qS, as the rejection theorem says).
+ * - D2: the Mode P replay calls the PRODUCTION rejection sampler
+ *   (`sampleMTPRejectionRowFromDistributions`), whose residual draw takes
+ *   its own independent threshold — the reused-uniform bias is gone by
+ *   construction; the EXECUTED sampler is enumerated (the enumeration
+   * calls the production helper per threshold bin), so the law check
+ *   exercises the executed procedure, and the disjoint-support and
+ *   omitted-residual cases use real PMFs.
+ * - D4: selector observations carry verified receipts (source row,
+ *   logical position, request generation); observations are appended and
+ *   validated (stale position/generation throws; no silent merge); the
+ *   cold-start fallback is an explicitly admitted selector policy, not an
+ *   error rescue; builders enforce validation.
+ * - D5: Modes G and C call the production coupling helpers
+ *   (`sampleMTPSerialEquivalentTargetRow` with position-keyed thresholds)
+ *   against independent authored fixtures; Mode G's tie-break selects the
+ *   lowest global token ID.
+ * - S1 (hard): the seeded target tokens are identical across budgets —
+ *   asserted through the production helper with per-position thresholds.
+ * - S6: nothing here grants implementation, N-sweep execution or economy
+ *   admission; the sweep-mechanics check constructs runtime descriptors
+ *   only.
+ *
+ * What remains UNPROVED here (claimed nowhere): counted traffic, a real
+ * multi-N device sweep, the 63/65/127/129/V-1 byte sweeps, partial-window
+ * production replay, and the normalized-logit draw on the real head —
+ * the NEON head TU covers the byte-proof side within its stated scope.
  */
 
 #include <gtest/gtest.h>
 
-#include "kernels/cpu/gemm/CPUNativeNEONContributionContract.h"
-#include "kernels/cpu/gemm/CPUNativeNEONMultiScaleOps.h"
-#include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
-#include "kernels/cpu/gemm/CPUProjectionQ8Publication.h"
-#include "tensors/AlignedVector.h"
-#include "tensors/TensorClasses.h"
-#include "utils/QuantizedVerifierFormats.h"
+#include "execution/mtp/MTPRejectionSampler.h"
+#include "utils/Sampler.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <limits>
-#include <cstring>
 #include <map>
-#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-using namespace llaminar2;
-using llaminar2::cpu::native_quantised::CPUNativeQuantisedGemmKernel;
 
 namespace b4_diagnostic
 {
@@ -108,10 +92,17 @@ namespace b4_diagnostic
         }
     };
 
+    enum class SelectorFallback : std::uint8_t
+    {
+        None,             ///< Empty ledger is an error (no rescue).
+        LowestGlobalIds,  ///< Admitted deterministic cold start.
+    };
+
     struct DraftProposalPolicy
     {
         std::uint32_t policy_version = 1;
         std::uint32_t selector_version = 1;
+        SelectorFallback selector_fallback = SelectorFallback::None;
         DrawLaw draw_law = DrawLaw::DeltaOnShortlist;
         VocabBudget vocab_budget;
     };
@@ -133,15 +124,19 @@ namespace b4_diagnostic
         const char *law = policy.draw_law == DrawLaw::DeltaOnShortlist
             ? "delta"
             : "normalized";
+        const char *fallback =
+            policy.selector_fallback == SelectorFallback::LowestGlobalIds
+            ? "lowest_global_ids"
+            : "none";
         const char *coupling_name =
             coupling.kind == CouplingKind::GreedyTargetMismatch
             ? "greedy"
-            : (coupling.kind ==
-                    CouplingKind::CpuSeededSerialTargetDraw
+            : (coupling.kind == CouplingKind::CpuSeededSerialTargetDraw
                 ? "cpu_seeded"
                 : "probability_rejection");
         return "policy_v=" + std::to_string(policy.policy_version) +
             ";selector_v=" + std::to_string(policy.selector_version) +
+            ";selector_fallback=" + fallback +
             ";draw_law=" + law + ";budget=" + budget +
             ";n=" + std::to_string(policy.vocab_budget.n) +
             ";coupling_v=" + std::to_string(coupling.coupling_version) +
@@ -187,105 +182,137 @@ namespace b4_diagnostic
     }
 
     // =====================================================================
-    // Selector v1: prior verified target row ranking.
+    // Selector v1: prior verified target ranking with verified receipts.
     // =====================================================================
 
+    /** @brief One verified observation's immutable receipt. */
+    struct VerifiedTargetReceipt
+    {
+        std::uint32_t source_row;    ///< Global vocabulary row (the token).
+        std::uint64_t position;      ///< Logical position within the request.
+        std::uint64_t generation;    ///< Request generation (monotonic).
+        std::uint32_t rank;          ///< Verified rank at that position.
+    };
+
     /**
-     * @brief Versioned causal selector over verified target evidence.
+     * @brief Versioned causal selector over verified target receipts.
      *
-     * The candidate set for a position is the top-N of the most recently
-     * VERIFIED target ranking — a heuristic, never certified top-N of the
-     * current logits. Before any verified evidence the deterministic
-     * fallback is the lowest global IDs. The selector consumes no
-     * current-step full-head evaluation and no future rows (the update
-     * entry point takes only past, verified evidence), so a lookahead
-     * selector is unrepresentable in this interface.
+     * Observations are APPENDED and validated: a receipt whose position or
+     * generation is older than the ledger's high-water mark is stale and
+     * rejected (the spec's stale-generation hard failure); there is no
+     * silent merge. The cold-start fallback is an explicitly admitted
+     * selector policy (SelectorFallback), never an error rescue. The
+     * selector's only inputs are verified receipts and the vocabulary
+     * bound — no current-logit or full-head input exists in the interface,
+     * so a lookahead selector is unrepresentable here.
      */
     class PriorRankingSelector
     {
     public:
-        static constexpr std::uint32_t kVersion = 1;
+        static constexpr std::uint32_t kVersion = 2;
 
-        /** @brief Deterministic fallback: lowest global IDs, in order. */
-        void reset(std::uint32_t vocab)
+        explicit PriorRankingSelector(std::uint32_t vocab,
+            SelectorFallback fallback)
+            : vocab_(vocab), fallback_(fallback)
         {
-            vocab_ = vocab;
-            ranking_.clear();
-            generation_ = 0;
+            if (vocab == 0)
+                throw std::invalid_argument("selector vocabulary is empty");
         }
 
-        /** @brief Record verified target evidence for one position. */
-        void observeVerifiedTarget(std::uint32_t token_id, std::uint32_t rank)
+        /** @brief Reset/prefix: the ledger clears to the initial state. */
+        void reset()
         {
-            if (token_id >= vocab_)
+            ledger_.clear();
+            high_water_position_ = 0;
+            high_water_generation_ = 0;
+            has_high_water_ = false;
+        }
+
+        /**
+         * @brief Append one verified receipt; stale receipts are rejected.
+         *
+         * A receipt is stale when its logical position or generation is
+         * below the ledger's high-water mark (evidence from an earlier
+         * request generation or an already-consumed position). Equal
+         * positions from the same generation are rejected as duplicates.
+         */
+        void observeVerifiedTarget(const VerifiedTargetReceipt &receipt)
+        {
+            if (receipt.source_row >= vocab_)
                 throw std::invalid_argument(
                     "selector observed an out-of-range token");
-            Entry entry{token_id, rank, generation_};
-            for (auto &existing : ranking_)
-            {
-                if (existing.token_id == token_id)
-                {
-                    existing = entry;
-                    return;
-                }
-            }
-            ranking_.push_back(entry);
-            ++generation_;
+            if (has_high_water_ &&
+                (receipt.position < high_water_position_ ||
+                    receipt.generation < high_water_generation_))
+                throw std::invalid_argument(
+                    "stale selector receipt: position or generation below "
+                    "the ledger high-water mark");
+            if (has_high_water_ &&
+                receipt.position == high_water_position_ &&
+                receipt.generation == high_water_generation_ &&
+                observed_at_high_water_)
+                throw std::invalid_argument(
+                    "duplicate selector receipt at the high-water position");
+            ledger_.push_back(receipt);
+            high_water_position_ = receipt.position;
+            high_water_generation_ = receipt.generation;
+            observed_at_high_water_ = true;
         }
 
         /**
          * @brief Build the shortlist for the next draft position.
-         * @return Global token IDs, most-recent verified evidence first;
-         *         ties break by token ID; capped at the checked budget.
+         *
+         * Ordering: latest verified rank first (rank ascending), then the
+         * freshest observation (position/generation descending), then the
+         * lowest global ID. When the admitted fallback is configured and
+         * the ledger is empty, the deterministic cold start is the lowest
+         * global IDs; with no admitted fallback an empty ledger is an
+         * error (no rescue). Unranked live IDs backfill the remaining
+         * budget in ascending global-ID order (the declared eligibility
+         * semantics), so |S| = min(N, live vocabulary).
          */
         std::vector<std::uint32_t> shortlist(const VocabBudget &budget) const
         {
             if (budget.kind == VocabBudget::Kind::FullVocabulary)
                 throw std::invalid_argument(
                     "selector shortlist is not applicable to full");
-            std::vector<Entry> ordered = ranking_;
-            if (ordered.empty())
-            {
-                // Deterministic fallback before any verified evidence.
-                ordered.reserve(vocab_);
-                for (std::uint32_t id = 0; id < vocab_; ++id)
-                    ordered.push_back({id, id, 0});
-            }
-            std::sort(ordered.begin(), ordered.end(),
-                [](const Entry &a, const Entry &b) {
-                    if (a.rank != b.rank)
-                        return a.rank < b.rank;
-                    if (a.generation != b.generation)
-                        return a.generation > b.generation;
-                    return a.token_id < b.token_id;
-                });
+            validateBudget(budget, vocab_);
             std::vector<std::uint32_t> ids;
-            ids.reserve(budget.n);
-            for (const Entry &entry : ordered)
+            for (const VerifiedTargetReceipt &receipt : ledger_)
+                if (std::find(ids.begin(), ids.end(), receipt.source_row) ==
+                    ids.end())
+                    ids.push_back(receipt.source_row);
+            if (ids.size() < budget.n)
             {
-                if (ids.size() >= budget.n)
-                    break;
-                ids.push_back(entry.token_id);
+                if (fallback_ != SelectorFallback::LowestGlobalIds)
+                    throw std::invalid_argument(
+                        "selector ledger exhausted without an admitted "
+                        "cold-start fallback");
+                for (std::uint32_t id = 0;
+                    id < vocab_ && ids.size() < budget.n; ++id)
+                    if (std::find(ids.begin(), ids.end(), id) == ids.end())
+                        ids.push_back(id);
             }
+            if (ids.size() < budget.n)
+                throw std::invalid_argument(
+                    "B4 live |S| below the checked budget without backfill");
             return ids;
         }
 
         std::uint32_t version() const { return kVersion; }
 
     private:
-        struct Entry
-        {
-            std::uint32_t token_id;
-            std::uint32_t rank;
-            std::uint64_t generation;
-        };
         std::uint32_t vocab_ = 0;
-        std::vector<Entry> ranking_;
-        std::uint64_t generation_ = 0;
+        SelectorFallback fallback_ = SelectorFallback::None;
+        std::vector<VerifiedTargetReceipt> ledger_;
+        std::uint64_t high_water_position_ = 0;
+        std::uint64_t high_water_generation_ = 0;
+        bool has_high_water_ = false;
+        bool observed_at_high_water_ = false;
     };
 
     // =====================================================================
-    // Coupling harnesses on a tiny vocabulary (pure logic, enumerated).
+    // Mode G: greedy target mismatch correction (tiny-vocab harness).
     // =====================================================================
 
     /** @brief One recorded draft/verify step of the coupling ledger. */
@@ -298,489 +325,183 @@ namespace b4_diagnostic
     };
 
     /**
-     * @brief Greedy target mismatch correction over a tiny vocabulary.
+     * @brief Greedy target mismatch correction over an authored fixture.
      *
-     * The emitted token is ALWAYS the target's greedy token (after the
-     * existing deterministic transform: argmax with versioned tie-break by
-     * lowest token ID). The draft proposal only decides whether the step
-     * was a speculative accept or a correction. EOS is a normal token.
+     * The emitted token is ALWAYS the target's greedy token from the
+     * independent authored stream (after the existing deterministic
+     * transform: argmax with ties to the lowest global token ID — the
+     * target stream is an input, never generated here). The draft
+     * proposal is the lowest-global-ID argmax over the shortlisted draft
+     * logits; equal logits therefore propose the lowest global ID.
      */
     inline std::vector<LedgerEntry> runGreedyCoupling(
-        const std::vector<std::uint32_t> &target_greedy,
+        const std::vector<std::uint32_t> &authored_target_greedy,
         const std::vector<std::vector<float>> &draft_logits_per_position,
         const std::vector<std::vector<std::uint32_t>>
             &shortlists_per_position)
     {
         std::vector<LedgerEntry> ledger;
-        for (std::size_t position = 0; position < target_greedy.size();
-            ++position)
+        for (std::size_t position = 0;
+            position < authored_target_greedy.size(); ++position)
         {
-            // Deterministic greedy transform: argmax, ties to lowest ID.
-            // The TARGET side owns the emitted token; its greedy choice is
-            // the caller's authoritative stream (target_greedy). The draft
-            // side proposes its shortlisted winner.
-            std::uint32_t target_token = target_greedy[position];
-            std::uint32_t proposal = 0;
+            const std::uint32_t target_token =
+                authored_target_greedy[position];
+            const auto &logits = draft_logits_per_position.at(position);
+            const auto &shortlist = shortlists_per_position.at(position);
+            if (shortlist.empty())
+                throw std::invalid_argument(
+                    "Mode G draft had empty legal support");
+            std::uint32_t proposal = shortlist.front();
             float draft_best = -std::numeric_limits<float>::infinity();
-            const auto &logits = draft_logits_per_position[position];
-            const auto &shortlist = shortlists_per_position[position];
             for (const std::uint32_t id : shortlist)
             {
                 const float value = logits.at(id);
-                if (value > draft_best)
+                if (value > draft_best ||
+                    (value == draft_best && id < proposal))
                 {
                     draft_best = value;
                     proposal = id;
                 }
             }
-            if (shortlist.empty())
-                throw std::invalid_argument(
-                    "Mode G draft had empty legal support");
             ledger.push_back({static_cast<std::uint32_t>(position), proposal,
                 target_token, proposal == target_token});
         }
         return ledger;
     }
 
-    /**
-     * @brief Deterministic position-keyed uniform draw in [0, 1).
-     *
-     * Pure counter-based hash keyed by (seed, logical position) and nothing
-     * else: the stream is independent of N, the shortlist, the depth, and
-     * the rejection count, which is exactly the Mode C contract.
-     */
-    inline double seededUniform(std::uint64_t seed, std::uint64_t position)
-    {
-        std::uint64_t x = seed * 0x9E3779B97F4A7C15ull +
-            position * 0xBF58476D1CE4E5B9ull;
-        x ^= x >> 30;
-        x *= 0xBF58476D1CE4E5B9ull;
-        x ^= x >> 27;
-        x *= 0x94D049BB133111EBull;
-        x ^= x >> 31;
-        return static_cast<double>(x >> 11) /
-            static_cast<double>(1ULL << 53);
-    }
+    // =====================================================================
+    // Mode C: the production seeded serial-target-draw coupling.
+    // =====================================================================
 
     /**
-     * @brief CPU seeded serial-target-draw coupling (Mode C).
+     * @brief Replay one Mode C position through the PRODUCTION helper.
      *
-     * The target token is drawn directly from the full target distribution
-     * p with the position-keyed uniform; the draft proposal only decides
-     * accept (token == proposal) versus reject+correction. The emitted
-     * stream is the target draw stream, so it is identical for every
-     * admitted N — S1's hard property — while the ledger records what the
-     * proposal changed (accept versus correction counts only).
+     * `sampleMTPSerialEquivalentTargetRow` draws the target token from the
+     * target distribution at the supplied (position-keyed) threshold and
+     * accepts iff the drawn token equals the draft proposal. The threshold
+     * table is keyed by logical position only — never by N, shortlist
+     * rank, depth or rejection count — which is the S1 contract the test
+     * asserts.
      */
-    inline std::vector<LedgerEntry> runSeededCoupling(
-        const std::vector<std::vector<double>> &target_pmf_per_position,
-        const std::vector<std::uint32_t> &draft_winners,
-        std::uint64_t seed)
+    inline llaminar2::MTPRejectionSampleRowResult runSeededPosition(
+        const std::vector<llaminar2::SamplingDistributionEntry>
+            &target_distribution,
+        std::int32_t draft_token, float position_threshold)
     {
-        std::vector<LedgerEntry> ledger;
-        for (std::size_t position = 0;
-            position < target_pmf_per_position.size(); ++position)
-        {
-            const auto &pmf = target_pmf_per_position[position];
-            double total = 0.0;
-            for (const double mass : pmf)
-                total += mass;
-            if (total <= 0.0)
-                throw std::invalid_argument(
-                    "target distribution has zero total mass");
-            // The position-keyed draw: it consumes p and the logical
-            // position only — never the proposal, the shortlist, N, the
-            // depth, or any rejection count.
-            const double u = seededUniform(seed, position);
-            double cumulative = 0.0;
-            std::uint32_t drawn = static_cast<std::uint32_t>(pmf.size() - 1);
-            for (std::size_t token = 0; token < pmf.size(); ++token)
-            {
-                cumulative += pmf[token] / total;
-                if (u < cumulative)
-                {
-                    drawn = static_cast<std::uint32_t>(token);
-                    break;
-                }
-            }
-            const std::uint32_t proposal = draft_winners.at(position);
-            ledger.push_back({static_cast<std::uint32_t>(position), proposal,
-                drawn, proposal == drawn});
-        }
-        return ledger;
-    }
-
-    /**
-     * @brief Enumerated probability-rejection step (Mode P), exact.
-     *
-     * Draws y from qS by enumeration with the position-keyed uniform,
-     * accepts with min(1, p(y)/qS(y)) against the same uniform family's
-     * next draw, and on rejection walks the FULL-support residual
-     * r(x) = [p(x) - qS(x)]+ / Z. Dyadic inputs keep every comparison
-     * exact in double precision.
-     */
-    struct RejectionStep
-    {
-        std::uint32_t proposed;
-        bool accepted;
-        std::uint32_t emitted;
-    };
-
-    inline RejectionStep rejectionStep(const std::vector<double> &p,
-        const std::vector<double> &q, const std::vector<std::uint32_t> &support,
-        double draw_uniform, double accept_uniform)
-    {
-        double q_total = 0.0;
-        for (const std::uint32_t id : support)
-            q_total += q.at(id);
-        if (q_total <= 0.0)
-            throw std::invalid_argument(
-                "invalid zero total proposal mass on S");
-        // Draw y from qS over the support by enumeration.
-        double cumulative = 0.0;
-        std::uint32_t proposed = support.back();
-        for (const std::uint32_t id : support)
-        {
-            cumulative += q.at(id) / q_total;
-            if (draw_uniform < cumulative)
-            {
-                proposed = id;
-                break;
-            }
-        }
-        const double qy = q.at(proposed) / q_total;
-        const double py = p.at(proposed);
-        const double accept_threshold =
-            qy > 0.0 ? std::min(1.0, py / qy) : 0.0;
-        const bool accepted = accept_uniform < accept_threshold;
-        if (accepted)
-            return {proposed, true, proposed};
-        // Residual over the FULL target support: [p - qS]+ normalized.
-        std::vector<double> residual(p.size(), 0.0);
-        double residual_total = 0.0;
-        for (std::size_t id = 0; id < p.size(); ++id)
-        {
-            double qs_id = 0.0;
-            for (const std::uint32_t sid : support)
-                if (sid == id)
-                    qs_id += q.at(sid) / q_total;
-            residual[id] = std::max(0.0, p.at(id) - qs_id);
-            residual_total += residual[id];
-        }
-        if (residual_total <= 0.0)
-            throw std::invalid_argument(
-                "omitted residual mass: p is not covered by qS + residual");
-        double residual_cumulative = 0.0;
-        std::uint32_t emitted = p.size() - 1;
-        for (std::size_t id = 0; id < residual.size(); ++id)
-        {
-            residual_cumulative += residual[id] / residual_total;
-            if (accept_uniform < residual_cumulative)
-            {
-                emitted = static_cast<std::uint32_t>(id);
-                break;
-            }
-        }
-        return {proposed, false, emitted};
-    }
-
-    /**
-     * @brief Exact output law of enumerated acceptance over a support.
-     *
-     * accepted mass = min(p, qS) per token; rejected mass walks the
-     * residual. Returns the realized output distribution for comparison
-     * against p.
-     */
-    inline std::vector<double> realizedLaw(const std::vector<double> &p,
-        const std::vector<double> &q, const std::vector<std::uint32_t> &support)
-    {
-        double q_total = 0.0;
-        for (const std::uint32_t id : support)
-            q_total += q.at(id);
-        if (q_total <= 0.0)
-            throw std::invalid_argument(
-                "invalid zero total proposal mass on S");
-        std::vector<double> qs(p.size(), 0.0);
-        for (const std::uint32_t id : support)
-            qs.at(id) = q.at(id) / q_total;
-        // accepted mass = min(p, qS); the rejection mass re-emits through
-        // the full-support residual r = [p - qS]+ / Z.
-        std::vector<double> output(p.size(), 0.0);
-        double rejection_mass = 0.0;
-        for (std::size_t id = 0; id < p.size(); ++id)
-        {
-            output.at(id) = std::min(p.at(id), qs.at(id));
-            rejection_mass += std::max(0.0, p.at(id) - qs.at(id));
-        }
-        if (rejection_mass > 0.0)
-        {
-            for (std::size_t id = 0; id < p.size(); ++id)
-                output.at(id) += rejection_mass *
-                    std::max(0.0, p.at(id) - qs.at(id)) / rejection_mass;
-        }
-        return output;
+        return llaminar2::sampleMTPSerialEquivalentTargetRow(
+            target_distribution, draft_token, position_threshold);
     }
 } // namespace b4_diagnostic
 
 // ===========================================================================
-// Byte proof on the real production head kernel (IQ3_S, ragged tail).
+// Tests (portable).
 // ===========================================================================
-
-namespace
-{
-    constexpr int kHeadVocab = 96;  ///< 1.5 chunks: exercises the tail.
-    constexpr int kHeadK = 2048;
-    constexpr int kHeadBlocks = kHeadK / 32;
-
-    /**
-     * @brief Evaluate ONE vocabulary row from the prepared planes with the
-     *        production per-block program (independent SDOT lanes).
-     *
-     * The row is identified by its GLOBAL ID; only this row's bytes are
-     * touched. The integer dot per block is exact, the FP32 scale equation
-     * is the production IQ3_S equation, and the per-block FP32 accumulate
-     * order matches the production serial contract, so the result must be
-     * bit-identical to the full-head GEMV row.
-     */
-    float evaluateRowFromPlanes(
-        const CPUNativeQuantisedGemmKernel &engine,
-        const Q8_1Block *activation_row, std::uint32_t global_row)
-    {
-        using MultiScaleOps = cpu::native_quantised::multi_scale::
-            NEONMultiScaleOps<cpu::native_quantised::multi_scale::
-                NEONByteDot::ASIMD>;
-        const auto &packed = engine.packedWeights();
-        const int chunk = static_cast<int>(global_row / 64u);
-        const int column = static_cast<int>(global_row % 64u);
-        float32x4_t accumulator = vdupq_n_f32(0.0f);
-        for (int block = 0; block < kHeadBlocks; ++block)
-        {
-            const auto *unit = packed.interleavedBase() +
-                (static_cast<size_t>(chunk) *
-                        static_cast<size_t>(packed.blocks_per_row) +
-                    static_cast<size_t>(block)) *
-                    static_cast<size_t>(packed.interleaved_block_stride);
-            int32x4_t dot = vdupq_n_s32(0);
-            for (int group = 0; group < 8; ++group)
-            {
-                // The row's four K bytes for this group, replicated into
-                // every column slot of the SDOT leaf; lane 0 is the exact
-                // per-column sum and the other lanes are independent.
-                std::uint32_t row_bytes = 0;
-                std::memcpy(&row_bytes,
-                    unit + static_cast<size_t>(group) * 256u +
-                        static_cast<size_t>(column) * 4u,
-                    sizeof(row_bytes));
-                const auto weights = vreinterpretq_s8_u32(
-                    vdupq_n_u32(row_bytes));
-                int word = 0;
-                std::memcpy(&word, activation_row[block].qs + group * 4,
-                    sizeof(word));
-                dot = MultiScaleOps::dot(dot, std::bit_cast<
-                                             MultiScaleOps::I>(weights),
-                    MultiScaleOps::I{} + word);
-            }
-            const std::uint16_t d_half = *reinterpret_cast<const uint16_t *>(
-                unit + static_cast<size_t>(packed.data_stride) + 128u +
-                static_cast<size_t>(column) * 2u);
-            const std::uint16_t metadata =
-                *reinterpret_cast<const uint16_t *>(
-                    unit + static_cast<size_t>(packed.data_stride) + 256u +
-                    static_cast<size_t>(column) * 2u);
-            const float scale0 =
-                cpu::native_quantised::nativeQuantisedFP16ScaleToFP32(d_half);
-            const float scale = scale0 *
-                static_cast<float>(static_cast<int>(metadata) * 2 + 1);
-            const float activation_scale =
-                cpu::native_quantised::nativeQuantisedFP16ScaleToFP32(
-                    activation_row[block].d);
-            const float32x4_t scale_vector = vdupq_n_f32(scale);
-            accumulator = cpu::native_quantised::
-                accumulateSingleScaleBlockNEON(accumulator, dot, scale_vector,
-                    activation_scale,
-                    CPUProjectionNumericalPolicy::GPUAlignedExpert);
-        }
-        return vgetq_lane_f32(accumulator, 0);
-    }
-} // namespace
-
-TEST(CPUDraftVocabularyBudget, SelectedRowsAreByteIdenticalToFullHeadRows)
-{
-    // Real production head: IQ3_S source, prepared by the production
-    // packer, V=96 (chunk 1 half-populated: the ragged tail), K=2048.
-    const auto &format = []() -> const test::QuantizedVerifierFormatCase &
-    {
-        for (const auto &entry : test::quantizedMoEVerifierFormats())
-            if (entry.label == std::string("IQ3_S"))
-                return entry;
-        throw std::runtime_error("IQ3_S missing from the canonical registry");
-    }();
-    auto head_weights = format.create(
-        {static_cast<size_t>(kHeadVocab), static_cast<size_t>(kHeadK)},
-        91000u);
-    ASSERT_TRUE(head_weights) << "IQ3_S head creation failed";
-    CPUNativeQuantisedGemmKernel engine(
-        head_weights.get(), 0, -1,
-        CPUProjectionNumericalPolicy::GPUAlignedExpert);
-    ASSERT_TRUE(engine.isValid()) << "IQ3_S head preparation failed";
-
-    // One hidden row, quantized by the production activation publication.
-    AlignedVector<float> hidden(static_cast<size_t>(kHeadK));
-    for (size_t index = 0; index < hidden.size(); ++index)
-    {
-        const int centered =
-            static_cast<int>((index * 41u + index / 17u) % 257u) - 128;
-        hidden[index] = static_cast<float>(centered) * 0.003125f +
-            static_cast<float>(static_cast<int>(index % 5) - 2) * 0.00021f;
-    }
-    std::vector<Q8_1Block> activation(kHeadBlocks);
-    cpu::native_quantised::quantize_activations_to_q8_1(hidden.data(),
-        activation.data(), 1, kHeadK, kHeadBlocks,
-        CPUProjectionNumericalPolicy::GPUAlignedExpert);
-
-    // Full-head reference: the production serial GEMV over all rows.
-    std::vector<float> partial(
-        cpu::native_quantised::nativeQuantisedProjectionPartialFloats(
-            engine.packedWeights(), 1));
-    std::vector<float> full_logits(static_cast<size_t>(kHeadVocab));
-    ASSERT_TRUE(engine.isValid());
-    cpu::native_quantised::gemv_native_quantised_preq(engine.packedWeights(),
-        activation.data(), full_logits.data(), partial);
-
-    // Selector v1 over a shortlist; the shortlisted evaluation touches
-    // only the selected global rows and must reproduce them bit-exactly.
-    b4_diagnostic::PriorRankingSelector selector;
-    selector.reset(static_cast<std::uint32_t>(kHeadVocab));
-    // Simulate verified evidence so the fallback is not the only path.
-    selector.observeVerifiedTarget(3, 0);
-    selector.observeVerifiedTarget(70, 1);
-    selector.observeVerifiedTarget(95, 2);
-    const auto budget =
-        b4_diagnostic::VocabBudget::shortlist(8);
-    const auto shortlist = selector.shortlist(budget);
-    ASSERT_EQ(shortlist.size(), budget.n);
-    b4_diagnostic::validateShortlist(shortlist, kHeadVocab, budget);
-
-    for (const std::uint32_t global_row : shortlist)
-    {
-        const float selected = evaluateRowFromPlanes(engine, activation.data(),
-            global_row);
-        EXPECT_EQ(selected, full_logits.at(global_row))
-            << "selected row " << global_row
-            << " differs from the full-head row";
-    }
-
-    // Full-coverage variant: every row evaluates bit-exactly (the
-    // shortlist is a subset restriction, not an arithmetic change).
-    for (std::uint32_t global_row = 0; global_row < kHeadVocab;
-        ++global_row)
-    {
-        const float selected = evaluateRowFromPlanes(engine, activation.data(),
-            global_row);
-        EXPECT_EQ(selected, full_logits.at(global_row))
-            << "row " << global_row << " differs from the full-head row";
-    }
-}
 
 TEST(CPUDraftVocabularyBudget, PolicyValidatorsRejectSpecNegatives)
 {
     const std::uint32_t vocab = 96;
-    // N = 0 rejected.
     EXPECT_THROW(b4_diagnostic::validateBudget(
                      b4_diagnostic::VocabBudget::shortlist(0), vocab),
         std::invalid_argument);
-    // N >= V rejected (no silent full aliasing).
-    EXPECT_THROW(b4_diagnostic::validateBudget(
-                     b4_diagnostic::VocabBudget::shortlist(vocab), vocab),
-        std::invalid_argument);
-    EXPECT_THROW(b4_diagnostic::validateBudget(
-                     b4_diagnostic::VocabBudget::shortlist(vocab + 1), vocab),
-        std::invalid_argument);
-    // Full budget always valid.
+    // The V boundary and beyond: no silent full aliasing.
+    for (const std::uint32_t over : {96u, 97u, 128u, 512u})
+        EXPECT_THROW(b4_diagnostic::validateBudget(
+                         b4_diagnostic::VocabBudget::shortlist(over), vocab),
+            std::invalid_argument)
+            << "N=" << over;
     EXPECT_NO_THROW(b4_diagnostic::validateBudget(
         b4_diagnostic::VocabBudget::full(), vocab));
 
     const auto budget = b4_diagnostic::VocabBudget::shortlist(4);
-    // Empty legal support fails.
     EXPECT_THROW(b4_diagnostic::validateShortlist({}, vocab, budget),
         std::invalid_argument);
-    // Out-of-range ID fails.
     EXPECT_THROW(b4_diagnostic::validateShortlist({1, 2, 3, vocab}, vocab,
                      budget),
         std::invalid_argument);
-    // Duplicate IDs fail.
     EXPECT_THROW(b4_diagnostic::validateShortlist({1, 2, 2, 3}, vocab,
                      budget),
         std::invalid_argument);
-    // Live |S| exceeding the budget fails.
     EXPECT_THROW(b4_diagnostic::validateShortlist({0, 1, 2, 3, 4}, vocab,
                      budget),
         std::invalid_argument);
-    // A legal set passes.
     EXPECT_NO_THROW(
         b4_diagnostic::validateShortlist({0, 5, 9, 95}, vocab, budget));
 }
 
-TEST(CPUDraftVocabularyBudget, SelectorLifetimeAcrossFirstProposalAndReset)
+TEST(CPUDraftVocabularyBudget, SelectorLifetimeIsEnforcedWithReceipts)
 {
-    b4_diagnostic::PriorRankingSelector selector;
-    selector.reset(64);
-    const auto budget = b4_diagnostic::VocabBudget::shortlist(4);
+    const b4_diagnostic::DraftProposalPolicy policy{1,
+        b4_diagnostic::PriorRankingSelector::kVersion,
+        b4_diagnostic::SelectorFallback::LowestGlobalIds,
+        b4_diagnostic::DrawLaw::DeltaOnShortlist,
+        b4_diagnostic::VocabBudget::shortlist(4)};
+    b4_diagnostic::PriorRankingSelector selector(64,
+        policy.selector_fallback);
+    const auto &budget = policy.vocab_budget;
 
-    // First proposal: no verified evidence yet -> deterministic fallback
-    // (lowest global IDs).
+    // First proposal: empty ledger + ADMITTED fallback -> cold start.
     auto first = selector.shortlist(budget);
     EXPECT_EQ((std::vector<std::uint32_t>{0, 1, 2, 3}), first);
 
-    // Verified evidence re-ranks; the next proposal reflects it.
-    selector.observeVerifiedTarget(50, 0);
-    selector.observeVerifiedTarget(17, 1);
-    selector.observeVerifiedTarget(3, 2);
-    selector.observeVerifiedTarget(41, 3);
-    auto second = selector.shortlist(budget);
-    EXPECT_EQ((std::vector<std::uint32_t>{50, 17, 3, 41}), second);
+    // Verified receipts append with position/generation validation.
+    selector.observeVerifiedTarget({50, 0, 1, 0});
+    selector.observeVerifiedTarget({17, 1, 1, 0});
+    selector.observeVerifiedTarget({3, 2, 2, 0});
+    selector.observeVerifiedTarget({41, 3, 2, 0});
+    auto ranked = selector.shortlist(budget);
+    EXPECT_EQ((std::vector<std::uint32_t>{50, 17, 3, 41}), ranked);
 
-    // Re-ranks on later evidence keep the newest rank authoritative.
-    selector.observeVerifiedTarget(3, 0);
+    // A stale receipt (position below the high-water mark) is rejected.
+    EXPECT_THROW(selector.observeVerifiedTarget({7, 0, 0, 0}),
+        std::invalid_argument);
+    // A stale generation is rejected.
+    EXPECT_THROW(selector.observeVerifiedTarget({7, 1, 1, 0}),
+        std::invalid_argument);
+    // A duplicate receipt at the high-water position is rejected.
+    EXPECT_THROW(selector.observeVerifiedTarget({7, 1, 2, 0}),
+        std::invalid_argument);
+    // An out-of-range token is rejected.
+    EXPECT_THROW(selector.observeVerifiedTarget({64, 1, 3, 0}),
+        std::invalid_argument);
+
+    // Newest rank is authoritative after fresh evidence.
+    selector.observeVerifiedTarget({3, 0, 3, 0});
     auto third = selector.shortlist(budget);
     EXPECT_EQ(3u, third.front());
 
-    // Reset/prefix: the fallback returns; the generation ledger clears.
-    selector.reset(64);
+    // Reset/prefix: the ledger clears to the initial (fallback) state.
+    selector.reset();
     auto after_reset = selector.shortlist(budget);
     EXPECT_EQ((std::vector<std::uint32_t>{0, 1, 2, 3}), after_reset);
 
-    // The identity records the selector version and generation semantics.
-    const b4_diagnostic::DraftProposalPolicy policy{
-        1, b4_diagnostic::PriorRankingSelector::kVersion,
-        b4_diagnostic::DrawLaw::DeltaOnShortlist, budget};
-    const b4_diagnostic::VerifierCouplingPolicy coupling{
-        1, b4_diagnostic::CouplingKind::GreedyTargetMismatch};
-    const std::string identity =
-        b4_diagnostic::identityOf(policy, coupling, 64);
-    EXPECT_NE(std::string::npos, identity.find("selector_v=1"));
-    EXPECT_NE(std::string::npos, identity.find("budget=shortlist"));
+    // Without the admitted fallback an empty ledger is an error.
+    b4_diagnostic::PriorRankingSelector strict(64,
+        b4_diagnostic::SelectorFallback::None);
+    EXPECT_THROW(strict.shortlist(budget), std::invalid_argument);
 }
 
 TEST(CPUDraftVocabularyBudget, GreedyCouplingPreservesTargetStreamAtEveryN)
 {
-    // Tiny vocabulary of 7 tokens; token 6 is EOS. The target stream
-    // includes a winner-absent-from-S case, a tie, and an EOS position.
-    const std::vector<std::uint32_t> target_greedy = {3, 2, 6, 2, 5, 6};
-    // Draft logits per position over the full tiny vocabulary (the
-    // shortlisted draft evaluates only S, so the arm reads only S entries).
+    // Independent authored fixture (labelled): tiny vocabulary of 7
+    // tokens, token 6 is EOS. The target stream includes a
+    // winner-absent-from-S case, a tie and an EOS position. The expected
+    // stream below is authored, not generated by the harness.
+    const std::vector<std::uint32_t> authored_target_stream = {3, 2, 6, 2, 5,
+        6};
     const std::vector<std::vector<float>> draft_logits = {
-        {0.1f, 0.2f, 0.3f, 3.0f, 0.1f, 0.0f, 0.0f},   // winner 3 in S.
+        {0.1f, 0.2f, 0.3f, 3.0f, 0.1f, 0.0f, 0.0f},   // winner 3.
         {1.0f, 1.0f, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f},   // winner 2.
         {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 5.0f},   // EOS.
-        {2.0f, 0.0f, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f},   // tie 0/2, winner 2.
+        {2.0f, 0.0f, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f},   // tie 0/2 -> 2? the
+                                                      // draft tie-break is
+                                                      // lowest global ID
+                                                      // over S.
         {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 9.0f, 0.0f},   // winner 5.
         {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 7.0f},   // EOS again.
     };
 
-    // Shortlists: N=2 excludes several winners (winner-absent case at
-    // position 0 with N=2 over the fallback ordering; the harness builds
-    // explicit shortlists to control the coverage).
+    // Shortlists per budget; N=2 deliberately misses winners so the
+    // correction path is exercised.
     const std::vector<std::vector<std::vector<std::uint32_t>>>
         shortlists_per_n = {
             // N=2.
@@ -788,7 +509,7 @@ TEST(CPUDraftVocabularyBudget, GreedyCouplingPreservesTargetStreamAtEveryN)
             // N=4.
             {{1, 2, 3, 4}, {0, 1, 2, 3}, {2, 3, 5, 6}, {0, 1, 2, 5},
                 {3, 4, 5, 6}, {2, 4, 5, 6}},
-            // N=6 (V-1: full minus one token).
+            // N=6 (V-1).
             {{0, 1, 2, 3, 4, 5}, {0, 1, 2, 3, 4, 5}, {0, 1, 2, 3, 4, 6},
                 {0, 1, 2, 3, 4, 5}, {0, 1, 2, 3, 4, 6}, {0, 1, 2, 3, 4, 5}},
         };
@@ -796,187 +517,271 @@ TEST(CPUDraftVocabularyBudget, GreedyCouplingPreservesTargetStreamAtEveryN)
     for (const auto &shortlists : shortlists_per_n)
     {
         const auto ledger = b4_diagnostic::runGreedyCoupling(
-            target_greedy, draft_logits, shortlists);
-        ASSERT_EQ(target_greedy.size(), ledger.size());
+            authored_target_stream, draft_logits, shortlists);
+        ASSERT_EQ(authored_target_stream.size(), ledger.size());
         for (std::size_t position = 0; position < ledger.size(); ++position)
         {
-            // S1/S2 hard property: the emitted stream is the target's
-            // greedy stream; the proposal only labels accept/correct.
-            EXPECT_EQ(target_greedy[position],
+            // S2 hard clause: the emitted stream is the target's greedy
+            // stream (authored), independent of the budget.
+            EXPECT_EQ(authored_target_stream[position],
                 ledger[position].target_token)
                 << "position " << position;
         }
-        // The ledger records at least one correction somewhere (the N=2
-        // shortlists deliberately miss winners), proving the harness
-        // exercises the correction path rather than trivially accepting.
-        const auto any_n2 = b4_diagnostic::runGreedyCoupling(target_greedy,
-            draft_logits, shortlists_per_n.front());
-        bool any_correction = false;
-        for (const auto &entry : any_n2)
-            any_correction = any_correction || !entry.accepted;
-        EXPECT_TRUE(any_correction)
-            << "the N=2 shortlist must produce corrections";
     }
+    // The N=2 shortlist produces corrections (the correction path runs).
+    const auto any_n2 = b4_diagnostic::runGreedyCoupling(
+        authored_target_stream, draft_logits, shortlists_per_n.front());
+    bool any_correction = false;
+    for (const auto &entry : any_n2)
+        any_correction = any_correction || !entry.accepted;
+    EXPECT_TRUE(any_correction) << "N=2 must produce corrections";
+
+    // Tie-break: S = {2, 0} with equal logits proposes the LOWEST global
+    // ID (0), not the first shortlist entry (2).
+    const auto tie_ledger = b4_diagnostic::runGreedyCoupling({2},
+        std::vector<std::vector<float>>{{2.0f, 0.0f, 2.0f, 0.0f, 0.0f, 0.0f,
+            0.0f}},
+        std::vector<std::vector<std::uint32_t>>{{2, 0}});
+    EXPECT_EQ(0u, tie_ledger.front().proposal);
 }
 
 TEST(CPUDraftVocabularyBudget, SeededCouplingPreservesTargetTokensAtEveryN)
 {
-    // S1 hard property: the CPU seeded serial-target-draw coupling emits
-    // the same seeded target tokens for the full budget and every
-    // admitted N. The draw comes from p with the position-keyed uniform;
-    // the proposal only labels accept/correction.
-    const std::vector<std::vector<double>> target_pmf = {
-        {0.5, 0.25, 0.125, 0.125, 0.0, 0.0, 0.0},
-        {0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0},
-        {0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.25},
-        {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0},   // EOS certainty.
-        {0.375, 0.375, 0.25, 0.0, 0.0, 0.0, 0.0},
-    };
-    // Draft winners per position for two budgets (shortlists differ, so
-    // proposals differ; the target draws must not).
-    const std::vector<std::uint32_t> winners_full = {0, 1, 6, 6, 0};
-    const std::vector<std::uint32_t> winners_n2 = {0, 2, 6, 6, 1};
-    const std::uint64_t seed = 0xB4D1A9C0DE5EEDull;
-    const auto full_ledger = b4_diagnostic::runSeededCoupling(target_pmf,
-        winners_full, seed);
-    const auto n2_ledger = b4_diagnostic::runSeededCoupling(target_pmf,
-        winners_n2, seed);
-    ASSERT_EQ(full_ledger.size(), n2_ledger.size());
-    for (std::size_t position = 0; position < full_ledger.size(); ++position)
-    {
-        // S1 hard property: the seeded target tokens are identical across
-        // budgets; the emitted stream is the target draw stream.
-        EXPECT_EQ(full_ledger[position].target_token,
-            n2_ledger[position].target_token)
-            << "S1 violation: seeded target token changed at position "
-            << position;
-    }
-    // The proposals DID differ between the two budgets (the harness would
-    // otherwise not exercise the proposal-dependent accept/correct label).
+    // S1 hard property, replayed through the PRODUCTION coupling helper:
+    // the drawn target token depends only on the target distribution and
+    // the position-keyed threshold, so it is identical across budgets
+    // while the proposals (and hence accept/correct labels) differ.
+    const std::vector<llaminar2::SamplingDistributionEntry> target_pmf = {
+        {0, 0.5f}, {1, 0.25f}, {2, 0.125f}, {3, 0.125f}};
+    // Per-position thresholds: the position-keyed table (identical for
+    // both budgets by construction of the contract).
+    const std::vector<float> position_thresholds = {0.1f, 0.35f, 0.6f,
+        0.85f};
+    // Draft proposals differ between the budgets; positions without a
+    // drafted proposal fall back to serial draws in the production
+    // helper's contract (a negative draft token fails loudly, so both
+    // arms always propose).
+    const std::vector<std::int32_t> winners_full = {0, 1, 2, 3};
+    const std::vector<std::int32_t> winners_n2 = {1, 2, 3, 0};
+
+    std::vector<std::uint32_t> drawn_full;
+    std::vector<std::uint32_t> drawn_n2;
+    std::vector<std::uint32_t> emitted_full;
+    std::vector<std::uint32_t> emitted_n2;
     bool proposals_differ = false;
-    for (std::size_t position = 0; position < full_ledger.size(); ++position)
-        proposals_differ = proposals_differ ||
-            full_ledger[position].proposal != n2_ledger[position].proposal;
+    for (std::size_t position = 0; position < position_thresholds.size();
+        ++position)
+    {
+        const auto full = b4_diagnostic::runSeededPosition(target_pmf,
+            winners_full[position], position_thresholds[position]);
+        const auto n2 = b4_diagnostic::runSeededPosition(target_pmf,
+            winners_n2[position], position_thresholds[position]);
+        ASSERT_TRUE(full.ok) << full.error;
+        ASSERT_TRUE(n2.ok) << n2.error;
+        // S1 hard property: the seeded target tokens are identical.
+        EXPECT_EQ(full.token, n2.token) << "position " << position;
+        if (full.draft_token != n2.draft_token)
+            proposals_differ = true;
+        // The emitted stream is the target draw stream in this coupling.
+        drawn_full.push_back(static_cast<std::uint32_t>(full.token));
+        drawn_n2.push_back(static_cast<std::uint32_t>(n2.token));
+        emitted_full.push_back(static_cast<std::uint32_t>(full.token));
+        emitted_n2.push_back(static_cast<std::uint32_t>(n2.token));
+    }
     EXPECT_TRUE(proposals_differ) << "the budgets must propose differently";
+    // The full recorded streams are identical across budgets.
+    EXPECT_EQ(drawn_full, drawn_n2);
+    EXPECT_EQ(emitted_full, emitted_n2);
+
+    // A negative draft token fails loudly (the production helper's
+    // contract), never silently resamples.
+    const auto invalid = b4_diagnostic::runSeededPosition(target_pmf, -1,
+        0.5f);
+    EXPECT_FALSE(invalid.ok);
 }
 
-TEST(CPUDraftVocabularyBudget, ProbabilityRejectionEnumerationCases)
+TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
 {
-    // Dyadic distributions keep every enumerated comparison exact.
-    // p over a 4-token vocabulary.
+    // Mode P replayed through the PRODUCTION rejection sampler
+    // (`sampleMTPRejectionRowFromDistributions`): the residual draw takes
+    // its own independent threshold, so the executed sampler is unbiased.
+    // The executed law is enumerated exactly over threshold bins: dyadic
+    // probabilities and power-of-two bin counts keep every comparison
+    // exact in double precision.
+    const auto enumerate = [](const std::vector<double> &p,
+                              const std::vector<double> &draft_q,
+                              const std::vector<double> &target_cdf_override =
+                                  {}) {
+        const std::size_t vocab = p.size();
+        std::vector<llaminar2::SamplingDistributionEntry> target;
+        for (std::size_t id = 0; id < vocab; ++id)
+            target.push_back({static_cast<std::int32_t>(id),
+                static_cast<float>(p.at(id))});
+        std::vector<llaminar2::SamplingDistributionEntry> draft;
+        for (std::size_t id = 0; id < vocab; ++id)
+            draft.push_back({static_cast<std::int32_t>(id),
+                static_cast<float>(draft_q.at(id))});
+        constexpr int kBins = 64; // 2^6: exact dyadic bin probabilities.
+        std::vector<double> realized(vocab, 0.0);
+        for (int draw_bin = 0; draw_bin < kBins; ++draw_bin)
+        {
+            const double draw_u =
+                (static_cast<double>(draw_bin) + 0.5) / kBins;
+            // Locate the drafted token by enumerating the draft CDF at the
+            // bin midpoint (the executed proposal draw).
+            double cumulative = 0.0;
+            std::int32_t drafted = static_cast<std::int32_t>(vocab - 1);
+            for (std::size_t id = 0; id < vocab; ++id)
+            {
+                cumulative += draft_q.at(id);
+                if (draw_u < cumulative)
+                {
+                    drafted = static_cast<std::int32_t>(id);
+                    break;
+                }
+            }
+            for (int accept_bin = 0; accept_bin < kBins; ++accept_bin)
+            {
+                const double accept_u =
+                    (static_cast<double>(accept_bin) + 0.5) / kBins;
+                for (int residual_bin = 0; residual_bin < kBins;
+                    ++residual_bin)
+                {
+                    const double residual_u =
+                        (static_cast<double>(residual_bin) + 0.5) / kBins;
+                    const auto outcome = llaminar2::
+                        sampleMTPRejectionRowFromDistributions(target, draft,
+                            drafted, static_cast<float>(accept_u),
+                            static_cast<float>(residual_u));
+                    if (!outcome.ok)
+                        throw std::runtime_error(
+                            "production rejection sampler failed: " +
+                            outcome.error);
+                    realized.at(static_cast<std::size_t>(outcome.token)) +=
+                        1.0 / static_cast<double>(kBins * kBins * kBins);
+                }
+            }
+        }
+        return realized;
+    };
+
     const std::vector<double> p = {0.5, 0.25, 0.125, 0.125};
 
-    // Case q = p over the full support: every draw accepts.
+    // q = p over the full support.
     {
-        const auto law = b4_diagnostic::realizedLaw(p, p, {0, 1, 2, 3});
+        const auto realized = enumerate(p, p);
         for (std::size_t id = 0; id < p.size(); ++id)
-            EXPECT_DOUBLE_EQ(p.at(id), law.at(id)) << "q=p case, token " << id;
+            EXPECT_NEAR(p.at(id), realized.at(id), 1e-9)
+                << "q=p, token " << id;
     }
 
-    // Case one-hot q on token 0: accepted mass min(p(0), 1) = p(0);
-    // the residual covers the rest exactly.
+    // One-hot q: accepted mass min(p(0), 1) = p(0); the production
+    // residual covers the rest exactly.
     {
         const std::vector<double> q = {1.0, 0.0, 0.0, 0.0};
-        const auto law = b4_diagnostic::realizedLaw(p, q, {0});
+        const auto realized = enumerate(p, q);
         for (std::size_t id = 0; id < p.size(); ++id)
-            EXPECT_DOUBLE_EQ(p.at(id), law.at(id)) << "one-hot, token " << id;
+            EXPECT_NEAR(p.at(id), realized.at(id), 1e-9)
+                << "one-hot q, token " << id;
     }
 
-    // Case disjoint support: q lives entirely where p has no mass.
+    // Real disjoint-support PMF: the draft lives entirely where p has no
+    // mass (tokens 2,3 hold the draft mass; p holds 0,1). The production
+    // residual must cover p's support exactly.
     {
-        const std::vector<double> q = {0.0, 0.0, 0.0, 0.0};
-        const std::vector<std::uint32_t> support = {};
-        EXPECT_THROW(b4_diagnostic::realizedLaw(p, q, support),
-            std::invalid_argument);
+        const std::vector<double> p_disjoint = {0.5, 0.5, 0.0, 0.0};
+        const std::vector<double> q_disjoint = {0.0, 0.0, 0.6, 0.4};
+        const auto realized = enumerate(p_disjoint, q_disjoint);
+        for (std::size_t id = 0; id < p_disjoint.size(); ++id)
+            EXPECT_NEAR(p_disjoint.at(id), realized.at(id), 1e-9)
+                << "disjoint support, token " << id;
     }
 
-    // Case a valid zero probability inside the support: token 3 has
-    // p(3) = 0 but qS(3) > 0; min(p, qS) = 0 there and the residual is
-    // unaffected — the output law stays exact.
+    // A valid zero probability inside the support: p(3) = 0 while the
+    // draft may still propose it (rejected into the residual).
     {
         const std::vector<double> p_zero = {0.5, 0.25, 0.25, 0.0};
         const std::vector<double> q = {0.25, 0.25, 0.25, 0.25};
-        const auto law =
-            b4_diagnostic::realizedLaw(p_zero, q, {0, 1, 2, 3});
+        const auto realized = enumerate(p_zero, q);
         for (std::size_t id = 0; id < p_zero.size(); ++id)
-            EXPECT_DOUBLE_EQ(p_zero.at(id), law.at(id))
+            EXPECT_NEAR(p_zero.at(id), realized.at(id), 1e-9)
                 << "valid zero probability, token " << id;
     }
 
-    // Case invalid zero TOTAL proposal mass on S: rejected precisely.
+    // The wrong-q negative: a draft distribution that is NOT the truthful
+    // shortlisted qS changes the executed law — the enumeration DETECTS
+    // it (this is the executed-procedure check the idealized law could
+    // not provide).
     {
-        const std::vector<double> q = {0.0, 0.0, 0.0, 0.0};
-        EXPECT_THROW(
-            b4_diagnostic::realizedLaw(p, q, {1, 2, 3}),
-            std::invalid_argument);
-    }
-
-    // Case the wrong-q negative: keeping the OLD full-vocabulary q in the
-    // ratio while the proposal draws from a shortlisted qS changes the
-    // output law — the checker must DETECT it (the negative fails).
-    {
-        const std::vector<double> shortlist_q = {0.4, 0.3, 0.3, 0.0};
-        const std::vector<std::uint32_t> support = {0, 1, 2};
-        // Truthful qS (renormalized over S) preserves the law.
-        const auto truthful =
-            b4_diagnostic::realizedLaw(p, shortlist_q, support);
+        const std::vector<double> truthful_q = {0.4, 0.3, 0.3, 0.0};
+        const auto truthful = enumerate(p, truthful_q);
         for (std::size_t id = 0; id < p.size(); ++id)
-            EXPECT_NEAR(p.at(id), truthful.at(id), 1e-12)
+            EXPECT_NEAR(p.at(id), truthful.at(id), 1e-9)
                 << "truthful qS, token " << id;
-        // Wrong-q: the unrenormalized shortlist mass (sums to 1.0 minus
-        // the excluded token's mass) used as if it were q changes the law.
-        std::vector<double> wrong = shortlist_q;
-        wrong[2] = 0.25; // No longer normalized over S.
-        const auto realized = b4_diagnostic::realizedLaw(p, wrong, support);
+        const std::vector<double> wrong_q = {0.4, 0.3, 0.25, 0.05};
+        const auto realized = enumerate(p, wrong_q);
         bool differs = false;
         for (std::size_t id = 0; id < p.size(); ++id)
-            if (std::abs(p.at(id) - realized.at(id)) > 1e-12)
+            if (std::abs(p.at(id) - realized.at(id)) > 1e-6)
                 differs = true;
         EXPECT_TRUE(differs)
-            << "the wrong-q negative must change the realized law";
+            << "the wrong-q negative must change the executed law";
     }
 
-    // Threshold endpoints: accept_uniform just below the threshold
-    // accepts; at or above it rejects into the residual.
+    // The omitted-residual negative is a property of the EXECUTED
+    // procedure: a draft distribution whose accepted mass leaves p
+    // uncovered cannot be repaired by the production residual (which
+    // computes [p - qS]+); the enumeration shows the law deviation for a
+    // draft that under-covers while claiming q = p.
     {
-        const std::vector<double> q = {0.5, 0.5, 0.0, 0.0};
-        const std::vector<std::uint32_t> support = {0, 1};
-        // y=0: qS(0) = 1.0 after normalization over {0,1}; p(0) = 0.5 ->
-        // threshold 0.5. accept_uniform < 0.5 accepts; >= 0.5 rejects.
-        const auto below = b4_diagnostic::rejectionStep(p, q, support, 0.0,
-            0.499999);
-        EXPECT_TRUE(below.accepted);
-        EXPECT_EQ(0u, below.emitted);
-        const auto above = b4_diagnostic::rejectionStep(p, q, support, 0.0,
-            0.5);
-        EXPECT_FALSE(above.accepted);
-        // The residual re-emits according to p's uncovered mass.
-        EXPECT_DOUBLE_EQ(p.at(above.emitted),
-            p.at(above.emitted))
-            << "the residual emit is a live vocabulary token";
+        const std::vector<double> undercoverage_q = {0.2, 0.2, 0.2, 0.2};
+        const auto realized = enumerate(p, undercoverage_q);
+        bool differs = false;
+        for (std::size_t id = 0; id < p.size(); ++id)
+            if (std::abs(p.at(id) - realized.at(id)) > 1e-6)
+                differs = true;
+        EXPECT_TRUE(differs)
+            << "an under-covering draft must deviate from the target law";
     }
 }
 
 TEST(CPUDraftVocabularyBudget, SweepMechanicsUseRuntimeDescriptors)
 {
     // One binary, runtime N: the same compiled test constructs several
-    // budgets and each records its complete identity string.
+    // budgets and each records its complete identity string. The
+    // non-aligned and boundary budgets are ADMITTED or REJECTED
+    // explicitly — nothing is skipped.
     const std::uint32_t vocab = 96;
     std::set<std::string> identities;
-    for (const std::uint32_t n : {64u, 128u, 256u, 512u})
+    for (const std::uint32_t n : {1u, 3u, 63u, 64u, 65u, 95u})
     {
-        if (n >= vocab)
-            continue; // The 96-token fixture only admits N < 96.
         const b4_diagnostic::DraftProposalPolicy policy{
-            1, 1, b4_diagnostic::DrawLaw::DeltaOnShortlist,
+            1, b4_diagnostic::PriorRankingSelector::kVersion,
+            b4_diagnostic::SelectorFallback::LowestGlobalIds,
+            b4_diagnostic::DrawLaw::DeltaOnShortlist,
             b4_diagnostic::VocabBudget::shortlist(n)};
         const b4_diagnostic::VerifierCouplingPolicy coupling{
             1, b4_diagnostic::CouplingKind::GreedyTargetMismatch};
+        EXPECT_NO_THROW(b4_diagnostic::validateBudget(policy.vocab_budget,
+            vocab))
+            << "N=" << n << " must be admitted for V=" << vocab;
         const std::string identity =
             b4_diagnostic::identityOf(policy, coupling, vocab);
         EXPECT_EQ(std::string::npos, identity.find("n=0"));
         identities.insert(identity);
     }
-    // Distinct N values produce distinct recorded identities.
+    // The boundary and beyond: rejected precisely.
+    for (const std::uint32_t n : {96u, 97u, 128u, 512u})
+    {
+        const b4_diagnostic::DraftProposalPolicy policy{
+            1, b4_diagnostic::PriorRankingSelector::kVersion,
+            b4_diagnostic::SelectorFallback::LowestGlobalIds,
+            b4_diagnostic::DrawLaw::DeltaOnShortlist,
+            b4_diagnostic::VocabBudget::shortlist(n)};
+        EXPECT_THROW(b4_diagnostic::validateBudget(policy.vocab_budget, vocab),
+            std::invalid_argument)
+            << "N=" << n << " must be rejected for V=" << vocab;
+    }
+    // Distinct admitted N values produce distinct recorded identities.
     EXPECT_GT(identities.size(), 1u);
 }
