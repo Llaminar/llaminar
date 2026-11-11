@@ -13,8 +13,17 @@ expansions are the noted forks by construction.
 The checker is fail-closed: it scans every supported file whether or not a
 pragma is present (an orphan note fails), fails on a missing source root,
 rejects duplicate or non-adjacent notes, and never admits a whole file as
-exempt. Supported grammar, explicitly: a line whose first token is `#` or
-`_Pragma`, followed by `omp parallel` with arbitrary horizontal whitespace.
+exempt. Supported grammar, explicitly:
+* a pragma line starts (after horizontal whitespace) with `#` `pragma omp
+  parallel` or with `_Pragma("omp parallel` - arbitrary horizontal
+  whitespace inside either form;
+* a note line is EXACTLY one unconditional statement,
+  `::llaminar::v2::noteOpenMPTeamFork();`, after horizontal whitespace -
+  a conditional note (`if (...) note...();`), two notes on one line, or a
+  note wrapped in any other expression is rejected;
+* any `omp parallel` occurrence NOT matched by the anchored pragma grammar
+  (an inline `_Pragma` after code, a continuation line, a different spelling)
+  is itself a violation: unsupported forms do not silently pass.
 It is not C++ semantic analysis; unknown provenance fails closed.
 """
 from __future__ import annotations
@@ -80,6 +89,12 @@ AUTHORITY_FILE = "src/v2/utils/OpenMPUtils.h"
 PRAGMA = re.compile(r"^[ \t]*(?:#[ \t]*pragma[ \t]+omp[ \t]+parallel\b|"
                     r"_Pragma[ \t]*\([ \t]*\"omp[ \t]+parallel)", re.MULTILINE)
 NOTE = "noteOpenMPTeamFork"
+# The one admitted note statement, whole-line: an unconditional call with the
+# canonical qualification. Anything else carrying the note name fails.
+NOTE_STATEMENT = re.compile(r"^[ \t]*::llaminar::v2::noteOpenMPTeamFork\(\);[ \t]*$")
+# Any parallel-fork mention the anchored grammar did not match is unsupported.
+UNSUPPORTED = re.compile(r"(?:^|[^\w])(?:#[ \t]*pragma[ \t]+omp[ \t]+parallel\b|"
+                         r"_Pragma[ \t]*\([ \t]*\"omp[ \t]+parallel)", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -116,7 +131,16 @@ def scan(relative: str, raw: str) -> tuple[list[Violation], int, int]:
     noted, exempted = 0, 0
     index = 0
     while index < len(lines):
-        if NOTE in lines[index]:
+        line = lines[index]
+        if "noteOpenMPTeamFork" in line:
+            # The note must be exactly one unconditional statement on its own
+            # line; a conditional, doubled or embedded note fails closed.
+            if not NOTE_STATEMENT.match(line):
+                violations.append(Violation(relative, index + 1,
+                                            "noteOpenMPTeamFork is not one unconditional "
+                                            "canonical statement on its own line"))
+                index += 1
+                continue
             following = index + 1
             while following < len(lines) and not lines[following].strip():
                 following += 1
@@ -128,18 +152,24 @@ def scan(relative: str, raw: str) -> tuple[list[Violation], int, int]:
                                             "noteOpenMPTeamFork with no adjacent pragma"))
                 index += 1
             continue
-        match = PRAGMA.match(lines[index])
-        if match is None:
+        match = PRAGMA.match(line)
+        if match is not None:
+            function = enclosing(index)
+            if (relative, function) in EXEMPT_SITES:
+                exempted += 1
+                index += 1
+                continue
+            violations.append(Violation(relative, index + 1,
+                                        f"raw OpenMP fork in {function or '<global>'} outside the note "
+                                        "authority and outside the named site exemptions"))
             index += 1
             continue
-        function = enclosing(index)
-        if (relative, function) in EXEMPT_SITES:
-            exempted += 1
-            index += 1
-            continue
-        violations.append(Violation(relative, index + 1,
-                                    f"raw OpenMP fork in {function or '<global>'} outside the note "
-                                    "authority and outside the named site exemptions"))
+        # Unsupported forms: any parallel-fork mention the anchored grammar did
+        # not match must fail closed instead of silently passing.
+        if UNSUPPORTED.search(line):
+            violations.append(Violation(relative, index + 1,
+                                        "unsupported OpenMP parallel form outside the anchored "
+                                        "grammar (inline _Pragma, continuation or other spelling)"))
         index += 1
     return violations, noted, exempted
 
@@ -159,7 +189,11 @@ def main() -> int:
             continue
         relative = str(path.relative_to(args.repo_root))
         raw = path.read_text(encoding="utf-8", errors="replace")
-        if not PRAGMA.search(raw) and NOTE not in raw:
+        # The pre-filter is a plain substring probe on purpose: a file that
+        # mentions a parallel fork in ANY form - including the unsupported
+        # inline spellings the anchored grammar rejects - must reach scan(),
+        # or an unsupported form could silently pass unread.
+        if "omp parallel" not in raw and NOTE not in raw:
             continue
         files += 1
         file_violations, file_noted, file_exempted = scan(relative, raw)

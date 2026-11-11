@@ -39,29 +39,64 @@ namespace
     {
     public:
         explicit ScopedForkEvidenceConfig(const char *summary_filter,
-            const char *stage_timing = nullptr)
+            const char *stage_timing = nullptr, bool force_absent = false)
         {
+            // EVERY enablement input is isolated: an ambient table, JSON or
+            // CSV export, legacy profiling switch or GPU stage-timing family
+            // would otherwise keep collection alive under the off-default.
+            for (const char *name : {"LLAMINAR_PERF_STATS_SUMMARY",
+                                     "LLAMINAR_PERF_STATS_FILTER",
+                                     "LLAMINAR_PERF_STATS_TABLE",
+                                     "LLAMINAR_PERF_STATS_JSON",
+                                     "LLAMINAR_PERF_STATS_CSV",
+                                     "LLAMINAR_PROFILING",
+                                     "LLAMINAR_PERF_STATS_CPU_STAGE_TIMING",
+                                     "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING"})
+                take(name);
             if (summary_filter)
             {
                 ::setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
                 ::setenv("LLAMINAR_PERF_STATS_FILTER", summary_filter, 1);
             }
+            else if (force_absent)
+            {
+                ::unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
+                ::unsetenv("LLAMINAR_PERF_STATS_FILTER");
+            }
             if (stage_timing)
                 ::setenv("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", stage_timing, 1);
+            else if (force_absent)
+                ::unsetenv("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING");
             llaminar2::mutableDebugEnv().reload();
             llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
             llaminar2::PerfStatsCollector::reset();
         }
         ~ScopedForkEvidenceConfig()
         {
-            ::unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
-            ::unsetenv("LLAMINAR_PERF_STATS_FILTER");
-            ::unsetenv("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING");
+            // Restore the exact prior values, then reload both authorities
+            // from the restored environment.
+            for (const auto &entry : saved_)
+            {
+                if (entry.second)
+                    ::setenv(entry.first.c_str(), entry.second->c_str(), 1);
+                else
+                    ::unsetenv(entry.first.c_str());
+            }
             llaminar2::mutableDebugEnv().reload();
             llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
         }
         ScopedForkEvidenceConfig(const ScopedForkEvidenceConfig &) = delete;
         ScopedForkEvidenceConfig &operator=(const ScopedForkEvidenceConfig &) = delete;
+
+    private:
+        void take(const char *name)
+        {
+            if (const char *prior = ::getenv(name))
+                saved_.emplace(name, std::string(prior));
+            else
+                saved_.emplace(name, std::nullopt);
+        }
+        std::map<std::string, std::optional<std::string>> saved_;
     };
 
     /** @brief A mock stage whose execution forks an exact number of real teams. */
@@ -251,13 +286,65 @@ TEST(OpenMPTeamForkStageEvidence, PublisherRefusesNonCpuDevicesAndUngatedCalls)
         llaminar::v2::publishOpenMPTeamForkStage(scope, "cpu_entry", "decode",
             DeviceId::cpu(), 7u, "GEMM");
         const auto records = llaminar2::PerfStatsCollector::snapshot({"omp"});
-        for (const auto &record : records)
+        // Exact keys: the earlier cpu_forks stage keeps its own 3-fork record
+        // untouched; the refusal publishes nothing for the GPU device, and the
+        // CPU-device publisher call lands exactly once with its own cell.
+        const auto stage_record = [&records](const std::string &stage) -> const PerfStatRecord *
         {
-            EXPECT_NE(record.device, "CUDA:0")
-                << "a GPU device must never gain a fork record";
-            if (record.name == llaminar::v2::kOpenMPTeamForkStageFamily)
-                EXPECT_EQ(record.value, 1.0);
-        }
+            for (const auto &record : records)
+                if (record.domain == "omp" &&
+                    record.name == llaminar::v2::kOpenMPTeamForkStageFamily &&
+                    record.tags.count("stage") && record.tags.at("stage") == stage)
+                    return &record;
+            return nullptr;
+        };
+        const auto *prior = stage_record("cpu_forks");
+        ASSERT_NE(prior, nullptr);
+        EXPECT_EQ(prior->value, 3.0);
+        EXPECT_EQ(stage_record("gpu_entry"), nullptr)
+            << "a GPU device must never gain a fork record";
+        const auto *accepted = stage_record("cpu_entry");
+        ASSERT_NE(accepted, nullptr);
+        EXPECT_EQ(accepted->value, 1.0);
+        EXPECT_EQ(accepted->device, "CPU:0");
+        EXPECT_TRUE(std::none_of(records.begin(), records.end(),
+            [](const PerfStatRecord &record) { return record.device == "CUDA:0"; }));
     }
 }
+}
+
+/** @brief Prior-present and prior-absent restoration are both exact. */
+TEST(OpenMPTeamForkStageEvidence, EvidenceConfigRestoresExactPriorEnvironment)
+{
+    // Prior-present: ambient values survive the selected configuration.
+    {
+        const ScopedForkEvidenceConfig present(nullptr, nullptr, false);
+        ::setenv("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", "0", 1);
+        ::setenv("LLAMINAR_PERF_STATS_FILTER", "mtp", 1);
+        llaminar2::mutableDebugEnv().reload();
+        llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
+        {
+            const ScopedForkEvidenceConfig selected("omp", "1");
+            EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_FILTER"), std::string("omp"));
+            EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING"), std::string("1"));
+        }
+        EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING"), std::string("0"));
+        EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_FILTER"), std::string("mtp"));
+        ::unsetenv("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING");
+        ::unsetenv("LLAMINAR_PERF_STATS_FILTER");
+        llaminar2::mutableDebugEnv().reload();
+        llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
+    }
+    // Prior-absent: after a selected run, absence is restored as absence.
+    {
+        const ScopedForkEvidenceConfig absent(nullptr, nullptr, true);
+        {
+            const ScopedForkEvidenceConfig selected("omp", "1");
+            EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_FILTER"), std::string("omp"));
+        }
+        EXPECT_EQ(::getenv("LLAMINAR_PERF_STATS_FILTER"), nullptr);
+        EXPECT_EQ(::getenv("LLAMINAR_PERF_STATS_SUMMARY"), nullptr);
+        EXPECT_EQ(::getenv("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING"), nullptr);
+        EXPECT_FALSE(llaminar2::PerfStatsCollector::cpuStageTimingEnabled());
+    }
 }

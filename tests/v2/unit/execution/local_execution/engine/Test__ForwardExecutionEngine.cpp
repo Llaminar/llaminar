@@ -4844,17 +4844,41 @@ namespace
             : ScopedForkEvidenceConfig(filter, filter == nullptr) {}
         ScopedForkEvidenceConfig(const char *filter, bool force_absent)
         {
-            take("LLAMINAR_PERF_STATS_SUMMARY");
-            take("LLAMINAR_PERF_STATS_FILTER");
+            // EVERY enablement input is isolated: an ambient table, JSON or
+            // CSV export, legacy profiling switch or stage-timing family would
+            // otherwise keep collection alive under the "off-default" shape.
+            for (const char *name : {"LLAMINAR_PERF_STATS_SUMMARY",
+                                     "LLAMINAR_PERF_STATS_FILTER",
+                                     "LLAMINAR_PERF_STATS_TABLE",
+                                     "LLAMINAR_PERF_STATS_JSON",
+                                     "LLAMINAR_PERF_STATS_CSV",
+                                     "LLAMINAR_PROFILING",
+                                     "LLAMINAR_PERF_STATS_CPU_STAGE_TIMING",
+                                     "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING"})
+                take(name);
             if (filter)
             {
                 ::setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
                 ::setenv("LLAMINAR_PERF_STATS_FILTER", filter, 1);
+                for (const char *name : {"LLAMINAR_PERF_STATS_TABLE",
+                                         "LLAMINAR_PERF_STATS_JSON",
+                                         "LLAMINAR_PERF_STATS_CSV",
+                                         "LLAMINAR_PROFILING",
+                                         "LLAMINAR_PERF_STATS_CPU_STAGE_TIMING",
+                                         "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING"})
+                    ::unsetenv(name);
             }
             else if (force_absent)
             {
-                ::unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
-                ::unsetenv("LLAMINAR_PERF_STATS_FILTER");
+                for (const char *name : {"LLAMINAR_PERF_STATS_SUMMARY",
+                                         "LLAMINAR_PERF_STATS_FILTER",
+                                         "LLAMINAR_PERF_STATS_TABLE",
+                                         "LLAMINAR_PERF_STATS_JSON",
+                                         "LLAMINAR_PERF_STATS_CSV",
+                                         "LLAMINAR_PROFILING",
+                                         "LLAMINAR_PERF_STATS_CPU_STAGE_TIMING",
+                                         "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING"})
+                    ::unsetenv(name);
             }
             mutableDebugEnv().reload();
             llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
@@ -4862,6 +4886,8 @@ namespace
         }
         ~ScopedForkEvidenceConfig()
         {
+            // Restore the exact prior values, then reload both authorities
+            // from the restored environment.
             for (const auto &entry : saved_)
             {
                 if (entry.second)
@@ -4934,26 +4960,40 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         MockForwardExecutionHost host(&mock_ctx_);
         host.graph_stage_count = 1;
         constexpr int kForksPerStage = 3;
-        llaminar2::testing::MockDeviceContext other_context(DeviceId::cpu());
-        std::optional<llaminar::v2::OpenMPTeamForkScope> concurrent_owner;
+        std::atomic<bool> window_live{false};
         std::atomic<int> concurrent_forks{0};
+        std::atomic<bool> concurrent_done{false};
+        // The concurrent owner lives entirely on the worker thread (constructed
+        // and destroyed there; the parent only joins), and its forks start only
+        // after the stage hook marks the engine window live - the overlap with
+        // the published window is proven, not scheduler luck. The join guard
+        // makes an early assertion failure still join before touching state.
         std::thread concurrent([&]
         {
-            concurrent_owner.emplace();
+            llaminar::v2::OpenMPTeamForkScope concurrent_owner;
+            while (!window_live.load(std::memory_order_acquire))
+                std::this_thread::yield();
             for (int fork = 0; fork < 5; ++fork)
             {
                 OMP_WORKSHARE_REGION(idle);
                 ++concurrent_forks;
             }
+            concurrent_done.store(true, std::memory_order_release);
         });
+        struct JoinGuard
+        {
+            std::thread &thread;
+            ~JoinGuard() { if (thread.joinable()) thread.join(); }
+        } join_guard{concurrent};
         host.graph_stage_factories = {
-            [](const std::string &name, DeviceId device)
+            [&window_live](const std::string &name, DeviceId device)
             {
                 auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
                     ComputeStageType::GEMM, name, device);
-                stage->setOnExecute([](IDeviceContext *)
+                stage->setOnExecute([&window_live](IDeviceContext *)
                 {
                     auto work = [] {};
+                    window_live.store(true, std::memory_order_release);
                     OMP_WORKSHARE_REGION(work);
                     OMP_WORKSHARE_REGION(work);
                     OMP_WORKSHARE_REGION(work);
@@ -4966,36 +5006,37 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         input.execution_phase = ForwardExecutionPhase::Decode;
         ForwardOutput output{};
         ASSERT_TRUE(engine.execute(input, output, host));
-        concurrent.join();
+        while (!concurrent_done.load(std::memory_order_acquire))
+            std::this_thread::yield();
         ASSERT_EQ(concurrent_forks.load(), 5);
 
-        const auto summary_value = [&]
+        // The published value is keyed and exact: the capture-step record
+        // (used_graph_replay=false) carries exactly the window's own three
+        // forks, immune to the prior total and to the concurrent owner whose
+        // five forks were live inside the same window.
+        const auto summary_records = [](const std::vector<PerfStatRecord> &records)
         {
-            double value = -1.0;
-            for (const auto &record : PerfStatsCollector::snapshot({"omp"}))
+            std::vector<const PerfStatRecord *> found;
+            for (const auto &record : records)
                 if (record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily)
-                {
-                    EXPECT_EQ(record.value, value < 0 ? value : record.value)
-                        << "summary records must agree per key";
-                    value = record.value;
-                }
-            return value;
+                    found.push_back(&record);
+            return found;
         };
-        EXPECT_EQ(summary_value(), static_cast<double>(kForksPerStage))
-            << "the published value must be the owner cell, immune to the "
-               "prior total and the concurrent owner";
+        const auto first_records = summary_records(PerfStatsCollector::snapshot({"omp"}));
+        ASSERT_FALSE(first_records.empty());
+        for (const auto *record : first_records)
+            EXPECT_EQ(record->value, static_cast<double>(kForksPerStage))
+                << "every keyed summary record must carry exactly the window cell";
 
         // The accumulator contract across a repeated step: the second decode
         // adds its cell to the same keyed record (3 -> 6, count 1 -> 2) when
         // the key is identical, and never resets it.
         ASSERT_TRUE(engine.execute(input, output, host));
-        const auto records = PerfStatsCollector::snapshot({"omp"});
-        for (const auto &record : records)
-            if (record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily)
-            {
-                EXPECT_EQ(record.value, 2.0 * kForksPerStage);
-                EXPECT_EQ(record.count, 2u);
-            }
+        for (const auto *record : summary_records(PerfStatsCollector::snapshot({"omp"})))
+        {
+            EXPECT_EQ(record->value, 2.0 * kForksPerStage);
+            EXPECT_EQ(record->count, 2u);
+        }
     }
 
     // Success/failure/prefill exclusions: a failed step and a prefill step
@@ -5023,8 +5064,12 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         EXPECT_TRUE(PerfStatsCollector::snapshot({"omp"}).empty())
             << "a failed step publishes no count rather than a partial one";
 
-        // Prefill exclusion: the same selected gates, a prefill phase.
-        auto prefill = makeTestInput(4, 1, DeviceId::cpu(), tokens.data(), positions.data());
+        // Prefill exclusion: the same selected gates, a prefill phase with
+        // COMPLETE input extents (four rows, four tokens, four positions).
+        const std::vector<int> prefill_tokens = {60, 61, 62, 63};
+        const std::vector<int> prefill_positions = {0, 1, 2, 3};
+        auto prefill = makeTestInput(4, 1, DeviceId::cpu(), prefill_tokens.data(),
+                                     prefill_positions.data());
         prefill.execution_phase = ForwardExecutionPhase::Prefill;
         ForwardOutput prefill_output{};
         MockForwardExecutionHost prefill_host(&mock_ctx_);
@@ -5059,23 +5104,40 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         auto input = makeTestInput(1, 1, DeviceId::cuda(0), tokens.data(), positions.data());
         input.execution_phase = ForwardExecutionPhase::Decode;
         ForwardOutput output{};
-        engine.execute(input, output, host);
+        // The refusal means something only when the step SUCCEEDED to the
+        // boundary where a CPU summary would have been published: assert the
+        // execution result, not just that a stage ran.
+        const bool executed = engine.execute(input, output, host);
         ASSERT_GT(seam_executions.load(), 0)
             << "the GPU decode must reach the stage seam for this refusal to mean anything";
-        for (const auto &record : PerfStatsCollector::snapshot({"omp"}))
-            EXPECT_FALSE(record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily)
-                << "a GPU device step must never publish a CPU fork summary";
+        if (executed)
+        {
+            for (const auto &record : PerfStatsCollector::snapshot({"omp"}))
+                EXPECT_FALSE(record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily)
+                    << "a GPU device step must never publish a CPU fork summary";
+        }
+        else
+        {
+            ADD_FAILURE() << "the mock GPU decode must reach a successful summary "
+                             "boundary for the GPU refusal to be actual-path";
+        }
     }
 
-    // The ambient-nondefault restoration: a caller that had an active export
-    // configuration before this test gets exactly that configuration back.
+    // The ambient-restoration controls, prior-present AND prior-absent: a
+    // caller value present before the test is restored verbatim, and a
+    // variable absent before the test is restored to absence.
     {
+        const ScopedForkEvidenceConfig present_setup(nullptr, false);
         ::setenv("LLAMINAR_PERF_STATS_SUMMARY", "0", 1);
         ::setenv("LLAMINAR_PERF_STATS_FILTER", "mtp", 1);
+        mutableDebugEnv().reload();
+        llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
         {
             const ScopedForkEvidenceConfig selected("omp");
             EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_FILTER"), std::string("omp"));
         }
+        // Prior-present: both ambient values came back exactly.
+        EXPECT_NE(::getenv("LLAMINAR_PERF_STATS_SUMMARY"), nullptr);
         EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_SUMMARY"), std::string("0"));
         EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_FILTER"), std::string("mtp"));
         EXPECT_TRUE(llaminar2::PerfStatsCollector::isRecordFamilyEnabled("mtp", "anything"));
@@ -5085,5 +5147,17 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         ::unsetenv("LLAMINAR_PERF_STATS_FILTER");
         mutableDebugEnv().reload();
         llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
+    }
+    {
+        const ScopedForkEvidenceConfig absent_setup(nullptr, true);
+        // Prior-absent: after a selected run, absence is restored as absence.
+        {
+            const ScopedForkEvidenceConfig selected("omp");
+            EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_FILTER"), std::string("omp"));
+        }
+        EXPECT_EQ(::getenv("LLAMINAR_PERF_STATS_FILTER"), nullptr);
+        EXPECT_EQ(::getenv("LLAMINAR_PERF_STATS_SUMMARY"), nullptr);
+        EXPECT_FALSE(llaminar2::PerfStatsCollector::isRecordFamilyEnabled(
+            "omp", llaminar::v2::kOpenMPTeamForkSummaryFamily));
     }
 }

@@ -253,33 +253,63 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
             "omp", "openmp_team_forks_stage"));
 
         constexpr std::uint64_t kMeasuredNotes = 1u << 20;
+        // Per-owner note latency, measured under the ownership configurations
+        // production runs. Every measuring thread constructs its OWN
+        // same-thread owner scope inside the thread (thread-affine lifecycle
+        // end to end), the timed window excludes thread creation and
+        // teardown, each run verifies its exact cell and process deltas, and
+        // the concurrent variant divides the concurrent wall time by the
+        // notes ONE thread executed - aggregate throughput would understate
+        // the per-owner latency the decode path experiences. Basis labels say
+        // so explicitly; earlier no-walk figures do not transfer.
         const auto measure = [&](int owners, bool concurrent) -> double
         {
-            std::vector<std::unique_ptr<llaminar::v2::OpenMPTeamForkScope>> scopes;
-            for (int owner = 0; owner < owners; ++owner)
-                scopes.push_back(std::make_unique<llaminar::v2::OpenMPTeamForkScope>());
+            const std::uint64_t before = llaminar::v2::openMPTeamForkSnapshot();
             const auto cost_start = std::chrono::steady_clock::now();
             if (concurrent)
             {
+                std::atomic<bool> gate{false};
+                std::atomic<bool> worker_done{false};
                 std::thread worker([&]
                 {
+                    llaminar::v2::OpenMPTeamForkScope scope;
+                    gate.store(true, std::memory_order_release);
                     for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
                         llaminar::v2::noteOpenMPTeamFork();
+                    EXPECT_EQ(scope.forks(), kMeasuredNotes);
+                    worker_done.store(true, std::memory_order_release);
                 });
+                while (!gate.load(std::memory_order_acquire))
+                    std::this_thread::yield();
+                llaminar::v2::OpenMPTeamForkScope scope;
                 for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
                     llaminar::v2::noteOpenMPTeamFork();
+                EXPECT_EQ(scope.forks(), kMeasuredNotes);
+                while (!worker_done.load(std::memory_order_acquire))
+                    std::this_thread::yield();
                 worker.join();
             }
             else
             {
+                llaminar::v2::OpenMPTeamForkScope outer;
+                std::optional<llaminar::v2::OpenMPTeamForkScope> inner;
+                for (int owner = 1; owner < owners; ++owner)
+                    inner.emplace();
                 for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
                     llaminar::v2::noteOpenMPTeamFork();
+                EXPECT_EQ(outer.forks(), kMeasuredNotes);
+                if (inner)
+                    EXPECT_EQ(inner->forks(), kMeasuredNotes);
+                inner.reset(); // Enforced reverse teardown before the outer dies.
             }
             const auto cost_ns = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - cost_start)
                     .count());
-            return cost_ns / static_cast<double>(concurrent ? 2 * kMeasuredNotes : kMeasuredNotes);
+            const std::uint64_t expected_total =
+                kMeasuredNotes * (concurrent ? 2u : 1u);
+            EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - before, expected_total);
+            return cost_ns / static_cast<double>(kMeasuredNotes);
         };
         const std::pair<const char *, double> variants[] = {
             {"no_owner", measure(0, false)},
@@ -291,10 +321,12 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
             PerfStatsCollector::addCounter(
                 "omp", std::string("openmp_team_fork_note_self_cost_") + label,
                 ns_per_note, "evidence", "host",
-                {{"basis", std::to_string(kMeasuredNotes) + "_invocations_per_measuring_thread"}});
+                {{"basis", std::to_string(kMeasuredNotes) +
+                               "_notes_per_measuring_thread_per_owner_latency"}});
             std::cout << "[evidence] openmp_team_fork_note_self_cost_" << label << "="
-                      << ns_per_note << " ns/invocation over " << kMeasuredNotes
-                      << " invocations per measuring thread" << std::endl;
+                      << ns_per_note << " ns per owner note, amortized over " << kMeasuredNotes
+                      << " notes per measuring thread (per-owner latency with the production "
+                         "owner walk; earlier no-walk figures do not transfer)" << std::endl;
             EXPECT_LT(ns_per_note, 100.0) << label;
         }
     }
