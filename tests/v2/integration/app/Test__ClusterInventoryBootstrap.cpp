@@ -5,7 +5,9 @@
  * The parent creates a local hostfile and calls the real parser/bootstrap.
  * MPI must use every declared slot without inheriting a launcher-local CPU
  * set. Children prove their full physical worker binding, then collectively
- * gather the canonical CPU inventory. Repeated rank-zero reads and topology
+ * gather the canonical CPU inventory. A bound single rank retains its measured
+ * NUMA ownership, just like a distributed rank; rank count is not locality.
+ * Repeated rank-zero reads and topology
  * construction must share that exact publication without another exchange.
  * Server evidence must project those same physical groups without a new probe
  * or collective, including when only the request authority reads the snapshot.
@@ -280,21 +282,21 @@ namespace
         int passed = provided >= MPI_THREAD_MULTIPLE;
         {
             auto context = MPIContextFactory::global();
+            const auto admitted_affinity = NUMATopology::detectLocalNUMANode();
             const auto inventory_owner = gatherClusterInventory(context, config.hostfile);
             const auto &inventory = *inventory_owner;
             passed = passed && inventory_owner == context->clusterInventory();
             const auto &local_observation = inventory.ranks.at(context->rank());
-            // A lone rank deliberately owns the whole host in the inventory
-            // (numa_node -1, e.g. a single-NUMA GB10). Serving then resolves
-            // the shorthand from the process's observed affinity, exactly as
-            // RuntimeInitPhase does; distributed ranks use the inventory.
-            const bool whole_host = context->world_size() == 1;
-            passed = passed && (!whole_host || local_observation.cpu.numa_node == -1);
-            const NUMAInfo admitted_affinity = whole_host ? NUMATopology::detectLocalNUMANode() : NUMAInfo{
-                .local_numa_node = local_observation.cpu.numa_node,
-                .total_numa_nodes = local_observation.numa_nodes,
-                .detection_succeeded = local_observation.cpu.numa_node >= 0,
-                .detection_method = "canonical-inventory"};
+            // Compare independent pre-discovery affinity with the canonical
+            // publication. One bound rank is not an unbound whole-host scope.
+            const int expected_numa = admitted_affinity.detection_succeeded
+                ? admitted_affinity.local_numa_node : -1;
+            if(local_observation.cpu.numa_node!=expected_numa) {
+                std::cerr<<"inventory_cpu_numa rank="<<context->rank()
+                         <<" actual="<<local_observation.cpu.numa_node
+                         <<" expected="<<expected_numa<<std::endl;
+                passed=false;
+            }
             // Exercise the serving specialization on the same observed rank
             // locality. MPI ordinal must not become an independent NUMA source.
             RuntimeInitPhase::resolveCPUShorthand(
