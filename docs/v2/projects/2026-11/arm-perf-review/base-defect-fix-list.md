@@ -425,3 +425,11 @@ wrong and are WITHDRAWN:
 - .79 HOLD; no env/placement workarounds.
 LESSON: report what the log shows, not the pattern it suggests — diagnose
 from printed evidence only; suspected mechanisms wait for their predicate.
+
+### Naming correction (Main, ~01:54:38Z) to the 9326b6b12 entry
+
+- The UNPRINTED failed predicate belongs to **ClusterInventoryBootstrap**.
+- **CPUClusterPermanentMasterPlacement's failure IS explicit**: worker 15
+  got cpu 15 where 0 was expected (plus the captured full vector) — its
+  CAUSE (not which predicate) remains open.
+- No further changes/qualification claims pending the diagnosis.
