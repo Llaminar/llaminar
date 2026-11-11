@@ -759,3 +759,24 @@ required (the .79 38/39 non-reproduction was on a DIFFERENT host).
 Next diagnostic step if pursued: inspect what mpirun changes that turns
 graceful-null into SIGSEGV (launcher-set memory policy? hwloc bind?
 different allocator code path under MPI init?).
+
+### **B11 CONCLUSION WITHDRAWN** (CB lead, ~12:20Z) — capture quality failure, claim retracted
+
+The CB lead inspected the actual logs and STOPPED the causal closure:
+- b11-direct.log is **403 bytes**, ends at '[ RUN ] NUMABufferIterators' +
+  EPERM with NO suite completion → the reported "exit 0" is NOT reliably
+  the tested process's status (likely a pipeline/tail exit status). The
+  direct log does NOT establish normal completion/no-crash.
+- b11-mpi.log explicitly reports SIGSEGV yet ends 'mpi-exit=0' —
+  internally contradictory capture.
+- Neither tiny log binds source/binary/container/config identities.
+- The "SIGSEGV is MPI-launcher-specific, not allocator-inherited"
+  conclusion is **WITHDRAWN** pending full untruncated commands/stdout/
+  stderr/native statuses. Even a genuine matched split alone would not
+  identify hwloc or rule out allocator defects.
+- Corrected capture requested from the SAME worker; no duplicate lane.
+TRACKER CORRECTIONS: the 8fae2a61e entry's conclusion is superseded by
+this entry; the claim as relayed to Main is also withdrawn. LESSON
+(recurring class): pipeline exit status ≠ child process status; log-tail
+capture ≠ suite completion; tiny logs bind nothing. Claim size must match
+capture quality.
