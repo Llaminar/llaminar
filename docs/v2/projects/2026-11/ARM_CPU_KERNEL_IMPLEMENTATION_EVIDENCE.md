@@ -126,6 +126,96 @@ independent numerical oracle. The new policy test exercises preweight, not an
 actual fused-ticket publication; that unchanged publisher's final finite gate
 is not newly certified by this test. No end-to-end or economy claim follows.
 
+## Native OpenMP entry and pool lifecycle — 2026-11-11
+
+Tracked through integration in [issue #57](https://github.com/Llaminar/llaminar/issues/57).
+
+The saved CPU-plan startup exposed two distinct defects. `763a8e15b` correctly
+retires temporary partition observation before permanent master placement, but
+one-time manual affinities still do not survive native pool shrink/regrowth.
+A local GNU14 runtime experiment installs `[5..9,0..4]` correctly, then shows
+retired workers returning at native places after full → half → one → full.
+The GB10 failure matches that lifecycle: its captured capacity order is
+`19,15..18,5..9,10..14,0..4`; recreated tail workers instead return to `15..19`.
+Every captured CPU's thread-sibling list is a singleton. The withdrawn
+core-id-aliasing and persistent-master-restore interpretations are not evidence.
+
+`274d0cff4` separately repairs the inventory probe's obsolete one-rank ⇒ NUMA-1
+premise. Base discovery already preserves actual locality for a bound single
+rank. The fixture now compares independently sampled pre-discovery NUMA with
+publication; it does not weaken production admission. Source ACK #188 covers
+that bounded test change.
+
+The first native-place candidate `2a4d496fa` was held. Final source
+`e0b7a7c1f` makes preparation private to authenticated original process entry,
+with main-thread, once-only, no-existing-worker and no-active-MPI guards before
+publication. An independently capacity-validated native place table owns worker
+creation and replacement. An initial same-executable exec, when required,
+retains original argv and guardian loans; no admitted model/request is restarted.
+Authored physical native placement remains separate from automatic policy.
+An immutable admission replaces the old manual worker-pool binder.
+
+```mermaid
+flowchart TD
+  A[Original main entry] --> B[Process owner authentication and startup guards]
+  B --> C[Observe admitted rank and native OpenMP places]
+  C --> D{Native automatic policy matches?}
+  D -- Initial launch only --> E[Publish explicit places and exec same application]
+  E --> B
+  D -- Yes --> F[Immutable native admission]
+  F --> G[MPI and inventory initialization]
+  G --> H[Model and request admission]
+  H --> I[Native pool resize and worker replacement]
+```
+
+Source ACK #189/#190 covers `2a4..e0`, including matching-wrong-order rejection,
+recorded GB10 policy replay, foreign/late entry rejection, actual exec failure,
+PID/shared-root identity and usable-loan continuity, cancellation and pre-entry
+worker rejection. It does not authenticate runtime artifacts or certify a backend.
+
+Main independently inspected the capable-host CPU-only GNU14/NEON Integration
+results at exact `e0b7a7c1f`: **eight registered focused tests, eight JUnit
+passes, zero failures/errors/skips**. Both pool and entry-lifecycle raw logs
+contain **400 passes each**. The owner's nested repeat loops exceeded the
+requested 20; this overrun is retained as such, never relabeled twenty or used
+as economy evidence. The local related selection passes six tests, including
+both lifecycle tests repeated twenty times and the recorded-input replay.
+
+Verified host source is clean at the exact revision. Relevant source digests
+match Main; the configured compiler is GNU14, ISA NEON, Integration, CUDA/ROCm
+both disabled. Relevant artifact SHA256 values:
+
+- core: `a9cb029e55d78c263a3f6a879d18fef450ac064aa554fe83545bf070ad2f1898`
+- startup probe: `dddddc2d2afe029dd91d1718b12deb26daec724707f867a1174530744872908f`
+- cluster probe: `32527dac15ca757942f5f65f65b99fb906b591b4300d57c0b14ee3b69c3663cc`
+- fault fixture MODULE: `c6152c4164c518ef6409004d6a0e6edc46bb859c583a326631025faa43834cb9`
+
+The build remains `/home/factory/idea25/build-gb10i-763` despite its newer source;
+folder names are not revision evidence. Actual failed-763 bytes remain under
+`/home/factory/idea25/preserve763`, including old core `09c1b1ef…`; that is not
+the current core. Main also inspected ELF self-directory RUNPATH and the pinned
+Ninja command graph. `CMAKE_EXPORT_COMPILE_COMMANDS` was disabled: the existing
+137-entry JSON is partial and omits changed core files. It is preserved, not
+rewritten or advertised as complete. Read-only export through the configured
+Ninja verifies compiler/source commands for all seven relevant core/probe files.
+
+Raw capable-host results are `/home/factory/idea25/b12-e0/`; Main inspection
+copies are `/tmp/qfn75-e0/` (including source hashes, cache, original partial
+compile database, ELF/image metadata and read-only Ninja graph). The initial
+wrong-directory/no-tests/syntax-error harness and failed `b12-final` results
+remain predecessors. Later owner narratives claiming five tests, absent module
+or old-core identity contradict the actual files and are excluded from binding.
+No driver-diagnostic window was recorded for this CPU-only run; older plan
+windows are not reused as its driver evidence. The run proves no GPU execution,
+full-backend serving, inference correctness, throughput or installed register
+qualification.
+
+This closes focused B12 source maintenance and releases a **source-handover
+base**. Lanes hand over focused evidence plus unverified whole-suite items;
+Main owns one full campaign on the final collection tip. The complete 18-cell ×
+14-alias register/envelope obligation remains. Qualified/SETTLED collection,
+register-coordinator #175/#191, A1/A2 and final integration remain separate.
+
 ## 2026-11-06 immutable4e56 successor audit
 
 Main independently verified the x86 return archive SHA256
