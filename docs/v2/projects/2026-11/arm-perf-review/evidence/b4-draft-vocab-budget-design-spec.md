@@ -115,4 +115,4 @@ Stage greedy-target (Mode G) first on the measured CPU/IQ3_S lane; then Mode C (
 
 ## 9. Fences (restated)
 
-DESIGN RECORD. Implementation and the N-sweep remain FENCED until a separate explicit operator instruction; a spec-faithful review verdict grants no implementation and no economy admission. No tuner/gate apparatus, no new issues/artifacts; tracker-only. Existing B1 diagnostic + single post-campaign rider remain the only approved execution scope.
+DESIGN RECORD. Production-path implementation, the N-sweep, and economy/admission remain FENCED until a separate explicit operator instruction; a spec-faithful review verdict grants no production implementation and no economy admission. The DIAGNOSTIC implementation is AUTHORIZED (operator answer recorded: "Yes — diagnostic authorized"); its scope is validation of the design's claims, not productionization. No tuner/gate apparatus, no new issues/artifacts; tracker-only. Approved execution scope: the B1 diagnostic bench, the single post-campaign greedy rider, and the authorized B4 diagnostic (d7eb73708).
