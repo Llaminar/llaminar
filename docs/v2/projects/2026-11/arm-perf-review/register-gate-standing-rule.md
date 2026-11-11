@@ -166,3 +166,25 @@ The pinned contents do NOT match several reported closures:
 REVIEWER DIRECTIVE: reconcile the SENT PIN vs the CLAIMED TREE before more
 evidence (verify what ab860378b actually contains — possible push/line-up
 mismatch). Source HOLD #175/#191 remains.
+
+### Pin-vs-claims reconciliation (arm-addon, ~03:33Z): findings REAL, no push mismatch
+
+Reconciled ab860378b vs the working tree per the reviewer's directive:
+- The findings are REAL in the pinned content — NO push mismatch.
+- Most severe CONFIRMED: acceptance writer emits schema-2 `artifacts`+
+  `inputs`, publication reader still `.get('digests', {})` → all
+  retained-artifact verification silently vanished; no input seal checked.
+- The lane's "RG3 closed / 9/9 authenticated" claims at ab860378b are
+  QUARANTINED as UNAUTHENTICATED/NOT-ADMISSION; the d4cdcd998-era claims
+  of the same closures were also wrong at that pin (same reader-bug
+  lineage).
+- Fix-back IN PROGRESS, all four classes verbatim: schema-2 reader with
+  strict key/schema fail-closed; post-accept artifact+input mutation
+  controls (stub latest-cell alias mutating the first cell's retained
+  artifact); RG4 replaced with canonical-binding authentication from
+  proof.json's own recorded digests; RG2 attached/split/preload refusals +
+  cache-content no-op configure check + home/cachefile/generator; RG1
+  checked writes/ops with real filesystem-failure injection
+  (directory-shaped targets) + retention source-vs-copy digests.
+- Corrected successor SHA to follow when green; final campaign/re-pin stay
+  on Main's source-handover base notice.
