@@ -301,3 +301,18 @@ error (station driver issue — installing nsys cannot fix it); if the smoke
 test attaches cleanly, the profiler-safety HOLD lifts for nsys-specific
 use and idea 25's 15-min prefill trace rerun is UNBLOCKED (still scheduled
 after the B12 window to avoid host contention).
+
+### NSYS SMOKE TEST CLEAN (arm-sparks, ~04:51Z) — nsys-specific HOLD LIFTS
+
+- nsys 2025.3.2.474 ALREADY PRESENT in the uma4 image (no install needed;
+  the operator's install directive is satisfied by the existing tag).
+- Smoke: trivial vectorAdd (nvcc sm_121, exit 0) → direct run ok 3069.0
+  (exit 0) → `nsys profile -o smoke ./va` = NSYS_PROFILE=0, report
+  generated (1/1 100%); refcnt/NVRM/error grep = 0 hits.
+- VERDICT: nsys attach works on this host/driver as of now — the
+  nsys-specific profiler HOLD LIFTS; idea-25's 15-min prefill trace rerun
+  UNBLOCKS (scheduled post-FF per the queue).
+- SCOPE NOTE: the earlier NVRM refcntRequestReference_IMPL warnings came
+  from the NCU-attachment path (Main's final2 window) — NCU remains a
+  SEPARATE question; nothing here clears it.
+- Artifacts: .79 /home/factory/idea25/nsys-smoke/ + nsys-smoke-run.log.
