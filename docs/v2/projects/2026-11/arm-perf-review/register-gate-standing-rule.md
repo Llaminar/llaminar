@@ -188,3 +188,21 @@ Reconciled ab860378b vs the working tree per the reviewer's directive:
   (directory-shaped targets) + retention source-vs-copy digests.
 - Corrected successor SHA to follow when green; final campaign/re-pin stay
   on Main's source-handover base notice.
+
+### #175 RE-PIN delivered: 53461e5bc on 880429059 (arm-addon, ~04:28Z)
+
+Mechanical re-rebase of the combined candidate onto the SOURCE-HANDOVER
+BASE 880429059. Push force-with-lease pinned to ab860378b. **Range-diff
+13/13 `=`** (21c282da9 … b651f89ac, 53461e5bc) — no conflicts, no
+placement/native-place file overlap; authorship preserved. Focused
+evidence (owner report, NOT admission): coordinator regression 12/12 OK
+device-free; hardened coordinator 9/9 publication=authenticated (run
+predates the #191 fix-back; the #191 driver changes ride in 53461e5bc).
+Unverified-at-lane for Main's ONE collection campaign: 18×14 canonical
+receipts at the final pin, portability matrix, full preflight,
+Linux/GNU-14 Integration execution of the new registration. #191 source
+HOLD unaffected by the re-pin (the comprehensive fix-back review is
+pending; ab860378b content = 53461e5bc content, range-diff `=` 13/13 —
+verdict transfer is the reviewer's call). ctest -N inventory unchanged
+from reviewer-pinned content. No FF until Main's 18×14 current-binding
+acceptance.
