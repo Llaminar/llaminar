@@ -433,3 +433,24 @@ from printed evidence only; suspected mechanisms wait for their predicate.
   got cpu 15 where 0 was expected (plus the captured full vector) — its
   CAUSE (not which predicate) remains open.
 - No further changes/qualification claims pending the diagnosis.
+
+### NEW MECHANISM EVIDENCE (Main local experiment, ~01:57Z) — libgomp pool recreation
+
+Standalone GNU-14/OpenMP actual-scheduler experiment (NOT production
+qualification; 10 cores permuted [5..9, 0..4]):
+- First full team / masks CORRECT.
+- **full → half → 1 → FULL causes libgomp to RECREATE the retired tail
+  workers at their ORIGINAL places [5..9], duplicating the fast prefix** —
+  manual once-only sched_setaffinity is NOT persistent across pool resize.
+- Matches the .79 tail pattern EXACTLY: worker positions 10–14 coincide
+  with expected slow 10–14 (native places), while 15–19 RESET to fast
+  15–19 instead of expected slow 0–4 — i.e., the recreated tail lands on
+  native OMP places, not the manually-affinitized ones.
+- Implication: the 763 stale-restore fix can be CORRECT (master placement
+  preserved) AND EXPOSE a latent pool-recreation bug — the width-20
+  failure may be the LAST full team, not the first (the current diagnostic
+  lacks phase ordinal).
+- Required fix direction: **pre-exec ordered OpenMP places / native
+  authority** (binding established at spawn via OMP places, not a wait
+  policy or hot-path rebinding).
+- Constraints: no .79 rerun, no model/env workaround.
