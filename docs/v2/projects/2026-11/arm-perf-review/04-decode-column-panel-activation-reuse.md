@@ -208,3 +208,20 @@ in the plan. Any NibbleMap touch points must remain seam-based.
   (5.0s vs 0.44s fail) = WSL 'env' failure FIXED by the ARM-tip NUMA commits
   (real improvement). Base 29351a57e x86 gate: GREEN. R2 = ALL GATES COMPLETE
   -> handover doc to Main (lane). WSL disclosure: late reporting, no infra.
+
+### Lane-2 residual candidate (addon plan, ~11:10Z): M=1 activation-reload headroom
+
+Documented open observation: M=1 decode saturates ~8 threads and Q8_K
+regresses 2.96× at 10 threads (00-measured-baseline). C4 widened N panels,
+but candidate-2 (32-byte activation payload loaded ONCE per block +
+lane-indexed dot + per-panel metadata reuse) was only partially realized —
+consume()/consumePair() still walk strips with per-strip activation
+reloads. Plan: M=1 decode economy window (Q8_K/Q8_0/Q4_K, threads
+1/10/20, baseline shapes, ABBA) at bb893cd79 to quantify the
+activation-reuse headroom; if the window shows the bandwidth/reload
+signal → implement load-once-per-block + vdotq_laneq activation feeding
+per panel with byte-auth vs serial, panel tails, register witness (Rows=1
+zero spills, budgets only down), tournament before/after. The Ops seam
+stays encoding-agnostic for the MXFP4 lane. NOTE: ideas 03/04/11 are
+ADDRESSED in the tracker (R1/R2 lands) — the Lane-2 "successor scope" was
+based on a stale index; the true residual is this idea-04 observation.

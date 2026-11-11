@@ -36,15 +36,15 @@ references are as of the head above and may drift.
 |---|---|---|---|
 | 1 | Local kernel-benchmark A/B harness | `01-local-benchmark-harness.md` | Partial (Perf__ suite exists for projection; gaps below) |
 | 2 | Shared CPU/GPU (UMA) memory admission | `02-uma-shared-memory-admission.md` | Partial (joint pool implemented `80985c08e`; live GB10 page-cache admission gap open) |
-| 3 | Move projection metadata validation out of the K loop | `03-projection-metadata-validation-hoist.md` | Open |
-| 4 | Wider decode column panel + activation reuse | `04-decode-column-panel-activation-reuse.md` | Open |
+| 3 | Move projection metadata validation out of the K loop | `03-projection-metadata-validation-hoist.md` | Addressed (R1 `5d4e3716a` + P2 hardening; evidence complete) |
+| 4 | Wider decode column panel + activation reuse | `04-decode-column-panel-activation-reuse.md` | Addressed (R2 C4 `8fcc0fe0b` + tournament); residual open: M=1 activation-reload headroom (Lane-2 candidate) |
 | 5 | Heterogeneous (X925/A725) core scheduling | `05-heterogeneous-core-scheduling.md` | Partial (dynamic tile claiming; task-count-dependent placement evidence; typed policy pending) |
 | 6 | I8MM (SMMLA) row-pair dot-product | `06-i8mm-row-pair-dot.md` | Implemented + measured (kernel 1.01–1.19, engine +1.3–1.7%, M=1 guard holds, no spills; Q6_K ~0 gain; tip cd55f6b27) |
 | 7 | Hot-path allocation / cache cleanup (RoPE, RMSNorm, gamma TLS) | `07-hot-path-allocation-cleanup.md` | Bundle-1 proven (graded BOUND on 28ddbe253; awaiting combined FF) |
 | 8 | ARM prepared-weight layout (drop dead compensation bytes, compact expansions) | `08-arm-prepared-weight-layout.md` | Open (Phase A plan approved + GO; window queued post-FF) |
 | 9 | Non-volatile rounding barrier evidence | `09-rounding-barrier-evidence.md` | Open (evidence required first) |
 | 10 | FP32 RMSNorm scalar sum order + sanitizer warnings (issue #36) | `10-rmsnorm-fp32-sumsq-order.md` | Addressed (`3086894b5`, `ac3289bd9`); residuals listed |
-| 11 | Attention validation hoist + integer-dot range proof | `11-attention-validation-and-integer-dot-range.md` | Open |
+| 11 | Attention validation hoist + integer-dot range proof | `11-attention-validation-and-integer-dot-range.md` | Addressed (R2 C2c + Q16 bound; evidence complete) |
 | 12 | Cache-topology-derived tiling / prefetch on GB10 | `12-cache-topology-tiling.md` | Addressed (overlay table retired `264970e14` after head A/B confirmed regression; methodology in idea 20) |
 | 13 | Fewer OpenMP regions per decode step | `13-openmp-region-count-and-wakeup.md` | Partial (spin `27585692d` + verified bundle `408ff90e5`; remaining regions open) |
 | 14 | Dense-model MTP verifier economics (27B) | `14-dense-mtp-verifier-economics.md` | Base-dependent (new base: MTP wins 5.45–5.55 vs 5.28; B-wave depth tuning booked: first post-FF window) |
