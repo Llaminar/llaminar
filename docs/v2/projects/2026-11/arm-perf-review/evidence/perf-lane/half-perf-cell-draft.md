@@ -289,3 +289,23 @@ known-slow control), M=1, shapes 512×2048/2048×4096/17408×5120, threads
 OMP_PROC_BIND=close, bb893cd79 Release NEON. Decision gate: the Q8_K
 10-thread regression signal + per-strip activation touch counts decide
 the load-once-per-block + lane-indexed-dot successor.
+
+### Step-2 window script staged + queued (arm-addon, ~11:25Z)
+
+Script: /Users/floriankinder/repo/arm-addon-notes/window-m1-activation.sh
+(window-r1.sh protocol). Design approved as-is: SINGLE bb893cd79 Release
+NEON_I8MM build; TWO reps per cell (no candidate yet — implementation
+gated ON this window; successor gets its own ABBA); harness
+v2_perf_cpu_native_quantised_thread_scaling with FORMATS=all (unknown
+labels fatal); three baseline shapes isolated + one all-shapes sweep each
+r1/r2; THREADS=1,2,4,8,10,12,16,20; N=1; WARMUP=5 ITERS=31;
+OMP_PLACES=cores OMP_PROC_BIND=close. DECISION METRICS (script header):
+(a) Q8_K 10-thread regression (2.96×) present/gone; (b) per-encoding
+thread-saturation knee at M=1; (c) per-width ms/iter curves sizing the
+activation-reuse win (4-strip panel = 4× touch amplification + per-strip
+metadata recompute; load-once-per-block + vdotq_laneq removes both). Est.
+20-40 min; outputs /work/build/results/w-m1act-<ts>/. QUEUED with
+arm-sparks BEHIND the Main campaign — preferred slot .80 post-campaign
+(disk-safe); alternative .79 post-trace only if the Release build fits
+the 66G budget (sparks' disk call). Model-inference window: protected
+from interruption once started.
