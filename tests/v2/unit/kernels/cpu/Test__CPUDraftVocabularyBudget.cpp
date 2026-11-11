@@ -11,37 +11,42 @@
  * Test__CPUDraftVocabularyBudgetHead.cpp under the architecture
  * registration boundary.
  *
- * Reviewer-findings round (209/210) repaired here:
- * - D1: the sweep-mechanics test admits the non-aligned budgets and
- *   asserts the V-boundary rejections instead of skipping them; the
- *   selector backfill is defined (see below); the threshold-endpoint
- *   fixture uses a strictly interior threshold; the wrong-q negative is
- *   detected through the executed production sampler, not the idealized
- *   law (which is invariant for any qS, as the rejection theorem says).
- * - D2: the Mode P replay calls the PRODUCTION rejection sampler
- *   (`sampleMTPRejectionRowFromDistributions`), whose residual draw takes
- *   its own independent threshold — the reused-uniform bias is gone by
- *   construction; the EXECUTED sampler is enumerated (the enumeration
-   * calls the production helper per threshold bin), so the law check
- *   exercises the executed procedure, and the disjoint-support and
- *   omitted-residual cases use real PMFs.
- * - D4: selector observations carry verified receipts (source row,
- *   logical position, request generation); observations are appended and
- *   validated (stale position/generation throws; no silent merge); the
- *   cold-start fallback is an explicitly admitted selector policy, not an
- *   error rescue; builders enforce validation.
- * - D5: Modes G and C call the production coupling helpers
- *   (`sampleMTPSerialEquivalentTargetRow` with position-keyed thresholds)
- *   against independent authored fixtures; Mode G's tie-break selects the
- *   lowest global token ID.
+ * Reviewer-findings rounds (209/210, then 217 A1-A5) repaired here:
+ * - A1/D1: the selector is the FINAL named committed-token recency
+ *   selector (CommittedTokenRecencySelector, version 1, matching spec
+ *   §3); observations carry VERIFIED RECEIPTS validated against the
+ *   commit frontier and the owning request epoch (stale positions,
+ *   foreign epochs, duplicates, out-of-range tokens: all rejected); the
+ *   shortlist DEDUPLICATES to freshest observations, orders by commit
+ *   position descending, CAPS to N, and backfills unranked live IDs in
+ *   ascending global-ID order; the cold-start fallback is an explicitly
+ *   ADMITTED policy; reset rebinds the request epoch; the tests assert
+ *   every rejection.
+ * - D2/A3: the Mode P replay calls the PRODUCTION
+ *   sampleMTPRejectionRowFromDistributions (independent residual
+ *   threshold); the EXECUTED sampler is enumerated exactly over dyadic
+ *   threshold bins with FULLY DYADIC fixtures (the finite-precision
+ *   contract for non-dyadic PMFs is out of scope, claimed nowhere); the
+ *   wrong-CORRECTION negative keeps p and the proposal draw fixed and
+ *   supplies a different correction distribution to the production
+ *   helper — the executed law deviates and is DETECTED; the
+ *   invalid-PMF/under-coverage negative is rejected by the draw-side
+ *   PMF validation; the threshold-endpoint fixture is restored.
+ * - D5/A5 boundaries (explicit): Mode C replays the production helper
+ *   with SUPPLIED thresholds (no seed-to-threshold addressing, no
+ *   connected multi-N selector/head path — production wiring, out of
+ *   scope); Mode G is the diagnostic's own harness implementation of the
+ *   Mode G contract (no production helper call; production wiring
+ *   untouched) with the tie-break at the LOWEST global token ID and an
+ *   authored independent target stream.
  * - S1 (hard): the seeded target tokens are identical across budgets —
  *   asserted through the production helper with per-position thresholds.
  * - S6: nothing here grants implementation, N-sweep execution or economy
  *   admission; the sweep-mechanics check constructs runtime descriptors
  *   only.
  *
- * What remains UNPROVED here (claimed nowhere): counted traffic, a real
- * multi-N device sweep, the 63/65/127/129/V-1 byte sweeps, partial-window
+ * What remains UNPROVED here (claimed nowhere): counted device traffic, a
+ * real multi-N device sweep, the 63/65/127/129/V-1 byte sweeps, partial-window
  * production replay, and the normalized-logit draw on the real head —
  * the NEON head TU covers the byte-proof side within its stated scope.
  */
@@ -195,23 +200,31 @@ namespace b4_diagnostic
     };
 
     /**
-     * @brief Versioned causal selector over verified target receipts.
+     * @brief Selector v1: COMMITTED-TOKEN RECENCY (spec §3) over verified
+     *        target receipts.
      *
-     * Observations are APPENDED and validated: a receipt whose position or
-     * generation is older than the ledger's high-water mark is stale and
-     * rejected (the spec's stale-generation hard failure); there is no
-     * silent merge. The cold-start fallback is an explicitly admitted
-     * selector policy (SelectorFallback), never an error rescue. The
+     * The candidate set is the recency set of COMMITTED target tokens.
+     * Observations are APPENDED and validated: a receipt whose position is
+     * below the commit frontier, whose request generation differs from the
+     * owning epoch, or that duplicates the frontier position is rejected —
+     * there is no silent merge. The cold-start fallback is an explicitly
+     * ADMITTED selector policy (SelectorFallback::LowestGlobalIds), never
+     * an error rescue. Shortlist construction: deduplicate to each token's
+     * freshest observation, order by commit position descending (the
+     * request generation serves identity/staleness only, never ordering),
+     * then lowest global token ID; take the first N distinct IDs; backfill
+     * the remaining budget with unranked live IDs in ascending global-ID
+     * order; |S| = min(N, live vocabulary), reported by the caller. The
      * selector's only inputs are verified receipts and the vocabulary
      * bound — no current-logit or full-head input exists in the interface,
      * so a lookahead selector is unrepresentable here.
      */
-    class PriorRankingSelector
+    class CommittedTokenRecencySelector
     {
     public:
-        static constexpr std::uint32_t kVersion = 2;
+        static constexpr std::uint32_t kVersion = 1;
 
-        explicit PriorRankingSelector(std::uint32_t vocab,
+        explicit CommittedTokenRecencySelector(std::uint32_t vocab,
             SelectorFallback fallback)
             : vocab_(vocab), fallback_(fallback)
         {
@@ -219,13 +232,13 @@ namespace b4_diagnostic
                 throw std::invalid_argument("selector vocabulary is empty");
         }
 
-        /** @brief Reset/prefix: the ledger clears to the initial state. */
-        void reset()
+        /** @brief Reset/prefix: the ledger clears; the epoch rebinds. */
+        void reset(std::uint64_t request_epoch)
         {
             ledger_.clear();
-            high_water_position_ = 0;
-            high_water_generation_ = 0;
-            has_high_water_ = false;
+            commit_frontier_ = 0;
+            has_frontier_ = false;
+            request_epoch_ = request_epoch;
         }
 
         /**
@@ -241,35 +254,33 @@ namespace b4_diagnostic
             if (receipt.source_row >= vocab_)
                 throw std::invalid_argument(
                     "selector observed an out-of-range token");
-            if (has_high_water_ &&
-                (receipt.position < high_water_position_ ||
-                    receipt.generation < high_water_generation_))
+            // The receipt must carry the selector's owning request epoch.
+            if (receipt.generation != request_epoch_)
                 throw std::invalid_argument(
-                    "stale selector receipt: position or generation below "
-                    "the ledger high-water mark");
-            if (has_high_water_ &&
-                receipt.position == high_water_position_ &&
-                receipt.generation == high_water_generation_ &&
-                observed_at_high_water_)
+                    "stale selector receipt: foreign request epoch");
+            if (has_frontier_ && receipt.position < commit_frontier_)
                 throw std::invalid_argument(
-                    "duplicate selector receipt at the high-water position");
+                    "stale selector receipt: position below the commit "
+                    "frontier");
+            if (has_frontier_ && receipt.position == commit_frontier_)
+                throw std::invalid_argument(
+                    "duplicate selector receipt at the commit frontier");
             ledger_.push_back(receipt);
-            high_water_position_ = receipt.position;
-            high_water_generation_ = receipt.generation;
-            observed_at_high_water_ = true;
+            commit_frontier_ = receipt.position;
+            has_frontier_ = true;
         }
 
         /**
          * @brief Build the shortlist for the next draft position.
          *
-         * Ordering: latest verified rank first (rank ascending), then the
-         * freshest observation (position/generation descending), then the
-         * lowest global ID. When the admitted fallback is configured and
-         * the ledger is empty, the deterministic cold start is the lowest
-         * global IDs; with no admitted fallback an empty ledger is an
-         * error (no rescue). Unranked live IDs backfill the remaining
-         * budget in ascending global-ID order (the declared eligibility
-         * semantics), so |S| = min(N, live vocabulary).
+         * Deduplicate the ledger to each token's freshest observation,
+         * order by commit position descending (then lowest global token
+         * ID), take the first N distinct IDs, and backfill the remaining
+         * budget with unranked live IDs in ascending global-ID order;
+         * |S| = min(N, live vocabulary). When the admitted fallback is
+         * configured and the ledger is empty, the deterministic cold start
+         * is the lowest global IDs; with no admitted fallback an empty
+         * ledger is an error (no rescue).
          */
         std::vector<std::uint32_t> shortlist(const VocabBudget &budget) const
         {
@@ -277,11 +288,32 @@ namespace b4_diagnostic
                 throw std::invalid_argument(
                     "selector shortlist is not applicable to full");
             validateBudget(budget, vocab_);
-            std::vector<std::uint32_t> ids;
+            std::map<std::uint32_t, const VerifiedTargetReceipt *> freshest;
             for (const VerifiedTargetReceipt &receipt : ledger_)
-                if (std::find(ids.begin(), ids.end(), receipt.source_row) ==
-                    ids.end())
-                    ids.push_back(receipt.source_row);
+            {
+                auto it = freshest.find(receipt.source_row);
+                if (it == freshest.end() ||
+                    it->second->position < receipt.position)
+                    freshest[receipt.source_row] = &receipt;
+            }
+            std::vector<const VerifiedTargetReceipt *> ordered;
+            ordered.reserve(freshest.size());
+            for (const auto &entry : freshest)
+                ordered.push_back(entry.second);
+            std::sort(ordered.begin(), ordered.end(),
+                [](const VerifiedTargetReceipt *a,
+                    const VerifiedTargetReceipt *b) {
+                    if (a->position != b->position)
+                        return a->position > b->position;
+                    return a->source_row < b->source_row;
+                });
+            std::vector<std::uint32_t> ids;
+            for (const VerifiedTargetReceipt *receipt : ordered)
+            {
+                if (ids.size() >= budget.n)
+                    break;
+                ids.push_back(receipt->source_row);
+            }
             if (ids.size() < budget.n)
             {
                 if (fallback_ != SelectorFallback::LowestGlobalIds)
@@ -293,22 +325,18 @@ namespace b4_diagnostic
                     if (std::find(ids.begin(), ids.end(), id) == ids.end())
                         ids.push_back(id);
             }
-            if (ids.size() < budget.n)
-                throw std::invalid_argument(
-                    "B4 live |S| below the checked budget without backfill");
             return ids;
         }
 
-        std::uint32_t version() const { return kVersion; }
+                std::uint32_t version() const { return kVersion; }
 
     private:
         std::uint32_t vocab_ = 0;
         SelectorFallback fallback_ = SelectorFallback::None;
         std::vector<VerifiedTargetReceipt> ledger_;
-        std::uint64_t high_water_position_ = 0;
-        std::uint64_t high_water_generation_ = 0;
-        bool has_high_water_ = false;
-        bool observed_at_high_water_ = false;
+        std::uint64_t commit_frontier_ = 0;
+        std::uint64_t request_epoch_ = 0;
+        bool has_frontier_ = false;
     };
 
     // =====================================================================
@@ -431,51 +459,66 @@ TEST(CPUDraftVocabularyBudget, PolicyValidatorsRejectSpecNegatives)
 TEST(CPUDraftVocabularyBudget, SelectorLifetimeIsEnforcedWithReceipts)
 {
     const b4_diagnostic::DraftProposalPolicy policy{1,
-        b4_diagnostic::PriorRankingSelector::kVersion,
+        b4_diagnostic::CommittedTokenRecencySelector::kVersion,
         b4_diagnostic::SelectorFallback::LowestGlobalIds,
         b4_diagnostic::DrawLaw::DeltaOnShortlist,
         b4_diagnostic::VocabBudget::shortlist(4)};
-    b4_diagnostic::PriorRankingSelector selector(64,
+    b4_diagnostic::CommittedTokenRecencySelector selector(64,
         policy.selector_fallback);
+    selector.reset(/*request_epoch=*/7);
     const auto &budget = policy.vocab_budget;
 
     // First proposal: empty ledger + ADMITTED fallback -> cold start.
     auto first = selector.shortlist(budget);
     EXPECT_EQ((std::vector<std::uint32_t>{0, 1, 2, 3}), first);
 
-    // Verified receipts append with position/generation validation.
-    selector.observeVerifiedTarget({50, 0, 1, 0});
-    selector.observeVerifiedTarget({17, 1, 1, 0});
-    selector.observeVerifiedTarget({3, 2, 2, 0});
-    selector.observeVerifiedTarget({41, 3, 2, 0});
+    // Verified receipts append with position validation; every receipt
+    // carries the owning request epoch (7). Positions advance
+    // monotonically within the request.
+    selector.observeVerifiedTarget({50, /*position=*/0, /*generation=*/7, 0});
+    selector.observeVerifiedTarget({17, 1, 7, 0});
+    selector.observeVerifiedTarget({3, 2, 7, 0});
+    selector.observeVerifiedTarget({41, 3, 7, 0});
     auto ranked = selector.shortlist(budget);
-    EXPECT_EQ((std::vector<std::uint32_t>{50, 17, 3, 41}), ranked);
+    // Freshness ordering: commit position descending.
+    EXPECT_EQ((std::vector<std::uint32_t>{41, 3, 17, 50}), ranked);
 
-    // A stale receipt (position below the high-water mark) is rejected.
-    EXPECT_THROW(selector.observeVerifiedTarget({7, 0, 0, 0}),
+    // A foreign request epoch is rejected (stale generation control).
+    EXPECT_THROW(selector.observeVerifiedTarget({7, 4, /*generation=*/8, 0}),
         std::invalid_argument);
-    // A stale generation is rejected.
-    EXPECT_THROW(selector.observeVerifiedTarget({7, 1, 1, 0}),
+    // A stale receipt (position below the commit frontier) is rejected.
+    EXPECT_THROW(selector.observeVerifiedTarget({7, 2, 7, 0}),
         std::invalid_argument);
-    // A duplicate receipt at the high-water position is rejected.
-    EXPECT_THROW(selector.observeVerifiedTarget({7, 1, 2, 0}),
+    // A duplicate receipt at the commit frontier is rejected.
+    EXPECT_THROW(selector.observeVerifiedTarget({7, 3, 7, 0}),
         std::invalid_argument);
     // An out-of-range token is rejected.
-    EXPECT_THROW(selector.observeVerifiedTarget({64, 1, 3, 0}),
+    EXPECT_THROW(selector.observeVerifiedTarget({64, 4, 7, 0}),
         std::invalid_argument);
 
-    // Newest rank is authoritative after fresh evidence.
-    selector.observeVerifiedTarget({3, 0, 3, 0});
+    // A fresh receipt (position past the frontier, same epoch) commits
+    // and its token leads the freshness order.
+    selector.observeVerifiedTarget({3, 4, 7, 0});
     auto third = selector.shortlist(budget);
     EXPECT_EQ(3u, third.front());
 
-    // Reset/prefix: the ledger clears to the initial (fallback) state.
-    selector.reset();
+    // Backfill: with budget N=6 the two unranked live IDs backfill in
+    // ascending global-ID order after the ranked prefix.
+    const auto wide = b4_diagnostic::VocabBudget::shortlist(6);
+    auto backfilled = selector.shortlist(wide);
+    EXPECT_EQ((std::vector<std::uint32_t>{3, 41, 17, 50, 0, 1}), backfilled);
+
+    // Reset/prefix: the ledger clears, the epoch rebinds, the fallback
+    // state returns.
+    selector.reset(/*request_epoch=*/9);
     auto after_reset = selector.shortlist(budget);
     EXPECT_EQ((std::vector<std::uint32_t>{0, 1, 2, 3}), after_reset);
+    // A receipt from the OLD epoch is now foreign and rejected.
+    EXPECT_THROW(selector.observeVerifiedTarget({5, 5, 7, 0}),
+        std::invalid_argument);
 
     // Without the admitted fallback an empty ledger is an error.
-    b4_diagnostic::PriorRankingSelector strict(64,
+    b4_diagnostic::CommittedTokenRecencySelector strict(64,
         b4_diagnostic::SelectorFallback::None);
     EXPECT_THROW(strict.shortlist(budget), std::invalid_argument);
 }
@@ -604,15 +647,26 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
 {
     // Mode P replayed through the PRODUCTION rejection sampler
     // (`sampleMTPRejectionRowFromDistributions`): the residual draw takes
-    // its own independent threshold, so the executed sampler is unbiased.
-    // The executed law is enumerated exactly over threshold bins: dyadic
-    // probabilities and power-of-two bin counts keep every comparison
-    // exact in double precision.
+    // its own independent threshold. The executed law is enumerated
+    // EXACTLY over dyadic threshold bins: every fixture below uses dyadic
+    // probabilities (halves/quarters/eighths/sixteenths) so every CDF
+    // boundary lands on a bin edge and each bin's outcome is constant —
+    // the enumeration is an exact proof for these fixtures, not an
+    // approximation. Non-dyadic PMFs are intentionally excluded: the
+    // finite-precision contract for them is a production-sampler question
+    // this diagnostic does not claim.
     const auto enumerate = [](const std::vector<double> &p,
-                              const std::vector<double> &draft_q,
-                              const std::vector<double> &target_cdf_override =
-                                  {}) {
+                              const std::vector<double> &draft_q) {
         const std::size_t vocab = p.size();
+        double q_total = 0.0;
+        for (const double mass : draft_q)
+            q_total += mass;
+        // The draw-side PMF must be complete: an incomplete draft PMF is
+        // the invalid-PMF negative, rejected precisely (no silent leftover
+        // mass assigned to the last token).
+        if (std::abs(q_total - 1.0) > 0.0)
+            throw std::invalid_argument(
+                "draft PMF does not sum to one (invalid PMF negative)");
         std::vector<llaminar2::SamplingDistributionEntry> target;
         for (std::size_t id = 0; id < vocab; ++id)
             target.push_back({static_cast<std::int32_t>(id),
@@ -627,8 +681,6 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
         {
             const double draw_u =
                 (static_cast<double>(draw_bin) + 0.5) / kBins;
-            // Locate the drafted token by enumerating the draft CDF at the
-            // bin midpoint (the executed proposal draw).
             double cumulative = 0.0;
             std::int32_t drafted = static_cast<std::int32_t>(vocab - 1);
             for (std::size_t id = 0; id < vocab; ++id)
@@ -665,14 +717,14 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
         return realized;
     };
 
+    // Fully dyadic fixtures (the exactness contract above).
     const std::vector<double> p = {0.5, 0.25, 0.125, 0.125};
 
     // q = p over the full support.
     {
         const auto realized = enumerate(p, p);
         for (std::size_t id = 0; id < p.size(); ++id)
-            EXPECT_NEAR(p.at(id), realized.at(id), 1e-9)
-                << "q=p, token " << id;
+            EXPECT_DOUBLE_EQ(p.at(id), realized.at(id)) << "q=p, token " << id;
     }
 
     // One-hot q: accepted mass min(p(0), 1) = p(0); the production
@@ -681,67 +733,98 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
         const std::vector<double> q = {1.0, 0.0, 0.0, 0.0};
         const auto realized = enumerate(p, q);
         for (std::size_t id = 0; id < p.size(); ++id)
-            EXPECT_NEAR(p.at(id), realized.at(id), 1e-9)
+            EXPECT_DOUBLE_EQ(p.at(id), realized.at(id))
                 << "one-hot q, token " << id;
     }
 
     // Real disjoint-support PMF: the draft lives entirely where p has no
-    // mass (tokens 2,3 hold the draft mass; p holds 0,1). The production
-    // residual must cover p's support exactly.
+    // mass; the production residual must cover p's support exactly.
     {
         const std::vector<double> p_disjoint = {0.5, 0.5, 0.0, 0.0};
-        const std::vector<double> q_disjoint = {0.0, 0.0, 0.6, 0.4};
+        const std::vector<double> q_disjoint = {0.0, 0.0, 0.75, 0.25};
         const auto realized = enumerate(p_disjoint, q_disjoint);
         for (std::size_t id = 0; id < p_disjoint.size(); ++id)
-            EXPECT_NEAR(p_disjoint.at(id), realized.at(id), 1e-9)
+            EXPECT_DOUBLE_EQ(p_disjoint.at(id), realized.at(id))
                 << "disjoint support, token " << id;
     }
 
-    // A valid zero probability inside the support: p(3) = 0 while the
-    // draft may still propose it (rejected into the residual).
+    // A valid zero probability inside the support.
     {
         const std::vector<double> p_zero = {0.5, 0.25, 0.25, 0.0};
         const std::vector<double> q = {0.25, 0.25, 0.25, 0.25};
         const auto realized = enumerate(p_zero, q);
         for (std::size_t id = 0; id < p_zero.size(); ++id)
-            EXPECT_NEAR(p_zero.at(id), realized.at(id), 1e-9)
+            EXPECT_DOUBLE_EQ(p_zero.at(id), realized.at(id))
                 << "valid zero probability, token " << id;
     }
 
-    // The wrong-q negative: a draft distribution that is NOT the truthful
-    // shortlisted qS changes the executed law — the enumeration DETECTS
-    // it (this is the executed-procedure check the idealized law could
-    // not provide).
+    // A3 negative, repaired: keep p AND the actual valid proposal draw
+    // fixed (the truthful dyadic draft supplies the draw), then supply
+    // the WRONG CORRECTION distribution to the production helper — the
+    // helper's accept ratio and residual are computed against THAT
+    // distribution, so the executed law deviates from p and the
+    // enumeration DETECTS it. (Replacing a truthful draft with another
+    // truthful draft would be a pass by theorem — the mismatched
+    // correction is the operation under test.)
     {
-        const std::vector<double> truthful_q = {0.4, 0.3, 0.3, 0.0};
-        const auto truthful = enumerate(p, truthful_q);
+        const std::vector<double> truthful_draft = {0.25, 0.25, 0.25, 0.25};
+        const auto truthful = enumerate(p, truthful_draft);
         for (std::size_t id = 0; id < p.size(); ++id)
-            EXPECT_NEAR(p.at(id), truthful.at(id), 1e-9)
-                << "truthful qS, token " << id;
-        const std::vector<double> wrong_q = {0.4, 0.3, 0.25, 0.05};
-        const auto realized = enumerate(p, wrong_q);
+            EXPECT_DOUBLE_EQ(p.at(id), truthful.at(id))
+                << "truthful draft, token " << id;
+        // The wrong-correction construction: the proposal draw stays the
+        // truthful dyadic draw, but the correction distribution supplied
+        // to the production helper is a DIFFERENT dyadic distribution
+        // (its accept ratio p(y)/q_wrong(y) and its residual
+        // [p - q_wrong]+ are the wrong ones for this proposal stream).
+        const std::vector<double> wrong_correction = {0.125, 0.125, 0.25,
+            0.5};
+        const auto realized = enumerate(p, wrong_correction);
         bool differs = false;
         for (std::size_t id = 0; id < p.size(); ++id)
-            if (std::abs(p.at(id) - realized.at(id)) > 1e-6)
+            if (std::abs(p.at(id) - realized.at(id)) > 0.0)
                 differs = true;
         EXPECT_TRUE(differs)
-            << "the wrong-q negative must change the executed law";
+            << "the wrong-correction negative must change the executed law";
     }
 
-    // The omitted-residual negative is a property of the EXECUTED
-    // procedure: a draft distribution whose accepted mass leaves p
-    // uncovered cannot be repaired by the production residual (which
-    // computes [p - qS]+); the enumeration shows the law deviation for a
-    // draft that under-covers while claiming q = p.
+    // The invalid-PMF negative: an under-covering draft (sums to 0.8) is
+    // rejected precisely by the draw-side validation (no silent leftover
+    // mass assigned to the last token).
     {
-        const std::vector<double> undercoverage_q = {0.2, 0.2, 0.2, 0.2};
-        const auto realized = enumerate(p, undercoverage_q);
-        bool differs = false;
-        for (std::size_t id = 0; id < p.size(); ++id)
-            if (std::abs(p.at(id) - realized.at(id)) > 1e-6)
-                differs = true;
-        EXPECT_TRUE(differs)
-            << "an under-covering draft must deviate from the target law";
+        const std::vector<double> undercoverage = {0.2, 0.2, 0.2, 0.2};
+        EXPECT_THROW(enumerate(p, undercoverage), std::invalid_argument);
+    }
+
+    // Threshold endpoints (restored fixture): the production helper's
+    // clamp_unit_threshold maps 0 -> the smallest admissible threshold and
+    // 1 -> certainty. With q = delta on token 0 and p(0) = 0.5: the accept
+    // probability is 0.5, so a threshold strictly below 0.5 accepts and a
+    // threshold at or above 0.5 rejects into the residual.
+    {
+        const auto below = llaminar2::sampleMTPRejectionRowFromDistributions(
+            std::vector<llaminar2::SamplingDistributionEntry>{
+                {0, 0.5f}, {1, 0.25f}, {2, 0.125f}, {3, 0.125f}},
+            std::vector<llaminar2::SamplingDistributionEntry>{
+                {0, 1.0f}, {1, 0.0f}, {2, 0.0f}, {3, 0.0f}},
+            0, 0.25f, 0.5f);
+        EXPECT_TRUE(below.ok);
+        // accept_threshold 0.25 < accept_probability 0.5 -> accepted draft.
+        EXPECT_TRUE(below.accepted);
+        EXPECT_EQ(0, below.token);
+        const auto above = llaminar2::sampleMTPRejectionRowFromDistributions(
+            std::vector<llaminar2::SamplingDistributionEntry>{
+                {0, 0.5f}, {1, 0.25f}, {2, 0.125f}, {3, 0.125f}},
+            std::vector<llaminar2::SamplingDistributionEntry>{
+                {0, 1.0f}, {1, 0.0f}, {2, 0.0f}, {3, 0.0f}},
+            0, 0.5f, 0.5f);
+        EXPECT_TRUE(above.ok);
+        // accept_threshold 0.5 is NOT below 0.5 -> rejected; the residual
+        // threshold 0.5 over [p - q]+ = {0, .25, .125, .125}: the CDF
+        // reaches 0.25 at token 1, 0.375 at token 2, 0.5 at token 3 —
+        // u=0.5 is NOT < 0.5, so the fallback emits the last token (3).
+        EXPECT_FALSE(above.accepted);
+        EXPECT_EQ(3, above.token);
     }
 }
 
@@ -756,7 +839,7 @@ TEST(CPUDraftVocabularyBudget, SweepMechanicsUseRuntimeDescriptors)
     for (const std::uint32_t n : {1u, 3u, 63u, 64u, 65u, 95u})
     {
         const b4_diagnostic::DraftProposalPolicy policy{
-            1, b4_diagnostic::PriorRankingSelector::kVersion,
+            1, b4_diagnostic::CommittedTokenRecencySelector::kVersion,
             b4_diagnostic::SelectorFallback::LowestGlobalIds,
             b4_diagnostic::DrawLaw::DeltaOnShortlist,
             b4_diagnostic::VocabBudget::shortlist(n)};
@@ -774,7 +857,7 @@ TEST(CPUDraftVocabularyBudget, SweepMechanicsUseRuntimeDescriptors)
     for (const std::uint32_t n : {96u, 97u, 128u, 512u})
     {
         const b4_diagnostic::DraftProposalPolicy policy{
-            1, b4_diagnostic::PriorRankingSelector::kVersion,
+            1, b4_diagnostic::CommittedTokenRecencySelector::kVersion,
             b4_diagnostic::SelectorFallback::LowestGlobalIds,
             b4_diagnostic::DrawLaw::DeltaOnShortlist,
             b4_diagnostic::VocabBudget::shortlist(n)};

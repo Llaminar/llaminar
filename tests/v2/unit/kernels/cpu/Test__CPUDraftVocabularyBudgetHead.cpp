@@ -10,7 +10,7 @@
  * no production routing, sampler, verifier, CLI/config, PerfStats
  * production family, PMA admission or graph change is implied or granted.
  *
- * Reviewer-findings round (209/210) repaired here:
+ * Reviewer-findings rounds (209/210, then 217 A2/A5) repaired here:
  * - D3: the shortlisted row evaluation uses the ACTUAL production policy
  *   and tree. The ordinary LM head runs BackendNative, for which the
  *   canonical partition count is ONE ordered chain over the complete K
@@ -31,6 +31,16 @@
  *   verifier path (M=4 rows, bit-exact per row). True multi-rank
  *   shard/replicate movement is device-scope and remains unproved here —
  *   claimed nowhere.
+ * - A2: the traffic accounting is per arm and counts LOGICAL
+ *   PREPARED-OPERAND VOLUME (rows x per-row prepared bytes) against a
+ *   like-for-like full-head figure — it is NOT measured DRAM/cache-line
+ *   traffic and is never described as hardware-bandwidth evidence.
+ * - A5: coverage equals EXECUTED source — both head geometries are
+ *   actually evaluated, even-sized shortlists exercise the backfill
+ *   branch, and a reverse arm covers the final vocabulary row (V-1) and
+ *   the ragged tail. The grouped M=4-versus-serial check is a production
+ *   METAMORPHIC HEAD check; it is NOT a full model/KV/GDN/stop-state
+ *   replay — that boundary is explicit.
  * - Counted traffic: the shortlisted evaluation's touched prepared bytes
  *   are counted and reported against the full head (rows x per-row
  *   bytes), so the traffic claim is a measurement, not a comment.
@@ -244,36 +254,50 @@ TEST(CPUDraftVocabularyBudgetHead, SelectedRowsAreBitwiseIdenticalAndCounted)
         }
     }
 
-    // Multi-N execution: the same engine, several shortlist sizes,
-    // including the non-aligned values and V-1. Every selected row must
-    // be BITWISE identical to the reference row.
+    // Multi-N execution: the same engine, several shortlist sizes and
+    // orderings — odd sizes (ascending), EVEN sizes (the backfilled
+    // reverse-order branch), a chunk-spanning size, and a shortlist that
+    // INCLUDES the final vocabulary row (V-1). Every selected row must be
+    // BITWISE identical to the reference row for the activation row it is
+    // evaluated against. The traffic accounting is per arm and counts
+    // LOGICAL PREPARED-OPERAND VOLUME (rows x per-row prepared bytes) —
+    // it is NOT measured DRAM/cache-line traffic.
     size_t counted_selected_bytes = 0;
-    const size_t full_head_bytes =
-        static_cast<size_t>(kTailVocab) * rowBytes(kHeadBlocks(kHeadK));
-    for (const std::uint32_t n : {1u, 3u, 63u, 65u, 95u})
+    size_t evaluated_rows_total = 0;
+    struct Arm
+    {
+        std::uint32_t n;
+        bool reverse;
+        const char *label;
+    };
+    const Arm arms[] = {{1, false, "ascending1"}, {3, false, "ascending3"},
+        {2, true, "reverse2"}, {64, true, "reverse64"},
+        {63, false, "ascending63"}, {95, true, "reverse95"}};
+    for (const Arm &arm : arms)
     {
         std::vector<std::uint32_t> shortlist;
-        for (std::uint32_t id = 0; id < n; ++id)
-            shortlist.push_back(n % 2 == 0 ? (n - 1u) - id : id);
+        for (std::uint32_t index = 0; index < arm.n; ++index)
+        {
+            const std::uint32_t id =
+                arm.reverse ? (kTailVocab - 1u) - index : index;
+            shortlist.push_back(id);
+        }
         size_t touched = 0;
         for (const std::uint32_t global_row : shortlist)
         {
             ASSERT_LT(global_row, static_cast<std::uint32_t>(kTailVocab));
-            const auto *act = &activations[static_cast<size_t>(global_row) %
-                static_cast<size_t>(kVerifierRows)] -
-                global_row % static_cast<size_t>(kVerifierRows) +
-                global_row % static_cast<size_t>(kVerifierRows);
-            (void)act;
+            // Each row is evaluated against its own activation row
+            // (round-robin over the verifier-row set); the reference is
+            // the GEMV row for the SAME pairing.
+            const size_t activation_row_index =
+                static_cast<size_t>(global_row % kVerifierRows);
             const auto *activation_row =
-                &activations[static_cast<size_t>(global_row %
-                                static_cast<uint32_t>(kVerifierRows)) *
-                    static_cast<size_t>(kHeadBlocks(kHeadK))];
+                &activations[activation_row_index *
+                             static_cast<size_t>(kHeadBlocks(kHeadK))];
             const float selected = evaluateRowFromPlanes(*heads[0].engine,
                 activation_row, global_row, touched);
             const float reference_row =
-                reference[static_cast<size_t>(global_row %
-                    static_cast<uint32_t>(kVerifierRows))]
-                    [global_row];
+                reference[activation_row_index][global_row];
             // Bitwise comparison: signed zero and payload bits included.
             std::uint32_t selected_bits, reference_bits;
             std::memcpy(&selected_bits, &selected, sizeof(selected_bits));
@@ -282,21 +306,73 @@ TEST(CPUDraftVocabularyBudgetHead, SelectedRowsAreBitwiseIdenticalAndCounted)
             EXPECT_EQ(selected_bits, reference_bits)
                 << "selected row " << global_row
                 << " is not bitwise identical to the full-head row";
+            evaluated_rows_total += 1;
         }
+        EXPECT_EQ(touched, static_cast<size_t>(arm.n) *
+                rowBytes(kHeadBlocks(kHeadK)))
+            << "arm " << arm.label << " touched-byte accounting";
         counted_selected_bytes += touched;
+        std::cout << "CPU_B4_HEAD_TRAFFIC,arm=" << arm.label
+                  << ",rows=" << arm.n
+                  << ",logical_operand_bytes=" << touched
+                  << ",like_for_like_full_head_bytes="
+                  << static_cast<size_t>(kTailVocab) *
+                     rowBytes(kHeadBlocks(kHeadK))
+                  << ",accounting=logical_prepared_operand_volume"
+                  << ",not_hardware_traffic=1\n";
     }
-    // Counted traffic: the five shortlisted evaluations touched five rows
-    // worth of prepared bytes; the full head touches all ninety-six.
-    EXPECT_EQ(counted_selected_bytes, 5u * rowBytes(kHeadBlocks(kHeadK)));
-    std::cout << "CPU_B4_HEAD_TRAFFIC,selected_bytes=" <<
-        counted_selected_bytes
-              << ",full_head_bytes=" << full_head_bytes
-              << ",rows_evaluated=5,rows_full=" << kTailVocab
-              << ",counted=1\n";
+    EXPECT_EQ(evaluated_rows_total, 227u)
+        << "the aggregate evaluated rows across arms (1+3+2+64+63+95)";
+    // The reverse arms cover the final vocabulary row (V-1) and the
+    // ragged tail rows (chunk 1, columns 0..31).
+    EXPECT_EQ(counted_selected_bytes, 227u * rowBytes(kHeadBlocks(kHeadK)));
 
-    // The ragged tail rows (chunk 1, columns 0..31) are covered by the
-    // N=95 shortlist (global IDs 0..94 span both chunks); the V-1 row
-    // (95) is covered by construction of the shortlists above.
+    // Second geometry exercised: the V=64/K=1024 head gets its own
+    // reference and a shortlist arm (the same bitwise oracle).
+    {
+        const auto &packed1 = heads[1].engine->packedWeights();
+        std::vector<float> partial1(
+            cpu::native_quantised::nativeQuantisedProjectionPartialFloats(
+                packed1, 1));
+        const auto hidden1 = makeHidden(kVerifierRows, kSmallK);
+        std::vector<Q8_1Block> activations1(
+            static_cast<size_t>(kVerifierRows) *
+            static_cast<size_t>(kHeadBlocks(kSmallK)));
+        cpu::native_quantised::quantize_activations_to_q8_1(hidden1.data(),
+            activations1.data(), kVerifierRows, kSmallK,
+            kHeadBlocks(kSmallK),
+            CPUProjectionNumericalPolicy::BackendNative);
+        std::vector<std::vector<float>> reference1(
+            kVerifierRows, std::vector<float>(kSmallVocab));
+        for (int row = 0; row < kVerifierRows; ++row)
+        {
+            const auto *act = &activations1[static_cast<size_t>(row) *
+                static_cast<size_t>(kHeadBlocks(kSmallK))];
+            cpu::native_quantised::gemv_native_quantised_preq(packed1, act,
+                reference1[static_cast<size_t>(row)].data(), partial1);
+        }
+        size_t touched1 = 0;
+        for (std::uint32_t global_row : {0u, 32u, 63u})
+        {
+            const size_t activation_row_index =
+                static_cast<size_t>(global_row % kVerifierRows);
+            const auto *activation_row =
+                &activations1[activation_row_index *
+                              static_cast<size_t>(kHeadBlocks(kSmallK))];
+            const float selected = evaluateRowFromPlanes(*heads[1].engine,
+                activation_row, global_row, touched1);
+            const float reference_row =
+                reference1[activation_row_index][global_row];
+            std::uint32_t selected_bits, reference_bits;
+            std::memcpy(&selected_bits, &selected, sizeof(selected_bits));
+            std::memcpy(&reference_bits, &reference_row,
+                sizeof(reference_bits));
+            EXPECT_EQ(selected_bits, reference_bits)
+                << "second geometry: selected row " << global_row
+                << " is not bitwise identical";
+        }
+        EXPECT_EQ(touched1, 3u * rowBytes(kHeadBlocks(kSmallK)));
+    }
 }
 
 TEST(CPUDraftVocabularyBudgetHead, GroupedTargetRowsMatchSerialM1)
