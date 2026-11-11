@@ -1844,3 +1844,16 @@ focused/diagnostic dirs (build-focused-ae76 [failed first candidate],
 build-focused-fix2, build-diag3, build-a1fix, build-a1fix2, build-shared1
 + their ctest logs/xml); mpi480-baseline.{log,xml}. Local copies:
 /tmp/llaminar-main-bb-linux-results/.
+
+### STATE-AUDIT VERIFIED SNAPSHOT (sparks literal, 20:50Z) — reconciled clean
+
+.80: **greedy rider RUNNING** (container 15b95d465be2, launched 20:41Z;
+phase = MTP-dynamic n=256 benchmark after PLAN=0; plan-rider.json/
+rider.out → /work/results/i16rider/). A2 exports complete at
+/work/a2-bb893cd79/ (checker identity 176/27/54 in the run log) —
+delivered to addon3. .79: Dir-B sealed (K14-IDEA25-Q38-TRACE-CPU4096-
+20261111); B1 focused check = NOT a .79 item (addon2's W2 at edcce0183
+is booked on the .80 post-campaign queue — W2 after W1; the earlier
+.79-offer superseded by the coordinator's locked order); .79 otherwise
+idle. RECONCILIATION: matches the locked order + lease state; no drift.
+Verified snapshot timestamp: 20:50Z.
