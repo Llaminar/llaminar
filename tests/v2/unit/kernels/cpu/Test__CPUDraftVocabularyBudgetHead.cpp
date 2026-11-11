@@ -256,9 +256,10 @@ TEST(CPUDraftVocabularyBudgetHead, SelectedRowsAreBitwiseIdenticalAndCounted)
     }
 
     // Multi-N execution: the same engine, several shortlist sizes and
-    // orderings — odd sizes (ascending), EVEN sizes (the backfilled
-    // reverse-order branch), a chunk-spanning size, and a shortlist that
-    // INCLUDES the final vocabulary row (V-1). Every selected row must be
+    // orderings — odd sizes (ascending), EVEN sizes (the reverse-
+    // ORDERING branch — a fixture ordering choice, not selector
+    // backfill), a chunk-spanning size, and a shortlist that INCLUDES
+    // the final vocabulary row (V-1). Every selected row must be
     // BITWISE identical to the reference row for the activation row it is
     // evaluated against. The traffic accounting is per arm and counts
     // LOGICAL PREPARED-OPERAND VOLUME (rows x per-row prepared bytes) —
@@ -280,7 +281,8 @@ TEST(CPUDraftVocabularyBudgetHead, SelectedRowsAreBitwiseIdenticalAndCounted)
         for (std::uint32_t index = 0; index < arm.n; ++index)
         {
             // Reverse arms are an ORDERING choice of this fixture, not
-            // selector backfill (backfill is selector-v1 semantics).
+            // selector backfill (backfill is selector-v1 semantics);
+            // this fixture's reverse ordering is its own choice.
             const std::uint32_t id =
                 arm.reverse ? (kTailVocab - 1u) - index : index;
             shortlist.push_back(id);
