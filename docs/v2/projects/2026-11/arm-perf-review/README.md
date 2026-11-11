@@ -1734,3 +1734,18 @@ CLEAN. Retained: results /tmp/llaminar-main-bb-mac-results/, build
 SCOPE: Main post-merge campaign MAC LEG — NOT Mac engine/full-backend/
 economy qualification. .80 canonical full Unit/preflight Engine leg
 PENDING the booked slot. PR status updating hash-free.
+
+### OPERATOR DECISIONS (2026-11-11 ~13:10Z) — recorded
+
+1. **nsys wrapped smoke: APPROVED.** One booked window:
+   gpu_driver_diagnostics begin → nsys profile on the trivial vectorAdd
+   (no model/inference) → finish, with REAL begin-before/after-finish per
+   the custody rule. Booked by coordinator/arm-sparks at a clean slot.
+   NCU stays separate/unlifted.
+2. **B4 LM-head shortlist contract: routed to the REVIEWER for expert
+   input** (operator: "ask the reviewer, it has more knowledge about it")
+   — reviewer advises on the contract shape (greedy exactness vs
+   stochastic semantics boundary) before any unfence/design.
+3. **idea-14 27B rider: APPROVED after the 35B result** — one matching
+   rider (same controlled-reference protocol) once the 35B greedy rider
+   settles the sampling-mode question.

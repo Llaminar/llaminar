@@ -874,3 +874,21 @@ filtering. Log: artifacts/cb-c1-staging/current/b11-sysnice-experiment.log.
 RUNBOOK CONFIRMATION: the established "SYS_NICE + seccomp=unconfined for
 page-owner tests" rule was correct, and now has the attribution experiment
 proving which mechanism does what.
+
+### B11 permission path RESOLVED by CB lead (~13:06Z) — OCI profile move_pages arg-restriction
+
+Same guarded binary (6a60032d/source) on the Station:
+- default Docker profile: DENIES get_mempolicy;
+- cap-add SYS_NICE: allows the query BUT move_pages EPERM; effective
+  SYS_NICE also fails;
+- actual default OCI profile + ONE arg-restricted move_pages allow
+  (pid 0, nodes NULL, flags 0): PASSES.
+Same UID 1000/groups, CapEff 0, seccomp 2, no host changes/unconfined/
+privileged. Sole profile diff verified; profile SHA
+4b5631f1da22b270ac8169c8203eb3ae3cd6c794f08485d2357e6b16dd81f54b.
+Evidence: cb-c1/artifacts/cb-c1-staging/lead-numa-self-query-20261111T1305.
+Worker ownership returned; GO = missing preflight registration/full NUMA
+suite + full canonical under this EXPLICIT NARROW environment. No blanket
+140 closure or allocator/topology cause claim; remaining assertions still
+need triage. RUNBOOK: the get_mempolicy/move_pages path needs the exact
+arg-restricted profile (not broad seccomp=unconfined).
