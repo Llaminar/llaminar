@@ -530,3 +530,30 @@ stood; the only B4 action was the S1–S6 spec text). With the operator's
 "yes — diagnostic authorized" now on record, addon2 proceeds with the
 diagnostic implementation (S1–S6 as test properties) and sends the
 corrected blob + diagnostic SHA to the reviewer.
+
+### **GREEDY RIDER RESULT (arm-sparks, ~21:02Z): the 38.9% acceptance is NOT a sampling-mode artifact**
+
+Seal K14-I16RIDER-880429059-20261111 (retained 880 Release binary verified
+= build-i16a @ 880429059d; same GGUF/prompt/context/256-output; ONLY
+sampler intent changed):
+- EXIT SBENCH=0; tok/s 58.74 prefill / 18.39 decode.
+- **RESOLVED ACTUAL SAMPLER: {'seed': 42, 'temperature': 0.0, 'top_k': 40,
+  'top_p': 0.9} — GREEDY (temp0) confirmed in the resolved request
+  config.**
+- **MTP counters: acceptance_rate 0.3889 (168 accepted / 432 draft_steps /
+  65 rejected); verifier_runs 88; verifier_token_count 432+; current_depth
+  10; max_depth 15; min_depth 1; depth_policy=dynamic; depth_policy_updates
+  24 (promotions 24, demotions 0); last_depth_policy_reason=budget_limited;
+  stochastic_accepts 0 (purely greedy verify: all accept tests = 0);
+  transaction_commits 264; mtp_cached_tokens 267; mdp config_enabled=True,
+  bypassed=False.**
+- TEXT DIGEST: 256 tokens, sha256(ids) = 0a4c0002a4a6de72f174….
+- **INTERPRETATION: with temp0/stochastic fully disabled, acceptance =
+  EXACTLY 38.89% → NOT a sampling-mode artifact.** The tracker-verified
+  99% @ depth 7 baseline differs in protocol (earlier runs' sampler/policy
+  state or the depth policy at that time). The controlled reference now =
+  38.89% at current_depth 10, budget_limited, 24 promotions. MTP-dyn vs
+  no-MTP decode = 18.39 vs 25.2 (−27%, mode-independent observation).
+- .80 = Main's FMLAL window (started 21:02Z, ~30-40 min). W2 (edcce0183)
+  → .79 (16G free, build ≈10G fits) STARTING NOW per the parallelization
+  directive.

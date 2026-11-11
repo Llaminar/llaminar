@@ -277,3 +277,14 @@ axis; this sweep isolates the DEPTH axis with everything else pinned.
 - **INSTRUMENTATION: zero new code** — the existing mtp/
   depth_transaction_trace v3 family publishes every field the curve
   needs; the sweep = run-matrix + export-analysis only.
+
+### GREEDY-RIDER CROSS-REFERENCE (35B, ~21:02Z): the 35B acceptance answer is DEPTH/CONTROLLER-linked
+
+The 35B greedy rider (temp0 confirmed in the RESOLVED sampler) shows
+acceptance 0.3889 at current_depth 10 with depth_policy=dynamic,
+budget_limited (24 promotions, 0 demotions) — the acceptance anomaly is
+NOT sampling-mode. The depth-sweep protocol (5/7/10/12/dynamic cells)
+now carries a sharpened hypothesis set: depth 10 + budget_limited vs the
+tracker's depth-7 99% — the sweep's budget_limited-event-rate column
+tests exactly this. The 27B rider (T1/T2 mode pair) proceeds
+independently for the dense case.
