@@ -1884,3 +1884,12 @@ NOT transfer across the rebase — FMLAL/B4/idea16 lane tips rebase onto
 the new base at handover and their verdicts re-pin.** FMLAL K=16
 repair tip should land ON the new base if the announcement precedes
 its push.
+
+### REBASED TIP = dd8f2bd96 (Main, ~23:56Z); campaign #2 STARTED on .80
+
+Main announced the rebased tip dd8f2bd96 (207 commits onto d1fd0a077)
+and GRANTED-started campaign #2 immediately (the B1 attribution
+export's exit was UNCONFIRMED at grant time — sparks overdue on the
+audit answer; the export re-queues post-campaign if it didn't
+complete). Force-push of dd8f2bd96 = the rebase-anchoring base for
+FMLAL/B4/idea16 at handover; verdicts re-pin.
