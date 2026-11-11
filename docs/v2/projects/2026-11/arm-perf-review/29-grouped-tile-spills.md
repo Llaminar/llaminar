@@ -78,3 +78,28 @@ FETCHCONTENT_SOURCE_DIR overrides at repo-local copies (ignored
 artifacts dir; shared external/ untouched; network-none container;
 versions/hashes unchanged — ONLY the transport is local). Provisioned
 rerun launching; exit + JUnit + SHAs to follow.
+
+### B9 VERDICT (reviewer): SOURCE HOLD at 108bce2e — one blocking omission
+
+f265d2950 was ALREADY LOCAL to the reviewer (read-only range-diff, no
+fetch/execution). **BLOCKING: the independent composition admits the two
+forms but OMITS f265's base/transfer overlap refusal + its three focused
+negatives.** :1209-1212 goes from post-index-shape validation straight
+to base_values — nothing rejects a writeback base that is ALSO a
+transferred GP register; the loaded destination is assigned at :1245
+then :1262-1268 overwrites it with the advanced OLD base (selecting one
+interpretation of architecturally constrained-unpredictable behavior).
+'ldr x1,[x1],#8' classifies CLEAN instead of structural failure.
+Witness: str d8,[sp,#40]; mov x10,sp; ldr x10,[x10],#40; ldr d8,[x10];
+ret — the model invents x10=sp+40 and ACCEPTS the d8 restore (static
+predicted false-clean). FIX: restore the fail-closed overlap invariant
+(canonical gp/gp_view comparison BEFORE transfer/update) + the three
+alias controls (post-index ldr / pre-index ldr / post-index ldp) from
+f265; keep the new grammar + strengthening controls. The 'post-index
+combined with !' test does NOT cover destination/base aliasing.
+POSITIVE: non-overlapping post-index ldr semantics correct; whole-X
+slot propagation present; ldurh exact-2-byte/not-ABI-eligible; new
+controls meaningful. No production/budget/inventory delta.
+DISPOSITION: station 64/64 stays attributed (the controls omit the
+failing invariant — green does not transfer f265's ACK); fix = port
+invariant + controls; B4 round-5 unchanged (Linux/JUnit handoff).
