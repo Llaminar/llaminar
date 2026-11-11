@@ -357,3 +357,44 @@ successor:
   ns per owner note.
 VALIDATION: portability 295/295; Linux stub-syntax; runtime at the
 canonical gates. A2 held until the verdict.
+
+### Reviewer verdict #185 successor — HOLD at aa31ccbe9; consolidated #186 (T1–T5)
+
+- **T1 [P2] dangling pointers from temporaries:** engine summary_records
+  returns pointers into its const-vector argument but BOTH calls pass
+  temporary PerfStatsCollector::snapshot vectors — those die at the end of
+  the full expression BEFORE first_records dereferences (and before the
+  repeat range-loop body). FIX: named owning locals or copied records; no
+  borrowed pointers from temporary snapshots.
+- **T2 [P2] JoinGuard hang + unproven overlap:** the engine JoinGuard hangs
+  if execute fails BEFORE the stage hook sets window_live (worker waits
+  forever; destructor joins forever) — need cancellation/stop on every
+  failure exit. Also worker_done is awaited AFTER engine.execute/
+  publication, so the five competing forks are not PROVEN inside the window;
+  the stage must rendezvous/hold the window until the competing work
+  completes WITHOUT changing production execution.
+- **T3 [R7] cost helpers still wrong:** BOTH always construct an outer even
+  when owners==0 → 'no_owner' is actually one-owner; the clock starts
+  BEFORE thread/scopes and stops AFTER assertions, join and teardown
+  (contradicting the excluded-overhead claim); the worker starts
+  immediately after setting the gate, before main scope/readiness →
+  contention not established. FIX: genuine 0/1/2 scopes, synchronized
+  ready/start/finish, off-clock checking/lifecycle, accurate basis; prior
+  measurements REMAIN UNUSABLE for these claims.
+- **T4 [P2] grammar prefilter hole:** the checker main prefilter now tests
+  the literal 'omp parallel'; a file with an unnoted
+  `#pragma omp\tparallel` or `#pragma omp  parallel` (both expressly
+  supported) contains no literal and is SKIPPED; same for whitespace
+  _Pragma forms. FIX: actual CLI tests WITHOUT any NOTE substring +
+  grammar-aware detection that cannot discard supported/unsupported forms.
+- **T5 [P2] stage config guard incomplete + wrong device expectation:** the
+  stage guard saves originals but still does NOT clear ambient CPU timing
+  for existing off_default("omp")/ungated("omp") calls; force_absent clears
+  only 3 of the 8 saved enablement inputs. The new accepted→device
+  expectation 'CPU:0' is WRONG — unchanged DeviceId::to_string/toString
+  returns 'CPU' — fix using the canonical device representation; preserve
+  exact-key values.
+- POSITIVE: scope teardown lexical/inner-first; worker scope lifetime
+  same-thread; the 3-vs-1 key confusion repaired; full 4-row prefill input
+  + GPU-result failure recorded. No execution; 295/295 + stubs + timings
+  unauthenticated; no A2/B-stage qualification.
