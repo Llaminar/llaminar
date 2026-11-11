@@ -292,3 +292,18 @@ inspection = causality evidence. Station container identities (SYS_NICE /
 seccomp / flags) come from the 64K validation owner's runbook. Coordinator
 routes; the CB worker executes on its own host without interrupting its
 proof fixes.
+
+### B12 — CONFIRMED production placement defect (rebase interaction; Main, 2026-11-11)
+
+Actual configureClusterRankThreads model-free regression FAILS native
+GNU-14/NEON 10-core: worker0 returns CPU9 although the new permanent place
+is CPU0; the temporary scope restores the stale caller 9. GOMP default
+3000000 IS present (cannot explain away missing GOMP). => base fdc72
+ScopedOpenMPPartitionAffinity RAII + ARM 417dd3dc5 fastest-first BINDING
+INTERACTION — NOT a new verifier, NOT env. NARROW FIX: retire the temporary
+partition scope BEFORE the permanent team binding; keep the RAII restore
+contract elsewhere unchanged. New focused preflight actual-production-API
+test in progress. MAIN MUST REOPEN the settled tip (1f01cb3e5 is no longer
+the handover base while the fix lands); the #175 owner holds the final
+register campaign pending the fix/re-pin. .79 root cause still awaits the
+full rep CPU/command packet. No model runs/env/cap workarounds.
