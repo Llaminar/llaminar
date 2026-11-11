@@ -307,3 +307,19 @@ test in progress. MAIN MUST REOPEN the settled tip (1f01cb3e5 is no longer
 the handover base while the fix lands); the #175 owner holds the final
 register campaign pending the fix/re-pin. .79 root cause still awaits the
 full rep CPU/command packet. No model runs/env/cap workarounds.
+
+### B12 fix progress (Main, 2026-11-11, ~00:18Z): 763 source ACK #184
+
+Fix + new master contract + MPIBootstrap Unit + placement preflight PASS
+natively; the BROADER CPUStartupAffinity/ClusterInventoryBootstrap NOT
+GREEN in the local VM (NUMA sysfs missing → explicit cpu:0 has no physical
+set / CPU shorthand unknown; MPI memory-bind warning) — Main running
+original-source controls to separate environment + corrected focused 20x.
+REQUESTED: an explicit .79 CAPABLE-HOST CPU-ONLY MODEL-FREE source
+build/rerun window after the focused done (the 3 affinity aliases) — NOT
+inference authorization; trace STOP held.
+PACKET PROVENANCE ISSUES (Main): the app b5e6c0 hash alone ALSO matches 35
+→ cannot pin the 5b SHARED CORE; a manual OMP20 export was present;
+--iterations was omitted; the 20-CPU vs 10-core topology summary needs
+raw. Main requested the CORE hash/path + exact command + seal from the
+owner before closing the actual .79 attribution.
