@@ -65,3 +65,19 @@ reference context, not authenticated evidence.
 NO new apparatus/issue/host requirement. Diagnostic repair stays
 authorized. d7 HOLD D1-D6 separate, not cured by spec text. FMLAL
 landing review = reviewer's next item.
+
+## SPEC v3 APPLIED (~22:57Z): blob f26fd8ba (commit 93d836b14)
+
+addon2's authored in-place replacement carries the reviewer-211
+corrections: §3 selector v1 = COMMITTED-TOKEN RECENCY (explicitly
+admitted LowestGlobalIds cold start, honest count/sweep limits,
+realized distinct-support counts reported), v2 = PRIOR VERIFIED TARGET
+ROW RANKING as versioned alternative (every N explorable, separate
+staging decision); §7 policy-valid-history vs stale-receipt; header
+synchronized with §9; Mode P MAY-CHANGE (§0+§4); §5 880-seal =
+historical exemplar, not a future-binary identity requirement.
+ONE DECLARED SUBSTITUTION: addon2's raw body §9 had reverted to the old
+fence wording (contradicting the corrected header + Main's §9 point) —
+restored to the reviewed §9 (diagnostic AUTHORIZED; production-path +
+N-sweep + economy fenced). Blob f26fd8ba01af0533bed7073383ee3deabd66acfa
+= the re-verification target. d7 HOLD (D1-D6) separate.
