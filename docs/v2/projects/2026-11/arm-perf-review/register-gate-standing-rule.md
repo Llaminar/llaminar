@@ -323,3 +323,14 @@ with per-file SHAs + raw log path. No native cell campaign/GPU involved;
 - ARCHIVE TASK: Main raw log + full hashes link in the tracker
   (/tmp/arm-review-c002/actual-regression.log + Gate.sh 564c0594…, test
   864a0874…) — keep Core holding task 77.
+
+### GitHub issue 58 filed (Main, ~05:28Z) — register-gate coordinator defects
+
+https://github.com/Llaminar/llaminar/issues/58 tracks the ACTUAL
+coordinator defects + Main's exact c002 9-FAIL/12 verification + the
+archived log/binding obligations through fix/integration. Distinct from
+the closed classifier issue 56. No Main code/head change; Main's source
+base = 880/PR43.
+LANE OBLIGATIONS: link the fix commit(s) to issue 58; do NOT close it
+from working-tree green — closure requires exact-source evidence + the
+focused ACK + collection admission.
