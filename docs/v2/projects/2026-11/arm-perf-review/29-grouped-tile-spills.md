@@ -55,3 +55,26 @@ range-diff. Evidence: /home/tdsynnex/repo/llaminar-perf-b9/artifacts/
 b9-strengthening/ (baseline-red/ + after-method/ logs, receipt SHA256s);
 bundle ffbbb8a8… + patch 935c18a6…. PUSH authorized (FF from 825fe8deb
 only); branch cleanup for b9-strengthening = post-review.
+
+### B9 PUSHED (station, ~23:10Z): 825fe8deb → 108bce2e (FF, verified)
+
+codex/arm-b9-strengthening advanced exactly as authorized: pre-push
+ls-remote = 825fe8deb, post-push = 108bce2eab… (fast-forward, no force).
+The B9-strengthening branch is now implemented + validated (64/64) +
+pushed; reviewer range-diff vs the addon's f265d2950 composition remains
+available if desired.
+
+### FMLAL station co-validation: dependency transport solved locally
+
+Watcher r2 exit 2 as predicted: the codex lineage's configure fetches
+FOUR pinned third-party deps before any target (pcre2 10.49 + utf8proc
+2.11.3 tarballs @ src/v2/CMakeLists.txt:1361/1364; ftxui v5.0.0 + libfort
+v0.4.2 git tags @ :1385/:1402) — the no-network container cannot. NOTE:
+with GPU languages off, OneDNN PASSED on this tree ('V2: BLAS backend:
+OneDNN' — the idea14 lock blocker did NOT reproduce). Fix in flight:
+hash-verified local provision (SHA256s match the pinned URL_HASH
+constants exactly; shallow pinned-tag clones for ftxui/libfort) +
+FETCHCONTENT_SOURCE_DIR overrides at repo-local copies (ignored
+artifacts dir; shared external/ untouched; network-none container;
+versions/hashes unchanged — ONLY the transport is local). Provisioned
+rerun launching; exit + JUnit + SHAs to follow.
