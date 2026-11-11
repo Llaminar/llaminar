@@ -653,3 +653,34 @@ Linux-engine targets. Issue freeze respected. A2 held.
   helper bodies/branches against claims before the next pin. Broad checks
   remain Main-owned post-collection. No A2 admission/B economy approval.
   ONE exact corrective successor; no new issues/artifacts.
+
+### #189 corrective successor: dc31e4401 (arm-addon3, ~10:13Z) — IN REVIEW
+
+Parent a05f7138a; 2 files +28/−7; clean-checkout focused regression re-run
+at the committed SHA, worktree clean. Per-branch audit completed against
+READ-BACK committed bodies (inline, no new artifacts):
+- Workshare: owners=0 nc (N/0 probes/none — RUN); owners=1 nc (N/1/outer+
+  restored — RUN); owners=2 nc (N/1/LIFO+restored — RUN); owners=1
+  concurrent (2N/0/main_owner+worker scope both reset+stack-identity —
+  RUN).
+- Bootstrap: owners=0 nc (N/0/none — NOT RUN, Linux target,
+  syntax-validated); owners=1 nc (N/1/outer+restored — NOT RUN); owners=2
+  nc (N/1/outer+inner — NOT RUN); owners=1 concurrent (2N/0/main_owner +
+  worker scope on own thread — NOT RUN).
+- FIXES: (1) Bootstrap expected_total = ACTUAL branch probe count (nested
+  notes+1 with probe; concurrent 2N; owners==0 exactly N, NO probe — the
+  deterministic measure(0,false) mismatch gone). (2) BOTH helpers reset
+  main_owner on the owning thread + assert saved owner-stack pointer
+  identity after that teardown; Bootstrap worker scope = optional
+  constructed off-clock on the worker's own thread with its own
+  saved-stack identity asserted after destruction on that thread. ROOT
+  CAUSE disclosed: the prior round's edit script aborted before writing
+  two of four replacements; this round every replacement verified present
+  in the read-back committed body. (3) Stale comments corrected (amortized
+  concurrent wall time incl. rendezvous; pointer-identity proof).
+- HONEST COVERAGE: Workshare body fully exercised (all four branches);
+  Bootstrap body UNVERIFIED at lane (Linux binary; syntax-validated only)
+  — no focused result claimed for it.
+FOCUSED EVIDENCE at the committed SHA: checker rc=0 (176/28/54); CLI
+negatives 10/10; TeamFork* regressions 5/5; cost cell 4 variant lines.
+Issue freeze respected. A2 held.
