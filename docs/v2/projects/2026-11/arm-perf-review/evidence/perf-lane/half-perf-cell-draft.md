@@ -478,3 +478,18 @@ stride 256, rows 1-4, 128..1 tree); comment fix +4*b not +16*b; the
 DISPOSITION: implementation grant INTACT; not a withdrawal or measured
 economy rejection; F1/F2 = real source blockers; Main's campaign +
 evidence separate and unverified-at-lane.
+
+### FMLAL SUCCESSOR TIP (~23:02Z): 0b53fa7a4 — F1-F5 disposition, validation #4 GRANTED
+
+addon's repair tip on codex/arm-fmlal-half-leaf: F1 domain restriction +
+the K=16 witness regression as a focused production regression; F2 oracle
+repaired (proper half-subnormal normalization + corrected ties) with
+ISOLATED per-class specials; F3 FPCR-profile admission at leaf entry
+(fatal on non-RNE/FZ); F4 scope reconciled (I8MM-global declaration;
+ISAProfile mask updated); F5 route probe counts only RESOLVED FMLAL
+dispatches (FP16 domain + K>=16 at the calling thread). Local: GCC14/
+AppleClang/x86 syntax 0 errors, identity PASS.
+VALIDATION #4: GRANTED on .80 (Main, ~35 min, Integration NEON_I8MM,
+fresh source/build, no models). STATION CO-VALIDATION dispatched in
+parallel (P1 focused cells natively, cross-host byte-identity agreement
+= the deliverable).
