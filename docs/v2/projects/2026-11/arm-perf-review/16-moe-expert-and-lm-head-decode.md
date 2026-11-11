@@ -437,3 +437,14 @@ The B4 draft-vocabulary-budget design spec is the FINAL design record
 separate later go (after the B1 diagnostic, the greedy rider, and the
 campaign queue clear). No work until then. Fences: design-only; no N-sweep
 run; no economy admission; no tuner/gate apparatus; tracker-only.
+
+### Post-campaign .80 window ORDER LOCKED (coordinator, ~14:57Z)
+
+(1) **GREEDY RIDER FIRST** (Main's verbatim protocol; retained Phase-A
+880429059 binary/artifact state — differs from the B1/tournament tip;
+running it first avoids a second build-dance; ~2 min machine time;
+unlocks the idea-16 Phase B selection input — the sampling-mode question
+behind the 38.9% acceptance anomaly); (2) idea-08 BOM census +
+compact-decode tournament; (3) M=1 economy window (B1 at bdbb8e370);
+(4) Lane-2 window. All after the Main campaign completes + the lease
+returns. arm-addon2 executes each on relay.
