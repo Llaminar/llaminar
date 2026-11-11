@@ -800,9 +800,9 @@ namespace
     NoteCostRun measureNoteCost(std::uint64_t notes, int owners, bool concurrent_threads)
     {
         // Off the clock: the exact scope configuration. owners==0 constructs
-        // NO scope (the no-owner figure must not secretly carry one); 1
+        // NO scope at all (the no-owner figure must not secretly carry one); 1
         // constructs one; 2 constructs two lexically nested scopes whose
-        // teardown is inner-first.
+        // teardown is inner-first and asserted as restored before returning.
         const std::uint64_t before = openMPTeamForkSnapshot();
         std::optional<OpenMPTeamForkScope> outer;
         std::optional<OpenMPTeamForkScope> inner;
@@ -811,17 +811,19 @@ namespace
         if (!concurrent_threads && owners >= 2)
             inner.emplace();
 
-        // Off the clock (concurrent): the worker exists, has built its own
-        // same-thread scope, and both sides have signalled readiness BEFORE
-        // the clock starts - so contention inside the timed window is
-        // established, not hoped for.
+        // Off the clock (concurrent): BOTH measuring threads construct their
+        // own same-thread owner scopes, and both sides have signalled
+        // readiness BEFORE the clock starts - so contention inside the timed
+        // window is established, not hoped for, and both owners are real.
         std::atomic<bool> worker_ready{false};
-        std::atomic<bool> main_ready{false};
         std::atomic<bool> start_gate{false};
-        std::atomic<bool> worker_done{false};
+        std::atomic<bool> worker_notes_done{false};
+        std::atomic<bool> verify_gate{false};
         std::thread worker;
+        std::optional<OpenMPTeamForkScope> main_owner;
         if (concurrent_threads)
         {
+            main_owner.emplace(); // The measuring thread owns a cell too.
             worker = std::thread([&]
             {
                 OpenMPTeamForkScope scope; // Same-thread owner, built off the clock.
@@ -830,15 +832,14 @@ namespace
                     std::this_thread::yield();
                 for (std::uint64_t note = 0; note < notes; ++note)
                     noteOpenMPTeamFork();
-                worker_done.store(true, std::memory_order_release);
-                // Verification off the clock, on the owning thread, before the
-                // scope dies: the lifecycle is thread-affine end to end.
+                worker_notes_done.store(true, std::memory_order_release);
+                // Verification and teardown happen only after the main thread
+                // stopped the clock and opened the verify gate: the timed
+                // window contains the notes and nothing else.
+                while (!verify_gate.load(std::memory_order_acquire))
+                    std::this_thread::yield();
                 EXPECT_EQ(scope.forks(), notes);
             });
-        }
-        if (concurrent_threads)
-        {
-            main_ready.store(true, std::memory_order_release);
             while (!worker_ready.load(std::memory_order_acquire))
                 std::this_thread::yield();
         }
@@ -851,9 +852,11 @@ namespace
         for (std::uint64_t note = 0; note < notes; ++note)
             noteOpenMPTeamFork();
         if (concurrent_threads)
-            while (!worker_done.load(std::memory_order_acquire))
+            while (!worker_notes_done.load(std::memory_order_acquire))
                 std::this_thread::yield();
         const auto stop = std::chrono::steady_clock::now();
+        if (concurrent_threads)
+            verify_gate.store(true, std::memory_order_release);
 
         // Off the clock: verification, join and teardown.
         const auto elapsed_ns = static_cast<double>(
@@ -861,10 +864,11 @@ namespace
                 .count());
         NoteCostRun result;
         result.ns_per_note =
-            elapsed_ns / static_cast<double>(concurrent_threads ? notes : notes);
+            elapsed_ns / static_cast<double>(notes);
         if (concurrent_threads)
         {
-            worker.join(); // The worker destroyed its own scope before this.
+            EXPECT_EQ(main_owner->forks(), notes);
+            worker.join(); // The worker verified and destroyed its own scope.
             result.process_delta = 2 * notes;
         }
         else
@@ -872,11 +876,27 @@ namespace
             EXPECT_EQ(outer ? outer->forks() : notes, notes) << "owners " << owners;
             if (inner)
                 EXPECT_EQ(inner->forks(), notes) << "owners " << owners;
-            if (outer)
-                outer.reset(); // Enforced reverse teardown before anything dangles.
-            result.process_delta = notes;
+            // The total is checked BEFORE the teardown probe so the probe's
+            // own fork stays out of the measured figure.
+            EXPECT_EQ(openMPTeamForkSnapshot() - before, notes)
+                << "nested owners " << owners;
+            // Enforced LIFO teardown: the inner scope dies FIRST, and the
+            // restored stack is asserted before the outer follows - the
+            // outer must never die above a live inner.
+            inner.reset();
+            {
+                OpenMPTeamForkScope restored;
+                auto local_idle = [] {};
+                OMP_WORKSHARE_REGION(local_idle);
+                EXPECT_EQ(restored.forks(), 1u)
+                    << "the owner stack must be exactly the outer scope after "
+                       "the inner was torn down";
+            }
+            outer.reset();
+            result.process_delta = notes + 1; // Measured notes plus the probe.
         }
-        // Every configuration counts each fork exactly once in the total.
+        // Every configuration counts each fork exactly once in the total
+        // (the nested branch's figure includes its restoration probe).
         EXPECT_EQ(openMPTeamForkSnapshot() - before, result.process_delta)
             << (concurrent_threads ? "concurrent" : "nested") << " owners, " << owners;
         return result;

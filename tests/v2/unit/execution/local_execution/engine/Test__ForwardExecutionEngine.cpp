@@ -4999,7 +4999,7 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
                            if (thread.joinable()) thread.join(); }
         } join_guard{concurrent, stop};
         host.graph_stage_factories = {
-            [&window_live, &concurrent_done, &stop](const std::string &name, DeviceId device)
+            [&window_live, &concurrent_done, &stop, &concurrent_forks](const std::string &name, DeviceId device)
             {
                 auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
                     ComputeStageType::GEMM, name, device);
@@ -5007,15 +5007,23 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
                 {
                     auto work = [] {};
                     window_live.store(true, std::memory_order_release);
-                    // Hold the window until the concurrent forks are done (a
-                    // bounded wait: the worker always completes once the gate
-                    // is open, and a lost race must not hang the engine).
+                    // Hold the window until the concurrent forks COMPLETE. A
+                    // deadline is a failure detector, not an escape hatch: on
+                    // the deadline the hook throws BEFORE leaving, so the
+                    // competing forks can never silently run after the window
+                    // closed, and the completed count is required at the held
+                    // boundary.
                     const auto hold_until = std::chrono::steady_clock::now() +
                                             std::chrono::seconds(10);
                     while (!concurrent_done.load(std::memory_order_acquire) &&
                            !stop.load(std::memory_order_acquire) &&
                            std::chrono::steady_clock::now() < hold_until)
                         std::this_thread::yield();
+                    if (!concurrent_done.load(std::memory_order_acquire) ||
+                        concurrent_forks.load() != 5)
+                        throw std::runtime_error(
+                            "the concurrent owner did not complete its forks "
+                            "inside the held window");
                     OMP_WORKSHARE_REGION(work);
                     OMP_WORKSHARE_REGION(work);
                     OMP_WORKSHARE_REGION(work);
@@ -5090,12 +5098,29 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         auto input = makeTestInput(1, 1, DeviceId::cpu(), tokens.data(), positions.data());
         input.execution_phase = ForwardExecutionPhase::Decode;
         ForwardOutput output{};
-        EXPECT_FALSE(engine.execute(input, output, host));
-        EXPECT_TRUE(PerfStatsCollector::snapshot({"omp"}).empty())
-            << "a failed step publishes no count rather than a partial one";
+        // Baseline: the summary record the earlier successful step published
+        // in THIS configuration. The exclusion assertions compare against it
+        // (unchanged snapshot), because a bare emptiness check would be
+        // vacuous by construction.
+        const std::vector<PerfStatRecord> baseline =
+            PerfStatsCollector::snapshot({"omp"});
+        EXPECT_FALSE(baseline.empty());
 
-        // A SUCCESSFUL decode on the same gates publishes exactly once, so
-        // the failure exclusion is discriminating rather than vacuous.
+        EXPECT_FALSE(engine.execute(input, output, host));
+        const std::vector<PerfStatRecord> after_failure =
+            PerfStatsCollector::snapshot({"omp"});
+        EXPECT_EQ(after_failure.size(), baseline.size())
+            << "a failed step must leave the summary inventory unchanged";
+        for (size_t record = 0; record < after_failure.size() &&
+                                 record < baseline.size(); ++record)
+        {
+            EXPECT_EQ(after_failure[record].name, baseline[record].name);
+            EXPECT_EQ(after_failure[record].value, baseline[record].value);
+            EXPECT_EQ(after_failure[record].count, baseline[record].count);
+        }
+
+        // A SUCCESSFUL decode on the same gates publishes exactly once more,
+        // so the failure exclusion is discriminating rather than vacuous.
         host.graph_stage_factories = {
             [](const std::string &name, DeviceId device)
             {
@@ -5110,14 +5135,19 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
             }};
         ForwardOutput success_output{};
         ASSERT_TRUE(engine.execute(input, success_output, host));
+        const std::vector<PerfStatRecord> after_success =
+            PerfStatsCollector::snapshot({"omp"});
         bool published = false;
-        for (const auto &record : PerfStatsCollector::snapshot({"omp"}))
-            if (record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily)
+        for (const auto &record : after_success)
+            if (record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily &&
+                record.value == 1.0 && record.count == 1u)
                 published = true;
-        EXPECT_TRUE(published) << "a successful step on the same gates must publish";
+        EXPECT_TRUE(published)
+            << "a successful step on the same gates must publish exactly one fork";
 
         // Prefill exclusion: the same selected gates, a prefill phase with
         // COMPLETE input extents (four rows, four tokens, four positions).
+        // The summary inventory must be UNCHANGED by the prefill step.
         const std::vector<int> prefill_tokens = {60, 61, 62, 63};
         const std::vector<int> prefill_positions = {0, 1, 2, 3};
         auto prefill = makeTestInput(4, 1, DeviceId::cpu(), prefill_tokens.data(),
@@ -5127,8 +5157,17 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         MockForwardExecutionHost prefill_host(&mock_ctx_);
         prefill_host.graph_stage_count = 1;
         ASSERT_TRUE(engine.execute(prefill, prefill_output, prefill_host));
-        EXPECT_TRUE(PerfStatsCollector::snapshot({"omp"}).empty())
-            << "the summary is a decode-step surface; prefill publishes none";
+        const std::vector<PerfStatRecord> after_prefill =
+            PerfStatsCollector::snapshot({"omp"});
+        EXPECT_EQ(after_prefill.size(), after_success.size())
+            << "a prefill step must leave the summary inventory unchanged";
+        for (size_t record = 0; record < after_prefill.size() &&
+                                 record < after_success.size(); ++record)
+        {
+            EXPECT_EQ(after_prefill[record].name, after_success[record].name);
+            EXPECT_EQ(after_prefill[record].value, after_success[record].value);
+            EXPECT_EQ(after_prefill[record].count, after_success[record].count);
+        }
     }
 
     // The GPU refusal reached PAST the seam: the GPU device's decode runs a

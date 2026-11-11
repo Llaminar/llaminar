@@ -262,18 +262,43 @@ TEST(OpenMPTeamForkStageEvidence, RetainedLoopPublishesExactPerStageCells)
 /** @brief The retained multi-device plan publishes no fork record for GPU entries. */
 TEST(OpenMPTeamForkStageEvidence, PublisherRefusesNonCpuDevicesAndUngatedCalls)
 {
-    // The publisher owns the explicit stage-enable policy: with the CPU
-    // stage-timing gate off, even a CPU device and a selected family publish
-    // nothing; gate, family and device must all accept.
+    // Control (a): EVERYTHING off. The publisher must refuse, and the gate
+    // predicates prove the configuration actually is all-off before the call.
+    {
+        const ScopedForkEvidenceConfig all_off(nullptr, nullptr, true);
+        EXPECT_FALSE(llaminar2::PerfStatsCollector::cpuStageTimingEnabled());
+        EXPECT_FALSE(llaminar2::PerfStatsCollector::isRecordFamilyEnabled(
+            "omp", llaminar::v2::kOpenMPTeamForkStageFamily));
+        llaminar::v2::OpenMPTeamForkScope scope;
+        auto work = [] {};
+        OMP_WORKSHARE_REGION(work);
+        llaminar::v2::publishOpenMPTeamForkStage(scope, "all_off_entry", "decode",
+            DeviceId::cpu(), 1u, "GEMM");
+        EXPECT_TRUE(llaminar2::PerfStatsCollector::snapshot({"omp"}).empty())
+            << "an all-off configuration must publish nothing";
+    }
+    // Control (b): collection ON, the omp family selected, the CPU
+    // stage-timing gate OFF. The predicates prove exactly that state before
+    // the call, so the empty result is attributable to the gate alone - a
+    // removed gate would flip this control to publishing.
     {
         const ScopedForkEvidenceConfig ungated("omp", nullptr, true);
+        ::setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+        ::setenv("LLAMINAR_PERF_STATS_FILTER", "omp", 1);
+        mutableDebugEnv().reload();
+        llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
+        ASSERT_TRUE(llaminar2::PerfStatsCollector::isRecordFamilyEnabled(
+            "omp", llaminar::v2::kOpenMPTeamForkStageFamily))
+            << "the family must be selected for the gate refusal to mean anything";
+        ASSERT_FALSE(llaminar2::PerfStatsCollector::cpuStageTimingEnabled())
+            << "the stage gate must be the OFF input in this control";
         llaminar::v2::OpenMPTeamForkScope scope;
         auto work = [] {};
         OMP_WORKSHARE_REGION(work);
         llaminar::v2::publishOpenMPTeamForkStage(scope, "cpu_entry", "decode",
             DeviceId::cpu(), 1u, "GEMM");
         EXPECT_TRUE(llaminar2::PerfStatsCollector::snapshot({"omp"}).empty())
-            << "the stage family must not appear without the stage-timing gate";
+            << "the stage-timing gate alone must refuse the publication";
     }
     {
         const ScopedForkEvidenceConfig selected("omp", "1");
