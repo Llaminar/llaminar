@@ -603,3 +603,17 @@ owner launched its own still-buggy harness instead. Source code e0 NOT
 implicated without results — purely harness scope. Lesson repeated:
 the runner SHA-verification step existed and was still bypassed —
 verify the RUNNING artifact's identity, not just the handed-off one.
+
+### B12 attempt-3 ACTUAL DATA POSITIVE (Main read-only, ~03:46Z): e0 8/8 PASS on .79
+
+run8.log: **8/8 PASS — BOTH previous failures now pass** at the e0 pin:
+CPUClusterPermanentMasterPlacement ✓ and ClusterInventoryBootstrap ✓
+(the fixture alignment + native-ownership fix both hold on the real host).
+Repeat summary: 20 OUTER rc=0 for EACH name; inner --repeat 20 → 400 PASS
+per alias — scope overrun RECORDED AS 400 (not relabeled 20). Main
+directed: STOP additional work; final binding + retained-763 evidence +
+JUnit + inventory + driver terminal + handoff packet NOW. No source
+failure in the selected results; Main inspects binding before releasing
+the SOURCE-HANDOVER BASE. Extra unapproved repeats ≠ full qualification/
+economy. Owner's own-script issues require an owner ACK; Main's corrected
+runner unused. No Main remote workload.
