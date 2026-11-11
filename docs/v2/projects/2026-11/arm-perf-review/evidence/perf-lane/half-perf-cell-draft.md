@@ -238,3 +238,24 @@ Provisional disposition: **economy NOT ADMITTED / insufficient evidence**
 — NOT a measured FMLAL rejection. Existing source ACK stays scoped.
 Review of supplied records (read-only) proceeds once exact artifact paths
 arrive from arm-sparks.
+
+### PROVENANCE CORRECTIONS (reviewer-verified + coordinator-confirmed, 2026-11-11 ~09:52Z)
+
+1. **a847db3286 is NOT an ancestor of b512e25a** (merge-base --is-ancestor
+   exits 1; verified). b512e25a = exactly adb1c98e9 → 1ea08211 → b512e25a
+   (#173 docs; only Perf__CPUHalfOperandProjection.cpp +166/−13).
+   a847db3286 lives on the witness/mainline lineage (contained in
+   origin/codex/arm-s4-nibble-witness AND feat/arm64-native-kernels;
+   parent 0d6f09919). The earlier framing 'fixture defects FIXED at
+   a847db3286 within the b512 gate' was a coordinator mislabel: any
+   fixture-repair overlay used in b512-era gate builds is a separate tree
+   whose exact identity was never recorded — the arm-sparks artifact
+   bundle must state what tree the b512-era builds actually used. The
+   b512 failed gates (Unit 990/16, Preflight 2419/23) stand UNCHANGED as
+   failures.
+2. **half-perf-cell-draft.md (v2.1) is NOT at b512e25a** — it is
+   tracker-only: branch codex/arm-perf-review, blob
+   69bb3800b05de4e7d9c18efa1d6536bfd3d30a0a (this file). The coordinator's
+   pointer claiming it was on the half-perf branch was wrong.
+Disposition unchanged: economy NOT ADMITTED / insufficient evidence;
+reviewer proceeds read-only once artifact paths arrive.
