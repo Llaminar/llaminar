@@ -1514,3 +1514,30 @@ SETTLED pin (post-B12 tip = the re-pin target; confirmed again). Source ACK
   regression + preflight registration) next; exact SHA when coherent.
   Reviewer re-check at the final pin (digest consistency between the
   reviewed pre-reflow script and the committed one must be noted).
+
+### Bundle-1 lane RETIRED (operator, 2026-11-11 ~00:35Z) — 01 + idea-31 handover accepted
+
+Lane 01a1bd53 retired; handover note archived:
+evidence/bundle1-handover-01-and-i31.md + evidence/idea31-appleclang-secondary.md.
+STATE + INHERITED RESPONSIBILITIES:
+1. **LANE 01 — one mechanical step remains, coordinator executes after the
+   combined FF relay**: remote codex/bundle1-perf-harness = 5d606a108;
+   acceptance inputs COMPLETE (WSL final GREEN; .80 bound run graded BOUND
+   @ 5d606a108); local candidate a4ebff3dd proven on 28ddbe253 (11/11 `=`
+   vs 897727484; delta-equality; ctest -N; 5/5 rerun), NOT pushed. Procedure
+   at execution: re-rebase --onto the then-current tip (bases were
+   REWRITTEN: ce9ddb326 → 8fcc0fe0b → 28ddbe253 → settled), fresh range-diff
+   + ctest -N + 5/5 rerun → proof → push --force-with-lease=
+   codex/bundle1-perf-harness:5d606a108 → Main FFs. Runner container
+   llaminar-b1-dev (private; cmake -S /src/src/v2 -B /build;
+   CCACHE_DIR=/ccache). The only local copy of a4ebff3dd = worktree
+   llaminar-bundle1-dev — clean up ONLY after the push lands.
+2. **IDEA-31 AppleClang closure — REASSIGNED (queued to arm-addon post-#175)**:
+   the lane's AppleClang-21 closure offer (NEON + DOTPROD + I8MM
+   compile-only canonical-witness extension) does not survive the session;
+   the accepted record = evidence/idea31-appleclang-secondary.md
+   (0ad84ecca). The i31 worktrees + 4 builds are freed once the closure is
+   reassigned (Mac session: addon lane).
+3. **Cleanup after 01 push + FF confirm**: worktrees llaminar-bundle1(-dev),
+   containers llaminar-b1/-dev, volumes, remaining /tmp evidence — per the
+   standing rule (coordinator enforces).
