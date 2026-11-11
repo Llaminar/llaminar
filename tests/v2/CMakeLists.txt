@@ -3106,6 +3106,7 @@ add_v2_test(V2_Unit_MPIBackend
 
 # Test: MPIBootstrap - self-launch mpirun command construction and CPU PE binding
 add_executable(v2_unit_mpi_bootstrap unit/utils/Test__MPIBootstrap.cpp)
+target_include_directories(v2_unit_mpi_bootstrap PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_unit_mpi_bootstrap
     llaminar2_core
     v2_core_gtest_main
@@ -3253,6 +3254,24 @@ add_v2_test(V2_Integration_NativeCorePlacesPublicationContract
     COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
         --gtest_filter=Test__MPIBootstrap.NativeCorePlaceReceiptRejectsMalformedAndIncompatiblePublication:Test__MPIBootstrap.NativeCorePlaceEntryRejectsForeignAndLateCallers
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Bootstrap;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_NativeCorePlaceOrderReplay
+    COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
+        --gtest_filter=Test__MPIBootstrap.RecordedGB10NativePlaceOrderReplay
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Bootstrap;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_library(v2_native_cpu_entry_exec_fault MODULE fixtures/cpu/NativeCPUEntryExecFault.c)
+set_target_properties(v2_native_cpu_entry_exec_fault PROPERTIES C_STANDARD 11)
+target_link_libraries(v2_native_cpu_entry_exec_fault PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+add_v2_test(V2_Integration_NativeCPUEntryLifecycle
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_native_cpu_entry_lifecycle.py
+        --probe $<TARGET_FILE:v2_integration_cpu_startup_affinity>
+        --helper $<TARGET_FILE:llaminar_mpi_session>
+        --fault $<TARGET_FILE:v2_native_cpu_entry_exec_fault>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Bootstrap;Lifecycle;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
 # Command discovery must not lose a GPU on another CPU socket. Both vendors
@@ -29839,6 +29858,8 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MPIBootstrapCallerAffinity
     V2_Integration_MPIBootstrapOpenMPPlacement
     V2_Integration_NativeCorePlacesPublicationContract
+    V2_Integration_NativeCorePlaceOrderReplay
+    V2_Integration_NativeCPUEntryLifecycle
     V2_Integration_CPUSeededSamplingPositionIdentity
     V2_Integration_PrefixCacheCoordinatorMPI
     # The campaign prerequisite first builds and runs the complete V2_Unit_*
