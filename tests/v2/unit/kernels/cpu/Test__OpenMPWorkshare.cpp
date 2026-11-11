@@ -880,23 +880,49 @@ namespace
             // own fork stays out of the measured figure.
             EXPECT_EQ(openMPTeamForkSnapshot() - before, notes)
                 << "nested owners " << owners;
-            // Enforced LIFO teardown: the inner scope dies FIRST, and the
-            // restored stack is asserted before the outer follows - the
-            // outer must never die above a live inner.
-            inner.reset();
+            if (outer)
             {
-                OpenMPTeamForkScope restored;
+                // Enforced LIFO teardown: the inner scope dies FIRST, and the
+                // restored stack is asserted before the outer follows - the
+                // outer must never die above a live inner.
+                inner.reset();
+                {
+                    OpenMPTeamForkScope restored;
+                    auto local_idle = [] {};
+                    OMP_WORKSHARE_REGION(local_idle);
+                    EXPECT_EQ(restored.forks(), 1u);
+                    // STACK IDENTITY, not just a self-count: the probe fork
+                    // must attribute to BOTH the fresh scope and the
+                    // surviving outer (the walked stack is exactly
+                    // [restored, outer]). A lost or wrong previous link would
+                    // leave the outer at `notes` and fail here.
+                    EXPECT_TRUE(outer.has_value());
+                    EXPECT_EQ(outer->forks(), notes + 1)
+                        << "the probe must walk restored AND the surviving outer";
+                }
+                outer.reset();
+                result.process_delta = notes + 1; // Notes plus the probe.
+            }
+            else
+            {
+                // owners==0: nothing was alive, so the stack is already the
+                // restored original and there is nothing to tear down.
+                inner.reset();
+                result.process_delta = notes;
+            }
+            // The ORIGINAL stack is restored after the teardown: a fork now
+            // must attribute to nothing (the total is its only witness).
+            const std::uint64_t after_teardown = openMPTeamForkSnapshot();
+            {
                 auto local_idle = [] {};
                 OMP_WORKSHARE_REGION(local_idle);
-                EXPECT_EQ(restored.forks(), 1u)
-                    << "the owner stack must be exactly the outer scope after "
-                       "the inner was torn down";
             }
-            outer.reset();
-            result.process_delta = notes + 1; // Measured notes plus the probe.
+            EXPECT_EQ(openMPTeamForkSnapshot() - after_teardown, 1u);
+            result.process_delta += 1; // The post-teardown fork.
         }
         // Every configuration counts each fork exactly once in the total
-        // (the nested branch's figure includes its restoration probe).
+        // (the nested branch's figure includes its restoration probe and the
+        // post-teardown fork that proves the original stack is restored).
         EXPECT_EQ(openMPTeamForkSnapshot() - before, result.process_delta)
             << (concurrent_threads ? "concurrent" : "nested") << " owners, " << owners;
         return result;
@@ -924,9 +950,11 @@ TEST(OpenMPWorkshare, TeamForkCounterPublicationCostAndDefault)
     {
         EXPECT_LT(cost, 100.0) << label;
         std::cout << "[evidence] openmp_team_fork_note_self_cost_" << label << "="
-                  << cost << " ns per owner note, amortized over " << kMeasuredNotes
+                  << cost << " ns per owner note, amortized concurrent wall time "
+                            "including rendezvous over " << kMeasuredNotes
                   << " notes per measuring thread (per-owner latency, not aggregate "
-                     "throughput; figures measured with the production owner walk)"
+                     "throughput; figures measured with the production owner walk; "
+                     "readiness permits concurrency and does not prove scheduler overlap)"
                   << std::endl;
     }
     EXPECT_GE(two_owners, no_owner * 0.5)
