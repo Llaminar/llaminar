@@ -1721,3 +1721,16 @@ logs/JUnit, no subset/count hardcode. Results:
 qualification / 18-gate. .80 definitional already delivered (canonical
 full Unit/preflight); awaiting the planned slot ACK. Old scheduled prompt's
 #58-OPEN state ignored: #58 CLOSED NOGO — no apparatus work.
+
+### MAC CAMPAIGN LEG COMPLETE + VERIFIED (Main, ~11:34Z)
+
+Exact MERGED bb clean isolated source; AppleClang-21/libomp Integration
+NEON; full build -k 0 unrestricted PASS; **complete portability CTest
+295/295 PASS in 22.31s**. Main independently parsed inventory + JUnit:
+EXACT 295 names, zero failures/errors/skips/embedded zero-or-skip markers,
+raw 295 Passed records; exit phase=completed 0. Source checkout still
+CLEAN. Retained: results /tmp/llaminar-main-bb-mac-results/, build
+/tmp/llaminar-main-bb-portability/, source /tmp/llaminar-main-bb-source/.
+SCOPE: Main post-merge campaign MAC LEG — NOT Mac engine/full-backend/
+economy qualification. .80 canonical full Unit/preflight Engine leg
+PENDING the booked slot. PR status updating hash-free.
