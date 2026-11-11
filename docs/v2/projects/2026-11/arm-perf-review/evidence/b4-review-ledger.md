@@ -188,3 +188,27 @@ backfill branch exercised; V-1/ragged covered; header boundaries
 explicit (G harness-level corrected). Portable TU ± __ARM_NEON verified.
 NOTE: a brief TU clobber during patching was recovered from the
 committed a42ac312b blob (committed diff = authoritative).
+
+## DIAGNOSTIC RE-REVIEW #3 (~23:23Z): 3002d37cc SOURCE HOLD — A2/A3/A4 deterministic, A1 partial, A5 narrow-closed
+
+- A2: aggregate 228 vs asserted 227 (1+3+2+64+63+95); fix the aggregate,
+  don't remove an exercised row; per-arm accounting + labels stand.
+- A3: draw_q and correction_q still the SAME input (enumerate(p,·)
+  changes both) → EXPECT_TRUE(differs) false; separate the two inputs
+  (draw (1/4×4) vs correction (1/8,1/8,1/4,1/2); algebra predicts
+  (31/64,21/64,1/8,1/16)); the omitted-residual negative REMAINS ABSENT.
+- A4: boundary oracle wrong — residual normalizes to (1,2,3)=(.5,.25,.25)
+  with r<=cumulative → threshold .5 selects token 1, not 3;
+  clamp_unit_threshold comment misstates endpoints; keep the production
+  convention; positive fixtures' 64-bin alignment CLOSED for these
+  fixtures (retain the narrow claim).
+- A1: frontier/epoch machinery present BUT constructor takes no epoch,
+  the frontier is advanced by the same untrusted receipt, future
+  positions are accepted → "lookahead unrepresentable" still false;
+  enforce provenance or explicitly limit to assumed-committed inputs;
+  exercise cap with fewer slots than distinct IDs; stale v2 text at :190.
+- A5: NARROW CLOSED (geometry evaluated, reverse arms incl. 95,
+  boundaries explicit); rename "backfill" → "reverse ordering" in the
+  head (:39/:258).
+DISPOSITION: focused repairs in existing files; no new apparatus; spec
+ACK intact; fences unchanged.
