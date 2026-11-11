@@ -263,3 +263,64 @@ TIMEOUT 300). Contract compliance:
   CPUMoESingleTokenTransaction invocation at bdbb8e370, Release
   Integration build, default formats, unprofiled, evidence = stdout +
   CPU_STT_* lines per placement into a K14 seal.
+
+### B4 DESIGN INPUT (reviewer, ~13:33Z) — operator-directed consultation; no implementation grant
+
+Static source checked at bb893cd79; Phase-A timings remain owner-reported.
+(1) **Correct boundary is not greedy-vs-stochastic** — it is unchanged
+   TARGET law p + truthful PROPOSAL law q + correct coupling/correction.
+   For shortlisted qS (zero outside S): draw y~qS, accept
+   min(1,p(y)/qS(y)); on rejection draw r(x)=[p(x)-qS(x)]+/Z. Accepted
+   mass=min(p,qS), output mass=p. qS = normalized shortlisted logits does
+   NOT require the old full-vocab normalizer; but changing the proposal
+   while keeping OLD q in the ratio is INCORRECT. Acceptance
+   probabilities generally change with q; the invariant is the corrected
+   TARGET OUTPUT distribution — equal distribution ≠ identical old seeded
+   output.
+(2) **Cheap stochastic-valid special case already in the repo:**
+   deterministic proposal a(h) (incl. shortlist argmax) = q=delta_a, accept
+   with p(a), on rejection sample p with a removed; a need NOT be the
+   full-draft argmax. SamplingMath.h/IBackend.h/DeviceGraphOrchestrator.cpp
+   support greedy draft/one-hot q with stochastic TARGET. STRONGER CPU
+   seeded contract: OrchestrationRunner.cpp:9056 selects
+   serial-sample-equivalent host stochastic when seed!=0;
+   MTPRejectionSampler.cpp:129ff draws directly from TARGET p with a
+   position-keyed threshold (accept iff token==draft proposal) — changed
+   draft proposals can preserve the same serial seeded target stream
+   (Unit SerialEquivalentCorrectionIgnoresDraftChoice documents it). Do
+   NOT replace this CPU seeded coupling with one-hot rejection silently.
+(3) **Operator contract wording (reviewer-drafted, for the operator's
+   approval):** "B4 is an explicit versioned draft-proposal policy
+   evaluating only admitted live vocabulary rows. Full target head/
+   sampling policy, grouped target arithmetic and committed-state
+   authority remain unchanged. Shortlist miss causes normal speculative
+   correction, never target restriction to the shortlist or a
+   full-draft-head retry. Proposal policy and verifier coupling are
+   separate typed axes." Minimum proof per clause (selected-row arithmetic
+   byte-compare to identical full-head rows, IQ3_S ragged/sharded; proposal
+   ownership valid unique nonempty live S + deterministic tie-breaking +
+   no lookahead; greedy = same serial target-greedy tokens AND continued
+   KV/GDN/sampler state incl. winner-absent/ties/EOS/rejection positions;
+   stochastic = analytic/enumerated tiny-vocab proof + recorded-state/RNG
+   replay, wrong-q and omitted-mass negatives fail; seed/version =
+   unchanged coupling retains records, changed q explicitly approved;
+   ownership/runtime = existing authorities only; economy = counted
+   rows/bytes, cost per EMITTED token).
+(4) **RECOMMENDATION: GREEDY-TARGET FIRST** on the measured CPU/IQ3_S lane
+   as the smallest engineering slice, stochastic modes unchanged.
+   Unsupported shortlist+coupling requests reject; no silent stochastic
+   disabling/fallback. Staging ≠ mathematical ban on stochastic. Next:
+   existing CPU seeded target-draw coupling or GPU one-hot semantics
+   BEFORE inventing sampled sparse-q machinery.
+(5) Building S must avoid full-head evaluation (full logits then top-k
+   saves no dominant weight traffic); prior verified target top-k = a
+   possible cheap heuristic, NOT certified current top-k. A =
+   sum min(p,qS) = 1-TV(p,qS) ≤ p(S); deterministic A = p(a). Savings
+   can vanish via extra rejections/target transactions. Conditional on
+   13-15% being non-overlapped MTP wall time: removing ALL draft-head work
+   with unchanged transaction counts caps speedup ≈1.15-1.18×; overhead/
+   acceptance loss lower it. The no-MTP 10.2% fraction is NOT additive.
+BOTTOM LINE: greedy-first staged design recommended; "stochastic
+shortlist necessarily changes target law" is FALSE. Preserve target law,
+actual q, and the installed seeded coupling separately. No implementation/
+economy admission.
