@@ -1780,3 +1780,7 @@ call. Main proceeds with lease execution; own read-only dockerps at
 start per its standard practice. Sparks quiesced until lease returned
 in writing; lockbox (greedy rider, M=1 window, B1 checks, Dir-B, nsys
 smoke) queued behind the campaign.
+ONE-BIT CONFIRMED by sparks: the full campaign wrapper was NEVER launched
+("resuming NOW" = plan statement superseded by the lease transfer; message-
+sequencing error, admitted). No wrapper process/container; dockerps empty.
+.80 CLEAR for Main; relinquish stands. Lease execution unblocked.
