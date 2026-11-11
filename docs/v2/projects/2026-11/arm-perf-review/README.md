@@ -1541,3 +1541,35 @@ STATE + INHERITED RESPONSIBILITIES:
 3. **Cleanup after 01 push + FF confirm**: worktrees llaminar-bundle1(-dev),
    containers llaminar-b1/-dev, volumes, remaining /tmp evidence — per the
    standing rule (coordinator enforces).
+
+## Branch-lifecycle rule + remote-branch matrix (operator, 2026-11-11)
+
+RULE: when a session's work is fully handed over to Main (merged into
+feat/arm64-native-kernels) and confirmed, the session's REMOTE BRANCH IS
+REMOVED (coordinator executes the deletion after the FF/merge confirm; SHAs
+remain in the tracker docs + sealed receipts). Keep refs ONLY while their
+content is unmerged or carries a reviewer ACK pin still needed.
+
+REMOTE BRANCHES (ARM perf program) + removal triggers:
+- codex/arm-addon — DELETED (2026-11-11): content merged via Main's R2
+  re-land cd0f95150 (11/11 `=` vs 29351..8fcc; cd0f is an ancestor of the
+  current tip — verified).
+- codex/arm-s4-nibble-witness @ 38ed21507 — combined candidate; REMOVE
+  after Main's FF of the combined stack (its commits then live in #43).
+- codex/arm-panel-tournament-policy @ e5248cba8 + codex/arm-witness-post-index
+  @ f265d2950 — reviewer-ACK pins (#161-#165, #169); REMOVE after the
+  combined FF + Main confirmation (ACK history preserved in the tracker).
+- codex/bundle1-perf-harness @ 5d606a108 — REMOVE after Bundle-1's FF.
+- codex/arm-b9-strengthening @ 825fe8deb — REMOVE after the fold lands
+  (post-FF; content then in #43).
+- codex/arm-half-perf-cell @ b512e25a — REMOVE after the half-perf
+  handover/merge.
+- codex/arm-idea26-openmp-wakeup @ 16d633c15 — REMOVE after the A1/OpenMP
+  item's handover.
+- feat/neon-s4-nibble-lifetimes @ 972c0081e — frozen idea-31 evidence pin;
+  REMOVE after the combined FF (content re-derived in the stack).
+- codex/arm-perf-review — PERMANENT (the tracker; never removed).
+NON-ARM branches (feat/continuous-batching*, feat/mxfp4*, feat/qfn*,
+feat/qwen*, feat/clover*, feat/native-*, claude/*) belong to their own
+programs — not removed by the ARM program; their owners follow the same
+rule at their own completions (informed).
