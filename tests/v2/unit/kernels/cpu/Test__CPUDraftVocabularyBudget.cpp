@@ -216,8 +216,11 @@ namespace b4_diagnostic
      * the remaining budget with unranked live IDs in ascending global-ID
      * order; |S| = min(N, live vocabulary), reported by the caller. The
      * selector's only inputs are verified receipts and the vocabulary
-     * bound — no current-logit or full-head input exists in the interface,
-     * so a lookahead selector is unrepresentable here.
+     * bound — no current-logit or full-head input exists in the interface.
+     * SCOPE LIMIT: receipts are ASSUMED-COMMITTED — the caller attests
+     * commitment, so a future-dated position is admitted as an
+     * assumed-committed receipt and the provenance enforcement is the
+     * production wiring's responsibility (stated, not claimed proven).
      */
     class CommittedTokenRecencySelector
     {
@@ -225,8 +228,9 @@ namespace b4_diagnostic
         static constexpr std::uint32_t kVersion = 1;
 
         explicit CommittedTokenRecencySelector(std::uint32_t vocab,
-            SelectorFallback fallback)
-            : vocab_(vocab), fallback_(fallback)
+            SelectorFallback fallback, std::uint64_t request_epoch)
+            : vocab_(vocab), fallback_(fallback),
+              request_epoch_(request_epoch)
         {
             if (vocab == 0)
                 throw std::invalid_argument("selector vocabulary is empty");
@@ -464,7 +468,7 @@ TEST(CPUDraftVocabularyBudget, SelectorLifetimeIsEnforcedWithReceipts)
         b4_diagnostic::DrawLaw::DeltaOnShortlist,
         b4_diagnostic::VocabBudget::shortlist(4)};
     b4_diagnostic::CommittedTokenRecencySelector selector(64,
-        policy.selector_fallback);
+        policy.selector_fallback, /*request_epoch=*/7);
     selector.reset(/*request_epoch=*/7);
     const auto &budget = policy.vocab_budget;
 
@@ -517,9 +521,31 @@ TEST(CPUDraftVocabularyBudget, SelectorLifetimeIsEnforcedWithReceipts)
     EXPECT_THROW(selector.observeVerifiedTarget({5, 5, 7, 0}),
         std::invalid_argument);
 
+    // An assumed-committed FUTURE position is accepted by this harness
+    // (the caller attests commitment); the frontier advances and the
+    // freshness order follows. This is the documented scope limit, not a
+    // proven-impossible case.
+    selector.observeVerifiedTarget({9, 100, 7, 0});
+    auto future = selector.shortlist(budget);
+    EXPECT_EQ(9u, future.front());
+
+    // Cap with fewer slots than distinct observed IDs: six distinct
+    // observations, budget N=4 -> the shortlist caps at the four
+    // freshest (positions 10..15 descending).
+    selector.observeVerifiedTarget({10, 5, 9, 0});
+    selector.observeVerifiedTarget({11, 6, 9, 0});
+    selector.observeVerifiedTarget({12, 7, 9, 0});
+    selector.observeVerifiedTarget({13, 8, 9, 0});
+    selector.observeVerifiedTarget({14, 9, 9, 0});
+    selector.observeVerifiedTarget({15, 10, 9, 0});
+    auto capped = selector.shortlist(
+        b4_diagnostic::VocabBudget::shortlist(4));
+    EXPECT_EQ(capped.size(), 4u);
+    EXPECT_EQ((std::vector<std::uint32_t>{15, 14, 13, 12}), capped);
+
     // Without the admitted fallback an empty ledger is an error.
     b4_diagnostic::CommittedTokenRecencySelector strict(64,
-        b4_diagnostic::SelectorFallback::None);
+        b4_diagnostic::SelectorFallback::None, /*request_epoch=*/9);
     EXPECT_THROW(strict.shortlist(budget), std::invalid_argument);
 }
 
@@ -656,10 +682,11 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
     // finite-precision contract for them is a production-sampler question
     // this diagnostic does not claim.
     const auto enumerate = [](const std::vector<double> &p,
-                              const std::vector<double> &draft_q) {
+                              const std::vector<double> &draw_q,
+                              const std::vector<double> &correction_q) {
         const std::size_t vocab = p.size();
         double q_total = 0.0;
-        for (const double mass : draft_q)
+        for (const double mass : draw_q)
             q_total += mass;
         // The draw-side PMF must be complete: an incomplete draft PMF is
         // the invalid-PMF negative, rejected precisely (no silent leftover
@@ -667,6 +694,12 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
         if (std::abs(q_total - 1.0) > 0.0)
             throw std::invalid_argument(
                 "draft PMF does not sum to one (invalid PMF negative)");
+        double correction_total = 0.0;
+        for (const double mass : correction_q)
+            correction_total += mass;
+        if (std::abs(correction_total - 1.0) > 0.0)
+            throw std::invalid_argument(
+                "correction PMF does not sum to one (invalid PMF negative)");
         std::vector<llaminar2::SamplingDistributionEntry> target;
         for (std::size_t id = 0; id < vocab; ++id)
             target.push_back({static_cast<std::int32_t>(id),
@@ -674,7 +707,7 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
         std::vector<llaminar2::SamplingDistributionEntry> draft;
         for (std::size_t id = 0; id < vocab; ++id)
             draft.push_back({static_cast<std::int32_t>(id),
-                static_cast<float>(draft_q.at(id))});
+                static_cast<float>(correction_q.at(id))});
         constexpr int kBins = 64; // 2^6: exact dyadic bin probabilities.
         std::vector<double> realized(vocab, 0.0);
         for (int draw_bin = 0; draw_bin < kBins; ++draw_bin)
@@ -685,7 +718,7 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
             std::int32_t drafted = static_cast<std::int32_t>(vocab - 1);
             for (std::size_t id = 0; id < vocab; ++id)
             {
-                cumulative += draft_q.at(id);
+                cumulative += draw_q.at(id);
                 if (draw_u < cumulative)
                 {
                     drafted = static_cast<std::int32_t>(id);
@@ -722,7 +755,7 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
 
     // q = p over the full support.
     {
-        const auto realized = enumerate(p, p);
+        const auto realized = enumerate(p, p, p);
         for (std::size_t id = 0; id < p.size(); ++id)
             EXPECT_DOUBLE_EQ(p.at(id), realized.at(id)) << "q=p, token " << id;
     }
@@ -731,7 +764,7 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
     // residual covers the rest exactly.
     {
         const std::vector<double> q = {1.0, 0.0, 0.0, 0.0};
-        const auto realized = enumerate(p, q);
+        const auto realized = enumerate(p, q, q);
         for (std::size_t id = 0; id < p.size(); ++id)
             EXPECT_DOUBLE_EQ(p.at(id), realized.at(id))
                 << "one-hot q, token " << id;
@@ -742,7 +775,7 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
     {
         const std::vector<double> p_disjoint = {0.5, 0.5, 0.0, 0.0};
         const std::vector<double> q_disjoint = {0.0, 0.0, 0.75, 0.25};
-        const auto realized = enumerate(p_disjoint, q_disjoint);
+        const auto realized = enumerate(p_disjoint, q_disjoint, q_disjoint);
         for (std::size_t id = 0; id < p_disjoint.size(); ++id)
             EXPECT_DOUBLE_EQ(p_disjoint.at(id), realized.at(id))
                 << "disjoint support, token " << id;
@@ -752,79 +785,172 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
     {
         const std::vector<double> p_zero = {0.5, 0.25, 0.25, 0.0};
         const std::vector<double> q = {0.25, 0.25, 0.25, 0.25};
-        const auto realized = enumerate(p_zero, q);
+        const auto realized = enumerate(p_zero, q, q);
         for (std::size_t id = 0; id < p_zero.size(); ++id)
             EXPECT_DOUBLE_EQ(p_zero.at(id), realized.at(id))
                 << "valid zero probability, token " << id;
     }
 
     // A3 negative, repaired: keep p AND the actual valid proposal draw
-    // fixed (the truthful dyadic draft supplies the draw), then supply
-    // the WRONG CORRECTION distribution to the production helper — the
-    // helper's accept ratio and residual are computed against THAT
-    // distribution, so the executed law deviates from p and the
-    // enumeration DETECTS it. (Replacing a truthful draft with another
-    // truthful draft would be a pass by theorem — the mismatched
-    // correction is the operation under test.)
+    // FIXED (the uniform dyadic draw), then supply the WRONG CORRECTION
+    // distribution to the production helper. The executed law is
+    // INDEPENDENTLY PREDICTED from the coupling algebra — accepted mass
+    // per token y = draw_q(y)*min(1, p(y)/correction_q(y)); the rejection
+    // mass 20/64 re-emits through r = [p - correction_qS]+/Z = (3/4, 1/4,
+    // 0, 0) — giving (31/64, 21/64, 1/8, 1/16), NOT p. The enumeration
+    // must reproduce that prediction exactly (a discriminating negative,
+    // specified before observing any result).
     {
-        const std::vector<double> truthful_draft = {0.25, 0.25, 0.25, 0.25};
-        const auto truthful = enumerate(p, truthful_draft);
+        const std::vector<double> draw_q = {0.25, 0.25, 0.25, 0.25};
+        const std::vector<double> correction_q = {0.125, 0.125, 0.25, 0.5};
+        const auto realized = enumerate(p, draw_q, correction_q);
+        const std::vector<double> predicted = {31.0 / 64.0, 21.0 / 64.0,
+            8.0 / 64.0, 4.0 / 64.0};
         for (std::size_t id = 0; id < p.size(); ++id)
-            EXPECT_DOUBLE_EQ(p.at(id), truthful.at(id))
-                << "truthful draft, token " << id;
-        // The wrong-correction construction: the proposal draw stays the
-        // truthful dyadic draw, but the correction distribution supplied
-        // to the production helper is a DIFFERENT dyadic distribution
-        // (its accept ratio p(y)/q_wrong(y) and its residual
-        // [p - q_wrong]+ are the wrong ones for this proposal stream).
-        const std::vector<double> wrong_correction = {0.125, 0.125, 0.25,
-            0.5};
-        const auto realized = enumerate(p, wrong_correction);
-        bool differs = false;
-        for (std::size_t id = 0; id < p.size(); ++id)
-            if (std::abs(p.at(id) - realized.at(id)) > 0.0)
-                differs = true;
-        EXPECT_TRUE(differs)
-            << "the wrong-correction negative must change the executed law";
+        {
+            EXPECT_DOUBLE_EQ(realized.at(id), predicted.at(id))
+                << "wrong-correction executed law, token " << id;
+            EXPECT_NE(std::abs(p.at(id) - realized.at(id)), 0.0)
+                << "token " << id
+                << ": the wrong correction must deviate from p";
+        }
     }
 
-    // The invalid-PMF negative: an under-covering draft (sums to 0.8) is
-    // rejected precisely by the draw-side validation (no silent leftover
-    // mass assigned to the last token).
+    // The invalid-PMF negative: an under-covering DRAW PMF (sums to 0.8)
+    // is rejected precisely by the draw-side validation (no silent
+    // leftover mass assigned to the last token); the same validation
+    // covers the correction PMF.
     {
         const std::vector<double> undercoverage = {0.2, 0.2, 0.2, 0.2};
-        EXPECT_THROW(enumerate(p, undercoverage), std::invalid_argument);
+        EXPECT_THROW(enumerate(p, undercoverage, p), std::invalid_argument);
+        EXPECT_THROW(enumerate(p, p, undercoverage), std::invalid_argument);
     }
 
-    // Threshold endpoints (restored fixture): the production helper's
-    // clamp_unit_threshold maps 0 -> the smallest admissible threshold and
-    // 1 -> certainty. With q = delta on token 0 and p(0) = 0.5: the accept
-    // probability is 0.5, so a threshold strictly below 0.5 accepts and a
-    // threshold at or above 0.5 rejects into the residual.
+    // The OMITTED-RESIDUAL negative (previously absent): a coupling
+    // implementation that re-draws the correction distribution on
+    // rejection INSTEAD of the [p - qS]+ residual is a real bug pattern.
+    // The enumerated harness variant with that omitted residual is checked
+    // against the target law and MUST deviate — proving the law checker
+    // catches an omitted residual, while the production helper's own
+    // residual (the positive cases above) passes the same checker.
     {
+        const std::vector<double> draw_q = {0.25, 0.25, 0.25, 0.25};
+        const std::vector<double> correction_q = {0.125, 0.125, 0.25, 0.5};
+        constexpr int kBins = 64;
+        std::vector<double> broken_realized(p.size(), 0.0);
+        for (int draw_bin = 0; draw_bin < kBins; ++draw_bin)
+        {
+            const double draw_u =
+                (static_cast<double>(draw_bin) + 0.5) / kBins;
+            double cumulative = 0.0;
+            std::int32_t drafted = static_cast<std::int32_t>(p.size() - 1);
+            for (std::size_t id = 0; id < p.size(); ++id)
+            {
+                cumulative += draw_q.at(id);
+                if (draw_u < cumulative)
+                {
+                    drafted = static_cast<std::int32_t>(id);
+                    break;
+                }
+            }
+            for (int accept_bin = 0; accept_bin < kBins; ++accept_bin)
+            {
+                const double accept_u =
+                    (static_cast<double>(accept_bin) + 0.5) / kBins;
+                for (int residual_bin = 0; residual_bin < kBins;
+                    ++residual_bin)
+                {
+                    const double residual_u =
+                        (static_cast<double>(residual_bin) + 0.5) / kBins;
+                    const auto outcome = llaminar2::
+                        sampleMTPRejectionRowFromDistributions(
+                            std::vector<llaminar2::SamplingDistributionEntry>{
+                                {0, static_cast<float>(p.at(0))},
+                                {1, static_cast<float>(p.at(1))},
+                                {2, static_cast<float>(p.at(2))},
+                                {3, static_cast<float>(p.at(3))}},
+                            std::vector<llaminar2::SamplingDistributionEntry>{
+                                {0, static_cast<float>(correction_q.at(0))},
+                                {1, static_cast<float>(correction_q.at(1))},
+                                {2, static_cast<float>(correction_q.at(2))},
+                                {3, static_cast<float>(correction_q.at(3))}},
+                            drafted, static_cast<float>(accept_u),
+                            static_cast<float>(residual_u));
+                    if (!outcome.ok)
+                        throw std::runtime_error(
+                            "production rejection sampler failed: " +
+                            outcome.error);
+                    // The OMITTED-RESIDUAL variant: on rejection, ignore
+                    // the produced residual token and re-draw from the
+                    // correction distribution instead (the bug pattern).
+                    double broken_cumulative = 0.0;
+                    std::int32_t broken_emit =
+                        static_cast<std::int32_t>(p.size() - 1);
+                    for (std::size_t id = 0; id < correction_q.size(); ++id)
+                    {
+                        broken_cumulative += correction_q.at(id);
+                        if (residual_u < broken_cumulative)
+                        {
+                            broken_emit = static_cast<std::int32_t>(id);
+                            break;
+                        }
+                    }
+                    const std::int32_t emitted =
+                        outcome.accepted ? outcome.token : broken_emit;
+                    broken_realized.at(static_cast<std::size_t>(emitted)) +=
+                        1.0 / static_cast<double>(kBins * kBins * kBins);
+                }
+            }
+        }
+        bool differs = false;
+        for (std::size_t id = 0; id < p.size(); ++id)
+            if (std::abs(p.at(id) - broken_realized.at(id)) > 0.0)
+                differs = true;
+        EXPECT_TRUE(differs)
+            << "the omitted-residual bug pattern must deviate from the "
+            << "target law (the checker catches it)";
+    }
+
+    // Threshold endpoints (restored fixture, production boundary
+    // convention): with q = delta on token 0 and p(0) = 0.5, the accept
+    // probability is 0.5 — a threshold strictly below 0.5 accepts; at or
+    // above 0.5 the helper rejects and the residual is NORMALIZED over
+    // tokens 1/2/3 to (.5, .25, .25) with the production selection rule
+    // r <= cumulative, so residual_threshold 0.5 selects TOKEN 1. The
+    // clamp contract: threshold 0 stays 0; threshold 1 clamps to
+    // 0.99999994f (largest float below 1) — neither endpoint is passed
+    // un-clamped by this fixture, and both extremes are asserted.
+    {
+        const std::vector<llaminar2::SamplingDistributionEntry> target{
+            {0, 0.5f}, {1, 0.25f}, {2, 0.125f}, {3, 0.125f}};
+        const std::vector<llaminar2::SamplingDistributionEntry> draft{
+            {0, 1.0f}, {1, 0.0f}, {2, 0.0f}, {3, 0.0f}};
         const auto below = llaminar2::sampleMTPRejectionRowFromDistributions(
-            std::vector<llaminar2::SamplingDistributionEntry>{
-                {0, 0.5f}, {1, 0.25f}, {2, 0.125f}, {3, 0.125f}},
-            std::vector<llaminar2::SamplingDistributionEntry>{
-                {0, 1.0f}, {1, 0.0f}, {2, 0.0f}, {3, 0.0f}},
-            0, 0.25f, 0.5f);
+            target, draft, 0, 0.25f, 0.5f);
         EXPECT_TRUE(below.ok);
         // accept_threshold 0.25 < accept_probability 0.5 -> accepted draft.
         EXPECT_TRUE(below.accepted);
         EXPECT_EQ(0, below.token);
         const auto above = llaminar2::sampleMTPRejectionRowFromDistributions(
-            std::vector<llaminar2::SamplingDistributionEntry>{
-                {0, 0.5f}, {1, 0.25f}, {2, 0.125f}, {3, 0.125f}},
-            std::vector<llaminar2::SamplingDistributionEntry>{
-                {0, 1.0f}, {1, 0.0f}, {2, 0.0f}, {3, 0.0f}},
-            0, 0.5f, 0.5f);
+            target, draft, 0, 0.5f, 0.5f);
         EXPECT_TRUE(above.ok);
         // accept_threshold 0.5 is NOT below 0.5 -> rejected; the residual
-        // threshold 0.5 over [p - q]+ = {0, .25, .125, .125}: the CDF
-        // reaches 0.25 at token 1, 0.375 at token 2, 0.5 at token 3 —
-        // u=0.5 is NOT < 0.5, so the fallback emits the last token (3).
+        // normalized (.5, .25, .25) with r <= cumulative selects TOKEN 1.
         EXPECT_FALSE(above.accepted);
-        EXPECT_EQ(3, above.token);
+        EXPECT_EQ(1, above.token);
+        // Endpoint: threshold 0 accepts any positive accept probability.
+        const auto zero_threshold =
+            llaminar2::sampleMTPRejectionRowFromDistributions(target, draft,
+                0, 0.0f, 0.5f);
+        EXPECT_TRUE(zero_threshold.ok);
+        EXPECT_TRUE(zero_threshold.accepted);
+        // Endpoint: threshold 1 clamps below certainty -> rejected into
+        // the residual.
+        const auto one_threshold =
+            llaminar2::sampleMTPRejectionRowFromDistributions(target, draft,
+                0, 1.0f, 0.5f);
+        EXPECT_TRUE(one_threshold.ok);
+        EXPECT_FALSE(one_threshold.accepted);
     }
 }
 

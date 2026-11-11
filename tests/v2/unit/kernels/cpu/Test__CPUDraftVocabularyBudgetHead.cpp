@@ -36,9 +36,10 @@
  *   like-for-like full-head figure — it is NOT measured DRAM/cache-line
  *   traffic and is never described as hardware-bandwidth evidence.
  * - A5: coverage equals EXECUTED source — both head geometries are
- *   actually evaluated, even-sized shortlists exercise the backfill
- *   branch, and a reverse arm covers the final vocabulary row (V-1) and
- *   the ragged tail. The grouped M=4-versus-serial check is a production
+ *   actually evaluated, even-sized shortlists exercise the reverse
+ *   ORDERING branch (a fixture ordering choice, not selector backfill),
+ *   and a reverse arm covers the final vocabulary row (V-1) and the
+ *   ragged tail. The grouped M=4-versus-serial check is a production
  *   METAMORPHIC HEAD check; it is NOT a full model/KV/GDN/stop-state
  *   replay — that boundary is explicit.
  * - Counted traffic: the shortlisted evaluation's touched prepared bytes
@@ -278,6 +279,8 @@ TEST(CPUDraftVocabularyBudgetHead, SelectedRowsAreBitwiseIdenticalAndCounted)
         std::vector<std::uint32_t> shortlist;
         for (std::uint32_t index = 0; index < arm.n; ++index)
         {
+            // Reverse arms are an ORDERING choice of this fixture, not
+            // selector backfill (backfill is selector-v1 semantics).
             const std::uint32_t id =
                 arm.reverse ? (kTailVocab - 1u) - index : index;
             shortlist.push_back(id);
@@ -321,11 +324,11 @@ TEST(CPUDraftVocabularyBudgetHead, SelectedRowsAreBitwiseIdenticalAndCounted)
                   << ",accounting=logical_prepared_operand_volume"
                   << ",not_hardware_traffic=1\n";
     }
-    EXPECT_EQ(evaluated_rows_total, 227u)
+    EXPECT_EQ(evaluated_rows_total, 228u)
         << "the aggregate evaluated rows across arms (1+3+2+64+63+95)";
     // The reverse arms cover the final vocabulary row (V-1) and the
     // ragged tail rows (chunk 1, columns 0..31).
-    EXPECT_EQ(counted_selected_bytes, 227u * rowBytes(kHeadBlocks(kHeadK)));
+    EXPECT_EQ(counted_selected_bytes, 228u * rowBytes(kHeadBlocks(kHeadK)));
 
     // Second geometry exercised: the V=64/K=1024 head gets its own
     // reference and a shortlist arm (the same bitwise oracle).
