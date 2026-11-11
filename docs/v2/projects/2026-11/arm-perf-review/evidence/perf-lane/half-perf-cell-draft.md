@@ -224,3 +224,17 @@ untouched.
 - Sequence: idea31 .80 economy + explicit disposition → separate 777f branch
   → this cell/smoke → .80 production baseline/economy → only then separate
   native candidate/leaf slice. No arithmetic/API contract created/altered.
+
+### Reviewer initial scope finding (2026-11-11 ~09:51Z) — economy NOT ADMITTED (insufficient evidence)
+
+At exact b512e25a: CPUHalfOperandProjection.md explicitly states no native
+leaf candidate is IMPLEMENTED; resolved-leaf/observed-team remain
+unobserved; K255/256/257 diagnostics are NOT canonical GDN evidence; and
+authentic GDN trace + Linux economy are still OUTSTANDING. Therefore the
+source-complete cell + 5/5 correctness can neither justify nor cancel
+FMLAL on economic grounds. v2.1 requires matched fresh-process samples +
+authentic geometry + external identity/FP/team/profiler receipts.
+Provisional disposition: **economy NOT ADMITTED / insufficient evidence**
+— NOT a measured FMLAL rejection. Existing source ACK stays scoped.
+Review of supplied records (read-only) proceeds once exact artifact paths
+arrive from arm-sparks.
