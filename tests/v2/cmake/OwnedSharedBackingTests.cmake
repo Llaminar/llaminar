@@ -1,3 +1,8 @@
+# @file OwnedSharedBackingTests.cmake
+# @brief Model-free guardian, shared-backing and original-root lifetime regressions.
+#
+# Standalone consumers use the session-owner target for its complete native
+# startup dependency closure without linking the inference engine or a device runtime.
 # These declarations own only functional targets and registrations. Release
 # intentionally excludes them through V2TestTargetSelection/add_v2_test; return
 # before attaching target properties or labels to omitted owners.
@@ -140,7 +145,7 @@ add_executable(v2_test_mpi_root_retirement_body unit/utils/Test__MPIRootRetireme
 target_include_directories(v2_test_mpi_root_retirement_body PRIVATE ${REPO_ROOT}/src/v2)
 target_compile_features(v2_test_mpi_root_retirement_body PRIVATE cxx_std_20)
 target_link_libraries(v2_test_mpi_root_retirement_body PRIVATE
-    GTest::gtest_main OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
+    llaminar_mpi_session_owner GTest::gtest_main)
 foreach(_root_suite Unit Integration)
     add_v2_test(V2_${_root_suite}_MPIRootRetirementBody
         COMMAND $<TARGET_FILE:v2_test_mpi_root_retirement_body> --gtest_repeat=20
