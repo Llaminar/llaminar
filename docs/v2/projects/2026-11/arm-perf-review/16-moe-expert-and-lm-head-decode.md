@@ -324,3 +324,77 @@ BOTTOM LINE: greedy-first staged design recommended; "stochastic
 shortlist necessarily changes target law" is FALSE. Preserve target law,
 actual q, and the installed seeded coupling separately. No implementation/
 economy admission.
+
+### B4 follow-up: DRAFT VOCABULARY BUDGET design (reviewer, ~14:00Z) — design only, fence unchanged
+
+Terminology: **draft_vocab_limit**, NOT "proposal length" (confusable
+with MTP draft-token DEPTH). Three independent meanings kept separate:
+shortlist SELECTOR, proposal DRAW LAW, verifier COUPLING.
+- Typed: DraftProposalPolicy { policy_version, selector, draw_law,
+  vocab_budget }; VocabBudget = FullVocabulary | ShortlistLimit{checked_
+  positive_N}. Verifier coupling/version separate. "full" = CURRENT
+  full-vocabulary DRAFT PROPOSAL with MTP STILL ENABLED (≠ no-MTP);
+  preserve current baseline computation + seeded coupling.
+- N = maximum LIVE distinct candidate token IDs; actual |S(h)| explicit +
+  reported; smaller set only via declared selection/eligibility semantics,
+  never resource-error recovery; empty legal support fails. 1<=N<V;
+  zero/out-of-range error; 'full' spelled explicitly; do NOT alias N=V to
+  full if candidate draw law differs (one-hot vs CPU sampled full-draft).
+- N does NOT define selection/draw. Exact top-N of current full logits
+  requires full-head eval (defeats the savings) — use ONE fixed versioned
+  cheap causal selector (prior verified target row ranking = heuristic,
+  NOT certified top-N); then evaluate current draft logits ONLY on S. On S:
+  declared deterministic winner (q=delta_a) OR actual normalized sampled
+  qS. Never call rank scores/old full-head probabilities the proposal q
+  unless they generated the token. "Residual always on" is NOT universal:
+  greedy target = exact target-greedy mismatch correction; CPU seeded
+  serial-target-draw = existing sample+match coupling; probability-
+  rejection = min(1,p/qS) + normalized[p-qS]+ over FULL target support.
+  Different contracts; target policy p unchanged at EVERY admitted N.
+- Acceptance/economy: A=1-TV(p,qS) only for probability-rejection at fixed
+  prefix; one-hot q → p(a); target-greedy = exact match; CPU seeded = its
+  RNG coupling (NOT the TV formula). NO monotonicity in N. Measure
+  accepted-prefix LENGTH, rejection position, target transactions, actual
+  depth/controller, latency per EMITTED token. Extra rejections = work
+  amplification, not hysteresis — start repeated comparisons from
+  equivalent initial state. 'full' = 1.0× reference, NOT where the
+  1.15–1.18× ceiling sits (that ceiling assumes eliminating all 13–15%
+  draft-head cost with everything else fixed; N controls how close, and
+  changed acceptance/work invalidates it as an absolute bound).
+- IQ3_S exploratory points: full + 64/128/256/512/1024/4096; N=1 = extreme
+  diagnostic; add a larger point if quality poor, refine near the
+  measured frontier. NO default justified yet. Correctness covers
+  non-aligned counts/sparse IDs (63/65,127/129,V−1), zero/invalid, ties,
+  reset; pilot timing points ≠ supported-N envelope.
+- Per-model calibration plausible but identities matter (weights revision,
+  format, ISA/backend, placement/sharding, workload, sampler/coupling,
+  MTP-depth, prefix policy); start with explicit authored N + default
+  full; persist calibration via existing config/tracker surfaces; NO new
+  automatic tuner/gate apparatus; hold-out prompts + clean repeated
+  Release timings decide economy.
+- Seed: sweep NOT restricted to greedy/unseeded mathematically; CPU
+  seed≠0 = maybe the STRONGEST same-seed compatibility experiment. Target
+  RNG addressed by logical position + existing stream/token-ID
+  conventions — NOT by N/shortlist rank/depth/rejections. Retain
+  byte-equivalent target rows + accepted-state continuation. Probability-
+  rejection with changed q can change old seeded output despite
+  preserving p → explicit policy/version approval. Greedy-target first =
+  lower engineering risk; unsupported combinations reject WITHOUT
+  silently disabling MTP. IQ3_S packing does NOT justify rounding the
+  budget; kernel padding ≠ live support; invalid IDs/duplicates/stale
+  generation/zero-mass support fail precisely.
+- ONE BUILD: N = runtime descriptor DATA (not template/CMake/per-N
+  binary); same Release binary, separate fresh startup instances per N;
+  compile/source/ISA identity fixed; PMA admission for workspace/
+  weights/layout; each startup binds policy BEFORE capture; runtime-N
+  dispatch handles odd/tail; N + selector/draw/coupling versions in
+  config/results/capture identity. "One build" ≠ mutating N in a running
+  request (that needs an admitted dynamic-capacity contract; no hot
+  allocation/readback/recapture). Canonical timing unprofiled; selected-
+  row byte/traffic paths separately qualified.
+RECOMMENDATION (reviewer → operator): **approve the DESIGN of an explicit
+runtime draft-vocabulary budget** with full baseline + fixed selector/
+draw/coupling identity; stage greedy-target first, then the
+already-existing stochastic couplings as separately proved modes. NOT an
+implementation unfence; no N/economy result admitted. Existing focused
+tests + Main's post-merge campaign ownership unchanged.
