@@ -229,3 +229,51 @@ seed −1).
   slot. No execution before either.
 STATUS: draft for the tracker; awaiting (a) the T1/T2 two-transaction
 approval call, (b) the 35B greedy result, (c) a slot.
+
+### IDEA-14 B-WAVE DEPTH-SWEEP PROTOCOL (arm-addon3 design draft, ~15:17Z) — execution queued post-FF
+
+**QUESTION:** is the Phase A acceptance drop (38.89% at depth=10 [1,15]
+budget-limited vs tracker-verified 99% at depth 7) DEPTH-DRIVEN,
+sampling-driven, or base-driven? The greedy rider settles the sampler
+axis; this sweep isolates the DEPTH axis with everything else pinned.
+- **MODE DEPENDENCY (upfront):** the sweep runs under the controlled-
+  reference sampler (temp 0 + seed 42) IF the 35B greedy rider validates
+  the sampling-mode repair; otherwise BOTH modes per the greedy outcome —
+  the mode dependency is carried as a factor, not hidden. Depth is
+  orthogonal to sampler by design: only the depth policy changes.
+- **INDEPENDENT VARIABLE — depth policy:** fixed depths **5, 7, 10, 12**
+  (7 = tracker-verified baseline; 10 = Phase A observed; 5/12 bracket);
+  **dynamic** (the engine's depth controller) as a separate cell
+  (production mode; its own acceptance behavior is part of the question).
+  Budget pinned to default for fixed cells; budget-limited events recorded
+  per cell via the existing `mtp/depth_transaction_trace` v3 (pre_depth/
+  accepted_prefix/post_depth/recommended_depth/rollback/budget_limited/
+  requested_depth/effective_depth — zero new instrumentation).
+- **DEPENDENT VARIABLES per cell:** (1) acceptance curve — accepted-prefix
+  distribution (mean/median/p99 + rollback rate); (2) tok/s per depth
+  (idea-14's verifier-cost economics: acceptance vs per-row verifier
+  cost); (3) budget_limited event rate (confound candidate — acceptance
+  collapsing exactly where budget_limited fires = budget-driven, not
+  depth-driven); (4) requested vs effective vs recommended depth
+  divergence (controller behavior under each fixed depth).
+- **MODELS (paired blocks):** 27B Q4_K_S MTP repack (dense — idea-14's
+  subject; byte identity at staging, K14 artifact index checked first) +
+  35B IQ3_S MTP repack (where 38.89% originated). Each model = its own
+  paired block (same binary/GGUF/prompt/context/256-output/cache-reset/
+  placement/sampler across all depth cells; ONLY the depth policy
+  changes).
+- **CONTROLLED-REFERENCE DISCIPLINE:** one benchmark transaction per
+  cell; RESOLVED actual sampler + MTP counters + text signature recorded
+  per cell; no seed search; host identity in every artifact. **The text
+  signature doubles as a depth-invariance check:** at fixed sampler +
+  prompt, different depths change only the VERIFICATION schedule, not the
+  accepted-token sequence — divergent signatures across depths = itself a
+  finding (rollback/budget interaction changing outputs).
+- **EXECUTION SHAPE:** 2 models × 5 depth cells = 10 transactions, n=256
+  decode, at the merged tip. Anchor + artifact identities bound at
+  staging (refresh on drift). Queued post-FF, after the greedy rider (its
+  outcome sets the sampler mode), same window family (same host class/
+  binary).
+- **INSTRUMENTATION: zero new code** — the existing mtp/
+  depth_transaction_trace v3 family publishes every field the curve
+  needs; the sweep = run-matrix + export-analysis only.
