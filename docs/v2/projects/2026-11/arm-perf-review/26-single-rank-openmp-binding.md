@@ -957,3 +957,18 @@ Candidate fix shapes (pending confirmation): (a) tensor-transform group
 → per-op pooling under the byte-neutrality discipline; (b) GDN-adjacent
 correction → qkv-correction fork joins the zab fused group only if the
 correction contract allows grouping (kernel-contract, not layout).
+
+### B1 NAMED-ATTRIBUTION WINDOW BOOKED (~23:32Z): .80 now free (FMLAL #4 handed back)
+
+Run sheet (addon3): ONE Release run at 12675c956 (395dc20ef first-step
+summary included — definitional delta vs the A2 cache-hit-only exports,
+stated for the analysis); A2-rider-mirrored config (35B IQ3_S MTP
+repack ×2 modes, 27B MTP-Q4_K_S repack ×2 modes, same prompt/-c 8192/
+256-output/placement/sampler, n=256, 3 iterations); THE DELTA =
+LLAMINAR_PERF_STATS_FILTER=omp,kernel + SUMMARY=1 +
+LLAMINAR_PERF_STATS_JSON=full-records.json (complete untruncated tags —
+resolves the 4-fork stage identity AND the gdn_projection_route record
+in one pass). Identities recorded per the standard. Measurement-only
+(fork counts the deliverable; timings unlabeled). ~25 min / 4 configs.
+Seal K14-B1ATTR-12675C956-20261111. Booked via sparks; .80 available
+now (FMLAL #4 handback 23:30); fallback .79 AFTER W2.
