@@ -436,3 +436,45 @@ NOT RUN AT LANE (→ Main's post-collection campaign): 295/295 portability;
 Linux-engine targets (v2_test_forward_execution_engine, stage-evidence
 binary, v2_unit_mpi_bootstrap) — dev-host syntax-validated only.
 A2 held per boundary.
+
+### Reviewer verdict #186 successor — HOLD at 47d2711a7; consolidated #187 (U1–U4)
+
+- **U1 [P2] LIFO defect REINTRODUCED + label-vs-body mismatch:** Workshare
+  measureNoteCost now calls outer.reset() while inner remains live —
+  inner's later destructor restores TLS to the already-destroyed outer
+  (the defect #186 S1 fixed is back). Reset inner FIRST or use lexical-only
+  scopes; assert the restored stack before the next run. ALSO: concurrent
+  main constructs NO owner (both optional emplace conditions require
+  !concurrent_threads — only the worker owns a cell); worker verification/
+  teardown can run before main stops the clock despite comments. CRITICALLY:
+  the MPIBootstrap cost helper BODY is UNCHANGED from aa31 — it still
+  always creates the outer for owners==0 and times creation/checks/join/
+  teardown; ONLY THE EVIDENCE LABEL was changed to claim off-clock
+  construction. CORRECT BOTH actual focused cost cells with exact
+  owner-cell checks and timing boundaries.
+- **U2 [P2] vacuous empty-snapshot assertion:** the engine failure/prefill
+  block runs a successful decode and asserts publication, then runs prefill
+  expecting the ENTIRE omp snapshot EMPTY without reset or baseline-delta
+  comparison — the successful decode record necessarily remains. Assert
+  UNCHANGED snapshot/counts or explicitly isolate epochs; retain the
+  discriminating positive control.
+- **U3 [P2] deadline silently voids the overlap proof:** the mock hook's
+  10-second deadline silently exits the wait and proceeds to its own forks/
+  publication even when concurrent_done is false; the post-execute wait
+  then permits competing forks AFTER window closure — the claimed overlap
+  is not proven. Assert/throw on deadline BEFORE leaving the hook; require
+  the completed competing count at the held boundary. (Stop-flag pre-hook
+  cancellation otherwise improved.)
+- **U4 [P2] forced-absent destroys the control it claims:** stage
+  off_default("omp",nullptr,true)/ungated(...) first select omp, then the
+  forced-absent loop ERASES summary/filter — the 'selected family with
+  stage disabled' control has collection/family disabled too and would pass
+  even if the explicit stage gate were removed. Separate all-off from
+  collection+omp-on/stage-off configuration; assert gate predicates BEFORE
+  calling the publisher.
+- SOURCE-CLOSED: T1 named snapshot ownership; T4 tab/double-space prefilter;
+  canonical CPU spelling; pre-hook join cancellation improved. No broad
+  suite demanded. Checker/10-controls/5-TeamFork/timings = owner evidence;
+  focused core-linked engine/stage/publication controls still needed when
+  runnable (stub syntax is not their runtime proof). Whole-suite:
+  unverified-at-lane → Main post-collection. No ACK, no A2 acceptance.
