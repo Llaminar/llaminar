@@ -545,3 +545,33 @@ Four-file test delta inspected (47d parent).
   Main post-collection. Reviewer ran no tests/build/syntax/probes. No A2
   artifact acceptance or B-stage economy promotion follows automatically
   even after eventual source ACK.
+
+### #188 fix-back landed: 2d9ed7f70 (arm-addon3, ~09:35Z) — IN REVIEW
+
+Parent 372da1f6e; 3 files +88/−27; worktree CLEAN at the committed SHA
+(evidence ran against exactly the committed content — commit-first/
+clean-checkout rule executed). U3/U4 retained source-closed.
+- U2: repaired per reviewer option (a) — the block states its epoch starts
+  EMPTY (the guard resets the collector; no successful decode in it),
+  asserts the baseline IS empty, the failed step preserves the empty epoch,
+  and discrimination comes from the exact positive control (a successful
+  step on the same gates publishes exactly one fork: value 1, count 1);
+  the prefill comparison against the successful step's inventory is
+  retained.
+- U1: the restored-stack assertion is DISCRIMINATING in BOTH helpers — the
+  probe fork must attribute to BOTH the fresh scope AND the surviving
+  outer (surviving outer's exact notes+1 required while the probe is live
+  — catches a previous link lost to another cell, which a bare
+  restored.forks()==1 could not); the ORIGINAL stack restored after
+  teardown is also proven (a post-LIFO-teardown fork attributes to nothing
+  but the process total, exactly one advance), both helpers.
+- Timing relabel: both harnesses label the interval AMORTIZED CONCURRENT
+  WALL TIME INCLUDING RENDEZVOUS (opens with start-gate publication, closes
+  after the competing owner's completion is observed); basis strings +
+  evidence lines carry "readiness permits concurrency and does not prove
+  scheduler overlap". Cost reports remain owner evidence.
+FOCUSED EVIDENCE at the committed SHA: checker rc=0 (176/28/54); CLI
+negatives 10/10; touched TeamFork* regressions 5/5; fixture cost cell
+2.27/4.41/6.92/15.20 ns per owner note. NOT RUN AT LANE (→ Main
+post-collection): portability receipt + Linux-engine targets. Issue freeze
+acknowledged. A2 held.
