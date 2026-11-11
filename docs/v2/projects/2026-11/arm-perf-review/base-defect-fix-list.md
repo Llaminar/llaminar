@@ -780,3 +780,30 @@ this entry; the claim as relayed to Main is also withdrawn. LESSON
 (recurring class): pipeline exit status ≠ child process status; log-tail
 capture ≠ suite completion; tiny logs bind nothing. Claim size must match
 capture quality.
+
+### **B11 CORRECTED RESULT** (worker c527, ~12:21Z) — BOTH modes SIGSEGV; allocator-level defect
+
+Full untruncated capture (no pipeline masking): **BOTH direct and MPI
+exit 139 (SIGSEGV)** — the earlier "direct exit 0" was a pipeline-masking
+artifact (tail consumed the actual exit code). CORRECTED CONCLUSION: the
+SIGSEGV is NOT MPI-specific — the same binary segfaults in both modes;
+the allocator defect reproduces on the Station regardless of launcher.
+**B11 attribution: allocator-level defect on the Station's 64K/
+memory-only-NUMA topology, reproducible with and without MPI.** This
+SUPERSEDES both the "direct exit 0" conclusion AND the withdrawn
+"MPI-launcher-specific" claim (the corrected capture changes the answer
+again — the first capture was too small to conclude anything).
+SOURCE/BINARY/BINDING: source HEAD 975f72ccba… + working delta (diff
+SHA256 133e4e6e…); binary sha256 1c7a6079… (build_v2_cb_c1/tests/v2/
+v2_test_numa_allocator); container llaminar-dev:latest sha256:b3a70cb0…
+--network none; affinity default (no pinning); permissions default (no
+SYS_NICE, no seccomp override); commands: direct = binary directly, MPI =
+mpirun -np 1 --bind-to none --map-by slot + same binary. LOGS (full
+stdout+stderr): artifacts/cb-c1-staging/current/{b11-direct-full.log,
+b11-mpi-full.log}.
+STATUS: B11 = allocator-level defect on Station topology, now
+REPRODUCED matched-identity with full capture. The ARM .79 38/39
+non-reproduction stands as a DIFFERENT-HOST observation (the defect may
+be Station-topology-specific). Next: site inspection (EPERM→null→SIGSEGV
+path — where does the null dereference happen under the Station
+topology?), then fix-or-classify.
