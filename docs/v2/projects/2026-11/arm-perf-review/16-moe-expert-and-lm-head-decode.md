@@ -557,3 +557,23 @@ sampler intent changed):
 - .80 = Main's FMLAL window (started 21:02Z, ~30-40 min). W2 (edcce0183)
   → .79 (16G free, build ≈10G fits) STARTING NOW per the parallelization
   directive.
+
+### SWEEP HYPOTHESIS SHARPENED (arm-addon2, ~21:03Z): the acceptance METRIC itself may be depth-confounded
+
+Arithmetic from the seal: 168 accepted + 65 rejected = 233 of 432 draft
+steps — **~199 steps unaccounted, matching budget_limited TRUNCATED draft
+steps.** If the acceptance denominator counts truncated steps as
+non-accepts, a depth-policy change alone (7→10 dynamic, budget-limited)
+moves the REPORTED acceptance without any real draft/target agreement
+change — consistent with 24 promotions/0 demotions (zero_accept_demote=
+0.3 explains 0 demotions at 38.9% > 0.3). SWEEP DISCRIMINATORS (cheap):
+(1) the budget_limited-event-rate column — acceptance tracking that rate
+= metric confound; (2) **one FIXED depth-7 run at temp0/seed42** — if
+acceptance jumps toward ~99% at fixed depth with the same binary/model,
+the agreement is intact and the dynamic controller+metric is the whole
+story; (3) per-run emitted-token identity vs the archived C-state greedy
+text (byte-compare — real target-arithmetic drift shows as text
+differences). IMPLICATION FOR PHASE B RANKING: if the metric confound
+holds, the TOP candidate may be a DEPTH-POLICY/controller fix (idea-14
+adjacent, policy-only, no kernel change) — and B-candidate economics
+should be re-measured at the recovered acceptance before ranking.
