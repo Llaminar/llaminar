@@ -4476,9 +4476,9 @@ namespace llaminar2
         if (success && is_decode && !input.device.is_gpu())
         {
             llaminar::v2::publishOpenMPTeamForkSummary(
-                openmp_forks_at_exec_entry.forks(),
+                openmp_forks_at_exec_entry,
                 input.device,
-                forwardGraphPerfContext(signature),
+                [this, &signature] { return forwardGraphPerfContext(signature); },
                 used_graph_replay);
         }
 

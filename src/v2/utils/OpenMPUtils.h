@@ -75,6 +75,17 @@ namespace llaminar::v2
  * explicit stage-timing gate. Every counter is monotonic and shared by test
  * shards, so consumers read deltas between scopes and snapshots, never
  * absolutes.
+ *
+ * OWNERSHIP BOUNDARY, stated explicitly because thread-local state does not
+ * propagate into a forked team: a fork is attributed to the owner cells on
+ * the stack of the thread that EXECUTES the note. The thread that constructs
+ * a scope attributes its own forks - including forks it executes while it is
+ * also the master of some team. A team worker carries a fresh (empty)
+ * thread-local stack, so a fork executed in worker context contributes to
+ * the process total only and is never attributed to any owner cell. The
+ * decode discipline that stages execute on one thread and workers never fork
+ * is enforced by the retained-team authority (inLexicalWorkshare), not
+ * assumed here; a regression pins the accounting consequence.
  */
 inline std::atomic<std::uint64_t> openMPTeamForkCount{0};
 
