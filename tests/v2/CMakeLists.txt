@@ -7757,6 +7757,24 @@ add_v2_test(V2_Unit_DeviceIndexCPUKernels
     MPI_PROCS 1  # CPU kernel tests, single rank
 )
 
+# Diagnostic only: idea-16 B4 draft-vocabulary-budget mechanism validator.
+# Non-installed namespace; no production routing/sampler/verifier change is
+# implied or granted. Device-free: the byte proof runs the real production
+# IQ3_S head kernel, the coupling properties are enumerated tiny-vocab
+# harnesses (S1-S6 corrected spec clauses as the test-property list).
+add_executable(v2_test_draft_vocab_budget unit/kernels/cpu/Test__CPUDraftVocabularyBudget.cpp)
+target_link_libraries(v2_test_draft_vocab_budget
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUDraftVocabularyBudget
+    COMMAND $<TARGET_FILE:v2_test_draft_vocab_budget>
+    LABELS "V2;Unit;CPU;NativeQuantised;Diagnostic;ByteExact;Draft"
+    MPI_PROCS 1
+    TIMEOUT 120
+)
+
 # Test: KernelFactory centralized kernel dispatch
 add_executable(v2_test_kernel_factory unit/kernels/Test__KernelFactory.cpp)
 target_link_libraries(v2_test_kernel_factory
