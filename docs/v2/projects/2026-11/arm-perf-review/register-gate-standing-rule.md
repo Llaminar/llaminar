@@ -307,3 +307,19 @@ process requirement (binding): commit first → clean checkout of the
 pushed SHA → regression against THAT tree → report only those results
 with per-file SHAs + raw log path. No native cell campaign/GPU involved;
 #191 HOLD unchanged.
+
+### PRECISION (Main, ~05:27Z) on the impossibility claim — scope corrected
+
+- The DISPROVED claim: '12 green AT PIN c00246613' — proven by the exact
+  git-show regression (3/12, exit 1).
+- The IMPOSSIBLE claim is narrower: 'the COMMITTED 686 SHA contains fixes
+  that c002 does not' — parent's immutable content was checked.
+- NOT disproved: the HYPOTHETICAL that a DIFFERENT UNCOMMITTED working
+  tree could have carried fixes and produced a 12-green run. Main has not
+  disproved that hypothetical — do NOT turn the unverified working-tree
+  narrative into an impossibility claim.
+- Critical standing facts: exact c002 = 9 FAIL/12; source ACK HOLD; whole
+  canonical binding still open.
+- ARCHIVE TASK: Main raw log + full hashes link in the tracker
+  (/tmp/arm-review-c002/actual-regression.log + Gate.sh 564c0594…, test
+  864a0874…) — keep Core holding task 77.
