@@ -3091,6 +3091,12 @@ add_v2_test(V2_Integration_MPIBootstrapOpenMPPlacement
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MPI;Bootstrap;OpenMP;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
+add_v2_test(V2_Integration_NativeCorePlacesPublicationContract
+    COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
+        --gtest_filter=Test__MPIBootstrap.NativeCorePlaceReceiptRejectsMalformedAndIncompatiblePublication
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Bootstrap;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
 # Command discovery must not lose a GPU on another CPU socket. Both vendors
 # exercise the same model-free MPI invariant with their actual drivers.
 if(HAVE_CUDA OR HAVE_ROCM)
@@ -28896,6 +28902,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     ${V2_CPU_CLUSTER_PLACEMENT_PREFLIGHT_TESTS}
     V2_Integration_ClusterInventoryBootstrap
     V2_Integration_MPIBootstrapOpenMPPlacement
+    V2_Integration_NativeCorePlacesPublicationContract
     V2_Integration_CPUSeededSamplingPositionIdentity
     V2_Integration_PrefixCacheCoordinatorMPI
     # The campaign prerequisite first builds and runs the complete V2_Unit_*
