@@ -12,6 +12,7 @@
 
 #include "config/OrchestrationConfig.h"
 #include "utils/MPIBootstrap.h"
+#include "utils/NativeCPUPlacement.h"
 #include <set>
 #include <string>
 #include <vector>
@@ -21,38 +22,6 @@ namespace llaminar2
 {
 
     class DeviceManager;
-
-    /**
-     * @brief Immutable admission of this caller's native physical-core place order.
-     *
-     * Only bootstrap can construct it after validating the actual OpenMP runtime.
-     * A rank cannot configure workers from an unprepared or foreign-thread token.
-     */
-    class NativeOpenMPCorePlaces final
-    {
-        friend class MPIBootstrapPhase;
-    public:
-        NativeOpenMPCorePlaces(const NativeOpenMPCorePlaces&)=delete;
-        NativeOpenMPCorePlaces& operator=(const NativeOpenMPCorePlaces&)=delete;
-        /** @return Borrowed immutable native geometry, valid for this admission's lifetime. */
-        const std::vector<std::vector<int>>& places() const & noexcept { return places_; }
-        const std::vector<std::vector<int>>& places() const && = delete;
-    private:
-        /**
-         * @brief Seal a validated native snapshot to its original process/thread.
-         * @param places Runtime-owned physical-core place order.
-         * @param encoding Canonical environment representation of that order.
-         * @param process Original native process identity.
-         * @param thread Original rank-admission thread identity.
-         */
-        NativeOpenMPCorePlaces(std::vector<std::vector<int>> places,std::string encoding,
-                              long process,long thread)
-            : places_(std::move(places)),encoding_(std::move(encoding)),process_(process),thread_(thread) {}
-        std::vector<std::vector<int>> places_; ///< Actual native order, one physical core per place.
-        std::string encoding_; ///< Canonical explicit OMP_PLACES publication.
-        long process_; ///< Original process, never a process-retirement authority.
-        long thread_; ///< Original rank-admission caller.
-    };
 
     /** Discovery requirements derived from parsed device declarations, not names. */
     enum class BootstrapDeviceIntent
@@ -165,18 +134,6 @@ namespace llaminar2
          */
         static std::vector<std::vector<int>> capacityOrderedCorePlaces(
             const std::vector<int> &allowed_cpus, const std::string &sysfs_root = "/sys/devices/system/cpu");
-        /**
-         * @brief Admit native capacity-ordered places before MPI/model initialization.
-         * @param argc Original application argument count.
-         * @param argv Original application arguments, preserved across native startup exec.
-         * @return An immutable token for this caller's verified native places.
-         * @throws std::runtime_error for stale publication, active MPI, invalid places or failed exec.
-         * @details A runtime needing another place order starts the same executable with the
-         * explicit rank-local list before any execution state is admitted. The runtime then
-         * owns every worker, including workers recreated after smaller teams. Reentry verifies
-         * one versioned process-local receipt; it never retries an incompatible publication.
-         */
-        static NativeOpenMPCorePlaces prepareNativeCorePlaces(int argc,char *argv[]);
         /** @return Whether current thread affinity meets the requested socket/core policy. */
         static bool verifyStartupThreadAffinity(int required_numa,
                                                 bool require_physical_only,

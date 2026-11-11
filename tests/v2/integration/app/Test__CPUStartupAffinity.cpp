@@ -269,8 +269,7 @@ int main(int argc, char **argv)
     {
         if (argc==2 && std::string(argv[1])=="--cluster-master-placement-contract")
         {
-            const auto admission=MPIBootstrapPhase::prepareNativeCorePlaces(argc,argv);
-            return checkClusterMasterPlacement(admission);
+            return checkClusterMasterPlacement(NativeCPUPlacement::admission());
         }
         if (argc > 1)
             return probe(argc, argv);

@@ -2468,7 +2468,8 @@ target_link_libraries(llaminar_mpi_schizo PRIVATE
 set_target_properties(llaminar_mpi_schizo PROPERTIES
     PREFIX "" OUTPUT_NAME mca_schizo_llaminar
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/llaminar_mpi_components")
-add_library(llaminar_mpi_session_owner STATIC utils/MPISessionOwner.cpp)
+add_library(llaminar_mpi_session_owner STATIC
+    utils/MPISessionOwner.cpp utils/NativeCPUPlacement.cpp)
 target_compile_features(llaminar_mpi_session_owner PRIVATE cxx_std_20)
 set_target_properties(llaminar_mpi_session_owner PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(llaminar_mpi_session_owner PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
