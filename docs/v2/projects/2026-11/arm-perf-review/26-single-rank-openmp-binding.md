@@ -575,3 +575,32 @@ negatives 10/10; touched TeamFork* regressions 5/5; fixture cost cell
 2.27/4.41/6.92/15.20 ns per owner note. NOT RUN AT LANE (→ Main
 post-collection): portability receipt + Linux-engine targets. Issue freeze
 acknowledged. A2 held.
+
+### Reviewer verdict on 2d9ed7f70 — HOLD (reviewer-numbered #187); U1 two items left (~09:36Z)
+
+- **U2 SOURCE-CLOSED**: empty epoch explicitly asserted, failed step
+  preserves it, exact successful positive + unchanged prefill inventory
+  retained. **U3/U4 closures retained. Timing output correctly qualifies
+  rendezvous/overlap.**
+- **U1 still blocked, two items:**
+  1. MPIBootstrap helper's owners==0 branch STILL unconditionally executes
+     the restoration probe: EXPECT_TRUE(outer.has_value()) then
+     outer->forks() (~338–340). For measure(0,false) outer is disengaged by
+     design → EXPECT_TRUE fails NONFATALLY and the dereference is UNDEFINED
+     BEHAVIOR. Workshare correctly guards with if(outer) — Bootstrap must
+     likewise preserve genuine no-owner and adjust expected probe totals.
+  2. Post-teardown global delta==1 does NOT prove the original TLS owner
+     stack was restored (global increments exactly once regardless of
+     stale/extra owner links). FIX: save the original
+     openMPTeamForkOwnerStack pointer before configuration and assert
+     POINTER IDENTITY after inner/outer teardown (and concurrent
+     main_owner teardown if claimed), or an equally discriminating live
+     sentinel contract. KEEP the outer notes+1 assertion (usefully tests
+     surviving-outer attribution). Do not replace ownership proof with
+     global-total arithmetic. Correct stale notes-only comments if
+     retained.
+- No reviewer tests/builds/probes executed. Focused owner 5/5 does not
+  certify the separately unrun MPIBootstrap/engine bodies; broad checks
+  unverified-at-lane → Main post-collection. No automatic A2 admission/B
+  economy grant with eventual source ACK. ONE exact corrective successor;
+  no new GitHub issue/tracking artifact.
