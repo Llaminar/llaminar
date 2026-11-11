@@ -44,6 +44,9 @@
 #include <memory>
 #include <unordered_map>
 #include <type_traits>
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+#include <arm_neon.h>
+#endif
 #include "../../FloatingActivationOperandPrecision.h"
 
 #include "../../../tensors/TensorKernels.h"
@@ -1157,6 +1160,193 @@ namespace llaminar2
          * @param bias Optional FP32 output-column bias.
          * @return True after every output word is published.
          */
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+        /**
+        * @brief FMLAL core of the GPU-aligned expert schedule (ARM NEON).
+        *
+        * @tparam WeightType Native floating tensor storage type; the FMLAL
+        *        leaf serves FP16 weights (FP32/BF16 weights keep the scalar
+        *        schedule).
+        * @tparam Rows Compile-time row-tile capacity (1..4), matching the x86
+        *        schedule.
+        * @tparam HalfRNE Round original FP32 A to binary16 RNE in registers.
+        * @tparam HalfStorage A already has physical half storage; no A
+        *        conversion is needed.
+        *
+        * An FP16xFP16 product fits binary32 exactly, so one FMLAL is the same
+        * single-rounded binary32 fused multiply-add the scalar schedule
+        * performs through device_fp32_contract::fusedMultiplyAdd on exactly
+        * widened operands: lane l accumulates k = l, l+256, ... in k-ascending
+        * order and the 256 partials reduce through the fixed tree unchanged.
+        * Weights stream as halves without a widening pass.
+        *
+        * @param activations Admitted A operand (FP32 or physical half rows).
+        * @param weights Weight row base (column-major K-contiguous rows).
+        * @param weight_row First K element of this output column's weight row.
+        * @param k Reduction width.
+        * @param reduced Destination for one reduced word per row.
+        */
+        template <TensorType WeightType, int Rows, bool HalfRNE, bool HalfStorage>
+        inline void dot_gpu_aligned_expert_rows_neon(
+            const std::conditional_t<HalfStorage, uint16_t, float> *activations,
+            const void *weights,
+            std::size_t weight_row,
+            int k,
+            float *reduced) noexcept
+        {
+            static_assert(Rows >= 1 && Rows <= 4);
+            static_assert(WeightType == TensorType::FP16,
+                "the FMLAL leaf serves FP16 weights; other storages keep the scalar schedule");
+            constexpr int kLanes =
+                floating_expert_numerical_contract::kReductionLanes;
+            constexpr int kVectorLanes = 16;
+            constexpr int kLaneBlocksPerTile = kLanes / kVectorLanes;
+            alignas(16) float partials[Rows][kLanes] = {};
+            const auto *weight_halves =
+                static_cast<const std::uint16_t *>(weights);
+
+            for (int lane_tile = 0; lane_tile < kLanes;
+                 lane_tile += kVectorLanes)
+            {
+                float32x4_t accumulators[Rows][4];
+#pragma GCC unroll 4
+                for (int row = 0; row < Rows; ++row)
+                {
+#pragma GCC unroll 4
+                    for (int block = 0; block < 4; ++block)
+                        accumulators[row][block] = vdupq_n_f32(0.0f);
+                }
+
+                for (int base = 0; base < k; base += kLanes)
+                {
+                    const int first_k = base + lane_tile;
+                    if (first_k >= k)
+                        continue;
+                    const int valid = std::min(kVectorLanes, k - first_k);
+                    if (valid == kVectorLanes)
+                    {
+#pragma GCC unroll 4
+                        for (int row = 0; row < Rows; ++row)
+                        {
+                            const auto *activation_values =
+                                activations +
+                                static_cast<std::size_t>(row) * k +
+                                static_cast<std::size_t>(first_k);
+                            float16x8_t activation_low, activation_high;
+                            if constexpr (HalfStorage)
+                            {
+                                activation_low = vreinterpretq_f16_u16(
+                                    vld1q_u16(activation_values));
+                                activation_high = vreinterpretq_f16_u16(
+                                    vld1q_u16(activation_values + 8));
+                            }
+                            else
+                            {
+                                // FP32 A converts to binary16 RNE exactly as
+                                // the scalar schedule's
+                                // roundFloatingOperandHalfRNE does (AArch64
+                                // FCVT rounds to nearest-even under the
+                                // process FP environment).
+                                const float32x4_t row0 = vld1q_f32(activation_values);
+                                const float32x4_t row1 = vld1q_f32(activation_values + 4);
+                                const float32x4_t row2 = vld1q_f32(activation_values + 8);
+                                const float32x4_t row3 = vld1q_f32(activation_values + 12);
+                                activation_low = vcvt_high_f16_f32(
+                                    vcvt_f16_f32(row0), row1);
+                                activation_high = vcvt_high_f16_f32(
+                                    vcvt_f16_f32(row2), row3);
+                            }
+                            const float16x8_t weight_low = vreinterpretq_f16_u16(
+                                vld1q_u16(weight_halves + weight_row +
+                                          static_cast<std::size_t>(first_k)));
+                            const float16x8_t weight_high = vreinterpretq_f16_u16(
+                                vld1q_u16(weight_halves + weight_row +
+                                          static_cast<std::size_t>(first_k) + 8));
+                            // Lane i of accumulator block b carries tree lane
+                            // lane_tile + 16*b + i, whose chain is k = base +
+                            // lane_tile + 16*b + i and its successors at +256.
+                            accumulators[row][0] = vfmlalq_low_f16(
+                                accumulators[row][0], activation_low, weight_low);
+                            accumulators[row][1] = vfmlalq_high_f16(
+                                accumulators[row][1], activation_low, weight_low);
+                            accumulators[row][2] = vfmlalq_low_f16(
+                                accumulators[row][2], activation_high, weight_high);
+                            accumulators[row][3] = vfmlalq_high_f16(
+                                accumulators[row][3], activation_high, weight_high);
+                        }
+                    }
+                    else
+                    {
+                        // The K tail: the same single-rounded binary32 FMA per
+                        // element the scalar schedule performs, written into
+                        // the same accumulator lanes.
+#pragma GCC unroll 4
+                        for (int row = 0; row < Rows; ++row)
+                        {
+                            const auto *activation_values =
+                                activations +
+                                static_cast<std::size_t>(row) * k +
+                                static_cast<std::size_t>(first_k);
+                            for (int i = 0; i < valid; ++i)
+                            {
+                                const float activation_value =
+                                    HalfStorage
+                                        ? fp16_to_fp32(activation_values[i])
+                                        : (HalfRNE
+                                                ? roundFloatingOperandHalfRNE(activation_values[i])
+                                                : activation_values[i]);
+                                const float weight_value = fp16_to_fp32(
+                                    weight_halves[weight_row +
+                                                  static_cast<std::size_t>(first_k) + i]);
+                                float lane_value;
+                                vst1q_lane_f32(&lane_value,
+                                               accumulators[row][i / 4], i % 4);
+                                lane_value = device_fp32_contract::fusedMultiplyAdd(
+                                    activation_value, weight_value, lane_value);
+                                accumulators[row][i / 4] = vld1q_lane_f32(
+                                    &lane_value, accumulators[row][i / 4], i % 4);
+                            }
+                        }
+                    }
+                }
+
+#pragma GCC unroll 4
+                for (int row = 0; row < Rows; ++row)
+                {
+#pragma GCC unroll 4
+                    for (int block = 0; block < 4; ++block)
+                        vst1q_f32(partials[row] + lane_tile + block * 4,
+                                  accumulators[row][block]);
+                }
+            }
+
+#pragma GCC unroll 4
+            for (int row = 0; row < Rows; ++row)
+            {
+                for (int stride = kLanes / 2; stride >= 16; stride >>= 1)
+                {
+                    for (int lane = 0; lane < stride; lane += 4)
+                    {
+                        const float32x4_t lhs = vld1q_f32(partials[row] + lane);
+                        const float32x4_t rhs =
+                            vld1q_f32(partials[row] + lane + stride);
+                        vst1q_f32(partials[row] + lane,
+                                  vaddq_f32(lhs, rhs));
+                    }
+                }
+                for (int stride = 8; stride > 0; stride >>= 1)
+                {
+                    for (int lane = 0; lane < stride; ++lane)
+                    {
+                        partials[row][lane] = device_fp32_contract::add(
+                            partials[row][lane], partials[row][lane + stride]);
+                    }
+                }
+                reduced[row] = partials[row][0];
+            }
+        }
+#endif
+
         template <TensorType WeightType, ISALevel ISA, bool HalfRNE = false, bool HalfStorage = false>
         inline bool run_gpu_aligned_expert_fp32_matmul_isa(
             const std::conditional_t<HalfStorage, uint16_t, float> *A,
@@ -1174,10 +1364,18 @@ namespace llaminar2
                     WeightType == TensorType::FP16 ||
                     WeightType == TensorType::BF16,
                 "GPU-aligned expert weights must use a floating storage type");
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+            static_assert(
+                ISA == ISALevel::Scalar || ISA == ISALevel::AVX2 ||
+                    ISA == ISALevel::AVX512 || ISA == ISALevel::NEON ||
+                    ISA == ISALevel::NEONDotProd,
+                "GPU-aligned expert matmul needs a concrete ISA implementation");
+#else
             static_assert(
                 ISA == ISALevel::Scalar || ISA == ISALevel::AVX2 ||
                     ISA == ISALevel::AVX512,
                 "GPU-aligned expert matmul needs a concrete ISA implementation");
+#endif
             if (!A || !B || !C || M < 0 || N < 0 || K <= 0)
             {
                 LOG_ERROR("[FloatingPointGemmKernel] Invalid GPU-aligned expert matmul geometry"
@@ -1309,6 +1507,57 @@ namespace llaminar2
                         }
                         else
 #endif
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+                        if constexpr ((ISA == ISALevel::NEON ||
+                                       ISA == ISALevel::NEONDotProd) &&
+                                      WeightType == TensorType::FP16)
+                        {
+                            const std::size_t weight_row =
+                                static_cast<std::size_t>(column) * K;
+                            const auto *tile_activations =
+                                A + static_cast<std::size_t>(first_row) * K;
+                            switch (tile_rows)
+                            {
+                                case 1:
+                                    dot_gpu_aligned_expert_rows_neon<
+                                        WeightType,
+                                        1, HalfRNE, HalfStorage>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                                case 2:
+                                    dot_gpu_aligned_expert_rows_neon<
+                                        WeightType,
+                                        2, HalfRNE, HalfStorage>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                                case 3:
+                                    dot_gpu_aligned_expert_rows_neon<
+                                        WeightType,
+                                        3, HalfRNE, HalfStorage>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                                case 4:
+                                    dot_gpu_aligned_expert_rows_neon<
+                                        WeightType,
+                                        4, HalfRNE, HalfStorage>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                            }
+                        }
+                        else
+#endif
                         {
                             floating_expert_numerical_contract::dotRows<
                                 kRowTile>(
@@ -1367,6 +1616,31 @@ namespace llaminar2
          * @tparam HalfRNE Round FP32 A to half in registers, preserving the fixed FP32 tree.
          * @tparam HalfStorage A already has physical half storage; widen exact words.
          */
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+        /**
+        * @brief Execute the NEON FMLAL GPU-aligned expert schedule.
+        * @tparam WeightType Native floating tensor storage type.
+        * @tparam HalfRNE Round FP32 A to half in registers, preserving the fixed FP32 tree.
+        * @tparam HalfStorage A already has physical half storage; no conversion needed.
+        */
+        template <TensorType WeightType, bool HalfRNE = false, bool HalfStorage = false>
+        inline bool run_gpu_aligned_expert_fp32_matmul_neon(
+            const std::conditional_t<HalfStorage, uint16_t, float> *A,
+            const void *B,
+            float *C,
+            int M,
+            int N,
+            int K,
+            float alpha = 1.0f,
+            float beta = 0.0f,
+            const float *bias = nullptr)
+        {
+            return run_gpu_aligned_expert_fp32_matmul_isa<
+                WeightType, ISALevel::NEONDotProd, HalfRNE, HalfStorage>(
+                A, B, C, M, N, K, alpha, beta, bias);
+        }
+#endif
+
         template <TensorType WeightType, bool HalfRNE = false, bool HalfStorage = false>
         inline bool run_gpu_aligned_expert_fp32_matmul_scalar(
             const std::conditional_t<HalfStorage, uint16_t, float> *A,
@@ -1461,6 +1735,12 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+                return run_gpu_aligned_expert_fp32_matmul_neon<WeightType, HalfRNE, HalfStorage>(
+                    A, B, C, M, N, K, alpha, beta, bias);
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__)
             case ISALevel::AVX512:
                 return run_gpu_aligned_expert_fp32_matmul_avx512<WeightType, HalfRNE, HalfStorage>(

@@ -52,9 +52,38 @@ function(llaminar_cpu_instruction_set processor requested flags_output definitio
         else()
             message(FATAL_ERROR "CPU ISA '${requested}' is incompatible with AArch64 target '${processor}'; use NEON, NEON_DOTPROD or NEON_I8MM")
         endif()
+        # The FMLAL half-operand leaf needs the ARMv8.2 FP16 fused multiply-add
+        # extension. Probe the toolchain with the extension appended to the
+        # envelope's -march token (the evidence checkers admit extension
+        # suffixes); a toolchain that cannot assemble it keeps the envelope
+        # unchanged and the scalar half-operand dispatch intact.
+        set(llaminar_fp16fml 0)
+        include(CheckCXXSourceCompiles)
+        set(CMAKE_REQUIRED_QUIET ON)
+        string(REGEX REPLACE "-march=[^ ]+" "\\0+fp16fml" llaminar_fp16fml_flags "${flags}")
+        set(CMAKE_REQUIRED_FLAGS "${llaminar_fp16fml_flags}")
+        check_cxx_source_compiles([=[
+#include <arm_neon.h>
+int main()
+{
+    float32x4_t acc = vmovq_n_f32(0.0f);
+    float16x8_t a = vreinterpretq_f16_u16(vmovq_n_u16(1u));
+    float16x8_t b = vreinterpretq_f16_u16(vmovq_n_u16(2u));
+    acc = vfmlalq_low_f16(acc, a, b);
+    acc = vfmlalq_high_f16(acc, a, b);
+    return vgetq_lane_f32(acc, 0) == 0.0f ? 0 : 1;
+}
+]=]
+            llaminar_fp16fml_compiles)
+        unset(CMAKE_REQUIRED_FLAGS)
+        if(llaminar_fp16fml_compiles)
+            set(flags "${llaminar_fp16fml_flags}")
+            set(llaminar_fp16fml 1)
+        endif()
         set(definitions LLAMINAR_COMPILED_WITH_AVX2=0 LLAMINAR_COMPILED_WITH_AVX512=0
             LLAMINAR_COMPILED_WITH_NEON=1 LLAMINAR_COMPILED_WITH_NEON_DOTPROD=${dotprod}
-            LLAMINAR_COMPILED_WITH_NEON_I8MM=${i8mm})
+            LLAMINAR_COMPILED_WITH_NEON_I8MM=${i8mm}
+            LLAMINAR_COMPILED_WITH_FP16FML=${llaminar_fp16fml})
     else()
         set(flags "-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt")
         if(isa STREQUAL "AVX512")
@@ -67,7 +96,8 @@ function(llaminar_cpu_instruction_set processor requested flags_output definitio
         endif()
         set(definitions LLAMINAR_COMPILED_WITH_AVX2=1
             LLAMINAR_COMPILED_WITH_AVX512=${avx512} LLAMINAR_COMPILED_WITH_NEON=0
-            LLAMINAR_COMPILED_WITH_NEON_DOTPROD=0 LLAMINAR_COMPILED_WITH_NEON_I8MM=0)
+            LLAMINAR_COMPILED_WITH_NEON_DOTPROD=0 LLAMINAR_COMPILED_WITH_NEON_I8MM=0
+            LLAMINAR_COMPILED_WITH_FP16FML=0)
     endif()
     set(${flags_output} "${flags}" PARENT_SCOPE)
     set(${definitions_output} "${definitions}" PARENT_SCOPE)
