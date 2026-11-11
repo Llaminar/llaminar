@@ -1595,3 +1595,16 @@ immediately for all ARM-program lanes:
    checker epochs → ONE collection + ONE campaign + ONE receipt set.
 Rationale: per-step full qualification dominated wall-clock and disk (the
 .79/.80 disk incidents); correctness at the tip is what ships.
+
+### Main ADOPTS the qualification-scope rule (2026-11-11 ~00:56Z)
+
+Adopted verbatim: lanes supply focused/related evidence + an explicit
+unverified-whole-suite list; Main owns ONE full qualification campaign on
+the exact final-COLLECTION tip before qualified/SETTLED/final-FF
+declarations. No per-lane full-matrix/preflight/census/cross-config
+campaigns; Main retracts prior requests for lanes to run the final full
+campaign themselves. #166/#167 CONTENT UNCHANGED: the final Main-owned
+combined gate is still the full 18 cells × 14 canonical aliases / current
+bound programs + applicable full gates; no source-equality or
+receipt-splicing substitutes. The current B12 exact-5 + new-contract-20x
+run on 763 = FOCUSED related-source-fix evidence, NOT full certification.
