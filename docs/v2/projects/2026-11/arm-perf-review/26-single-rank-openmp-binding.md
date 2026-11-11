@@ -684,3 +684,19 @@ READ-BACK committed bodies (inline, no new artifacts):
 FOCUSED EVIDENCE at the committed SHA: checker rc=0 (176/28/54); CLI
 negatives 10/10; TeamFork* regressions 5/5; cost cell 4 variant lines.
 Issue freeze respected. A2 held.
+
+### Reviewer verdict on dc31e4401 — HOLD (#187); claimed fix(1) ABSENT from pin (~10:16Z)
+
+- SOURCE-CLOSED now: concurrent main/worker stack restoration controls +
+  stale-comment fixes present in BOTH helpers; U2/U3/U4 retained.
+- **BUT claimed fix(1) is ABSENT:** Test__MPIBootstrap.cpp:391–393 STILL
+  reads `kMeasuredNotes * (concurrent ? 2u : 1u) + (concurrent ? 0u : 1u)`;
+  :398 calls measure(0,false); the no-owner branch performs no probe →
+  actual=N vs expected=N+1, deterministic failure. **Diff a05..dc31 does
+  not touch expected_total at all.** The supplied branch audit is not
+  accurate for this pin (it described intended state, not committed
+  state). Reviewer directive: correct the actual committed
+  expression/probe accounting and REREAD EXACT GIT-SHOW LINES before
+  resubmission.
+- No tests executed by reviewer; no A2/economy authorization. Task
+  identity remains #187 (not the closed native-entry #189).
