@@ -1573,3 +1573,25 @@ NON-ARM branches (feat/continuous-batching*, feat/mxfp4*, feat/qfn*,
 feat/qwen*, feat/clover*, feat/native-*, claude/*) belong to their own
 programs — not removed by the ARM program; their owners follow the same
 rule at their own completions (informed).
+
+## Qualification-scope rule (OPERATOR DIRECTIVE, 2026-11-11 ~01:00Z)
+
+The per-step qualification burden was too heavy. STANDING RULE, effective
+immediately for all ARM-program lanes:
+1. **Lanes test ONLY the related changes** — focused tests on the touched
+   surface + the direct controls/regressions for the change. NO full-suite
+   portability/preflight/census runs as routine lane evidence.
+2. **FULL qualification belongs to MAIN, once per COLLECTION** — after a
+   batch of changes is merged into feat/arm64-native-kernels (e.g., the
+   combined FF), Main runs the complete qualification ON ITS TIP: portability
+   matrix, preflight, census/register campaign, cross-config receipts. That
+   single post-collection campaign is the actual gate — not per-lane
+   full-suite runs.
+3. **Reviewer verdicts judge focused evidence** — sufficient to reason about
+   the changed surface; the reviewer does NOT demand whole-suite execution
+   from lanes. Unexecuted whole-suite items are marked unverified-at-lane
+   and covered by Main's post-collection campaign.
+4. Consistent with the established principle: receipts don't compose across
+   checker epochs → ONE collection + ONE campaign + ONE receipt set.
+Rationale: per-step full qualification dominated wall-clock and disk (the
+.79/.80 disk incidents); correctness at the tip is what ships.
