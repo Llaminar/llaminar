@@ -352,3 +352,21 @@ progress-log content demanded); and the SOURCE VERIFIER reads
 explanation is UNSUPPORTED and corrected/withdrawn. Qualification closes
 only after Main inspects exact counts/no-skips/exits/binary+source
 binding.
+
+### B12 window attempt 1 = HARNESS FAILED (Main SCP inspection, 2026-11-11 ~01:40Z)
+
+Container f960d19cc533 (host PID 3990196, launched 00:47Z): BUILD_RC=0 but
+CTest NEVER EXECUTED — b12-ctest1.log = "Test project /home/ubuntu / No
+tests were found!!!"; wrapper run log: C1=0 then for-loop syntax error
+(line 9, "unexpected 2"). Executed script had: cd to empty dir, no
+--test-dir, no --no-tests=error, hardcoded C1/C20=0, ALL-targets 3193-step
+build. The owner's correction claims were NOT applied to the executed
+script. Main performed READ-ONLY SCP inspection only (copied existing text;
+no remote workload/source writes). Directed remediation (owner-executed):
+preserve failed script/logs; bash -n first; corrected TESTS-ONLY run with
+exact JSON inventory (5), --test-dir, --no-tests=error, real exit capture,
+proper 20x; NO ALL rebuild. Label: BUILD PASS ≠ TEST PASS; attempt 1 =
+HARNESS FAILED. Lesson (program-wide): executed-script identity must be
+verified (hash/echo of the actual file) BEFORE claims of "corrections
+applied" — a status claim about a script must reference the artifact that
+ran.
