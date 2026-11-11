@@ -1492,3 +1492,15 @@ are NOT admission. DIRECTIVES: the owner completes the comprehensive #175,
 then MECHANICALLY RE-BASES + re-pins the final candidate onto EXACT
 **1f01cb3e5** and obtains review — **NO FF yet** (Main decides after the
 reviewed re-pin).
+
+### Addon admission progress (2026-11-11, ~00:23Z): 2ff599ec0 pushed (FF from 252da4a53)
+
+origin/codex/arm-s4-nibble-witness = **2ff599ec0** (completed coherent
+checkpoint on the existing feature branch; no pin branch; no FF implied;
+checkpoint rule honored). Content = the fail-closed reconciler repair +
+RG-2 override rejection + RG-3 source-header binding/publication
+authentication + rc accounting. The #175 successor (checked-in coordinator
+regression + preflight registration) remains UNCOMMITTED until coherent →
+one exact SHA for the reviewer. Final campaign HOLD until Main's B12-fix
+SETTLED pin (post-B12 tip = the re-pin target; confirmed again). Source ACK
+#184 (763) received/noted.
