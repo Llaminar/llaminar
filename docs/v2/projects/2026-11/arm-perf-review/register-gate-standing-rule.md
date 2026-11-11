@@ -544,3 +544,18 @@ composition, then Main's ONE campaign → FF. Do not delay perf work.
 Composition owner: the addon lane (witness branch, both branches share
 base 880429059); expect small overlap in CMake registration files →
 semantic resolution + affected-diff capture.
+
+### **ISSUE 58 CLOSED — OPERATOR NOGO (2026-11-11 ~11:20Z)**
+
+The operator ruled the register-gate a NOGO: the per-change admission-gate
+model is superseded by the qualification rule (lanes = focused/related
+evidence only; full qualification ONCE on Main's tip AFTER a collection
+merges; no admission gates). Issue #58 CLOSED (reason: not planned) with
+the supersession comment. The register-gate coordinator = descoped
+non-blocking tooling, preserved unmerged at 7501904e8 (deferred witness
+branch; real-format fix included; owner 18/18 attributed only). The defect
+record (schema-2 reader, envelope key mismatch, RG1–RG4, Main's 9-FAIL/12)
+lives in THIS file + the archived handoff. NO fix work planned under the
+current model; revisitable only if the operator re-introduces an
+admission-gate requirement. All ARM sessions: #58 is CLOSED — do not
+reference it as open, do not link new commits to it.
