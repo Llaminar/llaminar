@@ -872,3 +872,53 @@ slot + toolchain/build-context inventory for full canonical Unit/preflight
 + portability/Bootstrap-engine coverage (NOT lane full qualification).
 Main PR body updating. **bb is NOT yet fully qualified/SETTLED.** A2 anchor
 unchanged (bb); no economy/artifact acceptance inferred.
+
+### B1 SERVING-LEVEL ANALYSIS (addon3 from the A2 exports, ~23:25Z): region-count hypothesis CONFIRMED
+
+Measured fork/join counts per decode step (a2-bb893cd79 exports, .80,
+NEON_I8MM, 3 iterations each; instrumentation worked end-to-end):
+- 35B MTP: **776.5 forks/step** (264 steps, 204,993 forks)
+- 35B no-MTP: **593.0/step** (765 steps, 453,645)
+- 27B MTP: **964.7/step** (267 steps, 257,562)
+- 27B no-MTP: **755.0/step** (765 steps, 577,575)
+
+STRUCTURE (per-occurrence fork histograms):
+- 35B MTP: 5-fork stages ×264 (once per VERIFIER step — the verifier
+  pipeline's 5-region group); 1-fork stages ×1296 (once per DRAFT step,
+  432×3); 2/3/4-fork stages. The MTP draft-vs-verifier structure is
+  directly visible.
+- 35B no-MTP: 4/3/2-fork stage groups ×765 (once per decode step).
+- 27B no-MTP: **4-fork stages ×765 — once per decode step, 27B-only
+  signature.** 27B = the DENSE model with GDN: a 4-fork once-per-step
+  stage is the signature of the GDN projection running as FOUR SEPARATE
+  forks — the fused 4-GEMM path (homogeneous_full) did NOT engage on
+  this shape (mixed kernels/codebooks candidate). **Concrete B1 pooling
+  target**, pending stage-name confirmation.
+- 27B MTP: adds 1-fork stages ×1134 (378 draft steps ×3) + 2/4-fork
+  groups.
+
+LIMITATION (honest): the stdout summary table truncates tags (~50
+chars) + shows only the first ~120 of 1011 records; the embedded JSON
+snapshot captured EMPTY records → stage names NOT recoverable from this
+export. Named per-stage attribution needs one follow-up export with
+LLAMINAR_PERF_STATS_JSON=<path> (~15 min on .80). The fork-count core
+is complete regardless.
+
+B1 MINI-PLAN (draft, archived as the working plan):
+1. Named-attribution export (one pass, .80, ~15 min) → name every fork
+   stage (confirm the 5-fork verifier group + the 27B 4-fork GDN
+   signature).
+2. B1 pooling targets by evidence: (a) 27B GDN 4-fork stage (if
+   confirmed = fused path not engaging on 27B → diagnose the route,
+   then pool); (b) serial SwiGLU batch between fused MoE regions (stage
+   timings will rank it); (c) 35B verifier 5-fork group (poolable
+   independent projections?).
+3. Byte-neutrality discipline: whole-output-tile tasks, fixed full-K
+   arithmetic, serial-row oracles.
+4. B1 items as their own commits with focused tests, same review
+   discipline.
+
+Artifacts: /Users/floriankinder/llaminar-spark-results/
+A2-EXPORTS-BB893CD79-20261111/ (11 files). Anchors: riders @ bb893cd79
+(merged tip); Phase A seal 880429059. NO economy claims — structural
+attribution only.
