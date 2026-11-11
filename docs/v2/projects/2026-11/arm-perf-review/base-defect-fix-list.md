@@ -819,3 +819,22 @@ without a validity assertion, matching the last direct-log test. NEED:
 backtrace + the actual failed allocation path. Do not propagate a stronger
 cause than the evidence. 'Default affinity/permissions' and truncated
 hashes are not full binding by themselves.
+
+### B11 SCOPE CORRECTION (Main, ~12:23Z) — remove 'allocator-level confirmed' from headline
+
+IF corrected native captures verify BOTH-139: MPI launcher is NOT
+NECESSARY for this matched crash — they still do NOT establish
+'allocator-level defect' or topology causality without the stack. Main
+independently read Test__NUMAAllocator.cpp:601: `NUMABuffer<int>
+buffer(64,0)` then IMMEDIATE range WRITE with NO ASSERT_TRUE(buffer.valid());
+NUMAAllocator.h constructor PRESERVES count_ even if allocation returns
+null; end() computes null+count. CONCRETE unchecked-buffer TEST/ITERATOR
+candidate matching where the truncated log stopped — not yet a proved
+allocator cause. NEEDED: capture the actual crashing frame + failed
+allocation return; distinguish legitimate EPERM refusal, invalid buffer/
+test use, and any allocator bug. A guard avoids the secondary crash but
+does NOT make the expected-allocation test green or waive permission/
+topology admission. CB lead already pursuing matched native status/stack;
+NO new ARM host job, no blanket env waiver. Tracker headline
+'allocator-level' removed per this correction (headline now: crash-site
+OPEN, unchecked-buffer fixture candidate identified).
