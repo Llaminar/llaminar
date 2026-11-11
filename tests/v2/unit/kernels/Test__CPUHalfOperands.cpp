@@ -360,6 +360,17 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
     if(fmlalLeafCompiledInEnvelope())
         EXPECT_TRUE(llaminar2::cpu::ARMCPUCapabilities::native().supports(
             llaminar2::cpu::ARMCPUFeature::FP16FML));
+    // Device-free admission semantics: an envelope declaring FP16 without the
+    // FML extension admits on an FHM-less machine; the FMLAL envelope does
+    // not — FP16 arithmetic alone never authorizes the leaf.
+    const uint32_t observed_fp16_no_fhm = uint32_t(llaminar2::cpu::ARMCPUFeature::ASIMD) |
+        uint32_t(llaminar2::cpu::ARMCPUFeature::FP16Arithmetic);
+    EXPECT_NO_THROW(llaminar2::cpu::ARMCPUCapabilities::requireEnvelope(
+        observed_fp16_no_fhm, observed_fp16_no_fhm));
+    EXPECT_THROW(llaminar2::cpu::ARMCPUCapabilities::requireEnvelope(
+        observed_fp16_no_fhm, observed_fp16_no_fhm |
+            uint32_t(llaminar2::cpu::ARMCPUFeature::FP16FML)),
+        std::runtime_error);
 }
 /** @test Explicit preflight scaling sweep; excluded from the fast Unit alias. */
 TEST(CPUHalfOperands, EveryPositiveWorkerBudget){
