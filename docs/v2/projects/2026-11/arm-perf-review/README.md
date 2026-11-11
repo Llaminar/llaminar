@@ -1637,3 +1637,27 @@ authorization; no hook tricks; no refusal-to-fix; escalate contradictions;
 no PR/merge/GPU/GLM/unauthorized downloads). Execution GO issued;
 detailed surviving-findings handoff follows from the C1 arc. WSL
 replacement plan = CB coordinator's call, not the worker's.
+
+### OPERATOR THROUGHPUT DIRECTIVE (2026-11-11 ~09:45Z) — no idle-while-queued
+
+The operator re-stated the operating model and called out the throughput
+failure: queued tasks sat behind the FF while sessions idled. BINDING
+CORRECTIONS:
+1. Operating model: task → session works it autonomously end-to-end →
+   hand fully-merge-ready to Main → Main applies to its branch → done.
+   Validation on the Sparks hosts where needed. Qualification per the
+   standing scope rule (lanes = focused/related evidence ONLY; Main = ONE
+   full campaign per collection on its tip).
+2. The FF is an integration formality, NOT a content gate: the B12 fix is
+   verified IN base 880429059 (8/8 on the real host), so measurement and
+   implementation on the current tip are valid; the anchor-refresh rule
+   covers tip movement. NO task waits for the FF to START.
+3. Assignments executed immediately: reviewer → half-perf economy/identity
+   review (queued since source-complete); addon2 → idea-16 Phase A on .80
+   NOW, then idea-08 Phase A; arm-sparks → host queue (.80 Phase A, .79
+   Dir-B trace rerun per its ACKed scope, nsys bounded-fact read, idea-25
+   runbook prep); addon → Lane-2 scope (ideas 03/04/11) on 880429059
+   immediately after #191 ACKs; Main → integrate as work arrives + ONE
+   campaign when the collection completes → FF → close #58.
+4. Coordinator duty: keep every session holding a current task; escalate
+   stalls instead of gating them.
