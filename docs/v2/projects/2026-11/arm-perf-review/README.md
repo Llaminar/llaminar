@@ -1784,3 +1784,21 @@ ONE-BIT CONFIRMED by sparks: the full campaign wrapper was NEVER launched
 ("resuming NOW" = plan statement superseded by the lease transfer; message-
 sequencing error, admitted). No wrapper process/container; dockerps empty.
 .80 CLEAR for Main; relinquish stands. Lease execution unblocked.
+
+### **MAIN CAMPAIGN LAUNCHED (Main, ~14:54Z) — epoch-480 canonical, exclusive lease**
+
+**Main480 continuation ACTUALLY LAUNCHED 14:52:19.599810845Z** on .80 under
+the exclusive lease: CID 5bab3cb5cce1a7bcb3d427a08aa289f70794d1d3b9d75d9
+386c44db01a3fc451, name main-campaign-480, host PID 2207511, image
+c0ca1dc9…; source 480 CLEAN verified; OUT campaign-480-results ABSENT
+before launch (no pre-create). Phase BUILD now. Main's thin phase-gated
+literal runner /work/build/main-campaign480.sh (actual file transferred +
+bash -n), logs /work/main-campaign480-{launch,build,driver}.log + actual
+phase/exit. Canonical UNMODIFIED driver after the full target build; no
+duplicate. Runtime qualification profile EXPLICIT UID 1000:1000, private
+IPC/default private PID, no network, SDK deps RO, SYS_NICE + seccomp
+unconfined (the repository NUMA/page-owner test-harness setup) — NOT a
+claim that old BB flags match or C1-restricted-profile qualification
+(old BB perms not reconstructed). No host driver/OMP changes or waived
+tests. .79 lease NOT needed by Main — its booking continues through
+arm-sparks under prior permissions.
