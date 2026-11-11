@@ -857,3 +857,18 @@ directly comparable with the existing stage-timing baselines). Host
 recorded as .80 in every artifact. Riders 1–3 execute in ~40 min;
 per-rider report after. The B1 analysis (from the exports) follows on
 addon3's side once the artifacts land.
+
+### **COUNTER COLLECTION LANDED — FF EXECUTED** (Main, ~11:01Z)
+
+**Main FF'd feat/arm64-native-kernels 880429059 → EXACT bb893cd79**
+(the ACKed counter tip), pushed; PR #43 now 204 commits above 2948b1e49.
+No rebase/merge commit/tag; tracker preserved. Operator MERGE-THEN-QUALIFY
+adopted: #191 six items CANCELLED as blocking; witness 27f49497 = tooling,
+DEFERRED to a later collection; issue 58 = non-blocking.
+**ONE Main-owned FULL campaign starts NOW AFTER THE MERGE on bb** —
+booking request through arm-perf/arm-sparks ONLY (no self-booking),
+protecting the ongoing A2/idea-16/Dir-B windows. Needs: available host
+slot + toolchain/build-context inventory for full canonical Unit/preflight
++ portability/Bootstrap-engine coverage (NOT lane full qualification).
+Main PR body updating. **bb is NOT yet fully qualified/SETTLED.** A2 anchor
+unchanged (bb); no economy/artifact acceptance inferred.
