@@ -72,3 +72,49 @@ register-gate coordinator lands (rule-166 hard gate from day one).
 TRACKER CORRECTION ACCEPTED: "no engine has loaded a real model" is stale
 — A1/35B/27B runs load real models; the resident BOM audit is runnable.
 .80 window: after the half-perf validation + idea-16 Phase A clear.
+
+### **idea-08 Phase A ANALYSIS CORE DONE** (arm-addon2, ~14:56Z) — full markdown to follow
+
+(1) **STATIC BOM AUDIT (exact from layout code at the current tip; tracker
+numbers reproduce EXACTLY: NibbleLUT 1280 B/10.0% comp, ExpandedInt8
+2304/5.56%):** full per-encoding stride table (composition, prepared bpw,
+catalog-source bpw, expansion ratio) for all 21 source formats. NEW
+findings: (a) CompactMultiScale carries 256-640 B per unit of STRUCTURAL
+fixed-payload padding (dead on BOTH ISAs — 29% of the unit for IQ2_S, 42%
+for IQ1_M) — new to the compact-layout family; (b) expansion pathology
+beyond IQ3_S: IQ1_S 4.75×, IQ2_XXS 3.60×, IQ1_M 3.0×, IQ3_XXS 2.57×,
+IQ2_S/IQ2_XS 2.18×, IQ3_S 2.53× (prepared 9.5 vs catalog-logical 3.75;
+raw GGUF ~3.44); Q6_K is the only 1.00× encoding.
+(2) **ARM ZERO-READER VERIFICATION (static, current tip):** zero
+occurrences of "compensation" in any NEON translation unit; the only
+data-plane accessors (chunkScales/chunkMins) skip the comp region by
+construction; the ARM contribution contract is signed×signed
+(vmull/SDOT/vdotq_s32/SMMLA) with no activation-bias or weight-sum term —
+the x86 u8xs8 correction has no ARM consumer. ALSO: the packer WRITES comp
+on every ISA (WeightPacker.h:247, :620-644) — ARM preparation WASTES
+compute filling dead bytes. Phase B mutation tests remain the dynamic
+proof; no static counter-indication.
+(3) **35B AGGREGATE (documented pairing IQ2_S gate/up + IQ4_XS down):**
+one routed expert ≈ 2.30 MB prepared vs ≈ 1.10 MB catalog-source (2.09×);
+whole-model ≈ 23.6 GB vs 11.3 GB (pending exact census). Compact wins
+target BOTH the IQ2_S padding and the expanded formats. Exact per-tensor
+census (attention/GDN/LM-head/shared/router formats) = the runnable
+resident-BOM audit on .80.
+(4) **ABI MECHANISM refined to concrete identity flow:**
+PreparedLayoutIdentity{cpu_family, layout_version, encoding_set_rev}
+through the enumerated sites (encoding/footprint/packer/view/BOM/cache
+keys/wire-slot-movement incl. ExpertTierWeightStream/MoEOverlayPrepared
+WeightSource/CpuExpertSlotPool/ExpertPreparedMemoryGeometry/evidence
+seals); same-version movement unchanged; mixed-version meshes fail fast at
+rank admission with re-prepare-from-GGUF; x86 keeps comp and versions
+independently; identity rides the EXISTING publication/admission surfaces.
+(5) **TOURNAMENT DESIGN (diagnostic, non-installed, rule-166-conformant):**
+compact IQ3_S primary — 1088 B/unit live floor = 4.25 bpw (2.24× below
+9.5); tighter interleaving ≈3.9-4.1 bpw; vqtbl in-register decode,
+byte-oracle per unit. Secondary: CompactMultiScale padding-aware variant
+(IQ2_S first). Matrix M=1 + M=15 (+ M=4 ALU check), IQ3_S/IQ2_S/IQ4_XS,
+all three ARM families, 2 placements. **NEEDS .80 WINDOW (build+run) —
+REQUEST: one CPU window after the current queue clears (resident BOM
+census + tournament, measurement-only).** macOS cannot build v2 (libnuma).
+GO/NO-GO gates unchanged; Phase A supports weight-bandwidth binding (GDN
+≈30-34 GB/s = lowest big stage; LM head 45; routed experts ~36).
