@@ -2068,6 +2068,14 @@ namespace llaminar2
         {
             return serving_slot_generation_;
         }
+
+        /** Read-only observation of the slot bank for lease-lifetime evidence. */
+        [[nodiscard]] const ServingSlotHandoff &servingSlotHandoffForTest() const noexcept
+        {
+            return slot_handoff_;
+        }
+
+    private:
         /** One immutable CPU/composed response admission; never a progress counter. */
         std::optional<DeviceGenerationAdmissionRequest> host_sparse_query_admission_;
         /**

@@ -2049,3 +2049,72 @@ TEST(Test__PrefixCachePrefillFlow, AdvertisedTerminalRestoreFailureHardFails)
     EXPECT_EQ(mock_ptr->forward_calls, 0);
     EXPECT_EQ(mock_ptr->harvest_calls, 0);
 }
+
+/**
+ * @brief Injected post-open failure regressions (consolidated review):
+ *        the prefix branch opens the slot handoff bank before the terminal
+ *        restore/harvest/planning publication phase; every later exit must
+ *        retire the bank so a failed admission never authorizes decode.
+ */
+TEST(Test__PrefixCachePrefillFlow, TerminalRestoreFailureAfterOpenRetiresSlotHandoff)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 4;
+    mock_ptr->lookup_result.has_terminal_logits = true;
+    mock_ptr->restore_terminal_ok = false;
+
+    auto runner = makeRunner(std::move(mock));
+    ASSERT_FALSE(runner->prefill({1, 2, 3, 4}));
+    EXPECT_THAT(runner->lastError(), HasSubstr("Prefix cache terminal restore failed"));
+
+    // The failed admission must not authorize decode or force.
+    const GenerationResult rejected = runner->decodeStep();
+    EXPECT_FALSE(rejected.success());
+    EXPECT_NE(rejected.error.find("requires an admitted request"),
+              std::string::npos)
+        << rejected.error;
+
+    // Recovery: with the restore failure removed, the same runner re-admits
+    // (its own mock/lookup state) and decode works again.
+    mock_ptr->restore_terminal_ok = true;
+    runner->clearCache();
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+    const GenerationResult after = runner->decodeStep();
+    EXPECT_TRUE(after.success()) << after.error;
+}
+
+TEST(Test__PrefixCachePrefillFlow, HarvestFailureAfterOpenRetiresSlotHandoff)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    // Partial hit with a suffix forces the open + suffix-forward + harvest
+    // diamond: cached_tokens 2 of a 4-token prompt.
+    mock_ptr->lookup_result.cached_tokens = 2;
+    mock_ptr->lookup_result.has_terminal_logits = false;
+    mock_ptr->harvest_ok = false;
+
+    auto runner = makeRunner(std::move(mock));
+    ASSERT_FALSE(runner->prefill({1, 2, 3, 4}));
+    EXPECT_THAT(runner->lastError(),
+                HasSubstr("Prefix cache harvest failed"));
+
+    const GenerationResult rejected = runner->decodeStep();
+    EXPECT_FALSE(rejected.success());
+    EXPECT_NE(rejected.error.find("requires an admitted request"),
+              std::string::npos)
+        << rejected.error;
+
+    // Recovery: a fresh admission on the same runner completes.
+    mock_ptr->harvest_ok = true;
+    ASSERT_TRUE(runner->prefill({1, 2}));
+    const GenerationResult after = runner->decodeStep();
+    EXPECT_TRUE(after.success()) << after.error;
+}
+

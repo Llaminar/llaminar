@@ -14875,6 +14875,15 @@ add_v2_test(V2_Unit_PrefixCachePrefillFlow
     LABELS "V2;Unit;PrefixCache;OrchestrationRunner;Prefill"
     MPI_PROCS 1
 )
+# Injected post-open prefix failure regressions (slot handoff retirement).
+add_v2_test(V2_Integration_PrefixPostOpenFailureRetiresSlotHandoff
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_prefill_flow>
+        --gtest_filter=Test__PrefixCachePrefillFlow.TerminalRestoreFailureAfterOpenRetiresSlotHandoff:Test__PrefixCachePrefillFlow.HarvestFailureAfterOpenRetiresSlotHandoff
+    LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;ServingSlotHandoff;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PrefixPostOpenFailureRetiresSlotHandoff)
+
 add_v2_test(V2_Integration_PrefixMetadataOnlyRestoreSummary
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_prefill_flow>
         --gtest_filter=Test__PrefixCachePrefillFlow.MetadataOnlyLookupReportsRestoredMTPSections
@@ -23616,6 +23625,16 @@ add_v2_test(V2_Integration_ServingSlotHandoffRecordedReplay
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSlotHandoffRecordedReplay)
+
+# The hardened lifecycle/defect regressions are explicit ProductionTestPreflight
+# members, not Unit-only cells, per the review-correction register.
+add_v2_test(V2_Integration_ServingSlotHandoffLifecycleContracts
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffLifecycle.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ServingSlotHandoff;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSlotHandoffLifecycleContracts)
 
 add_v2_test(V2_Unit_ServingSlotHandoffLifecycle
     COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>

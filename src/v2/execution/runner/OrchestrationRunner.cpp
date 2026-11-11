@@ -4682,9 +4682,12 @@ namespace llaminar2
                         return setError("Prefix cache reusable-boundary harvest failed");
                 }
 
-                // The admission generation is minted after the last
-                // failure-prone prefix step and before the first handoff
-                // publication: restored hit state must land in a live bank.
+                // The bank opens here, immediately before the first handoff
+                // publication (restored hit state must land in a live bank).
+                // Every later exit on this admission path retires explicitly:
+                // terminal-restore failure, post-restore harvest failure,
+                // planning-position failure, distributed completion, and the
+                // exception boundary below.
                 if (serving_slot_generation_ == std::numeric_limits<std::uint64_t>::max())
                 {
                     return setError(
@@ -4722,6 +4725,7 @@ namespace llaminar2
                           << (common_hit.has_terminal_hidden ? "yes" : "no")
                           << " mtp_requires_hidden="
                           << (mtp_full_hit_requires_terminal_hidden ? "yes" : "no");
+                    slot_handoff_.retire();
                     return setError(error.str());
                 }
 
@@ -4743,6 +4747,7 @@ namespace llaminar2
                         prompt_tokens,
                         static_cast<int>(prompt_tokens.size())))
                 {
+                    slot_handoff_.retire();
                     return setError(
                         "Prefix cache harvest failed after successful request execution");
                 }
@@ -4799,6 +4804,7 @@ namespace llaminar2
                                    ? "prefix_suffix_prefill"
                                    : "prefix_cache_miss_prefill")))
                 {
+                    slot_handoff_.retire();
                     return false;
                 }
                 if (!complete_distributed_prefill())

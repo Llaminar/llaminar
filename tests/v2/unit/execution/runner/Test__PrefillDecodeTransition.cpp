@@ -61,6 +61,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <regex>
 #include <set>
 #include <memory>
 #include <optional>
@@ -7414,6 +7415,19 @@ namespace
          * @param token_budget Exact number of terminal response tokens expected.
          * @return Result surfaced after the device-owned loop reaches terminal.
          */
+        /**
+         * @brief Exact configuration fingerprint swept by this harness.
+         *
+         * The recorded replay's policy declaration must match this fingerprint;
+         * a mismatch means the fixture was captured against a different
+         * configuration and is rejected before any behavioral comparison.
+         */
+        static std::string servingSlotPolicyFingerprint()
+        {
+            return "widths=1,2;chained=yes;prefix-cache=disabled;"
+                   "greedy-default+speculative-seeded-123;device-free-mock";
+        }
+
         static GenerationResult decodeWithBudget(
             OrchestrationRunner *runner,
             int token_budget)
@@ -7632,7 +7646,8 @@ namespace
         /**
          * @brief Create an OrchestrationRunner with the mock runner injected
          */
-        std::pair<OrchestrationRunner *, MockInferenceRunner *> createRunner(bool mtp_enabled = false,
+        template <typename RunnerType = OrchestrationRunner>
+        std::pair<RunnerType *, MockInferenceRunner *> createRunner(bool mtp_enabled = false,
                                                                              bool mtp_accept = true,
                                                                              std::string mtp_unsupported_reason = {},
                                                                              std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
@@ -7718,12 +7733,12 @@ namespace
             std::unique_ptr<OrchestrationRunner> runner;
             if (mpi_ctx)
             {
-                runner = std::make_unique<OrchestrationRunner>(
+                runner = std::make_unique<RunnerType>(
                     std::move(config), runner_plan, std::move(mock), std::move(mpi_ctx));
             }
             else
             {
-                runner = std::make_unique<OrchestrationRunner>(
+                runner = std::make_unique<RunnerType>(
                     std::move(config), runner_plan, std::move(mock));
             }
 
@@ -7733,7 +7748,7 @@ namespace
             runner->setSamplingParams(greedy);
 
             runners_.push_back(std::move(runner));
-            return {runners_.back().get(), mock_ptr};
+            return {static_cast<RunnerType *>(runners_.back().get()), mock_ptr};
         }
 
         std::pair<OrchestrationRunner *, MockInferenceRunner *>
@@ -19009,7 +19024,8 @@ namespace
 
         RecordedTrace parseRecordedTrace(
             const std::string &raw,
-            const std::vector<std::string> &expectedScenarios)
+            const std::vector<std::string> &expectedScenarios,
+            const std::string &expectedPolicyFingerprint)
         {
             RecordedTrace trace;
             std::istringstream reader(raw);
@@ -19089,11 +19105,52 @@ namespace
             if (trace.declaredScenarios != expectedScenarios)
                 throw std::runtime_error(
                     "recorded trace: declared scenario list does not match the harness scenarios");
+            if (trace.metadata.at("policy") != expectedPolicyFingerprint)
+                throw std::runtime_error(
+                    "recorded trace: declared policy \"" + trace.metadata.at("policy") +
+                    "\" is not compatible with this harness configuration (expected: \"" +
+                    expectedPolicyFingerprint + "\")");
+            // Structured identity contract. Role separation: the
+            // reference-source declares the base production source identity
+            // (40-hex commit/blob SHA prefix + description); the harness blob
+            // is a content identity of the exact captured harness; the build
+            // and capture-host identify the capture environment. Reference and
+            // candidate identities are separate roles and are never compared
+            // with each other for equality. Placeholder/short values are
+            // rejected before the structural checks so the diagnostic names
+            // the specific defect.
+            for (const char *contentKey :
+                 {"reference-source", "reference-build", "reference-harness-blob"})
+                if (trace.metadata.at(contentKey).size() < 16)
+                    throw std::runtime_error(
+                        std::string("recorded trace: placeholder-or-too-short ")
+                        + "identity value for: " + contentKey);
+            if (!std::regex_match(trace.metadata.at("reference-source"),
+                                  std::regex("[0-9a-f]{40}( .*)?")))
+                throw std::runtime_error(
+                    "recorded trace: reference-source is not a 40-hex content identity with optional description");
+            if (!std::regex_match(trace.metadata.at("reference-harness-blob"),
+                                  std::regex("[0-9a-f]{40}")))
+                throw std::runtime_error(
+                    "recorded trace: reference-harness-blob is not a full 40-hex content identity");
+            if (trace.metadata.at("reference-build").empty() ||
+                trace.metadata.at("reference-build").find("SHARED_CORE=ON") ==
+                    std::string::npos)
+                throw std::runtime_error(
+                    "recorded trace: reference-build must be a nonempty build identity declaring SHARED_CORE=ON");
+            if (trace.metadata.at("reference-capture-host").size() < 4)
+                throw std::runtime_error(
+                    "recorded trace: reference-capture-host too short to be a real host identity");
             for (const auto &scenario : expectedScenarios)
                 if (!trace.referenceStreams.count(scenario) ||
                     trace.referenceStreams.at(scenario).empty())
                     throw std::runtime_error(
                         "recorded trace: missing or empty reference stream for: " + scenario);
+            for (const auto &stream : trace.referenceStreams)
+                if (std::find(expectedScenarios.begin(), expectedScenarios.end(),
+                              stream.first) == expectedScenarios.end())
+                    throw std::runtime_error(
+                        "recorded trace: extra undeclared scenario section: " + stream.first);
             return trace;
         }
     }
@@ -19103,6 +19160,31 @@ namespace
 
     /** Synthetic lifecycle-contract suite over the same harness. */
     class Test__ServingSlotHandoffLifecycle : public Test__PrefillDecodeTransition {};
+
+    /**
+     * Derived seam-runner type for epoch/exhaustion/lease evidence. The
+     * seam-dependent tests compile only where the corrected runner (with the
+     * seam) exists; base-source reference captures compile from the same
+     * scenario/parse logic with this section excluded, recording that in the
+     * capture identity.
+     */
+    class TestableServingSlotRunner : public OrchestrationRunner
+    {
+     public:
+        template <typename... Args>
+        explicit TestableServingSlotRunner(Args &&...args)
+            : OrchestrationRunner(std::forward<Args>(args)...)
+        {
+        }
+
+#ifndef LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+        using OrchestrationRunner::stageServingSlotGenerationForTest;
+        using OrchestrationRunner::servingSlotGenerationForTest;
+        using OrchestrationRunner::servingSlotHandoffForTest;
+#endif
+    };
+
+#define LLAMINAR_CB_HANDOFF_SEAM_TESTS 1
 
     /**
      * @brief Recorded-input replay of the production controller baseline.
@@ -19149,7 +19231,7 @@ namespace
                    << "# reference-capture-host: " << captureHost << "\n"
                    << "# reference-build: " << build << "\n"
                    << "# reference-harness-blob: " << harnessBlob << "\n"
-                   << "# policy: greedy default unless a scenario sets seeded params; prefix-cache disabled; mtp draft widths 1 and 2 with chained sidecars; device-free mock boundary\n"
+                   << "# policy: " << servingSlotPolicyFingerprint() << "\n"
                    << "# candidate-binding: external, via qualification receipts pairing worktree HEAD, clean-tree status, and the full test-name inventory\n"
                    << "# scenarios:";
             for (const auto &kind : scenarios)
@@ -19173,7 +19255,8 @@ namespace
         serving_slot_replay::RecordedTrace trace;
         try
         {
-            trace = serving_slot_replay::parseRecordedTrace(raw.str(), scenarios);
+            trace = serving_slot_replay::parseRecordedTrace(
+                raw.str(), scenarios, servingSlotPolicyFingerprint());
         }
         catch (const std::exception &error)
         {
@@ -19202,131 +19285,98 @@ namespace
         {
             return std::string(
                 "# format: 1\n"
-                "# reference-source: base\n"
-                "# reference-capture-host: host\n"
-                "# reference-build: build\n"
-                "# reference-harness-blob: blob\n"
-                "# policy: p\n"
+                "# reference-source: 28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)\n"
+                "# reference-capture-host: dgx-station (tdsynnex, aarch64 Neoverse-V2)\n"
+                "# reference-build: Integration/SHARED_CORE=ON/NEON_I8MM/image:sha256:b3a70cb060bb\n"
+                "# reference-harness-blob: 83471b15c5bc2ab2f01e3d4455a6b7c8d9e0f1a2\n"
+                "# policy: " + servingSlotPolicyFingerprint() + "\n"
                 "# scenarios: serial3 mtp_greedy2\n"
                 ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n");
         };
         EXPECT_NO_THROW(serving_slot_replay::parseRecordedTrace(
-            makeValid(), scenarios));
+            makeValid(), scenarios, servingSlotPolicyFingerprint()));
 
+        // Negative cases: each derives from a valid trace and changes ONLY its
+        // targeted defect, so the failure reaches the intended branch and the
+        // asserted diagnostic verifies the parser caught that branch.
         struct Case
         {
             const char *name;
+            const char *expectedDiagnostic;
             std::string trace;
         };
+        const auto mutate = [&makeValid](const std::string &find,
+                                         const std::string &replacement,
+                                         bool insert = false)
+        {
+            std::string t = makeValid();
+            if (insert)
+                t.insert(t.find(find), replacement);
+            else
+                t.replace(t.find(find), find.size(), replacement);
+            return t;
+        };
+        auto eraseLine = [&makeValid](const std::string &lineWithNewline)
+        {
+            std::string t = makeValid();
+            const auto pos = t.find(lineWithNewline);
+            if (pos != std::string::npos)
+                t.erase(pos, lineWithNewline.size());
+            return t;
+        };
+
         const std::vector<Case> cases = {
-            {"missing format",
-             "# reference-source: base\n"
-             "# reference-capture-host: host\n"
-             "# reference-build: build\n"
-             "# reference-harness-blob: blob\n"
-             "# policy: p\n"
-             "# scenarios: serial3 mtp_greedy2\n"
-             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
-            {"unsupported format",
-             "# format: 2\n"
-             "# reference-source: base\n"
-             "# reference-capture-host: host\n"
-             "# reference-build: build\n"
-             "# reference-harness-blob: blob\n"
-             "# policy: p\n"
-             "# scenarios: serial3 mtp_greedy2\n"
-             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
-            {"missing required identity",
-             "# format: 1\n"
-             "# reference-capture-host: host\n"
-             "# reference-build: build\n"
-             "# reference-harness-blob: blob\n"
-             "# policy: p\n"
-             "# scenarios: serial3 mtp_greedy2\n"
-             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
-            {"duplicate identity key",
-             "# format: 1\n"
-             "# reference-source: base\n"
-             "# reference-source: base\n"
-             "# reference-capture-host: host\n"
-             "# reference-build: build\n"
-             "# reference-harness-blob: blob\n"
-             "# policy: p\n"
-             "# scenarios: serial3 mtp_greedy2\n"
-             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
-            {"unsupported metadata key",
-             "# format: 1\n"
-             "# reference-source: base\n"
-             "# reference-capture-host: host\n"
-             "# reference-build: build\n"
-             "# reference-harness-blob: blob\n"
-             "# future-key: x\n"
-             "# policy: p\n"
-             "# scenarios: serial3 mtp_greedy2\n"
-             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
-            {"empty metadata value",
-             "# format: 1\n"
-             "# reference-source: base\n"
-             "# reference-capture-host: host\n"
-             "# reference-build: build\n"
-             "# reference-harness-blob: blob\n"
-             "# policy: \n"
-             "# scenarios: serial3 mtp_greedy2\n"
-             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n"},
-            {"duplicate scenario section",
-             "# format: 1\n"
-             "# reference-source: base\n"
-             "# reference-capture-host: host\n"
-             "# reference-build: build\n"
-             "# reference-harness-blob: blob\n"
-             "# policy: p\n"
-             "# scenarios: serial3 mtp_greedy2\n"
-             ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n>>> serial3\nR1:1\n"},
-            {"event before section",
-             "# format: 1\n"
-             "R1:1\n"
-             "# reference-source: base\n"
-             "# scenarios: serial3 mtp_greedy2\n"
-             ">>> serial3\nR1:1\n"},
-            {"empty scenario stream",
-             "# format: 1\n"
-             "# reference-source: base\n"
-             "# reference-capture-host: host\n"
-             "# reference-build: build\n"
-             "# reference-harness-blob: blob\n"
-             "# policy: p\n"
-             "# scenarios: serial3 mtp_greedy2\n"
-             ">>> serial3\nR1:1\n>>> mtp_greedy2\n"},
-            {"declared scenario missing from stream",
-             "# format: 1\n"
-             "# reference-source: base\n"
-             "# reference-capture-host: host\n"
-             "# reference-build: build\n"
-             "# reference-harness-blob: blob\n"
-             "# policy: p\n"
-             "# scenarios: serial3\n"
-             ">>> serial3\nR1:1\n"},
+            {"missing format", "unsupported or missing format",
+             eraseLine("# format: 1\n")},
+            {"unsupported format", "unsupported or missing format",
+             mutate("# format: 1", "# format: 2")},
+            {"missing required identity", "missing required metadata: reference-source",
+             eraseLine("# reference-source: 28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)\n")},
+            {"duplicate identity key", "duplicate metadata key: reference-source",
+             mutate("28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)\n",
+                    "28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)\n# reference-source: 28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)\n", true)},
+            {"unsupported metadata key", "unsupported metadata key: future-key",
+             mutate("# reference-source:", "# future-key: x\n# reference-source:", true)},
+            {"empty metadata value", "empty metadata value for: policy",
+             mutate("# policy: " + servingSlotPolicyFingerprint(), "# policy: ")},
+            {"duplicate scenario section", "duplicate scenario section: serial3",
+             mutate(">>> mtp_greedy2", ">>> serial3\nR1:1\n>>> mtp_greedy2", true)},
+            {"event before section", "event line before any scenario section",
+             mutate("# format: 1", "# format: 1\nR1:1")},
+            {"empty scenario stream", "missing or empty reference stream for: mtp_greedy2",
+             mutate(">>> mtp_greedy2\nR1:1\n", ">>> mtp_greedy2\n")},
+            {"declared scenario missing from stream", "declared scenario list does not match",
+             mutate("# scenarios: serial3 mtp_greedy2", "# scenarios: serial3")},
+            {"extra undeclared scenario section", "extra undeclared scenario section: ghost",
+             mutate(">>> mtp_greedy2\nR1:1\n", ">>> mtp_greedy2\nR1:1\n>>> ghost\nR9:1\n")},
+            {"policy fingerprint incompatible", "not compatible with this harness configuration",
+             mutate("policy: " + servingSlotPolicyFingerprint(),
+                    "policy: widths=3;prefix-cache=enabled")},
+            {"placeholder identity rejected", "placeholder-or-too-short identity value for: reference-source",
+             mutate("reference-source: 28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)",
+                    "reference-source: x")},
+            {"malformed harness blob identity", "reference-harness-blob is not a full 40-hex content identity",
+             mutate("# reference-harness-blob: 83471b15c5bc2ab2f01e3d4455a6b7c8d9e0f1a2",
+                    "# reference-harness-blob: not-a-real-content-identity-value")},
         };
         for (const auto &attempt : cases)
         {
             SCOPED_TRACE(attempt.name);
-            EXPECT_THROW(serving_slot_replay::parseRecordedTrace(
-                             attempt.trace, scenarios),
-                         std::runtime_error);
+            try
+            {
+                (void)serving_slot_replay::parseRecordedTrace(
+                    attempt.trace, scenarios, servingSlotPolicyFingerprint());
+                FAIL() << "malformed trace parsed without rejection";
+            }
+            catch (const std::exception &error)
+            {
+                EXPECT_NE(std::string(error.what()).find(attempt.expectedDiagnostic),
+                          std::string::npos)
+                    << "diagnostic mismatch: " << error.what();
+            }
         }
     }
 
-
-    /**
-     * @brief Sequential request reuse must serve each request from its own
-     *        handoff bank, not from a predecessor's leftover state.
-     *
-     * Request B on a runner that served request A must match a fresh runner
-     * serving only B, byte-for-byte in observable tokens. The two terminal
-
-     * rows are deliberately distinct so any inherited condition, seed, or
-     * penalty state from A changes B's stream and fails this contract.
-     */
     TEST_F(Test__ServingSlotHandoffLifecycle, SequentialReuseMatchesFreshRunner)
     {
         const std::vector<float> rowA = {0.10f, 0.20f, 0.90f, 0.30f, 0.20f,
@@ -19509,6 +19559,213 @@ namespace
         EXPECT_EQ(b1.tokens, cb1.tokens)
             << "width-2 request B inherited prior-request handoff state";
     }
+
+    /**
+     * @brief Exhaustion refuses BEFORE any mutation, including the predecessor
+     *        retirement: a near-max staged generation mints exactly once, the
+     *        next admission is refused without touching the live bank, and the
+     *        predecessor admission remains fully functional.
+     */
+#ifndef LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+    TEST_F(Test__ServingSlotHandoffLifecycle, ExhaustionRefusesBeforePredecessorMutation)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(/*mtp_enabled=*/true);
+        (void)mock;
+        const std::uint64_t nearMax =
+            std::numeric_limits<std::uint64_t>::max() - 1;
+        runner->stageServingSlotGenerationForTest(nearMax);
+
+        // Admission mints the exhausted boundary value and opens the bank.
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        EXPECT_EQ(runner->servingSlotGenerationForTest(),
+                  std::numeric_limits<std::uint64_t>::max());
+        const auto admittedBank = runner->servingSlotHandoffForTest();
+        EXPECT_TRUE(admittedBank.hasPayload());
+        EXPECT_FALSE(admittedBank.retired);
+        EXPECT_EQ(admittedBank.admission_epoch,
+                  std::numeric_limits<std::uint64_t>::max());
+
+        // The next admission refuses: counter and predecessor bank unmoved.
+        const std::uint64_t errorEpochBefore = runner->servingSlotGenerationForTest();
+        EXPECT_FALSE(runner->prefill({3, 4}));
+        EXPECT_NE(runner->lastError(), "");
+        EXPECT_NE(runner->lastError().find("Serving-slot admission generation exhausted"),
+                  std::string::npos)
+            << runner->lastError();
+        EXPECT_EQ(runner->servingSlotGenerationForTest(), errorEpochBefore);
+        const auto afterBank = runner->servingSlotHandoffForTest();
+        EXPECT_EQ(afterBank.admission_epoch,
+                  std::numeric_limits<std::uint64_t>::max());
+        EXPECT_FALSE(afterBank.retired);
+        EXPECT_TRUE(afterBank.hasPayload());
+
+        // The predecessor admission is still fully funcional after the refusal.
+        const GenerationResult stillAlive = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(stillAlive.success()) << stillAlive.error;
+        EXPECT_EQ(runner->servingSlotGenerationForTest(),
+                  std::numeric_limits<std::uint64_t>::max());
+    }
+#endif
+
+    /**
+     * @brief Admission generations are observable and strictly monotonic
+     *        across admission edges, with retirement keeping the epoch and
+     *        re-admission minting the next one.
+     */
+#ifndef LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+    TEST_F(Test__ServingSlotHandoffLifecycle, AdmissionsMintMonotonicObservableEpochs)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(/*mtp_enabled=*/true);
+        (void)mock;
+        runner->stageServingSlotGenerationForTest(5);
+
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        EXPECT_EQ(runner->servingSlotGenerationForTest(), 6u);
+        EXPECT_EQ(runner->servingSlotHandoffForTest().admission_epoch, 6u);
+        EXPECT_FALSE(runner->servingSlotHandoffForTest().retired);
+
+        runner->clearCache();
+        EXPECT_EQ(runner->servingSlotGenerationForTest(), 6u);
+        EXPECT_TRUE(runner->servingSlotHandoffForTest().retired);
+        EXPECT_EQ(runner->servingSlotHandoffForTest().admission_epoch, 6u);
+
+        ASSERT_TRUE(runner->prefill({3, 4}));
+        EXPECT_EQ(runner->servingSlotGenerationForTest(), 7u);
+        EXPECT_EQ(runner->servingSlotHandoffForTest().admission_epoch, 7u);
+
+        // Direct replacement (no clearCache) mints the next generation.
+        ASSERT_TRUE(runner->prefill({5}));
+        EXPECT_EQ(runner->servingSlotGenerationForTest(), 8u);
+        EXPECT_EQ(runner->servingSlotHandoffForTest().admission_epoch, 8u);
+        EXPECT_FALSE(runner->servingSlotHandoffForTest().retired);
+    }
+#endif
+
+    /**
+     * @brief Direct replacement over a GENUINELY lease-bearing predecessor:
+     *        the device-resident grouped controller holds a live resident
+     *        mailbox in the slot handoff bank; the direct admission must
+     *        release that lease (single clearing owner, lease-first order)
+     *        before opening the successor, and the successor's publication
+     *        must be a NEW mailbox, not the predecessor's.
+     *
+     * Lifetime/order evidence: the mock's device-generation lifecycle event
+     * stream and the resident mailbox identity (publication generation +
+     * device) are observed through the production-mock boundary. No bank
+     * value copies are retained across the replacement; the predecessor bank
+     * is observed only before the replacement, and the successor state only
+     * after.
+     */
+#ifndef LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+    TEST_F(Test__ServingSlotHandoffLifecycle, DirectReplacementReleasesPredecessorLeases)
+    {
+        using sampling_math::DeviceGenerationLeadingRowDisposition;
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(
+                /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr,
+                /*mtp_token_coordination=*/true, false, DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/1);
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->setVerifierAcceptedPrefixScript({1, 1});
+        mock->enableDeviceResidentGeneration(
+            DeviceGenerationTerminalRequestResult{
+                .tokens = {MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                           MockInferenceRunner::MTP_ARGMAX_TOKEN},
+                .remaining_token_count = 0,
+                .model_stopped = false,
+                .transaction_count = 1,
+                .accepted_speculative_token_count = 1,
+                .rejected_transaction_count = 0,
+                .consumed_verifier_row_count = 2,
+                .published_state_commit_count = 2,
+                .attempted_draft_token_count = 1,
+                .verifier_token_count = 2,
+                .final_draft_depth = 1,
+            });
+
+        // Predecessor admission: opens the device-resident controller and
+        // leaves a LIVE lease-bearing condition in the slot bank.
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const GenerationResult first = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(first.success()) << first.error;
+
+        const auto &predecessorBank = runner->servingSlotHandoffForTest();
+        EXPECT_FALSE(predecessorBank.retired);
+        EXPECT_GE(predecessorBank.admission_epoch, 1u);
+        ASSERT_TRUE(predecessorBank.hasPayload());
+        // A genuine lease exists: the ready condition is device-resident with
+        // a live mailbox identity, or a pending resident handle is held.
+        const bool readyResident =
+            predecessorBank.ready_mtp_condition_.has_value() &&
+            predecessorBank.ready_mtp_condition_->authority ==
+                decltype(predecessorBank.ready_mtp_condition_)::value_type::
+                    Authority::DeviceResident &&
+            predecessorBank.ready_mtp_condition_->resident_state.has_value() &&
+            predecessorBank.ready_mtp_condition_->resident_state->valid();
+        const bool pendingResident =
+            predecessorBank.pending_mtp_condition_resident_state_.has_value() &&
+            predecessorBank.pending_mtp_condition_resident_state_->valid();
+        const bool predecessorHadLease = readyResident || pendingResident;
+            (predecessorBank.pending_mtp_condition_resident_state_.has_value() &&
+             predecessorBank.pending_mtp_condition_resident_state_->valid());
+        EXPECT_TRUE(predecessorHadLease)
+            << "the predecessor admission must hold a live resident lease for "
+               "this replacement-lifetime proof";
+        const auto &leaseHandle =
+            readyResident ? *predecessorBank.ready_mtp_condition_->resident_state
+                          : *predecessorBank.pending_mtp_condition_resident_state_;
+        const uint64_t predecessorPublicationGeneration =
+            leaseHandle.publication_generation;
+        const DeviceId predecessorDevice = leaseHandle.device;
+
+        // Direct replacement (no clearCache): the explicit lease-first
+        // retirement must release the predecessor lease before opening the
+        // successor. Only scalar identity values are captured before the
+        // replacement; no bank or lease handles are retained past it.
+        const uint64_t predecessorEpoch = predecessorBank.admission_epoch;
+        ASSERT_TRUE(runner->prefill({6, 7}));
+
+        const auto &replacementBank = runner->servingSlotHandoffForTest();
+        EXPECT_FALSE(replacementBank.retired);
+        EXPECT_EQ(replacementBank.admission_epoch, predecessorEpoch + 1u)
+            << "the direct replacement must mint the next admission generation";
+        const uint64_t replacementEpoch = replacementBank.admission_epoch;
+
+        // Successor admission: opens its own device-resident controller with
+        // a NEW mailbox (fresh publication generation on the same device).
+        const GenerationResult second = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(second.success()) << second.error;
+        const auto &successorLease = runner->servingSlotHandoffForTest();
+        EXPECT_FALSE(successorLease.retired);
+        EXPECT_EQ(successorLease.admission_epoch, replacementEpoch);
+        ASSERT_TRUE(successorLease.ready_mtp_condition_.has_value());
+        EXPECT_EQ(successorLease.ready_mtp_condition_->authority,
+                  decltype(successorLease.ready_mtp_condition_)::value_type::
+                      Authority::DeviceResident);
+        ASSERT_TRUE(successorLease.ready_mtp_condition_->resident_state.has_value());
+        EXPECT_TRUE(successorLease.ready_mtp_condition_->resident_state->valid());
+        EXPECT_EQ(successorLease.ready_mtp_condition_->resident_state->device,
+                  predecessorDevice);
+        EXPECT_GE(successorLease.ready_mtp_condition_->resident_state
+                      ->publication_generation,
+                  predecessorPublicationGeneration)
+            << "the successor mailbox must be a fresh publication, not the "
+               "predecessor's retired lease";
+
+        // Ordering: the replacement admission opened after the predecessor
+        // controller finished; two full admission/finish cycles are on record.
+        EXPECT_THAT(mock->deviceGenerationLifecycleEvents(),
+                    ElementsAre("admission", "resident_verifier",
+                                "materialize:greedy", "launch", "finish",
+                                "admission", "resident_verifier",
+                                "materialize:greedy", "launch", "finish"));
+    }
+
+#endif // LLAMINAR_CB_HANDOFF_BASE_CAPTURE
 
     /**
      * @brief Scalar/fixed-cohort boundary: the batched entry requires its own
