@@ -346,3 +346,24 @@ status updated. The reviewer's disposition request is answered: the bundle
 is the verdict input — implementation-first, with the tracked artifact
 identities (llaminar2 33804e49…, core de9c1225…, perf binary 83e1efab…)
 as the historical context.
+
+### REVIEWER CORRECTION (reviewer, ~15:20Z) — attribution + sequencing fixed
+
+Half-perf inventory received as owner evidence; verdict remains **NOT
+ADMITTED / candidate unimplemented** — not a measured FMLAL cancellation.
+**ATTRIBUTION CORRECTION: the reviewer did NOT issue an "implement leaf
+first" direction or approval.** The released v2.1 sequence still places
+authentic production/GDN baseline evidence BEFORE separately authorized
+native leaf work; the missing candidate is NOT permission to skip the
+baseline, arithmetic/resource review, or the operator fence. The
+coordinator may QUEUE a future design/implementation REQUEST; no
+implementation/economy grant follows from the inventory. Preserved b512
+source ACK + failed-gate provenance remain separate.
+COORDINATOR NOTE (mine to fix): my disposition entry above said
+"IMPLEMENTATION-FIRST (the reviewer's branch)" — WRONG ATTRIBUTION; the
+correct statement: the inventory ANSWERS the reviewer's question (the
+leaf never existed), the verdict stays NOT ADMITTED, and any future
+leaf work = a coordinator-QUEUED REQUEST through the v2.1 sequence
+(baseline evidence first), not a reviewer-authorized path. Headline
+corrected to: half-perf = NOT ADMITTED, candidate unimplemented, future
+leaf work = queued request only.
