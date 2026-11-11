@@ -214,10 +214,7 @@ namespace llaminar2::cpu
             add(ARMCPUFeature::FP16Arithmetic, optionalFeature("hw.optional.arm.FEAT_FP16"));
             add(ARMCPUFeature::BF16Arithmetic, optionalFeature("hw.optional.arm.FEAT_BF16"));
             add(ARMCPUFeature::IntegerMatMul, optionalFeature("hw.optional.arm.FEAT_I8MM"));
-            // Darwin does not expose FEAT_FHM as a separate key; Apple's
-            // FEAT_FP16 implementations carry the FML long multiply-add
-            // extension, so the FP16 arithmetic observation covers it.
-            add(ARMCPUFeature::FP16FML, optionalFeature("hw.optional.arm.FEAT_FP16"));
+            add(ARMCPUFeature::FP16FML, optionalFeature("hw.optional.arm.FEAT_FHM"));
 #elif defined(__linux__)
             errno = 0;
             const unsigned long hwcap = getauxval(AT_HWCAP);
