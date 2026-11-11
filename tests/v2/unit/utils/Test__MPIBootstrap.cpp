@@ -302,6 +302,13 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
                 if (owners >= 2)
                     inner.emplace();
             }
+            // The timed interval is the AMORTIZED CONCURRENT WALL TIME
+            // INCLUDING RENDEZVOUS: it opens with the start-gate publication
+            // and closes after the competing owner's completion is observed.
+            // Readiness gates permit concurrency; they do not prove scheduler
+            // overlap, so the interval is honestly labeled as wall time
+            // including the rendezvous, never as a literal notes-only span.
+            // Verification, join and teardown happen after the clock stops.
             const auto cost_start = std::chrono::steady_clock::now();
             if (concurrent)
                 start_gate.store(true, std::memory_order_release);
@@ -334,18 +341,35 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
                     llaminar::v2::OpenMPTeamForkScope restored;
                     auto local_idle = [] {};
                     OMP_WORKSHARE_REGION(local_idle);
-                    EXPECT_EQ(restored.forks(), 1u)
-                        << "the owner stack must be exactly the outer scope "
-                           "after the inner was torn down";
+                    EXPECT_EQ(restored.forks(), 1u);
+                    // STACK IDENTITY, not just a self-count: the probe fork
+                    // must attribute to BOTH the fresh scope and the
+                    // surviving outer (the walked stack is exactly
+                    // [restored, outer]). A lost or wrong previous link
+                    // would leave the outer at kMeasuredNotes and fail here.
+                    EXPECT_TRUE(outer.has_value());
+                    EXPECT_EQ(outer->forks(), kMeasuredNotes + 1)
+                        << "the probe must walk restored AND the surviving outer";
                 }
                 outer.reset(); // Only after the inner is gone and verified.
+                // The ORIGINAL stack is restored after the teardown: a fork
+                // now must attribute to nothing (the total is its only
+                // witness).
+                const std::uint64_t after_teardown =
+                    llaminar::v2::openMPTeamForkSnapshot();
+                {
+                    auto local_idle = [] {};
+                    OMP_WORKSHARE_REGION(local_idle);
+                }
+                EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - after_teardown, 1u);
             }
             const auto cost_ns = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(cost_stop - cost_start)
                     .count());
             const std::uint64_t expected_total =
                 kMeasuredNotes * (concurrent ? 2u : 1u) +
-                (concurrent ? 0u : 1u); // The nested branch's restoration probe.
+                (concurrent ? 0u : 2u); // Nested: the restoration probe plus
+            // the post-teardown fork that proves the original stack restored.
             EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - before, expected_total);
             return cost_ns / static_cast<double>(kMeasuredNotes);
         };
@@ -361,11 +385,14 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
                 ns_per_note, "evidence", "host",
                 {{"basis", std::to_string(kMeasuredNotes) +
                                "_notes_per_measuring_thread_per_owner_latency_"
+                               "amortized_concurrent_wall_time_including_rendezvous_"
                                "scope_config_built_off_clock"}});
             std::cout << "[evidence] openmp_team_fork_note_self_cost_" << label << "="
-                      << ns_per_note << " ns per owner note, amortized over " << kMeasuredNotes
+                      << ns_per_note << " ns per owner note, amortized concurrent wall time "
+                                        "including rendezvous over " << kMeasuredNotes
                       << " notes per measuring thread (per-owner latency with the production "
-                         "owner walk; earlier no-walk figures do not transfer)" << std::endl;
+                         "owner walk; readiness permits concurrency and does not prove "
+                         "scheduler overlap; earlier no-walk figures do not transfer)" << std::endl;
             EXPECT_LT(ns_per_note, 100.0) << label;
         }
     }
