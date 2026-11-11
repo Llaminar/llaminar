@@ -367,3 +367,27 @@ publication); (3) only then, if a defect remains, the coordinator
 consumption path. No full-9 run needed. The rollover handoff file
 (issue58-handoff.md) must be AMENDED with this correction before
 rollover completes — the argv blocker is a known, named, first-fix item.
+
+### First repair successor: 3ce558a6b (arm-addon post-rollover, ~09:24Z) — NOT an ACK request
+
+FF from c00246613; 3 files +17/−6; Refs #58. Fixes the DETERMINISTIC
+blockers: (1) argv mismatch — stub writer reads exactly argv[1]/argv[2];
+selectors via configured STUB_* vars (IndexError gone); (2) envelope_sha256
+bound in the stub proof (tree CPUCodegenEnvelope.py; new --envelope test
+input registered in the cmake suite); (3) coordinator consumption-path
+defects: bare `expected_id` NameError → os.environ["EXPECTED_ID"];
+`root = os.path.realpath(...)` str → Path (the mac-final WT fix, now
+committed); `cell_fail` first-failure-wins (explains the
+STUB_FAIL_BUILD→missing-artifact misattribution in Main's log); (4) dead
+missing-artifact selector now honoured in write+digest loops; (5)
+compile-DB entry names the real probe TU. EVIDENCE (the required format):
+fresh clean checkout at the pushed SHA (byte-identical vs FETCH_HEAD),
+regression Ran 12 OK rc=0 entirely from that tree, raw log
+/tmp/rg-clean-3ce5-regression.log, per-file SHA-256s (Gate.sh 1feeb802…,
+test module 632ccd7f…, V2CPUArchitectureTests.cmake cdb4e173…, Evidence.py
+f180104a…, Budget.json 6a34b344…, CPUCodegenEnvelope.py 4083b873…).
+DISCLOSURE: --no-verify (Integration configure impossible on the
+OpenMP-less Mac; hook documents the bypass). REMAINING = the full
+consolidated RG1–RG4 list — next successor commits on the same branch.
+HOLD unchanged; no FF/campaign/issue-58 closure until the focused ACK of
+the genuinely fixed source.
