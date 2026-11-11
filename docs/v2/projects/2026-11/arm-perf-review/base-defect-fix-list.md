@@ -323,3 +323,17 @@ PACKET PROVENANCE ISSUES (Main): the app b5e6c0 hash alone ALSO matches 35
 --iterations was omitted; the 20-CPU vs 10-core topology summary needs
 raw. Main requested the CORE hash/path + exact command + seal from the
 owner before closing the actual .79 attribution.
+### B12: 763 native focused qualification DONE (Main, ~00:21Z)
+
+MPIBootstrap Unit + placement preflight + new master contract = 3/3 PASS;
+new contract 20 consecutive PASS. The ORIGINAL 1f source control
+reproduces BOTH broader local-VM failures unchanged (no NUMA sysfs / CPU
+shorthand unknown) → those are ENVIRONMENT-UNQUALIFIED, not new-fix
+failures. Corrected mirror rebuilt/restored; source hashes match; source
+ACK #184. **EXPLICIT .79 OWNED WINDOW**: owner (arm-sparks) runs the
+CPU-only MODEL-FREE build at exact 763 (app + MPIBootstrap Unit +
+startup/cluster probes) + the affinity aliases (new master,
+CPUStartupAffinity, ClusterInventoryBootstrap, placement) 20x on the new
+contract — no inference/OMP-cap workaround/GPU. Main does not remote-
+execute without ownership; arm-sparks owns and returns commands/binary-
+core identities/CTest logs/exits/driver window.
