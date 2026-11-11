@@ -225,3 +225,21 @@ A1: constructor binds epoch; provenance scope EXPLICIT (receipts
 ASSUMED-COMMITTED); "lookahead unrepresentable" RETRACTED (the honest
 limit); cap-with-fewer-slots case added; A5: "reverse ordering" wording.
 D6/D3/D2 stand. Reviewer re-verdict pending.
+
+## DIAGNOSTIC RE-REVIEW #4 (~23:30Z): 688b0c14b SOURCE HOLD — three focused issues
+
+1. A1: the future-position fixture contradicts its own epoch (reset
+   epoch=9 then submits {9,100,7,0} → epoch guard throws unexpectedly;
+   cap checks never execute); reorder or isolate the lifecycle; cap
+   positions are 5..10 not 10..15. Constructor epoch-binding ACCEPTED;
+   ASSUMED-COMMITTED scope limit ACCEPTED; lookahead requirement NOT
+   reopened.
+2. A3: EXPECT_NE-every-component contradicts the predicted law (token2
+   = p(2)) — assert DISTRIBUTIONS differ, not every component.
+3. A3: the omitted-residual negative is confounded (wrong-correction
+   q already deviates) — clean counterfactual: same valid q both sides,
+   unmodified helper yields p, then change ONLY the rejected-token
+   source (predicts (5/16,5/16,3/16,3/16) vs p).
+CLOSED: A2 (228 assertions), A4 (token-1 boundary + endpoints), A5
+(coverage + scope limits), .8-negatives as total-mass validation.
+NONBLOCKING PROSE: :190, :251-254, head:259 wording.
