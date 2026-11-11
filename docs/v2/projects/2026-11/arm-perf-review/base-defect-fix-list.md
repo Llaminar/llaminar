@@ -617,3 +617,19 @@ failure in the selected results; Main inspects binding before releasing
 the SOURCE-HANDOVER BASE. Extra unapproved repeats ≠ full qualification/
 economy. Owner's own-script issues require an owner ACK; Main's corrected
 runner unused. No Main remote workload.
+
+### Owner-narration contradiction at packet time (Main, ~04:10Z) — quiesce + handback directed
+
+arm-sparks seq 70/71 claimed 5 tests / 20 repeats / missing e0 registration
+and proposed a rerun — ALL contradicting Main's frozen SCP + Python
+validation (8-test inventory, JUnit, run8.log 8/8 PASS, 400 raw passes
+EACH, script actual N≠8 / inner repeat 20). Main directed: NO rerun/
+reconfigure/overwrite; owner QUIESCE + terminal-state report + explicit
+HANDBACK; Main finishes the binding packet READ-ONLY after explicit
+transfer (no further execution). All artifacts/provenance preserved; no
+git repair; no source changes. Classification: owner-reporting/harness-
+custody issue — NOT missing registration, NOT production test failure.
+The actual data (8/8 at e0) stands; the narration about it failed.
+Meta-lesson: at handoff time, the owner narrates the frozen artifacts,
+not a re-derived story — every packet claim must be re-checked against
+the preserved bytes immediately before sending.
