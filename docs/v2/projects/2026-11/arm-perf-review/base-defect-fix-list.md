@@ -838,3 +838,24 @@ topology admission. CB lead already pursuing matched native status/stack;
 NO new ARM host job, no blanket env waiver. Tracker headline
 'allocator-level' removed per this correction (headline now: crash-site
 OPEN, unchecked-buffer fixture candidate identified).
+
+### **B11 CRASH SITE ISOLATED** (worker c527, ~12:24Z) — unchecked-null fixture site confirmed
+
+SIGSEGV isolated to **Test__NUMAAllocator.NUMABufferIterators (line 601)**
+with the single-test gtest filter (exit 139 confirmed). MECHANISM: the
+test constructs NUMABuffer<int>(64,0) — NUMAAllocator::allocateLocal
+returns NULL due to EPERM on get_mempolicy (Station 64K/memory-only-NUMA
+topology) — then range-iterates the buffer WITHOUT checking valid(),
+dereferencing null → SIGSEGV. **CLASSIFICATION: unchecked-null FIXTURE
+site, NOT an allocator defect** — the test should ASSERT_TRUE(buffer.
+valid()) before iterating. The EPERM itself (get_mempolicy EPERM on the
+Station topology) is a SEPARATE Station environment issue. Crash log:
+artifacts/cb-c1-staging/current/b11-iterators-crash.log; fixture code:
+tests/v2/unit/memory/Test__NUMAAllocator.cpp:601-616.
+DISPOSITION IMPLICATIONS: (1) B11 as a standalone allocator defect is
+CLOSED (fixture defect + environment issue); (2) the CB lane's fix = the
+assert-before-iterate fixture hardening (which Main already noted would
+avoid the secondary crash but NOT make the expected-allocation test green
+— permission/topology admission unchanged); (3) the underlying get_mempolicy
+EPERM on 64K/memory-only-NUMA remains a Station environment precondition
+to record, not an ARM defect.
