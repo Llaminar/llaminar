@@ -156,3 +156,19 @@ NEW FINDINGS (portable TU/fixtures):
   authored target token — header claim false).
 DISPOSITION: repair authorization intact; fixes stay in existing files;
 no new apparatus. Reviewer → spec 10137aa3 (§3-only) next.
+
+## SPEC ACK (~23:07Z): SPEC-FAITHFUL / DESIGN-ONLY at blob 10137aa3
+
+Final delta vs reviewed f26fd8ba verified: backfill/count semantics
+agree; freshness = commit position/observation sequence (generation =
+identity only); freshest-per-ID dedup precedes N; v2 obeys 1<=N<V.
+**S1-S6 SPEC FINDINGS CLOSED at this blob.** Intact: typed axes, strict
+Mode C seeded identity, Mode P truthful-q/full-residual contract,
+selected/grouped byte obligations, runtime-N/capture/PMA + measured
+sweep requirements. v1 (committed-token-recency + LowestGlobalIds) =
+explicitly a distinct heuristic, NOT certified useful/economical; v2
+separately versioned.
+SCOPE: DESIGN FAITHFULNESS ONLY — no production-unfence, N-sweep,
+execution, or economy grant; diagnostic authorization unchanged.
+a42 diagnostic = SOURCE HOLD A1-A5 (repair round 2 in flight); FMLAL =
+SOURCE HOLD F1-F5 (repair tip 0b53fa7a4 in validation).
