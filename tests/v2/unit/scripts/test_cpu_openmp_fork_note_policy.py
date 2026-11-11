@@ -134,6 +134,36 @@ class OpenMPForkNotePolicyCliTest(unittest.TestCase):
         self.assertEqual(len(violations(err)), 1)
         self.assertIn("no adjacent pragma", err)
 
+    def test_whitespace_forms_cannot_be_skipped(self) -> None:
+        # An unnoted pragma whose omp/parallel separator is a tab or double
+        # space is SUPPORTED grammar: the pre-filter must not discard the
+        # file, and the anchored rules must flag it.
+        self.write("src/v2/tab_form.cpp",
+                   "void kernel(float *out) {\n"
+                   "#pragma omp\tparallel for\n"
+                   "    for (int i = 0; i < n; ++i) out[i] = 0.0f;\n"
+                   "}\n")
+        self.write("src/v2/double_space_form.cpp",
+                   "void kernel(float *out) {\n"
+                   "#pragma omp  parallel for\n"
+                   "    for (int i = 0; i < n; ++i) out[i] = 0.0f;\n"
+                   "}\n")
+        code, out, err = run_cli(self.root)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(violations(err)), 2)
+        self.assertIn("raw OpenMP fork", err)
+
+    def test_noted_whitespace_form_is_accepted(self) -> None:
+        self.write("src/v2/tab_noted.cpp",
+                   "void kernel(float *out) {\n"
+                   "    ::llaminar::v2::noteOpenMPTeamFork();\n"
+                   "#pragma omp\tparallel for\n"
+                   "    for (int i = 0; i < n; ++i) out[i] = 0.0f;\n"
+                   "}\n")
+        code, out, err = run_cli(self.root)
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 noted sites", out)
+
     def test_conditional_note_is_rejected(self) -> None:
         self.write("src/v2/conditional.cpp",
                    "void kernel(float *out) {\n"

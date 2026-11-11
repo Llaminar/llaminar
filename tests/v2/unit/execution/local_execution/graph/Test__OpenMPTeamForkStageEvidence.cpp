@@ -66,7 +66,19 @@ namespace
             if (stage_timing)
                 ::setenv("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", stage_timing, 1);
             else if (force_absent)
-                ::unsetenv("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING");
+            {
+                // A forced-absent configuration must not leave ANY of the
+                // enablement inputs ambient: clear all of them, not a subset.
+                for (const char *name : {"LLAMINAR_PERF_STATS_SUMMARY",
+                                         "LLAMINAR_PERF_STATS_FILTER",
+                                         "LLAMINAR_PERF_STATS_TABLE",
+                                         "LLAMINAR_PERF_STATS_JSON",
+                                         "LLAMINAR_PERF_STATS_CSV",
+                                         "LLAMINAR_PROFILING",
+                                         "LLAMINAR_PERF_STATS_CPU_STAGE_TIMING",
+                                         "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING"})
+                    ::unsetenv(name);
+            }
             llaminar2::mutableDebugEnv().reload();
             llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
             llaminar2::PerfStatsCollector::reset();
@@ -126,7 +138,7 @@ TEST(OpenMPTeamForkStageEvidence, StagePublisherEmitsExactPerStageForkCounts)
     // The off-default shape: without the explicit CPU stage-timing gate the
     // executor costs no fork observation and publishes no omp record.
     {
-        const ScopedForkEvidenceConfig off_default("omp");
+        const ScopedForkEvidenceConfig off_default("omp", nullptr, true);
         llaminar2::CPUDeviceContext context{DeviceId::cpu()};
         DeviceGraphExecutor executor;
         ComputeGraph graph;
@@ -254,7 +266,7 @@ TEST(OpenMPTeamForkStageEvidence, PublisherRefusesNonCpuDevicesAndUngatedCalls)
     // stage-timing gate off, even a CPU device and a selected family publish
     // nothing; gate, family and device must all accept.
     {
-        const ScopedForkEvidenceConfig ungated("omp");
+        const ScopedForkEvidenceConfig ungated("omp", nullptr, true);
         llaminar::v2::OpenMPTeamForkScope scope;
         auto work = [] {};
         OMP_WORKSHARE_REGION(work);
@@ -306,7 +318,8 @@ TEST(OpenMPTeamForkStageEvidence, PublisherRefusesNonCpuDevicesAndUngatedCalls)
         const auto *accepted = stage_record("cpu_entry");
         ASSERT_NE(accepted, nullptr);
         EXPECT_EQ(accepted->value, 1.0);
-        EXPECT_EQ(accepted->device, "CPU:0");
+        EXPECT_EQ(accepted->device, "CPU")
+            << "the canonical DeviceId::cpu().toString() spelling";
         EXPECT_TRUE(std::none_of(records.begin(), records.end(),
             [](const PerfStatRecord &record) { return record.device == "CUDA:0"; }));
     }

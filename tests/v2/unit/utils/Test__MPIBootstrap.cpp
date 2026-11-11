@@ -322,7 +322,8 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
                 "omp", std::string("openmp_team_fork_note_self_cost_") + label,
                 ns_per_note, "evidence", "host",
                 {{"basis", std::to_string(kMeasuredNotes) +
-                               "_notes_per_measuring_thread_per_owner_latency"}});
+                               "_notes_per_measuring_thread_per_owner_latency_"
+                               "scope_config_built_off_clock"}});
             std::cout << "[evidence] openmp_team_fork_note_self_cost_" << label << "="
                       << ns_per_note << " ns per owner note, amortized over " << kMeasuredNotes
                       << " notes per measuring thread (per-owner latency with the production "
