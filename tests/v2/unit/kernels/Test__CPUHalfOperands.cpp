@@ -273,7 +273,13 @@ TEST(CPUHalfOperands, NativeBF16RouterSerialRowsAndRetainedBank){
 /** @test K tails of 0..255 around the 256-lane stripe and non-multiple widths. */
 TEST(CPUHalfOperands, KTailBoundariesAllRowsMatchSerial){
     for(int workers:{1,3})for(int m:{1,2,3,4})
-        for(int k:{255,256,257,300,511,512,513,767})proveLinear(m,k,workers);
+        for(int k:{255,256,257,300,511,512,513,767}){
+            const long long before=fmlalLeafInvocations();
+            proveLinear(m,k,workers);
+            // Four execution lanes over nine columns, one row tile at M<=4:
+            // the FMLAL envelope increments 36 times, the scalar envelope 0.
+            EXPECT_EQ(fmlalLeafInvocations()-before,fmlalLeafCompiledInEnvelope()?36:0)<<"k="<<k<<" m="<<m;
+        }
     // Repeated runs of one boundary geometry stay byte-identical.
     proveLinear(2,257,3);
     proveLinear(2,257,3);
@@ -339,10 +345,17 @@ TEST(CPUHalfOperands, FmlalSpecialOperandsMatchOwnedTree){
         }
         for(int repetition:{1,2}){
             std::fill_n(output.mutable_data(),size_t(5)*N,-777.f);
+            const long long before=fmlalLeafInvocations();
             ASSERT_TRUE(engine.multiply_tensor(&input,&output,5,N,k))<<"k="<<k<<" rep="<<repetition;
+            const long long after_fp32=fmlalLeafInvocations();
+            // The FMLAL path must actually execute under its declaring
+            // envelope: ceil(5/4) row tiles x N columns per multiply, or zero
+            // in an envelope without the leaf (the scalar schedule runs).
+            EXPECT_EQ(after_fp32-before,fmlalLeafCompiledInEnvelope()?6:0)<<"fp32A k="<<k;
             EXPECT_EQ(std::memcmp(output.data(),expected.data(),expected.size()*sizeof(float)),0)<<"fp32A k="<<k;
             std::fill_n(output.mutable_data(),5*N,-777.f);
             ASSERT_TRUE(engine.multiply_tensor(&half_input,&output,5,N,k))<<"half k="<<k<<" rep="<<repetition;
+            EXPECT_EQ(fmlalLeafInvocations()-after_fp32,fmlalLeafCompiledInEnvelope()?6:0)<<"halfA k="<<k;
             EXPECT_EQ(std::memcmp(output.data(),expected.data(),expected.size()*sizeof(float)),0)<<"halfA k="<<k;
         }
     }
@@ -360,6 +373,18 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
     if(fmlalLeafCompiledInEnvelope())
         EXPECT_TRUE(llaminar2::cpu::ARMCPUCapabilities::native().supports(
             llaminar2::cpu::ARMCPUFeature::FP16FML));
+    // The selection probe proves the FMLAL path — never a silent scalar
+    // fallback — actually executed: one leaf invocation per row tile times
+    // output column (M=1 -> one tile; the scalar route never increments).
+    {
+        FP16Tensor weight({size_t(2),size_t(65)},weightWords(2,65));
+        Engine probe_engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+        FP32Tensor probe_a({size_t(1),size_t(65)}),probe_c({size_t(1),size_t(2)});
+        std::fill_n(probe_a.mutable_data(),65,1.f);
+        const long long before=fmlalLeafInvocations();
+        ASSERT_TRUE(probe_engine.multiply_tensor(&probe_a,&probe_c,1,2,65));
+        EXPECT_EQ(fmlalLeafInvocations()-before,fmlalLeafCompiledInEnvelope()?2:0);
+    }
     // Device-free admission semantics: an envelope declaring FP16 without the
     // FML extension admits on an FHM-less machine; the FMLAL envelope does
     // not — FP16 arithmetic alone never authorizes the leaf.

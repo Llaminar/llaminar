@@ -51,6 +51,28 @@ inline constexpr bool fmlalLeafCompiledInEnvelope() noexcept
 #endif
 }
 
+/**
+ * @brief Test-visible selection probe: the FMLAL leaf's actual execution count.
+ *
+ * One relaxed increment per leaf invocation (one row tile times one output
+ * column of the GPU-aligned schedule), so device-free contracts can prove the
+ * FMLAL path — never a silent scalar fallback — executed under the declaring
+ * envelope. Compiled only with the leaf; envelopes without it report zero.
+ */
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+inline std::atomic<unsigned long long> &fmlalLeafCounter() noexcept
+{
+    static std::atomic<unsigned long long> counter{0};
+    return counter;
+}
+inline unsigned long long fmlalLeafInvocations() noexcept
+{
+    return fmlalLeafCounter().load(std::memory_order_relaxed);
+}
+#else
+inline constexpr unsigned long long fmlalLeafInvocations() noexcept { return 0; }
+#endif
+
 #include <oneapi/dnnl/dnnl.hpp>
 #include <cstdint>
 #include <stdexcept>
@@ -62,8 +84,9 @@ inline constexpr bool fmlalLeafCompiledInEnvelope() noexcept
 #include <memory>
 #include <unordered_map>
 #include <type_traits>
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
 #include <arm_neon.h>
+#include <atomic>
 #include "utils/ARMCPUFeatures.h"
 #endif
 #include "../../FloatingActivationOperandPrecision.h"
@@ -1179,7 +1202,7 @@ namespace llaminar2
          * @param bias Optional FP32 output-column bias.
          * @return True after every output word is published.
          */
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
         /**
         * @brief FMLAL core of the GPU-aligned expert schedule (ARM NEON).
         *
@@ -1224,6 +1247,7 @@ namespace llaminar2
             static_assert(Rows >= 1 && Rows <= 4);
             static_assert(WeightType == TensorType::FP16,
                 "the FMLAL leaf serves FP16 weights; other storages keep the scalar schedule");
+            fmlalLeafCounter().fetch_add(1, std::memory_order_relaxed);
             constexpr int kLanes =
                 floating_expert_numerical_contract::kReductionLanes;
             constexpr int kVectorLanes = 16;
@@ -1305,8 +1329,9 @@ namespace llaminar2
                     else
                     {
                         // The K tail: the same single-rounded binary32 FMA per
-                        // element the scalar schedule performs, written into
-                        // the same accumulator lanes.
+                        // element the scalar schedule performs, folded back
+                        // into the same accumulator lanes through one bounded
+                        // scratch vector (no runtime lane-index intrinsics).
 #pragma GCC unroll 4
                         for (int row = 0; row < Rows; ++row)
                         {
@@ -1314,24 +1339,28 @@ namespace llaminar2
                                 activations +
                                 static_cast<std::size_t>(row) * k +
                                 static_cast<std::size_t>(first_k);
-                            for (int i = 0; i < valid; ++i)
+#pragma GCC unroll 4
+                            for (int block = 0; block < 4; ++block)
                             {
-                                const float activation_value =
-                                    HalfStorage
-                                        ? fp16_to_fp32(activation_values[i])
-                                        : (HalfRNE
-                                                ? roundFloatingOperandHalfRNE(activation_values[i])
-                                                : activation_values[i]);
-                                const float weight_value = fp16_to_fp32(
-                                    weight_halves[weight_row +
-                                                  static_cast<std::size_t>(first_k) + i]);
-                                float lane_value;
-                                vst1q_lane_f32(&lane_value,
-                                               accumulators[row][i / 4], i % 4);
-                                lane_value = device_fp32_contract::fusedMultiplyAdd(
-                                    activation_value, weight_value, lane_value);
-                                accumulators[row][i / 4] = vld1q_lane_f32(
-                                    &lane_value, accumulators[row][i / 4], i % 4);
+                                alignas(16) float lanes[4];
+                                vst1q_f32(lanes, accumulators[row][block]);
+#pragma GCC unroll 4
+                                for (int j = 0; j < 4; ++j)
+                                {
+                                    const int i = block * 4 + j;
+                                    if (i >= valid) continue;
+                                    lanes[j] = device_fp32_contract::fusedMultiplyAdd(
+                                        HalfStorage
+                                            ? fp16_to_fp32(activation_values[i])
+                                            : (HalfRNE
+                                                    ? roundFloatingOperandHalfRNE(activation_values[i])
+                                                    : activation_values[i]),
+                                        fp16_to_fp32(
+                                            weight_halves[weight_row +
+                                                          static_cast<std::size_t>(first_k) + i]),
+                                        lanes[j]);
+                                }
+                                accumulators[row][block] = vld1q_f32(lanes);
                             }
                         }
                     }
@@ -1391,7 +1420,7 @@ namespace llaminar2
                     WeightType == TensorType::FP16 ||
                     WeightType == TensorType::BF16,
                 "GPU-aligned expert weights must use a floating storage type");
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
             static_assert(
                 ISA == ISALevel::Scalar || ISA == ISALevel::AVX2 ||
                     ISA == ISALevel::AVX512 || ISA == ISALevel::NEON ||
@@ -1534,7 +1563,7 @@ namespace llaminar2
                         }
                         else
 #endif
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
                         if constexpr ((ISA == ISALevel::NEON ||
                                        ISA == ISALevel::NEONDotProd) &&
                                       WeightType == TensorType::FP16)
@@ -1643,7 +1672,7 @@ namespace llaminar2
          * @tparam HalfRNE Round FP32 A to half in registers, preserving the fixed FP32 tree.
          * @tparam HalfStorage A already has physical half storage; widen exact words.
          */
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
         /**
         * @brief Execute the NEON FMLAL GPU-aligned expert schedule.
         * @tparam WeightType Native floating tensor storage type.
@@ -1762,7 +1791,7 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16FML)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
             case ISALevel::NEON:
             case ISALevel::NEONDotProd:
                 // The FMLAL leaf exists only in the envelope that declares
@@ -1770,7 +1799,7 @@ namespace llaminar2
                 // advertises FEAT_FHM before any leaf instruction runs, so a
                 // mismatch fails fatally instead of faulting on an unimplemented
                 // instruction.
-                ARMCPUCapabilities::native().require(ARMCPUFeature::FP16FML);
+                cpu::ARMCPUCapabilities::native().require(cpu::ARMCPUFeature::FP16FML);
                 return run_gpu_aligned_expert_fp32_matmul_neon<WeightType, HalfRNE, HalfStorage>(
                     A, B, C, M, N, K, alpha, beta, bias);
 #endif

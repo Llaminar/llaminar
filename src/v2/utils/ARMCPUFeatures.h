@@ -103,7 +103,7 @@ namespace llaminar2::cpu
 #if defined(__ARM_FEATURE_DOTPROD)
             features |= static_cast<std::uint32_t>(ARMCPUFeature::DotProd);
 #endif
-#if defined(__ARM_FEATURE_FP16FML)
+#if defined(__ARM_FEATURE_FP16_FML)
             features |= static_cast<std::uint32_t>(ARMCPUFeature::FP16FML);
 #endif
 #if defined(__ARM_FEATURE_MATMUL_INT8)
