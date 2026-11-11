@@ -633,3 +633,23 @@ The actual data (8/8 at e0) stands; the narration about it failed.
 Meta-lesson: at handoff time, the owner narrates the frozen artifacts,
 not a re-derived story — every packet claim must be re-checked against
 the preserved bytes immediately before sending.
+
+### Main read-only host hashes RESOLVE the packet discrepancies (~04:12Z)
+
+- git HOST e0 full CLEAN; source cpp/h hashes MATCH.
+- **CURRENT core = a9cb029e55d78c263a3f6a879d18fef450ac064aa554fe83545bf0
+  70ad2f1898** (09c1… is the PRESERVED FAILED-763 core — the owner packet
+  reused the WRONG EPOCH); current cluster = 32527dac15ca757942f5f65f65b
+  99fb906b591b4300d57c0b14ee3b69c3663cc; startup dddddd… unchanged.
+- **fault MODULE PRESENT**: tests/v2/libv2_native_cpu_entry_exec_fault.so
+  SHA c6152c4164c518ef6409004d6a0e6edc46bb859c583a326631025faa43834cb9 —
+  no 'in-memory fixture/gap'; the earlier flag is RESOLVED (wrong
+  filename epoch in the packet, not a build gap).
+- preserve763 = actual bytes, different inodes; app 09a0… unchanged
+  legitimate (same binary, rebuilt tree).
+- Inventory/JUnit actual 8 still match Main's hashes.
+- Container fecea… REMOVED (docker inspect: NoSuch) — not verified
+  running; terminal state consistent with quiesce.
+- DO NOT echo the owner packet's epoch-mixed hashes as binding. Main's
+  final read-only cache/compile/binary-loader inspection finishing; no
+  reruns.
