@@ -316,3 +316,20 @@ after the B12 window to avoid host contention).
   from the NCU-attachment path (Main's final2 window) — NCU remains a
   SEPARATE question; nothing here clears it.
 - Artifacts: .79 /home/factory/idea25/nsys-smoke/ + nsys-smoke-run.log.
+
+### CORRECTION (Main, ~04:53Z): nsys smoke DOWNGRADED to owner-reported candidate
+
+The earlier "HOLD LIFTS" verdict is WITHDRAWN. The smoke = OWNER-REPORTED
+nsys-specific smoke candidate ONLY. Rationale: exit 0 + grep-0 is not
+driver health — the earlier NCU test ALSO passed while the canonical
+kernel window caught NVRM warnings. Requirements before any lift:
+(1) the operator's EXPLICIT nsys scope; (2) a canonical HOST
+gpu_driver_diagnostics begin/finish/state/report + journal covering the
+EXACT smoke window (tool/binary/commands/exits/image binding). Without
+kernel capture = UNQUALIFIED driver window, not clean-attachment proof.
+NCU's separate HOLD unchanged; no CUDA model/performance/occupancy/
+full-backend qualification inferred. The post-FF queue is NOT "GPU trace
+unblocked" — idea-25's trace stays scheduled pending canonical
+diagnostics + operator scope. LESSON (recurring): process exit codes
+never certify driver state; only canonical host diagnostics bound to the
+exact window do.
