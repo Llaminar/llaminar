@@ -538,3 +538,19 @@ flight, PAST the origin check, helper configure/build underway in the
 writable worktree-local checkout. OneDNN + core build + two JUnit
 receipts on the one-CPU quota; incremental resume via the helper's
 markers if the watcher expires.
+
+### FMLAL VALIDATION #4 (~23:30Z): specials CLEAR, one F1 residue
+
+Main on .80 (main-fmlal4, exited; host handed back): **special values
+match byte for byte with the repaired, isolated oracle** — the F2 oracle
+repair + per-class isolation cleared the native FMLAL specials
+semantics. **REMAINING: the F1 mixed-policy K=16 witness still returns 1
+instead of 1+2^-12** — either the restriction isn't reached, or base
+arithmetic already narrows; addon dispatched to determine WHICH with
+evidence (route-trace vs shared-block-narrowing; the witness
+distinguishes the two). Not applied by Main.
+
+Note: reviewer-220 = the same spec ACK I received as seq-219
+(SPEC-FAITHFUL design-only @ 10137aa3); delivery-ordering across
+channels again. Diagnostic HOLD A1-A5 with 688b0c14b pending
+re-review.
