@@ -140,23 +140,97 @@ TEST(OpenMPTeamForkStageEvidence, StagePublisherEmitsExactPerStageForkCounts)
             [](const PerfStatRecord &record)
             { return record.name == llaminar::v2::kOpenMPTeamForkSummaryFamily; }));
 
-        // The exact-value contract survives a repeated step: each step's cell
-        // starts empty, so a drifted accumulation would expose the leak.
+        // The repeat contract is the collector's accumulator: the second
+        // execution adds its deltas to the same keyed record, so the values
+        // double (2→4, 5→10) and the observation count doubles (1→2). Changing
+        // collector semantics to keep single-step values would break every
+        // accumulating family; the test asserts the real contract.
         graph.reset();
         ASSERT_TRUE(executor.execute(graph, &context));
         for (const auto &record : llaminar2::PerfStatsCollector::snapshot({"omp"}))
             if (record.domain == "omp" &&
                 record.name == llaminar::v2::kOpenMPTeamForkStageFamily &&
                 record.tags.count("stage"))
-                EXPECT_EQ(record.value, record.tags.at("stage") == "fork_stage_0" ? 2.0 : 5.0);
+            {
+                const double expected = record.tags.at("stage") == "fork_stage_0" ? 4.0 : 10.0;
+                EXPECT_EQ(record.value, expected)
+                    << "two identical steps must accumulate " << expected;
+                EXPECT_EQ(record.count, 2u);
+            }
+    }
+}
+
+/**
+ * @brief The retained multi-device loop publishes the same exact cells.
+ *
+ * A CPU-only retained plan discriminates the retained publication seam from
+ * the ordinary single-device loop: the same stages, executed through
+ * executeMultiDevice, publish one record per CPU entry with the exact cell
+ * values, and the publisher's GPU refusal holds for a GPU device string
+ * without any GPU hardware.
+ */
+TEST(OpenMPTeamForkStageEvidence, RetainedLoopPublishesExactPerStageCells)
+{
+    const ScopedForkEvidenceConfig selected("omp", "1");
+    llaminar2::CPUDeviceContext context{DeviceId::cpu()};
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    graph.addNode("retained_stage_0", std::make_unique<ForkingStage>("retained_stage_0", DeviceId::cpu(), 2), DeviceId::cpu());
+    graph.addNode("retained_stage_1", std::make_unique<ForkingStage>("retained_stage_1", DeviceId::cpu(), 5), DeviceId::cpu());
+    graph.addDependency("retained_stage_1", "retained_stage_0");
+    graph.buildFastSchedule();
+    ASSERT_TRUE(executor.executeMultiDevice(graph, {{DeviceId::cpu(), &context}}));
+
+    const auto records = llaminar2::PerfStatsCollector::snapshot({"omp"});
+    const auto stage_value = [&records](const std::string &name) -> const PerfStatRecord *
+    {
+        for (const auto &record : records)
+            if (record.domain == "omp" &&
+                record.name == llaminar::v2::kOpenMPTeamForkStageFamily &&
+                record.tags.count("stage") && record.tags.at("stage") == name)
+                return &record;
+        return nullptr;
+    };
+    const auto *first = stage_value("retained_stage_0");
+    const auto *second = stage_value("retained_stage_1");
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(first->value, 2.0);
+    EXPECT_EQ(second->value, 5.0);
+
+    // The publisher's own GPU refusal: a GPU device gains no record even with
+    // a live owner scope and every gate selected (no GPU hardware needed).
+    {
+        llaminar::v2::OpenMPTeamForkScope scope;
+        auto work = [] {};
+        OMP_WORKSHARE_REGION(work);
+        const auto before = records.size();
+        llaminar::v2::publishOpenMPTeamForkStage(scope, "gpu_refused", "decode",
+            DeviceId::cuda(0), 9u, "GEMM");
+        EXPECT_EQ(llaminar2::PerfStatsCollector::snapshot({"omp"}).size(), before)
+            << "a GPU device must never gain a fork record";
     }
 }
 
 /** @brief The retained multi-device plan publishes no fork record for GPU entries. */
-TEST(OpenMPTeamForkStageEvidence, PublisherRefusesNonCpuDevicesByContract)
+TEST(OpenMPTeamForkStageEvidence, PublisherRefusesNonCpuDevicesAndUngatedCalls)
 {
-    const ScopedForkEvidenceConfig selected("omp");
-    llaminar2::CPUDeviceContext context{DeviceId::cpu()};
+    // The publisher owns the explicit stage-enable policy: with the CPU
+    // stage-timing gate off, even a CPU device and a selected family publish
+    // nothing; gate, family and device must all accept.
+    {
+        const ScopedForkEvidenceConfig ungated("omp");
+        llaminar::v2::OpenMPTeamForkScope scope;
+        auto work = [] {};
+        OMP_WORKSHARE_REGION(work);
+        llaminar::v2::publishOpenMPTeamForkStage(scope, "cpu_entry", "decode",
+            DeviceId::cpu(), 1u, "GEMM");
+        EXPECT_TRUE(llaminar2::PerfStatsCollector::snapshot({"omp"}).empty())
+            << "the stage family must not appear without the stage-timing gate";
+    }
+    {
+        const ScopedForkEvidenceConfig selected("omp", "1");
+        llaminar2::CPUDeviceContext context{DeviceId::cpu()};
     DeviceGraphExecutor executor;
     ComputeGraph graph;
     graph.addNode("cpu_forks", std::make_unique<ForkingStage>("cpu_forks", DeviceId::cpu(), 3), DeviceId::cpu());
@@ -172,8 +246,8 @@ TEST(OpenMPTeamForkStageEvidence, PublisherRefusesNonCpuDevicesByContract)
         OMP_WORKSHARE_REGION(work);
         llaminar::v2::publishOpenMPTeamForkStage(scope, "gpu_entry", "decode",
             DeviceId::cuda(0), 7u, "GEMM");
-        llaminar::v2::publishOpenMPTeamForkSummary(scope.forks(), DeviceId::cuda(0),
-            "context", false);
+        llaminar::v2::publishOpenMPTeamForkSummary(scope, DeviceId::cuda(0),
+            [] { return std::string("context"); }, false);
         llaminar::v2::publishOpenMPTeamForkStage(scope, "cpu_entry", "decode",
             DeviceId::cpu(), 7u, "GEMM");
         const auto records = llaminar2::PerfStatsCollector::snapshot({"omp"});
@@ -185,4 +259,5 @@ TEST(OpenMPTeamForkStageEvidence, PublisherRefusesNonCpuDevicesByContract)
                 EXPECT_EQ(record.value, 1.0);
         }
     }
+}
 }

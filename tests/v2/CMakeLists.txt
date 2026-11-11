@@ -3120,6 +3120,16 @@ add_v2_test(V2_Integration_OpenMPTeamForkCounterPublication
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;OpenMP;PerfStats;Ownership;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPTeamForkCounterPublication)
+# The engine actual-path fork evidence: the real decode executes (off-default,
+# filter-negative, exact owner-cell value under a prior total and a concurrent
+# owner, accumulator repeats, failure/prefill exclusions, GPU refusal past the
+# seam) with the evidence environment fully restored afterwards.
+add_v2_test(V2_Integration_OpenMPForkEvidenceEnginePath
+    COMMAND $<TARGET_FILE:v2_test_forward_execution_engine>
+        --gtest_filter=Test__ForwardExecutionEngine.Execute_DecodeForkSummaryPublishesExactOwnerCell
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;OpenMP;PerfStats;Execution;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPForkEvidenceEnginePath)
 # Native capacity-ordered places keep the serial master and low worker ids
 # on fast cores even when OpenMP retires/recreates part of its worker pool.
 # Self-launched core-placed ranks bind libgomp's pool to capacity-ordered

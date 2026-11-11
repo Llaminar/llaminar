@@ -28,7 +28,9 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <thread>
+#include <vector>
 
 namespace llaminar2::test
 {
@@ -695,6 +697,47 @@ TEST(OpenMPWorkshare, TeamForkScopeAttributesExactlyUnderOverlapAndNesting)
 }
 
 /**
+ * @brief The ownership boundary for team workers is explicit, not assumed.
+ *
+ * Thread-local owner stacks do not propagate into a forked team: a worker
+ * that executes a fork contributes to the process total only and must never
+ * be attributed to an owner cell. The decode discipline "workers never fork"
+ * is enforced by the retained-team authority, and this regression pins the
+ * accounting consequence: worker-context forks move the total and leave
+ * every owner cell untouched.
+ */
+TEST(OpenMPWorkshare, TeamForkWorkerContextForksNeverReachOwnerCells)
+{
+    const TeamPolicy policy;
+    const NumThreadsGuard threads(2);
+    auto idle = [] {};
+
+    OpenMPTeamForkScope outer;
+    OMP_WORKSHARE_REGION(idle); // One owner-thread fork for a known baseline.
+    const std::uint64_t total_before = openMPTeamForkSnapshot();
+    const std::uint64_t outer_before = outer.forks();
+#pragma omp parallel num_threads(2)
+    {
+        // Only a true worker (non-zero team member) forks here: the team's
+        // thread zero IS the owner thread, and a fork it executes legitimately
+        // attributes to the owner. The worker's fork must not.
+        if (omp_get_thread_num() != 0)
+        {
+            ::llaminar::v2::noteOpenMPTeamFork();
+#pragma omp parallel
+            {
+            }
+            EXPECT_EQ(outer.forks(), outer_before)
+                << "no worker fork may reach an owner cell";
+        }
+    }
+    EXPECT_EQ(openMPTeamForkSnapshot() - total_before, 1u)
+        << "the worker fork moves the total exactly once";
+    EXPECT_EQ(outer.forks(), outer_before)
+        << "no worker fork may reach an owner cell";
+}
+
+/**
  * @brief The counter's own admission and publication contract.
  *
  * Default serving materializes no "omp" record at all (the off-default
@@ -705,30 +748,66 @@ TEST(OpenMPWorkshare, TeamForkScopeAttributesExactlyUnderOverlapAndNesting)
  * selection, cost recorded as a PerfStats record) live in the bootstrap
  * fixture, which is the witness that links the collector.
  */
+namespace
+{
+    /** @brief Amortized ns per note under one ownership configuration. */
+    double measureNoteCost(std::uint64_t notes, int owners, bool concurrent_threads)
+    {
+        std::vector<std::unique_ptr<OpenMPTeamForkScope>> scopes;
+        for (int owner = 0; owner < owners; ++owner)
+            scopes.push_back(std::make_unique<OpenMPTeamForkScope>());
+        const std::uint64_t before = openMPTeamForkSnapshot();
+        const auto start = std::chrono::steady_clock::now();
+        if (concurrent_threads)
+        {
+            std::thread worker([&]
+            {
+                for (std::uint64_t note = 0; note < notes; ++note)
+                    noteOpenMPTeamFork();
+            });
+            for (std::uint64_t note = 0; note < notes; ++note)
+                noteOpenMPTeamFork();
+            worker.join();
+        }
+        else
+        {
+            for (std::uint64_t note = 0; note < notes; ++note)
+                noteOpenMPTeamFork();
+        }
+        const auto elapsed_ns = static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count());
+        return elapsed_ns / static_cast<double>(concurrent_threads ? 2 * notes : notes);
+    }
+} // namespace
+
 TEST(OpenMPWorkshare, TeamForkCounterPublicationCostAndDefault)
 {
-    // The note's own cost is asserted here against a generous ceiling and
-    // reported for the record; the collector-visible evidence cell (off-default
-    // publication shape, family selection, recorded cost) lives in the
-    // bootstrap fixture, which links the collector.
+    // The note's own cost is MEASURED under the ownership configurations
+    // production actually runs - no owner (utility threads), the one owner a
+    // decode window or stage holds, the two nested owners (window + stage),
+    // and two concurrent owners - because production's note does a stack walk
+    // over global+owner atomics and a bare ns figure would understate it.
+    // Each variant is bounded generously (the fork it describes costs
+    // microseconds); the collector-visible evidence cell in the bootstrap
+    // fixture records the same variants.
     constexpr std::uint64_t kMeasuredNotes = 1u << 20;
-    const std::uint64_t before = openMPTeamForkSnapshot();
-    const auto start = std::chrono::steady_clock::now();
-    for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
-        noteOpenMPTeamFork();
-    const auto elapsed_ns = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - start)
-            .count());
-    const double ns_per_note =
-        static_cast<double>(elapsed_ns) / static_cast<double>(kMeasuredNotes);
-    EXPECT_EQ(openMPTeamForkSnapshot() - before, kMeasuredNotes);
-    // The fork itself costs microseconds; anything past this bound would mean
-    // the observation costs a material fraction of the observed event.
-    EXPECT_LT(ns_per_note, 100.0);
-    std::cout << "[evidence] openmp_team_fork_note_self_cost=" << ns_per_note
-              << " ns/invocation over " << kMeasuredNotes << " invocations"
-              << std::endl;
+    const double no_owner = measureNoteCost(kMeasuredNotes, 0, false);
+    const double one_owner = measureNoteCost(kMeasuredNotes, 1, false);
+    const double two_owners = measureNoteCost(kMeasuredNotes, 2, false);
+    const double concurrent = measureNoteCost(kMeasuredNotes, 1, true);
+    for (const auto &[label, cost] : std::initializer_list<std::pair<const char *, double>>{
+             {"no_owner", no_owner}, {"one_owner", one_owner},
+             {"two_nested_owners", two_owners}, {"concurrent_two_threads", concurrent}})
+    {
+        EXPECT_LT(cost, 100.0) << label;
+        std::cout << "[evidence] openmp_team_fork_note_self_cost_" << label << "="
+                  << cost << " ns/invocation over " << kMeasuredNotes
+                  << " invocations per measuring thread" << std::endl;
+    }
+    EXPECT_GE(two_owners, no_owner * 0.5)
+        << "the two-owner walk must not be cheaper than a fabrication would allow";
 }
 
 } // namespace llaminar2::test
