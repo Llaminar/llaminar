@@ -238,3 +238,37 @@ FF from 53461e5bc; 15 commits on 880429059; driver-only.
   inputs).
 No FF/Main campaign until review + Main's 18×14 acceptance. Holds
 unchanged.
+
+### Reviewer #191 re-review #2 — HOLD at c00246613; pin CANNOT reach PASS (~05:22Z)
+
+Pinned source again differs from claimed closures; reported 12/12 +
+real-9/9 cannot establish this pin.
+NEW DETERMINISTIC BLOCKERS (Gate.sh publication): :324
+root=os.path.realpath(...) is a STRING → :349 `root / name` raises
+TypeError on the first sealed input (:376 `root / tree_rel` repeats it);
+:383 references `expected_id` which is NEVER ASSIGNED (exporting
+EXPECTED_ID does not define a Python local). Ordinary valid schema-2
+publication CANNOT reach PASS.
+NEW FIXTURE BREAK (Test…py:85–86): proof writer reads sys.argv[5]/[6]/[7]
+but the command supplies only TWO arguments before the next COMMAND →
+guaranteed IndexError; creates all artifacts unconditionally (ignores
+missing-artifact selection); omits the now-required envelope_sha256. The
+fake compile DB STILL uses STUB_HEADER as file. No post-accept
+mutation/schema controls added. Claimed 12-green "needs provenance
+correction."
+PARTIAL fixes acknowledged: schema-2 reader (artifacts/inputs + schema/key
+presence); invented header-as-TU check REMOVED; object/dis/i canonical
+digest comparisons ADDED. Broader RG3 gaps remain: empty/incomplete maps;
+six optional inputs omitting compiler/SDK/transitive deps; NO final
+canonical whole-closure validation/protected accepted epoch; envelope
+proof/asm/target binding unvalidated; manifest still writes before the
+accumulated-fail refusal. RG1/RG2 claims NOT in pin (per-cell mkdir/initial
+sha unchecked; retain = bare cp, no source/copy digests; attached
+-Spath/-Bpath/-Cfile pass; -GN* partial; bare -D wholesale refusal with
+dead second loop; reconfigure = exit-status only, NO cache-content
+comparison, NO CMAKE_CACHEFILE_DIR check; no real FS-failure controls;
+dead phase helper; bare PATH tools; no --parallel).
+REVIEWER DIRECTIVE: reconcile exact committed files vs the report FIRST;
+fix ALL consolidated items; supply focused ACTUAL-SCRIPT positive/direct
+negatives BOUND TO THE RESULTING SHA before another ACK request.
+#175/#191 HOLD; no lane full matrix requested; Main's 18×14 separate.
