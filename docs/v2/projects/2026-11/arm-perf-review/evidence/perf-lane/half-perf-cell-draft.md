@@ -431,3 +431,50 @@ met for specials. The addon diagnoses: which specials diverge and why
 (FMLAL2's denormal behavior vs the widened-scalar path; possibly a
 FZ/flush-to-zero mode difference — FPCR.FZ16 was stated explicitly in the
 plan). The ISA-profile test update is a separate mechanical fix.
+
+### **CORRECTION of the coordinator's #3 interpretation (reviewer F2):** the
+earlier note "ordinary data matches + specials mismatch = REAL arithmetic
+semantics finding (FMLAL denormal behavior)" is **NOT ESTABLISHED — the
+specials ORACLE itself is defective** (canonicalHalfTree writes
+mantissa<<13 directly into an exponent-0 FP32 word instead of normalizing
+half subnormals; hand-table ties wrong; NaN/Inf cycled through full rows
+so no special is isolated). The validation-#3 specials mismatch does NOT
+evidence a native FMLAL bug. My attribution error = the same class the
+coordinator discipline warns about (interpreting a red gate before the
+harness is verified).
+
+### FMLAL LANDING/PLAN SOURCE VERDICT (reviewer seq 213): HOLD — F1-F5
+
+Range a1913240..311c78403 (+ the 311→7175eca8c counter/include fixes so
+already-fixed findings aren't recycled). No execution by reviewer; #4
+unresolved there.
+- **F1 (BLOCKER): NEW production arithmetic regression** — leaf selected
+  for ALL FP16 weights (:1566-1569) with NO HalfRNE||HalfStorage
+  restriction; full 16-blocks always narrow FP32 A even for (F,F);
+  real mixed callers (:3127-3136, :5118-5127) use (F,F); tail leaves A
+  unrounded → precision rules differ by block size in ONE invocation.
+  Witness: M=N=1,K=16, A[0]=1+2^-12, B[0]=half1 → prescribed 1+2^-12,
+  new full block gives 1. Violates the plan's (F,F)=NOT FMLAL clause.
+  Fix: restore mixed-policy arithmetic; limit the half-product to its
+  operand domain; focused production regression incl. the 16-boundary.
+- **F2 (BLOCKER): specials oracle wrong** (canonicalHalfTree subnormal
+  widening defect; hand-table ties wrong; NaN/Inf not isolated). Fix the
+  oracle + isolate finite/signed-zero/subnormal/Inf/NaN cases; do NOT
+  waive exceptional bytes or rebaseline to the candidate.
+- F3: FP environment/conversion proof open (FCVTN ambient rounding vs
+  explicit RNE helper; no FPCR-profile admission contract). Preserve the
+  exact conversion contract.
+- F4: landing broadens the whole NEON_I8MM envelope (+fp16fml global +
+  FEAT_FHM admission) vs the plan's TU-local proposal — reconcile
+  scope explicitly; Test__CPUISAProfile.cpp:148-156 asserts the OLD mask
+  (contradiction, update); don't reopen cancelled register work.
+- F5: route counter ≠ actual-FMLAL-work evidence (counts FP32/BF16
+  weights, invalid work, K<16 scalar tails; unconditional in the timed
+  invocation). Distinguish compiled capability / route entry / executed
+  work; keep optional evidence out of clean timing.
+POSITIVE: bounded half/half schedule acknowledged (16 lanes/tile,
+stride 256, rows 1-4, 128..1 tree); comment fix +4*b not +16*b; the
+256-lane partial bank = intentional storage, not auto-spill.
+DISPOSITION: implementation grant INTACT; not a withdrawal or measured
+economy rejection; F1/F2 = real source blockers; Main's campaign +
+evidence separate and unverified-at-lane.
