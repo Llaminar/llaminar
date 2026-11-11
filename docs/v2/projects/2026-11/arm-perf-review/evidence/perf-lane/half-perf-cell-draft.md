@@ -412,3 +412,22 @@ Main; addon owns the source). .80 handed back to the coordinator; Main
 re-books when addon sends the new tip. The plan/structure otherwise
 validated (the build ran to the guard point — the failure is the
 compile-time macro, caught exactly as the selection test was designed).
+
+### FMLAL VALIDATION #3: FAIL — first real execution, byte mismatch on specials (Main on .80, ~22:26Z)
+
+Tip 7175eca8c (container main-fmlal3, started 21:59:45Z, exited). BUILD OK;
+**the leaf EXECUTES for the first time.** Result: byte mismatch on EVERY
+special-operand case (±0, subnormals, Inf, NaN, ties) while ORDINARY data
+matches. Separately: the ISA-profile contract test needs updating for the
+new FP16FML envelope bit. Sent to addon (not applied by Main); .80 idle,
+handed back to the queue.
+INTERPRETATION (coordinator): ordinary-data match + specials-mismatch = a
+denormal/zero/Inf handling difference between FMLAL and the scalar FMA
+path (FMLAL's FP16→FP32 widening may flush subnormals differently, or the
+RNE tie handling diverges at the specials) — a REAL arithmetic semantics
+finding, not a harness defect. The v2.1 byte-identity requirement (the
+leaf must be byte-identical to Scalar per the exactness argument) is NOT
+met for specials. The addon diagnoses: which specials diverge and why
+(FMLAL2's denormal behavior vs the widened-scalar path; possibly a
+FZ/flush-to-zero mode difference — FPCR.FZ16 was stated explicitly in the
+plan). The ISA-profile test update is a separate mechanical fix.
