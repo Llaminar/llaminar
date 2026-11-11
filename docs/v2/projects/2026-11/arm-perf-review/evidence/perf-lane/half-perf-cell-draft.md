@@ -367,3 +367,19 @@ leaf work = a coordinator-QUEUED REQUEST through the v2.1 sequence
 (baseline evidence first), not a reviewer-authorized path. Headline
 corrected to: half-perf = NOT ADMITTED, candidate unimplemented, future
 leaf work = queued request only.
+
+### OPERATOR GRANT: FMLAL leaf implementation authorized (coordinator accepted, ~15:30Z)
+
+The operator granted implementation ("I allow implementation if you want
+to"); the coordinator accepted and assigned the addon lane (plan-first).
+RECONCILIATION with the reviewer's sequence correction: code
+implementation proceeds NOW (no host needed — syntax-only until a
+window), while the EVIDENCE sequence stays intact — authentic baseline +
+economy measurement still precede any ADMISSION claim (v2.1 order
+preserved for evidence, not for code). Reviewer verdicts the leaf when
+it lands. Tracker state: candidate implementation AUTHORIZED + in
+flight; economy admission FENCED on evidence. Owner: arm-addon (plan
+first: FMLAL decode design, register budget, byte-auth oracle,
+integration point in CPUNativeNEONPreparedProjection; base = rebase
+half-perf branch onto bb893cd79 or fresh branch — lane's call, stated
+in the plan).
