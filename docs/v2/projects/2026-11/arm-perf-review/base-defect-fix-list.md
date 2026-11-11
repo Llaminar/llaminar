@@ -993,3 +993,20 @@ failures and fixed its own 10; the 25 inherited = base defects the
 campaign was designed to SURFACE (the triage is concrete: exact tests +
 lineage + base commits). Under merge-then-qualify, inherited defects are
 fixed on Main in subsequent work, not inside this collection.
+
+### ShmemSpin: independent-convergence datapoint (addon, ~20:36Z) — recorded, no action
+
+The addon's parallel diagnosis (dispatch/recall race) independently
+derived the starvation-quantum mechanism (full-speed spin in the single
+wait funnel waitForPeerEpoch never releases the CPU; ~3ms scheduler
+quantum per rendezvous × 6 waits/allreduce = the 18.17s stress) and
+proposed escalating backoff (spin → sched_yield ladder → 50µs nanosleep).
+Main's fix (12675c956) addressed the TRIGGER (B12 NativeCPUPlacement's
+shared pin to CPU19 — the pinning cause); the addon's mechanism analysis
+AGREES on the class and is recorded as an independent-convergence
+datapoint. Backoff work: NOT pursued (production latency economics out of
+scope without measured evidence — Main's rule, addon concurred).
+Post-fix validation: NP4 0.43s, NP8 0.64s, campaign passing.
+FMLAL leaf: addon RESUMED implementation (fresh branch
+codex/arm-fmlal-half-leaf off bb893cd79; plan approved; syntax-only
+locally; .80 legs deferred).
