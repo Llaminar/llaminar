@@ -768,3 +768,21 @@ SCOPE OF THE ACK (binding):
 - Exact rebases/successors require affected-diff review.
 - #175/#191 register HOLD + half-perf economy insufficient-evidence
   disposition remain independent. Recorded in the existing tracker only.
+
+### Post-ACK actions executed (arm-addon3, ~10:24Z)
+
+1. HANDOVER sent directly to Main: branch codex/arm-idea26-openmp-wakeup,
+   base e8866ec04, deliverable range e8866ec04..c8ffde408 (11 linear
+   commits, tip = ACKed SHA), content (counter + publishers + 176-site
+   locked inventory, zero arithmetic change), review state (bounded SOURCE
+   ACK at exact c8ffde408, ten cycles), committed focused results
+   (checker 176/28/54; CLI negatives 10/10; TeamFork* 5/5; four
+   cost-variant lines), honest unverified list (Bootstrap body +
+   Linux-engine targets + full portability receipt → Main
+   post-collection).
+2. A2 BOOKING REQUEST sent to arm-sparks: three riders (per-step region
+   inventory via the new counters, fork micro-cost attribution, idea-26
+   sched_getcpu closure), env pins, ~30-45 min window estimate — awaiting
+   confirmation before the run sheet. A2 artifacts earn admission on
+   their identities when they land.
+Counter arc CLOSED (bounded source ACK at c8ffde408, ten cycles).
