@@ -19117,6 +19117,22 @@ if(NOT V2_CPU_TARGET_X86)
     target_compile_definitions(v2_perf_cpu_native_neon_exact_overlay PRIVATE
         LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_QUANTISED_SHAPE_MANIFEST}"
         LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG}")
+
+    # Diagnostic only: idea-08 compact IQ3_S decode tournament bound at the
+    # unit level. Non-installed, byte-oracled against the production
+    # expanded engine; families come from the ISA-cell build configuration.
+    add_executable(v2_perf_cpu_compact_iq3s_decode
+        performance/kernels/cpu/native_quantised/Perf__CPUCompactIQ3SDecode.cpp)
+    target_link_libraries(v2_perf_cpu_compact_iq3s_decode PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    target_include_directories(v2_perf_cpu_compact_iq3s_decode PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    add_v2_test(V2_Perf_CPUCompactIQ3SDecode
+        COMMAND $<TARGET_FILE:v2_perf_cpu_compact_iq3s_decode>
+        LABELS "V2;Performance;CPU;NativeQuantised;ARM;Diagnostic;ByteExact"
+        NO_MODELS NO_MPI MPI_PROCS 1
+        TIMEOUT 300
+    )
 endif()
 
 add_executable(v2_perf_cpu_fused_verifier
