@@ -668,3 +668,72 @@ STILL HOLD (comprehensive fix-back required first). .79 needs NO further
 work; STOP owner text packets mixing epochs — use Main's record/raw
 hashes. Source-proof docs updated; all current bad/e0 artifacts kept. NO
 benchmark/trace/GPU queue unblock inferred.
+
+### CB/C1 BASE-FIX INVENTORY (Main→CB, 2026-11-11 ~12:14Z) — relayed verbatim to CB lead
+
+Main inspected the C1 final JUnit + actual 28dd source; NO rebase/cherry-
+pick/workspace/action authorized from ARM side.
+1) **a0393b64a2** — GroupedSealedPlan synthetic observation explicitly
+   physical_launch_evidence={}; PROD validator unchanged. Relevant file:
+   tests/v2/unit/scripts/test_cpu_native_quantised_grouped_sealed_plan.py
+   (temp-index file-only patch --check exit 0 against EXACT 28dd). Whole
+   commit ALSO contains unrelated docs → prefer minimal relevant hunk,
+   not blind whole-commit import. Focused: V2_Unit_CPUNativeQuantised
+   GroupedSealedPlan; the 10 Python errors = ONE CTest alias; repaired
+   full script passed natively.
+2) **e33bf1de6** — sole file Test__CPUShardRouteCollective.cpp (28dd
+   temp-index file patch CHECK exit 0). Diagnostic special-value
+   arithmetic scopes fail_on_nan=false + cached-bool RAII restoration;
+   FusedFinalAddPreweightHonorsNonFiniteValidationPolicy proves the
+   finite/nonfinite/default-policy/empty/inactive/source-byte/restoration
+   contracts. PROD admission/dispatch UNCHANGED. Addresses
+   V2_Unit_CPUShardRouteCollective + V2_Integration_CPUShardFusedFinalAdd
+   Preweight_{scalar,neon,neon_i8mm} — TWO Unit + THREE host aliases,
+   NOT all 140. Check-clean-apply ≠ runtime green; CB owner decides
+   minimal integration + focused checks + full canonical exit 0; NO
+   waiver. I8MM post-integration check still needed on the Station.
+   Arithmetic comparison = metamorphic/preweight only, NOT a new
+   fused-ticket publication oracle.
+3) **B12 mechanism IS PRESENT on 28dd** (MPIBootstrapPhase.cpp:585+
+   ScopedOpenMPPartitionAffinity lives through
+   bindOpenMPWorkersFastestFirst :615). Fix chain: 763a8e15b (scope-
+   lifetime first fix) → 2a4d496fa (initial candidate — HELD/UNSAFE
+   ALONE) → c2b1e779 (private authenticated original entry) → e0b7a7c1f
+   (replay/exec/loan/worker/cancellation controls); final correct state
+   merged in 880 then bb. **DO NOT cherry-pick 2a4 alone or a range
+   omitting c2** — semantics require the B12 final API/lifetime chain.
+   Pool defect CONDITIONAL on manual place order differing native +
+   worker retirement/recreation — not 'any pool resize'. DOES NOT fix
+   mbind EPERM/memory-only-NUMA selectors or prove the 29-Unit root
+   cause. The C1 ClusterInventoryBootstrap failure shows 9 ranks → all
+   NUMA 0 → CPU participant cpu:0 ambiguous across ranks;
+   CPUStartupAffinity explicit cpu:5..8 memory-only targets refused (no
+   physical CPU set) — NOT demonstrated B12 duplicate-core failures.
+   Current Main still needs a Station-specific fixture/topology
+   disposition; don't attribute wholesale to B12. 274d0cff4 independently
+   fixes the obsolete SINGLE-rank inventory NUMA −1 expectation — not the
+   9-rank ambiguity/permission issue.
+4) **Other narrow candidates:** a847db3286 corrects observed-NUMA fixtures
+   in Test__MoEPipelineNgramPublication/Test__OrchestrationCandidate
+   NgramAdmission (+PP checks); 5b76a146c certifies mandatory capacity
+   before optional ngram selection — applicability = MATCHING actual
+   assertion, not generic immutable/NUMA failure. No later NUMA topology
+   detection fix to offer (55/52-class already in the 28dd lineage). Many
+   C1 raw outputs show mbind/set_mempolicy EPERM + CPU first-touch failed
+   → inspect Station kernel/seccomp/caps/NUMA preconditions and match
+   context — no blanket env waiver, no promise cherry-picks fix
+   permissions. Unmapped classes: missing docker/model/ROCm-CSV fixtures;
+   Developer PR test-method names absent; registration-config errors;
+   trainer expectations 3-vs-2/10-vs-9 — no verified Main fix commits;
+   route each concretely, don't label 140 'env'.
+5) **B11 OPEN/UNATTRIBUTED.** .79 direct 38/39 + 1 skip = NON-reproduction
+   on a DIFFERENT host, not MPI-cause proof. Station paired canonical
+   MPI+direct from the SAME source/build/binary/container/affinity/NUMA/
+   policy identities needed; direct-fail only rules out MPI necessity,
+   not allocator-vs-fixture-vs-permission cause. Preserve the
+   EPERM→null→SIGSEGV context + skip name; inspect the actual site.
+   Tracker base-defect-fix-list methodology corrections authoritative
+   over the old 'closed env' paragraph.
+Main has NOT claimed canonical green for C1; unchanged failed names =
+baseline-relative only. ARM post-merge campaign separate — do not
+interrupt its booked .80/A2/DirB windows.
