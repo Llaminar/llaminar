@@ -1872,3 +1872,15 @@ a CLEAN item idling in a lane branch is coordinator neglect.
 Current candidates (2026-11-11 late): FMLAL leaf (one K=16 residue),
 B9 fold (verdict requested), B4 diagnostic bench (round-5 verdict
 pending → W3 JUnit).
+
+### PR #43 REBASE COMPLETE on Main's side (~23:55Z); campaign #2 booked
+
+207 commits replayed onto base d1fd0a077, ~17 conflicts resolved;
+force-push pending validation; new tip to be announced. Campaign #2
+(the post-rebase qualification) GRANTED on .80 immediately after the
+B1 attribution export (seal K14-B1ATTR-12675C956); W3 (B4 diagnostic)
+RE-QUEUED behind it. **Reviewer rule now explicit: source verdicts do
+NOT transfer across the rebase — FMLAL/B4/idea16 lane tips rebase onto
+the new base at handover and their verdicts re-pin.** FMLAL K=16
+repair tip should land ON the new base if the announcement precedes
+its push.
