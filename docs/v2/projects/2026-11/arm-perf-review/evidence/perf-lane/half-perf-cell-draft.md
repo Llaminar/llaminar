@@ -401,3 +401,14 @@ implementation proceeds now (addon lane, plan-first, syntax-only until a
 window, NO economy claims); the BASELINE/EVIDENCE step precedes ADMISSION
 — the implementation carries no economy grant and the v2.1 order is
 intact for evidence. Reviewer verdicts the leaf when it lands.
+
+### FMLAL VALIDATION #1: FAIL — wrong ACLE macro guard (Main on .80, ~21:27Z)
+
+Container main-fmlal exited. Result: **FAIL — the leaf was never
+compiled: the guard tests `__ARM_FEATURE_FP16FML` instead of the correct
+ACLE macro `__ARM_FEATURE_FP16_FML`** — caught by the addon's own
+selection test on .80. Main sent addon the required fixes (not applied by
+Main; addon owns the source). .80 handed back to the coordinator; Main
+re-books when addon sends the new tip. The plan/structure otherwise
+validated (the build ran to the guard point — the failure is the
+compile-time macro, caught exactly as the selection test was designed).
