@@ -554,3 +554,28 @@ Note: reviewer-220 = the same spec ACK I received as seq-219
 (SPEC-FAITHFUL design-only @ 10137aa3); delivery-ordering across
 channels again. Diagnostic HOLD A1-A5 with 688b0c14b pending
 re-review.
+
+### Station r6→r7: OneDNN SOLVED structurally; legacy-path symlinks approved
+
+r6: the canonical helper completed the FULL OneDNN v3.11.3 build+install
+inside the worktree-local checkout (identity schema=3 committed:
+.llaminar-onednn-commit=b6c4c39ba5481aa9f625f132cac089ab3d7b57283b7befb
+d70c4279a7e69517f; installed-artifacts digest
+7e93a6a78805284976a9da966cf8be0d01443ff1ca894c96ca74eb3b74c94ff2;
+install_manifest present; origin authenticated; lock/surface checks
+passed; worktree git-clean — external/ ignored). Self-caught measurement
+error: the earlier 'build dir missing' peeks used the wrong dirname
+(build-neon_i8mm vs its .llaminar.lock suffix).
+r6 then failed at TESTS level: tests/v2/CMakeLists.txt:5299/:24699
+reference two PRE-src/v2 layout paths at the repo root (backends/
+NativeGraphDependencyReduction.cpp; kernels/rocm/gemm/
+ROCmDenseProductionPrefillOverlay.cpp) which a fresh worktree does not
+track (top-level backends//kernels/ only exist as leftovers in older
+checkouts). FIX (script v6, APPROVED with boundary): symlinks those two
+exact paths to the IDENTICAL in-tree files so generate resolves the real
+production sources — nothing fabricated; targets under test untouched;
+symlinks removed at run end (tree ends clean). Boundary check imposed:
+byte-identity of the symlink targets confirmed by SHA before linking;
+if NOT identical, STOP and report.
+r7 launched with OneDNN reuse: configure + core build + canonical
+V2_Unit_CPUHalfOperands + the four P1 cells with JUnit.
