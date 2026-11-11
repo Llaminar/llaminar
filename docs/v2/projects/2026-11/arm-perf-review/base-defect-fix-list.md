@@ -527,3 +527,20 @@ checks. A .79 pass will make the SOURCE-HANDOVER BASE available for the
 collection (reusable focused 6 + 20×), but QUALIFIED/SETTLED for the
 collection still requires ONE Main-owned full campaign per the operator
 directive — never inferred from the focused B12 set.
+
+### #190 comprehensive fix-back pushed: e0b7a7c1f (Main, ~03:28Z) — verdict PENDING
+
+`e0b7a7c1f388e0fe9a2208385f3270f4db508d17` (#43190 above base; CLEAN/
+MERGEABLE; reviewer asked full 2a4..e0 range-diff). Both #189 boundaries:
+- Native prep is now PRIVATE inside the original MPISessionOwner entry
+  (main-thread/once/no-workers/no-active-MPI authority);
+- the matching current-PID receipt is INDEPENDENTLY capacity-validated.
+Also: recorded GB10 replay + actual-exec fault / borrowed-root PID-inode
+continuity / cancellation / pre-entry worker controls explicitly
+preflight. Native focused 6/6 GREEN; master AND entry-lifecycle 20× each
+GREEN (author evidence). Source verdict PENDING — NO .79 run, no source
+handover base, no SETTLED yet.
+Future focused set grows to 8 (adds replay + lifecycle); the one final
+Main full campaign remains post-collection.
+Also: d4/#191 HOLD fix-back (ab860378b) routed to the addon for review —
+do NOT idle-wait on B12 with known #175 blockers in flight.
