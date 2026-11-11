@@ -929,3 +929,29 @@ issue/artifact. STATUS: fix-forward source-ACKed; focused epoch-480
 execution protocol already dispatched to arm-sparks (build 2 targets →
 exact 4-name regex → readelf → focused PASS → full campaign at 480 with
 new /work/campaign-480-results).
+
+### CAMPAIGN480 FIX-FORWARD PROGRESS (Main, ~17:06Z — literal, .80 lease still Main)
+
+1) **PUSHED ebbeee230:** authored OMP_PROC_BIND=false honored +
+   NativeCPUPlacement getenv bootstrap exception. Focused GB10: 12/12
+   placement/scan regressions pass incl. NativeCPUEntryLifecycle +
+   MPIProcessAffinity (first candidate broke spread lifecycle; preserved,
+   never pushed).
+2) **PUSHED 395dc20ef:** A1 fork evidence — CPU decode cache-miss runs
+   eagerly OUTSIDE executeCacheHit and never published the first-step
+   fork summary (PRODUCTION GAP, gated counter only); the retained test
+   used executeMultiDevice instead of a retained plan; restoration control
+   used SUMMARY=0. 4/4 fork-evidence Unit/Integration aliases pass.
+3) **ShmemSpin NP4/NP8 ROOT CAUSE — branch-introduced by B12:** under
+   mpirun with no authored OpenMP places, every co-resident rank
+   independently took canonical core admission and bound its master to
+   the SAME first place (all 4 ranks observed Cpus_allowed_list=19),
+   time-slicing on one core: 18 ms per 2048-float allreduce. Same defect
+   affects EXTERNAL mpirun launches of llaminar2. Candidate: co-resident
+   launcher ranks (OMPI_COMM_WORLD_LOCAL_SIZE/MPI_LOCALNRANKS >1) keep
+   native partition; added 'shared' case to preflight MPIProcessAffinity.
+   Building focused + full MPI-label validation (started 17:06:36Z); push
+   only after pass.
+Inherited/env classification unchanged; operator scope decision pending
+(dispatched by coordinator: fix-forward (1); (2) routed to addon3 (A1
+owner); (3) routed to addon (ShmemSpin ARM owner)).
