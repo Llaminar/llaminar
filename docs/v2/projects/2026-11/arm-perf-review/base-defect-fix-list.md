@@ -454,3 +454,21 @@ qualification; 10 cores permuted [5..9, 0..4]):
   authority** (binding established at spawn via OMP places, not a wait
   policy or hot-path rebinding).
 - Constraints: no .79 rerun, no model/env workaround.
+
+### HOST sysfs snapshot collected (Main read-only SFTP, ~02:07Z) — no physical core aliasing
+
+All 20 CPUs captured from the .79 HOST sysfs:
+- thread_siblings_list CPUi = ONLY i; core_id also i (CPU5 has core 5, not
+  0); package 36; cluster ids 56 for CPUs 0–9 and 1144 for 10–19.
+- cpu_capacity: 0–4 = 718, 5–9 = 997, 10–14 = 731, 15–18 = 1017, 19 = 1024.
+- This yields the EXACT expected fastest-first order
+  [19,15..18,5..9,10..14,0..4] → the first 15 workers match the observed
+  vector, and the .79 tail-reset fit (pool recreation at native places) is
+  now FULLY CONCRETE.
+- **No real physical core aliasing in the captured host sysfs** — the
+  earlier aliasing narrative is dead. The container-specific snapshot in
+  the owner's packet is NOT promoted to sysfs authority (do not treat
+  lscp-rendered core IDs as sysfs truth).
+- Evidence files: local /tmp/qfn75-openmp-roster.log (pool-resize
+  experiment); /tmp/qfn75-final/cpu-metadata (host snapshot).
+- No remote CPU job, model, or placement change performed.
