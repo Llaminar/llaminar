@@ -786,3 +786,22 @@ SCOPE OF THE ACK (binding):
    confirmation before the run sheet. A2 artifacts earn admission on
    their identities when they land.
 Counter arc CLOSED (bounded source ACK at c8ffde408, ten cycles).
+
+### Counter branch REBASED onto 880429059: a4f2da4d4 (arm-addon3, ~10:33Z) — affected-diff review pending
+
+Per Main's integration prerequisite: codex/arm-idea26-openmp-wakeup
+re-based onto EXACT 880429059; successor **a4f2da4d4** pushed
+(force-with-lease). Range-diff: 9/11 commits byte-identical; 2 `!` differing
+ONLY in tests/v2/CMakeLists.txt comment placement (Main's B12 comment +
+alias insertions, both preserved); 1 include-merge conflict in
+Test__MPIBootstrap.cpp resolved semantically (both include sets kept).
+POLICY INVENTORY THROUGH THE ACTUAL AUTHORITY: Main's B12 reown removed the
+bindOpenMPWorkersFastestFirst fork entirely → checker's ACTUAL numbers on
+the rebased tree: **176 noted (unchanged) / 27 named exempt (was 28 — the
+eliminated site's exemption dropped through the authority) / 54 files,
+rc=0**; stale exemption entry + header comment updated (follow-up commit
+a4f2da4d4). Focused evidence green at the rebased tip. **A2 anchor bound
+to a4f2da4d4** (+ artifact identities; refresh on drift) — run sheet to
+arm-sparks against this SHA. Affected-diff review request sent to the arm
+lane (2 CMakeLists hunks + 1 include merge + 2-file exemption cleanup; no
+semantic change to any reviewed counter/publisher body).
