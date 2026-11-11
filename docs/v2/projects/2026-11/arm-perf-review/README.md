@@ -1857,3 +1857,18 @@ is booked on the .80 post-campaign queue — W2 after W1; the earlier
 .79-offer superseded by the coordinator's locked order); .79 otherwise
 idle. RECONCILIATION: matches the locked order + lease state; no drift.
 Verified snapshot timestamp: 20:50Z.
+
+### STANDING DIRECTIVE (operator): keep the PR-branch pace
+
+The main PR (feat/arm64-native-kernels) must not sit static for hours
+while lanes churn. Whenever a lane item reaches a clean reviewer verdict
++ passing validation, IMMEDIATELY trigger the handback → Main
+application path; Main states application intent as soon as a candidate
+goes clean (don't wait to be asked). Coordinator duties: maintain the
+collection-candidate inventory, route clean items to Main proactively,
+keep at least one item in the handback pipeline at all times.
+Validation cycles that catch real defects justify slow PR movement —
+a CLEAN item idling in a lane branch is coordinator neglect.
+Current candidates (2026-11-11 late): FMLAL leaf (one K=16 residue),
+B9 fold (verdict requested), B4 diagnostic bench (round-5 verdict
+pending → W3 JUnit).
