@@ -274,3 +274,18 @@ verification; the earlier 35B GPU/automatic intent may not execute the same
 gate). GOMP_SPINCOUNT ≠ affinity repair; self-bootstrap sets the default.
 STOP HELD; no OMP/cap/validation workaround. Inbound evidence packet
 (commands/binary identity/masks/places/constraints/topology).
+
+### Dir-B STOP — STRONG source mechanism (Main, 2026-11-11, ~00:08Z)
+
+Main: configureClusterRankThreads has the BASE fdc72
+ScopedOpenMPPartitionAffinity SPANNING the permanent ARM 417dd3dc5
+bindOpenMPWorkersFastestFirst. At RAII return the destructor restores the
+MASTER's OLD place (e.g. CPU0) while worker10 retains the new CPU0; the
+master should remain fast5 → DUPLICATE 0 / VACANT 5. The AUTOMATIC plan
+route can AVOID the scope; the APPLIED saved execution selection ENTERS it.
+=> LIKELY **REBASE-INTERACTION PRODUCTION PLACEMENT DEFECT**, not a new
+verifier and not a GOMP fix (the 'same flags passed before' = automatic
+route). Main will do ONLY local model-free repro/source inspection; needs
+the complete error rep to confirm. WARNED: the addon's final register
+campaign may need to ride a Main NARROW FIX; do NOT change
+placement/validation/env on .79 (no workaround).
