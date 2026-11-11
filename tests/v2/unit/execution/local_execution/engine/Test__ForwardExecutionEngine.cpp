@@ -4958,19 +4958,23 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         auto input = makeTestInput(1, 1, DeviceId::cpu(), tokens.data(), positions.data());
         input.execution_phase = ForwardExecutionPhase::Decode;
         ForwardOutput output{};
-        // Baseline: the summary record the earlier successful step published
-        // in THIS configuration. The exclusion assertions compare against it
-        // (unchanged snapshot), because a bare emptiness check would be
-        // vacuous by construction.
+        // The baseline of THIS configuration's epoch is EMPTY by construction:
+        // the guard above reset the collector, and no successful decode has
+        // run in this epoch. The exclusion is therefore stated as the EMPTY
+        // baseline being preserved, and the discrimination comes from the
+        // exact positive control below - a successful step on the same gates
+        // publishes exactly one fork (value 1, count 1).
         const std::vector<PerfStatRecord> baseline =
             PerfStatsCollector::snapshot({"omp"});
-        EXPECT_FALSE(baseline.empty());
+        EXPECT_TRUE(baseline.empty())
+            << "this configuration's epoch starts empty: the guard reset the "
+               "collector and no successful decode has run in it yet";
 
         EXPECT_FALSE(engine.execute(input, output, host));
         const std::vector<PerfStatRecord> after_failure =
             PerfStatsCollector::snapshot({"omp"});
         EXPECT_EQ(after_failure.size(), baseline.size())
-            << "a failed step must leave the summary inventory unchanged";
+            << "a failed step must leave the empty epoch empty";
         for (size_t record = 0; record < after_failure.size() &&
                                  record < baseline.size(); ++record)
         {
@@ -4979,8 +4983,10 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
             EXPECT_EQ(after_failure[record].count, baseline[record].count);
         }
 
-        // A SUCCESSFUL decode on the same gates publishes exactly once more,
-        // so the failure exclusion is discriminating rather than vacuous.
+        // The exact positive control: a SUCCESSFUL decode on the same gates
+        // publishes exactly one fork (value 1, count 1), which is what makes
+        // the failure and prefill exclusions discriminating rather than
+        // vacuous.
         host.graph_stage_factories = {
             [](const std::string &name, DeviceId device)
             {
