@@ -109,3 +109,15 @@ REMAINING (precise text/meaning fixes, no new gate):
    descending; generation = identity/staleness only; dedupe IDs before N.
    Plus: v2 numeric range stays 1<=N<V.
 a42ac312b diagnostic re-review STARTED by the reviewer.
+
+## SPEC §3 FIXES APPLIED (~23:03Z): blob 10137aa3 (commit 607d8c274)
+
+All four reviewer-215 §3 fixes in place: backfill normative with the
+honest |S| = min(N, live vocabulary) semantics (collapse claim deleted;
+ranked-vs-backfilled split reported per arm); freshness ordering =
+commit position DESCENDING (generation = identity/staleness only);
+dedup-first construction bullet; v2 range 1<=N<V. §9/header unchanged
+from reviewed f26fd8ba. DECLARED: addon2's raw body carried the §9
+revert AGAIN (second recurrence of the assembly artifact) — kept the
+reviewed §9. Reviewer re-verdict pending; a42 diagnostic re-review
+running.
