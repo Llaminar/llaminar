@@ -102,3 +102,41 @@ exactly the rider question above.
 
 Evidence: seal `K14-I16A-880429059-20261111` (SUMMARY.md, g1a–g2b outputs, both stats JSONs,
 plan JSONs/logs, SHA256SUMS); reducer + reduction notes by the idea-16 addon session.
+
+---
+
+## CORRECTION (author, ~11:56Z — supersede the verifier-LM-head claims above)
+
+The "verifier computes one full-vocab M=1 GEMV PER VERIFIER ROW (1560
+calls, zero amortization)" claim was WRONG. Decisive counter in the same
+MTP stats: `mtp lm_head_grouped_decode_equivalent_verifier_prefill_rows
+count=264 value=1560` — the verifier LM head IS the grouped
+decode-equivalent path: 264 grouped calls covering all 1560 rows
+(~2.4-2.8× amortization vs serial). The 1560 stage_cpu LM_HEAD calls
+decompose as **1296 DRAFT-step M=1 calls + 264 verifier grouped calls**
+(1296 = mtp draft_steps exactly). The real per-row full-vocab cost is on
+the DRAFT side, BY DESIGN: Qwen35Graph::buildMTPGraph wires the sidecar's
+final projection with full_vocab_output at seq_len=1 (the draft samples
+its next token from the full distribution) — every draft step pays an
+M=1 full-vocab GEMV (~4.3-4.9 ms).
+CORRECTED MTP-dyn per-token deltas (profiled): LM head +6.56 ms/token
+TOTAL = draft full-vocab heads ≈ +2.95 (top MTP-specific kernel cost) +
+verifier grouped heads ≈ −0.67 (grouped WINS vs serial); grouped GDN
+recurrence +3.96 (≈1.0×, unchanged); MoE +2.17 (≈1.76× after removing
+draft calls from the blend); GDN projection −0.82; shared expert −1.14;
+net ≈ +11.9 ms/token profiled ✓.
+REFRAMED BREAKEVEN: blended amortization ≈1.9× vs rows/token 2.03 at
+38.9% acceptance → loses; at 99% acceptance rows/token ≈1.06 → wins even
+with today's kernels. The acceptance collapse (rider question) remains
+the decisive gate; kernel fixes change the breakeven, not the sign at
+38.9%.
+REFRAMED B-CANDIDATES: (A) grouped LM-head kernel at M≈6 runs at only
+~20-22 GB/s vs 45 GB/s at M=1 → ~2× kernel headroom (derived from blended
+averages — needs a microbench before any claim; REPLACES the old
+route-verifier-rows candidate, already taken). (B) draft-side logits =
+B4-family CONTRACT nuance: top-k/shortlist proposal is exactness-safe
+under GREEDY verification; changes semantics under STOCHASTIC — must go
+into the B4 contract proposal. idea-14's "5.7 ms per verifier row"
+sentence should be re-read against this correction (verifier rows were
+already grouped; the unamortized full-vocab cost is the DRAFT's per-step
+head — 27B dense draft economics apply there too).
