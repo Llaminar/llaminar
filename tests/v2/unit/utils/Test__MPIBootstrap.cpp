@@ -280,6 +280,10 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
             std::optional<llaminar::v2::OpenMPTeamForkScope> outer;
             std::optional<llaminar::v2::OpenMPTeamForkScope> inner;
             std::optional<llaminar::v2::OpenMPTeamForkScope> main_owner;
+            // Count the restoration probe WHERE IT EXECUTES: the optional is
+            // destroyed by the teardown, so no expected total may infer past
+            // work from it afterwards.
+            std::uint64_t probe_count = 0;
             std::atomic<bool> worker_ready{false};
             std::atomic<bool> start_gate{false};
             std::atomic<bool> worker_notes_done{false};
@@ -378,6 +382,7 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
                         EXPECT_TRUE(outer.has_value());
                         EXPECT_EQ(outer->forks(), kMeasuredNotes + 1)
                             << "the probe must walk restored AND the surviving outer";
+                        ++probe_count; // Counted where the probe executed.
                     }
                     outer.reset(); // Only after the inner is gone and verified.
                 }
@@ -399,12 +404,10 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
             const auto cost_ns = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(cost_stop - cost_start)
                     .count());
-            // The restoration probe counts ONLY when its guard actually
-            // executes it (non-concurrent with an engaged outer); measure(0,
-            // false) skips the probe, so its total is exactly the notes.
+            // The restoration probe is counted WHERE IT EXECUTED (the guard
+            // site above); the destroyed optional is never consulted here.
             const std::uint64_t expected_total =
-                kMeasuredNotes * (concurrent ? 2u : 1u) +
-                (concurrent ? 0u : (outer ? 1u : 0u));
+                kMeasuredNotes * (concurrent ? 2u : 1u) + probe_count;
             EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - before, expected_total);
             return cost_ns / static_cast<double>(kMeasuredNotes);
         };
