@@ -256,3 +256,21 @@ for this bounded run only. CONDITION: launch after arm-sparks classifies
 the a/b fast-rc1 failure text (config/authoring → its fix; authorization
 boundary → STOP + report). This = the operator-approved idea-25 Dir-B
 perf-structure evidence (on-demand helper, not a gate).
+
+### Dir-B trace startup STOP — attribution in progress (2026-11-11, ~00:06Z)
+
+The corrected trace run STOPPED at startup (no inference):
+RuntimeInitPhase.cpp:457 'prepare_local_runtime': Startup thread affinity
+verification failed: multiple OpenMP threads share <truncated> (production
+OMP 20T places=cores bind=close; uma4 container). MAIN'S INITIAL SOURCE
+ATTRIBUTION: the verifier/duplicate-physical-core diagnostic
+(MPIBootstrapPhase) = INHERITED ec7643c474 (March); the RuntimeInitPhase
+explicit-CPU invocation/throw = INHERITED e8dc63c523 (Sept); NO
+RuntimeInitPhase delta 2948..5b; :457 = the outer catch, NOT a new
+verifier. BUT ARM changes worker placement (e72c1c779/417dd3dc5
+fastest-first) → placement NOT exonerated. 'Same flags previously passed'
+≠ regression proof (the saved CPU-apply plan exercises explicit-CPU
+verification; the earlier 35B GPU/automatic intent may not execute the same
+gate). GOMP_SPINCOUNT ≠ affinity repair; self-bootstrap sets the default.
+STOP HELD; no OMP/cap/validation workaround. Inbound evidence packet
+(commands/binary identity/masks/places/constraints/topology).
