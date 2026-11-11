@@ -5225,7 +5225,10 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
     // variable absent before the test is restored to absence.
     {
         const ScopedForkEvidenceConfig present_setup(nullptr, false);
-        ::setenv("LLAMINAR_PERF_STATS_SUMMARY", "0", 1);
+        // A truthy summary makes the restored policy observable: the restored
+        // mtp filter must be live again and the inner omp selection gone.
+        // (SUMMARY=0 disables collection entirely, so it cannot prove that.)
+        ::setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
         ::setenv("LLAMINAR_PERF_STATS_FILTER", "mtp", 1);
         mutableDebugEnv().reload();
         llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
@@ -5235,7 +5238,7 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
         }
         // Prior-present: both ambient values came back exactly.
         EXPECT_NE(::getenv("LLAMINAR_PERF_STATS_SUMMARY"), nullptr);
-        EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_SUMMARY"), std::string("0"));
+        EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_SUMMARY"), std::string("1"));
         EXPECT_EQ(std::getenv("LLAMINAR_PERF_STATS_FILTER"), std::string("mtp"));
         EXPECT_TRUE(llaminar2::PerfStatsCollector::isRecordFamilyEnabled("mtp", "anything"));
         EXPECT_FALSE(llaminar2::PerfStatsCollector::isRecordFamilyEnabled(
