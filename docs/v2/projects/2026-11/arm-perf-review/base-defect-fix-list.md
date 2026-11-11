@@ -859,3 +859,18 @@ avoid the secondary crash but NOT make the expected-allocation test green
 — permission/topology admission unchanged); (3) the underlying get_mempolicy
 EPERM on 64K/memory-only-NUMA remains a Station environment precondition
 to record, not an ARM defect.
+
+### B11 ENVIRONMENT PRECONDITION ATTRIBUTED (worker c527, ~12:27Z): get_mempolicy EPERM = seccomp
+
+SYS_NICE-ONLY EXPERIMENT (controlled, same binary/container): SYS_NICE
+does NOT resolve the EPERM — first-touch certification still fails
+"Operation not permitted" with --cap-add SYS_NICE + DEFAULT seccomp.
+**The get_mempolicy/set_mempolicy EPERM is caused by Docker's default
+seccomp profile blocking those syscalls, not by a missing capability.**
+The prior "SYS_NICE + seccomp=unconfined" fix required BOTH — the seccomp
+relaxation was the actual fix. Two independent mechanisms confirmed:
+SYS_NICE addresses rlimit-based restrictions; seccomp addresses syscall
+filtering. Log: artifacts/cb-c1-staging/current/b11-sysnice-experiment.log.
+RUNBOOK CONFIRMATION: the established "SYS_NICE + seccomp=unconfined for
+page-owner tests" rule was correct, and now has the attribution experiment
+proving which mechanism does what.
