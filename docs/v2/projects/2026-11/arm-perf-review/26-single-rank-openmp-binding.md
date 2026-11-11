@@ -746,3 +746,25 @@ all four match the required totals. All other closures retained (U2/U3/U4
 + stack-identity/controls from a05). Focused evidence at the committed
 SHA: Workshare 5/5 (body unchanged); checker rc=0. Bootstrap UNVERIFIED
 at lane (honest). Committed-bytes read-back in the handover.
+
+### **SOURCE ACK #187** (reviewer, ~10:22Z) — exact c8ffde408b4ab0d0fcbcbc8dc25adb3b35b477a4
+
+Bounded SOURCE ACK. Inspected 95e..c8 committed diff: local probe_count
+initialized 0 per measurement, incremented inside the actual guarded probe
+BEFORE teardown, added to expected_total. All four Bootstrap totals follow
+executed work: N, N+1, N+1, 2N. Remaining U1 assertion defect
+source-closed; prior U1 lifetime/TLS controls + U2/U3/U4 closures
+retained. Historical HOLDs remain recorded.
+
+SCOPE OF THE ACK (binding):
+- Source-fix-back ACK ONLY — NOT the compound "A2 usable + B-evidence
+  stage" admission. Reviewer executed no builds/tests/syntax/probes or
+  artifact authentication.
+- Workshare 5/5 + checker = owner-attributed evidence; Bootstrap/engine +
+  broad checks unverified-at-lane → Main's post-collection campaign.
+- Main must EXPLICITLY admit any A2 artifact and B/economy evidence on
+  their actual identities; the source ACK cannot grant those
+  automatically.
+- Exact rebases/successors require affected-diff review.
+- #175/#191 register HOLD + half-perf economy insufficient-evidence
+  disposition remain independent. Recorded in the existing tracker only.
