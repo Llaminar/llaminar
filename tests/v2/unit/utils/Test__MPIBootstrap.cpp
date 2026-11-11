@@ -254,15 +254,24 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
         // the clock; the concurrent worker exists and has signalled readiness
         // with its own same-thread scope before the start gate opens (the
         // measuring main thread owns a cell too, so contention is between two
-        // real owners); the timed window contains the notes only; cell and
+        // real owners); the timed interval is the amortized concurrent wall
+        // time INCLUDING the rendezvous (start-gate publication through the
+        // competing owner's observed completion - readiness permits
+        // concurrency and does not prove scheduler overlap); cell and
         // process verification, the join and the teardown all happen after
-        // the clock stops; the LIFO teardown is enforced inner-first with the
-        // restored stack asserted. The concurrent figure divides by the notes
-        // ONE thread executed: per-owner latency, not aggregate throughput.
-        // Earlier no-walk figures do not transfer and are superseded.
+        // the clock stops; the LIFO teardown is enforced inner-first with
+        // the exact owner-stack pointer identity asserted after it. The
+        // concurrent figure divides by the notes ONE thread executed:
+        // per-owner latency, not aggregate throughput. Earlier no-walk
+        // figures do not transfer and are superseded.
         const auto measure = [&](int owners, bool concurrent) -> double
         {
             const std::uint64_t before = llaminar::v2::openMPTeamForkSnapshot();
+            // The ORIGINAL owner-stack pointer, saved before any scope
+            // exists: restoration is proven by POINTER IDENTITY against it,
+            // never by global-total arithmetic.
+            const llaminar::v2::OpenMPTeamForkCell *stack_at_entry =
+                llaminar::v2::openMPTeamForkOwnerStack;
             std::optional<llaminar::v2::OpenMPTeamForkScope> outer;
             std::optional<llaminar::v2::OpenMPTeamForkScope> inner;
             std::optional<llaminar::v2::OpenMPTeamForkScope> main_owner;
@@ -331,40 +340,49 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
                 EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - before,
                           kMeasuredNotes)
                     << "nested owners " << owners;
-                inner.reset(); // LIFO: the inner dies first.
+                if (outer)
                 {
-                    llaminar::v2::OpenMPTeamForkScope restored;
-                    auto local_idle = [] {};
-                    OMP_WORKSHARE_REGION(local_idle);
-                    EXPECT_EQ(restored.forks(), 1u);
-                    // STACK IDENTITY, not just a self-count: the probe fork
-                    // must attribute to BOTH the fresh scope and the
-                    // surviving outer (the walked stack is exactly
-                    // [restored, outer]). A lost or wrong previous link
-                    // would leave the outer at kMeasuredNotes and fail here.
-                    EXPECT_TRUE(outer.has_value());
-                    EXPECT_EQ(outer->forks(), kMeasuredNotes + 1)
-                        << "the probe must walk restored AND the surviving outer";
+                    // LIFO: the inner dies first (present only for
+                    // owners>=2), then the probe proves stack identity by
+                    // attribution, then the outer dies.
+                    inner.reset();
+                    {
+                        llaminar::v2::OpenMPTeamForkScope restored;
+                        auto local_idle = [] {};
+                        OMP_WORKSHARE_REGION(local_idle);
+                        EXPECT_EQ(restored.forks(), 1u);
+                        // STACK IDENTITY, not just a self-count: the probe
+                        // fork must attribute to BOTH the fresh scope and
+                        // the surviving outer. A lost or wrong previous link
+                        // would leave the outer at kMeasuredNotes and fail
+                        // here.
+                        EXPECT_TRUE(outer.has_value());
+                        EXPECT_EQ(outer->forks(), kMeasuredNotes + 1)
+                            << "the probe must walk restored AND the surviving outer";
+                    }
+                    outer.reset(); // Only after the inner is gone and verified.
                 }
-                outer.reset(); // Only after the inner is gone and verified.
-                // The ORIGINAL stack is restored after the teardown: a fork
-                // now must attribute to nothing (the total is its only
-                // witness).
-                const std::uint64_t after_teardown =
-                    llaminar::v2::openMPTeamForkSnapshot();
+                else
                 {
-                    auto local_idle = [] {};
-                    OMP_WORKSHARE_REGION(local_idle);
+                    // owners==0: nothing was alive; GENUINE no-owner - the
+                    // restoration probe never dereferences a disengaged
+                    // optional (the UB this branch used to carry).
+                    inner.reset();
                 }
-                EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - after_teardown, 1u);
+                // EXACT TLS STACK IDENTITY after the teardown: the owner
+                // stack pointer must be the ORIGINAL saved pointer, byte for
+                // byte - a stale or extra link would fail here. The global
+                // total is NOT the witness: it advances once per fork
+                // whatever the stack holds.
+                EXPECT_EQ(llaminar::v2::openMPTeamForkOwnerStack, stack_at_entry)
+                    << "the original owner stack must be restored exactly";
             }
             const auto cost_ns = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(cost_stop - cost_start)
                     .count());
             const std::uint64_t expected_total =
                 kMeasuredNotes * (concurrent ? 2u : 1u) +
-                (concurrent ? 0u : 2u); // Nested: the restoration probe plus
-            // the post-teardown fork that proves the original stack restored.
+                (concurrent ? 0u : 1u); // Nested: the restoration probe.
             EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - before, expected_total);
             return cost_ns / static_cast<double>(kMeasuredNotes);
         };
