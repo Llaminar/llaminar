@@ -13,6 +13,7 @@
 
 #include "utils/MPIBootstrap.h"
 #include "utils/DebugEnv.h"
+#include "utils/MPISessionOwner.h"
 #include "app/MPIBootstrapPhase.h"
 #include "backends/ComputeBackend.h"
 #include "backends/HardwareInventory.h"
@@ -33,6 +34,7 @@
 #include <array>
 #include "utils/NUMATopology.h"
 #include <type_traits>
+#include <thread>
 
 namespace
 {
@@ -480,16 +482,52 @@ TEST(Test__MPIBootstrap, NativeCorePlaceReceiptRejectsMalformedAndIncompatiblePu
     using namespace llaminar2;
     static_assert(!std::is_default_constructible_v<NativeOpenMPCorePlaces>);
     static_assert(!std::is_copy_constructible_v<NativeOpenMPCorePlaces>);
+    char pattern[]="/tmp/llaminar-native-receipt-XXXXXX";
+    const char *root=::mkdtemp(pattern);
+    ASSERT_NE(root,nullptr);
+    struct Cleanup {std::filesystem::path path;~Cleanup(){std::filesystem::remove_all(path);}} cleanup{root};
     const auto process=std::to_string(::getpid());
+    const std::vector<std::vector<int>> canonical{{0},{1}};
     for(const auto &receipt:std::vector<std::string>{"", "v2;1;{0}", "v1;;{0}",
             "v1;bad;{0}", "v1;-1;{0}", "v1;"+process+";", "v1;"+process+";{-1}"})
     {
         SCOPED_TRACE(receipt);
-        const ScopedLaunchEnvironment publication("LLAMINAR_NATIVE_CORE_PLACES",receipt.c_str());
-        char program[]="native-place-rejection";
-        char *argv[]={program};
-        EXPECT_THROW((void)MPIBootstrapPhase::prepareNativeCorePlaces(1,argv),std::runtime_error);
+        EXPECT_THROW(NativeCPUPlacement::validateCapacityReceipt(receipt,canonical,::getpid(),root),std::runtime_error);
     }
+    EXPECT_NO_THROW(NativeCPUPlacement::validateCapacityReceipt(
+        "v1;"+process+";{0},{1}",canonical,::getpid(),root));
+    // Matching native/receipt bytes are insufficient when their capacity order is wrong.
+    EXPECT_THROW(NativeCPUPlacement::validateCapacityReceipt(
+        "v1;"+process+";{1},{0}",{{1},{0}},::getpid(),root),std::runtime_error);
+}
+
+/** @test Late and foreign callers cannot reopen original entry or publish another exec. */
+TEST(Test__MPIBootstrap, NativeCorePlaceEntryRejectsForeignAndLateCallers)
+{
+    using namespace llaminar2;
+    ASSERT_TRUE(MPISessionOwner::sharedDirectory().has_value());
+    const auto environment=[] {
+        std::vector<std::optional<std::string>> values;
+        for(const char *name:{"OMP_PLACES","OMP_PROC_BIND","LLAMINAR_NATIVE_CORE_PLACES"})
+        {
+            const char *value=std::getenv(name);
+            values.push_back(value ? std::optional<std::string>(value) : std::nullopt);
+        }
+        return values;
+    };
+    const auto before=environment();
+    char program[]="late-native-entry";
+    char *argv[]={program};
+    const auto late=MPISessionOwner::enterProcess(1,argv);
+    ASSERT_TRUE(late.has_value());
+    EXPECT_EQ(*late,125);
+    std::optional<int> foreign;
+    {
+        std::jthread worker([&]{foreign=MPISessionOwner::enterProcess(1,argv);});
+    }
+    ASSERT_TRUE(foreign.has_value());
+    EXPECT_EQ(*foreign,125);
+    EXPECT_EQ(environment(),before);
 }
 
 /** @test Core places precede exec on every launch path; explicit placement remains authoritative. */

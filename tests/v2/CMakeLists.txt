@@ -3094,8 +3094,8 @@ add_v2_test(V2_Unit_MPIBackend
 add_executable(v2_unit_mpi_bootstrap unit/utils/Test__MPIBootstrap.cpp)
 target_link_libraries(v2_unit_mpi_bootstrap
     llaminar2_core
+    v2_core_gtest_main
     GTest::gtest
-    GTest::gtest_main
 )
 add_v2_test(V2_Unit_MPIBootstrap
     COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
@@ -3110,9 +3110,8 @@ add_v2_test(V2_Integration_OpenMPIdleSpinPolicy
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CPU;Bootstrap;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPIdleSpinPolicy)
-# Self-launched core-placed ranks bind libgomp's pool to capacity-ordered
-# physical cores: GB10's X925 cores, which run the serial master and static
-# partitions, would otherwise follow the A725 cores in CPU-id order.
+# Native capacity-ordered places keep the serial master and low worker ids
+# on fast cores even when OpenMP retires/recreates part of its worker pool.
 add_v2_test(V2_Integration_OpenMPCapacityOrderedCorePlaces
     COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
         --gtest_filter=Test__MPIBootstrap.CorePlacesFollowCapacityWithinTheRankMask:Test__MPIBootstrap.ClusterWorkersOrderFastCoresFirst
@@ -3238,7 +3237,7 @@ add_v2_test(V2_Integration_MPIBootstrapOpenMPPlacement
 
 add_v2_test(V2_Integration_NativeCorePlacesPublicationContract
     COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
-        --gtest_filter=Test__MPIBootstrap.NativeCorePlaceReceiptRejectsMalformedAndIncompatiblePublication
+        --gtest_filter=Test__MPIBootstrap.NativeCorePlaceReceiptRejectsMalformedAndIncompatiblePublication:Test__MPIBootstrap.NativeCorePlaceEntryRejectsForeignAndLateCallers
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Bootstrap;Contract;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
