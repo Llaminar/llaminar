@@ -1024,3 +1024,25 @@ remaining failures = the inherited set from Main's base-fix inventory
 classes against Main's inventory (concrete fixes vs environment
 preconditions — the seccomp attribution already resolved one class).
 CB-program work; ARM side informational only.
+
+### STATION CLEANUP (c1d0 worker, operator-ordered, ~21:06Z) — evidence consolidated FIRST
+
+All c1d0 build trees removed on the operator's direct "cleanup everything
+you don't need" order. **Evidence consolidated FIRST and INTACT:**
+/home/tdsynnex/repo/llaminar-evidence-2026-11-11/ (118MB, 40 files) —
+b-fix-0db136607/, b-fix-9490b66bc/, b-fix-ce9ddb326/ (counter-evidence +
+B10 discovery chain), canonical unit/preflight logs (NEON+I8MM), all
+bench_*.json/logs + bench_baseline.md, TESTED_SHA.txt, README-PATH-MAP.txt
+(old→new path map). TRACKERS TO REPOINT: e74703801/687fde099/df0370d80
+references → the evidence dir.
+ALSO REMOVED: llaminar-cb-c2 worktree+tree (34G, frozen C2 artifacts —
+C1 owns the branch, advanced to 975f72ccb in their own checkout); the
+22GB policy-rejected Qwen3.5-35B-A3B-Q4_K_M.gguf; host ~/tools; onednn
+build dirs + stale locks (source clone kept, 99M). KEPT: standard model
+set (11 GGUFs, 27G), main .venv (2.2G), llaminar-dev image, main checkout
+(clean, detached ce9ddb326), all other lanes' worktrees. Disk: 90%→86%
+(256G free).
+ARM-SIDE NOTE: the removed C2 artifacts were already dispositioned (C2
+closed; the coordinator-held C2 state was the frozen snapshot — the
+branch lives with C1). The B10/B11 evidence chains (b-fix-* dirs) are the
+ARM-relevant part — INTACT at the consolidated path.
