@@ -846,3 +846,14 @@ one post-collection campaign. No A2 artifact/economy/merge admission.
 NOTE: the comment checkpoint (bb893cd79) supersedes a4f2da4d4 as the
 collectible tip — docs-only delta from the ACKed pin (affected-diff
 triviality; Main to confirm at collection).
+
+### A2 window confirmed (arm-addon3 relay, ~10:45Z)
+
+arm-sparks confirmed: .80 — the Phase A bench matrix finishes ~40 min,
+seals K14-I16A, then the rider sheet runs. ISA resolved to NEON_I8MM
+(production envelope, matches every prior .80 measurement — the
+fork-count inventory is envelope-independent, so Rider 1's counts are
+directly comparable with the existing stage-timing baselines). Host
+recorded as .80 in every artifact. Riders 1–3 execute in ~40 min;
+per-rider report after. The B1 analysis (from the exports) follows on
+addon3's side once the artifacts land.
