@@ -212,3 +212,16 @@ committed a42ac312b blob (committed diff = authoritative).
   head (:39/:258).
 DISPOSITION: focused repairs in existing files; no new apparatus; spec
 ACK intact; fences unchanged.
+
+## DIAGNOSTIC ROUND-4 TIP (~23:27Z): 688b0c14b — routed for A1-A5 re-review
+
+parent 3002d37cc; 2 files +196/-67. A2: aggregate 228 (own miscount);
+A3: separate draw_q/correction_q — wrong-correction negative with fixed
+p+draw, independently predicted law (31/64,21/64,1/8,1/16) asserted
+EXPECT_DOUBLE_EQ; OMITTED-RESIDUAL negative ADDED (correction re-draw
+variant DETECTED); A4: endpoint fixture follows production convention
+(token 1 at threshold .5; clamp endpoints asserted; comment corrected);
+A1: constructor binds epoch; provenance scope EXPLICIT (receipts
+ASSUMED-COMMITTED); "lookahead unrepresentable" RETRACTED (the honest
+limit); cap-with-fewer-slots case added; A5: "reverse ordering" wording.
+D6/D3/D2 stand. Reviewer re-verdict pending.
