@@ -5,6 +5,8 @@
  * Test command construction with synthetic topology and validate malformed
  * placement before any hardware discovery, MPI launch, or model allocation.
  * Actual worker affinity belongs in the model-free CPU startup integration.
+ * Malformed native place receipts fail before exec or worker admission; the
+ * opaque native place token cannot be default-constructed or copied.
  * Diagnostic export tests deliberately distinguish portable observation policy
  * from launcher-local device visibility and cloud authentication environment.
  */
@@ -30,6 +32,7 @@
 #include <vector>
 #include <array>
 #include "utils/NUMATopology.h"
+#include <type_traits>
 
 namespace
 {
@@ -469,6 +472,24 @@ TEST(Test__MPIBootstrap, ExistingMPIKeepsExplicitRankConfigurationWithoutRelaunc
     const auto result = MPIBootstrapPhase{}.execute(config, 1, argv);
     EXPECT_EQ(result.action, BootstrapResult::Action::CONTINUE);
     EXPECT_EQ(config.mpi_procs, 4);
+}
+
+/** @test Invalid native place publications cannot reach exec or worker admission. */
+TEST(Test__MPIBootstrap, NativeCorePlaceReceiptRejectsMalformedAndIncompatiblePublication)
+{
+    using namespace llaminar2;
+    static_assert(!std::is_default_constructible_v<NativeOpenMPCorePlaces>);
+    static_assert(!std::is_copy_constructible_v<NativeOpenMPCorePlaces>);
+    const auto process=std::to_string(::getpid());
+    for(const auto &receipt:std::vector<std::string>{"", "v2;1;{0}", "v1;;{0}",
+            "v1;bad;{0}", "v1;-1;{0}", "v1;"+process+";", "v1;"+process+";{-1}"})
+    {
+        SCOPED_TRACE(receipt);
+        const ScopedLaunchEnvironment publication("LLAMINAR_NATIVE_CORE_PLACES",receipt.c_str());
+        char program[]="native-place-rejection";
+        char *argv[]={program};
+        EXPECT_THROW((void)MPIBootstrapPhase::prepareNativeCorePlaces(1,argv),std::runtime_error);
+    }
 }
 
 /** @test Core places precede exec on every launch path; explicit placement remains authoritative. */

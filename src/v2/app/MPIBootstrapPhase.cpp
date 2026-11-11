@@ -8,10 +8,9 @@
  * a NUMA placement. The same intent then selects the CPU MPI tuning profile.
  * An explicit CPU node requires a real physical-core set before self-launch;
  * unresolved locality never disables the default full-team MPI binding.
- * Rank worker admission restores the caller's exact incoming affinity even
- * when an initially unbound OpenMP runtime needs no temporary partition mask.
- * A bound runtime instead retains the master's permanent capacity-ordered
- * place; its temporary partition scope retires before team binding.
+ * Native OpenMP owns the capacity-ordered place list before MPI admission;
+ * process-local startup publication survives worker retirement and recreation
+ * without per-region scheduler calls or a manually mirrored worker pool.
  */
 
 #include "app/MPIBootstrapPhase.h"
@@ -21,10 +20,8 @@
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 #include "utils/NUMATopology.h"
-#include "utils/ScopedCallerThreadAffinity.h"
 #include "utils/ScopedOpenMPPartitionAffinity.h"
 #include <omp.h>
-#include <optional>
 #include <sched.h>
 #include <iostream>
 #include <algorithm>
@@ -35,11 +32,100 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string_view>
+#include <charconv>
+#include <optional>
+#include <cerrno>
+#include <cstring>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <mpi.h>
 
 namespace llaminar2
 {
     namespace
     {
+        using CorePlaces = std::vector<std::vector<int>>;
+        // Process-launch protocol owned here, not a live diagnostic/tuning switch.
+        constexpr const char *kNativeCorePlacesEnvironment="LLAMINAR_NATIVE_CORE_PLACES";
+
+        /** @return Canonical explicit OpenMP syntax for an already ordered place list. */
+        std::string encodeCorePlaces(const CorePlaces &places)
+        {
+            std::ostringstream output;
+            for (std::size_t p=0;p<places.size();++p)
+            {
+                if(p)output<<',';
+                output<<'{';
+                for(std::size_t c=0;c<places[p].size();++c)
+                {
+                    if(c)output<<',';
+                    output<<places[p][c];
+                }
+                output<<'}';
+            }
+            return output.str();
+        }
+
+        /** @return This caller's native partition order, not a guessed global worker roster. */
+        CorePlaces nativeCorePlaces()
+        {
+            const int count=omp_get_partition_num_places();
+            if(count<=0)return {};
+            std::vector<int> indices(static_cast<std::size_t>(count));
+            omp_get_partition_place_nums(indices.data());
+            CorePlaces places;
+            std::set<int> seen;
+            for(const int index:indices)
+            {
+                const int width=omp_get_place_num_procs(index);
+                if(width<=0)throw std::runtime_error("Native OpenMP partition contains an empty place");
+                std::vector<int> cpus(static_cast<std::size_t>(width));
+                omp_get_place_proc_ids(index,cpus.data());
+                std::sort(cpus.begin(),cpus.end());
+                for(const int cpu:cpus)
+                    if(cpu<0 || cpu>=CPU_SETSIZE || !seen.insert(cpu).second)
+                        throw std::runtime_error("Native OpenMP partition has invalid or overlapping CPUs");
+                places.push_back(std::move(cpus));
+            }
+            return places;
+        }
+
+        /** @brief One initial-exec receipt; a different process must admit its own rank partition. */
+        struct CorePlaceLaunchReceipt
+        {
+            long process;
+            std::string places;
+        };
+
+        /** @return Strictly parsed native startup publication, or absence before initial admission. */
+        std::optional<CorePlaceLaunchReceipt> corePlaceLaunchReceipt()
+        {
+            const char *raw=DebugEnv::envValue(kNativeCorePlacesEnvironment);
+            if(!raw)return std::nullopt;
+            const std::string_view value(raw);
+            const auto separator=value.find(';',3);
+            if(!value.starts_with("v1;") || separator==std::string_view::npos || separator+1==value.size())
+                throw std::runtime_error("Incompatible native OpenMP place launch receipt");
+            long process=0;
+            const auto parsed=std::from_chars(value.data()+3,value.data()+separator,process);
+            if(parsed.ec!=std::errc{} || parsed.ptr!=value.data()+separator || process<=0)
+                throw std::runtime_error("Invalid native OpenMP place launch process identity");
+            return CorePlaceLaunchReceipt{process,std::string(value.substr(separator+1))};
+        }
+
+        /**
+         * @brief Publish exact native startup data before exec or an already-compatible admission.
+         * @param places Canonical physical-core place list.
+         * @throws std::runtime_error when any environment publication fails.
+         */
+        void publishCorePlaces(const std::string &places)
+        {
+            const auto receipt="v1;"+std::to_string(::getpid())+';'+places;
+            if(::setenv("OMP_PLACES",places.c_str(),1)!=0 || ::setenv("OMP_PROC_BIND","close",1)!=0 ||
+               ::setenv(kNativeCorePlacesEnvironment,receipt.c_str(),1)!=0)
+                throw std::runtime_error("Cannot publish native OpenMP place startup: "+std::string(std::strerror(errno)));
+        }
+
         /**
          * @brief Whether this rank was self-launched with one worker per physical core.
          * @return True when the production launcher exported LLAMINAR_SELF_BOOTSTRAPPED
@@ -53,8 +139,10 @@ namespace llaminar2
             const char *self = DebugEnv::envValue("LLAMINAR_SELF_BOOTSTRAPPED");
             const char *places = DebugEnv::envValue("OMP_PLACES");
             const char *bind = DebugEnv::envValue("OMP_PROC_BIND");
-            return self && std::string_view(self) == "1" && places && std::string_view(places) == "cores" &&
-                bind && std::string_view(bind) == "close";
+            const bool core_policy=places && (std::string_view(places)=="cores" ||
+                DebugEnv::envValue(kNativeCorePlacesEnvironment));
+            return self && std::string_view(self)=="1" && core_policy &&
+                bind && std::string_view(bind)=="close";
         }
     } // namespace
 
@@ -364,47 +452,72 @@ namespace llaminar2
         return places;
     }
 
-    void MPIBootstrapPhase::bindOpenMPWorkersFastestFirst()
+    NativeOpenMPCorePlaces MPIBootstrapPhase::prepareNativeCorePlaces(int argc,char *argv[])
     {
-        // With OMP_PROC_BIND set, libgomp binds the initial thread to its
-        // first place before main(), so this thread's own mask is no longer
-        // the rank's. libgomp derived its place list from the original rank
-        // mask: their union is the admitted CPU set, never wider than it.
-        cpu_set_t affinity;
-        CPU_ZERO(&affinity);
-        if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0)
-            throw std::runtime_error("Cannot read rank affinity for OpenMP worker placement");
-        for (int place = 0; place < omp_get_num_places(); ++place)
+        int initialized=0;
+        if(omp_get_level()!=0 || MPI_Initialized(&initialized)!=MPI_SUCCESS || initialized)
+            throw std::runtime_error("Native core places require process entry before MPI and execution admission");
+        auto native=nativeCorePlaces();
+        const auto receipt=corePlaceLaunchReceipt();
+        const bool current=receipt && receipt->process==static_cast<long>(::getpid());
+        if(current)
         {
-            std::vector<int> ids(static_cast<std::size_t>(std::max(0, omp_get_place_num_procs(place))));
-            if (!ids.empty())
-                omp_get_place_proc_ids(place, ids.data());
-            for (const int cpu : ids)
-                if (cpu >= 0 && cpu < CPU_SETSIZE)
-                    CPU_SET(cpu, &affinity);
+            if(native.empty() || omp_get_proc_bind()!=omp_proc_bind_close || encodeCorePlaces(native)!=receipt->places)
+                throw std::runtime_error("Native OpenMP startup differs from its process-local place receipt");
+            // Validate physical ownership, not just syntactic equality of two CPU lists.
+            std::set<int> physical;
+            for(const auto &place:native)
+            {
+                const int core=physicalRepresentativeForCpu(place.front());
+                if(!physical.insert(core).second || std::any_of(place.begin(),place.end(),[&](int cpu){
+                    return physicalRepresentativeForCpu(cpu)!=core;
+                }))throw std::runtime_error("Native OpenMP core place contains invalid physical ownership");
+            }
+            return NativeOpenMPCorePlaces(std::move(native),receipt->places,::getpid(),::syscall(SYS_gettid));
+        }
+        cpu_set_t partition;
+        CPU_ZERO(&partition);
+        {
+            const ScopedOpenMPPartitionAffinity admitted_partition;
+            if(::sched_getaffinity(0,sizeof(partition),&partition)!=0)
+                throw std::runtime_error("Cannot observe rank partition for native OpenMP startup");
         }
         std::vector<int> allowed;
-        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
-            if (CPU_ISSET(cpu, &affinity))
-                allowed.push_back(cpu);
-        const auto places = capacityOrderedCorePlaces(allowed);
-        if (places.empty())
-            throw std::runtime_error("Rank affinity contains no CPU for OpenMP worker placement");
-        int binding_failed = 0;
-        // One thread per place creates/reuses exactly the pool threads whose
-        // close-binding place is their thread number. Teams of the admitted
-        // size or smaller then never need an unbound replacement thread.
-#pragma omp parallel num_threads(static_cast<int>(places.size())) reduction(| : binding_failed)
+        for(int cpu=0;cpu<CPU_SETSIZE;++cpu)if(CPU_ISSET(cpu,&partition))allowed.push_back(cpu);
+        auto desired=capacityOrderedCorePlaces(allowed);
+        if(desired.empty())throw std::runtime_error("Native OpenMP core startup has no admitted physical places");
+        const auto encoding=encodeCorePlaces(desired);
+        const bool compatible=native==desired && omp_get_proc_bind()==omp_proc_bind_close;
+        publishCorePlaces(encoding);
+        if(compatible)
+            return NativeOpenMPCorePlaces(std::move(desired),encoding,::getpid(),::syscall(SYS_gettid));
+        if(argc<=0 || !argv)throw std::runtime_error("Native OpenMP startup requires original application argv");
+        std::vector<char *> original;
+        original.reserve(static_cast<std::size_t>(argc)+1);
+        for(int i=0;i<argc;++i)
         {
-            const auto &place = places[static_cast<std::size_t>(omp_get_thread_num()) % places.size()];
-            cpu_set_t worker;
-            CPU_ZERO(&worker);
-            for (const int cpu : place)
-                CPU_SET(cpu, &worker);
-            binding_failed |= sched_setaffinity(0, sizeof(worker), &worker) != 0;
+            if(!argv[i])throw std::runtime_error("Native OpenMP startup received incomplete application argv");
+            original.push_back(argv[i]);
         }
-        if (binding_failed)
-            throw std::runtime_error("Cannot bind OpenMP workers to their capacity-ordered physical cores");
+        original.push_back(nullptr);
+        // Native place tables are created before main(). Exec is the initial rank
+        // startup transaction, never a retry after MPI, model or request admission.
+        // Only this process's already-admitted partition crosses that transaction.
+        const ScopedOpenMPPartitionAffinity admitted_partition;
+        ::execv("/proc/self/exe",original.data());
+        throw std::runtime_error("Cannot enter native OpenMP core places: "+std::string(std::strerror(errno)));
+    }
+
+    void MPIBootstrapPhase::bindNativeCoreMaster(const NativeOpenMPCorePlaces &places)
+    {
+        if(places.process_!=::getpid() || places.thread_!=::syscall(SYS_gettid) || omp_get_level()!=0 ||
+           places.places_.empty() || nativeCorePlaces()!=places.places_ || omp_get_proc_bind()!=omp_proc_bind_close)
+            throw std::runtime_error("Foreign or stale native OpenMP core place admission");
+        cpu_set_t master;
+        CPU_ZERO(&master);
+        for(const int cpu:places.places_.front())CPU_SET(cpu,&master);
+        if(::sched_setaffinity(0,sizeof(master),&master)!=0)
+            throw std::runtime_error("Cannot bind rank master to its native OpenMP core place");
     }
 
     bool MPIBootstrapPhase::verifyStartupThreadAffinity(int required_numa,
@@ -590,19 +703,12 @@ namespace llaminar2
         omp_set_dynamic(0);
     }
 
-    void MPIBootstrapPhase::configureClusterRankThreads(const OrchestrationConfig &config)
+    void MPIBootstrapPhase::configureClusterRankThreads(const OrchestrationConfig &config,
+                                                       const NativeOpenMPCorePlaces &places)
     {
-        // Team binding below also runs on the calling OpenMP master. An unbound
-        // runtime (OMP_PROC_BIND=false) has no master place: binding narrows the
-        // caller to a singleton, so restore its exact incoming rank mask and let
-        // native control children inherit it. A bound runtime owns a permanent
-        // capacity-ordered master place instead; restoring its stale pre-main
-        // place afterward would overlap another worker, so it is retained.
-        std::optional<ScopedCallerThreadAffinity> preserve_caller;
-        if (omp_get_proc_bind() == omp_proc_bind_false)
-            preserve_caller.emplace();
         // Observe the whole admitted partition, not the pre-main first place.
-        // Retire this temporary mask before installing permanent team placement.
+        // Retire this temporary mask before installing permanent team placement:
+        // restoring an old master place afterward would overlap another worker.
         cpu_set_t affinity;
         CPU_ZERO(&affinity);
         {
@@ -619,7 +725,7 @@ namespace llaminar2
         MPILaunchConfig workers;
         workers.omp_threads_per_rank = config.n_threads > 0
             ? config.n_threads : static_cast<int>(physical_cores.size());
-        workers.omp_places = "cores";
+        workers.omp_places = places.encoding_;
         workers.omp_proc_bind = "close";
         MPIBootstrap::configureOpenMPEnvironment(MPIBootstrap::detectCPUTopology(), workers);
         // libgomp may already have parsed its environment before main(). The
@@ -627,10 +733,9 @@ namespace llaminar2
         omp_set_dynamic(0);
         omp_set_num_threads(workers.omp_threads_per_rank);
 
-        // libgomp has no runtime setter for OMP_PLACES, and its environment may
-        // have been parsed before these strings changed. Bind the persistent
-        // pool to the rank's own capacity-ordered physical cores instead.
-        bindOpenMPWorkersFastestFirst();
+        // Worker creation and replacement consume the same native place table.
+        // Only the caller needs restoration after temporary partition observation.
+        bindNativeCoreMaster(places);
     }
 
     BootstrapResult MPIBootstrapPhase::execute(const OrchestrationConfig &config,
@@ -653,9 +758,15 @@ namespace llaminar2
             if (mpi_env.is_mpi_process &&
                 (!config.hostfile.empty() || config.execution_rank_selection ||
                  automatic_multi_rank_discovery || config.mpi_procs > 0))
-                configureClusterRankThreads(config);
+            {
+                const auto places=prepareNativeCorePlaces(argc,argv);
+                configureClusterRankThreads(config,places);
+            }
             else if (mpi_env.is_mpi_process && selfBootstrappedCorePlaces())
-                bindOpenMPWorkersFastestFirst();
+            {
+                const auto places=prepareNativeCorePlaces(argc,argv);
+                bindNativeCoreMaster(places);
+            }
             return {BootstrapResult::Action::CONTINUE, 0};
         }
 
