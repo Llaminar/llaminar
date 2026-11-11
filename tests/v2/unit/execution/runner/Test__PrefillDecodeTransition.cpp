@@ -1475,6 +1475,8 @@ namespace
             handle.ready_event = const_cast<int *>(&resident_ready_event_token_);
             handle.live_state_epoch = 1;
             handle.publication_generation = 1;
+            handle.mtp_transaction = const_cast<MockInferenceRunner *>(this)->makeMockMTPTransactionLease(
+                resident_logical_state_request_count_);
             return handle;
         }
 
@@ -19670,70 +19672,101 @@ namespace
 #ifndef LLAMINAR_CB_HANDOFF_BASE_CAPTURE
     TEST_F(Test__ServingSlotHandoffLifecycle, DirectReplacementReleasesPredecessorLeases)
     {
-        /*
-         * Focused lease-lifetime proof using the mock's
-         * makeMockMTPTransactionLease to create a genuine
-         * DeviceResidentMTPTransactionLease with a live shared_ptr to
-         * DeviceResidentMTPTransactionState (mock stream/event/backing).
-         * The lease-bearing condition is injected through the runner's
-         * protected seam; the shared_ptr refcount is observed through the
-         * mock's owning shared_ptr as the bank co-owns it and then releases
-         * it. The test never retains the lease itself.
-         */
-        auto mock = std::make_unique<MockInferenceRunner>();
-        auto *mock_ptr = mock.get();
-        mock_ptr->setPrimaryDevice(DeviceId::cuda(0));
+        using sampling_math::DeviceGenerationLeadingRowDisposition;
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(
+                /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr,
+                /*mtp_token_coordination=*/true, false, DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/1);
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+        mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPShiftedRowReuseFromSidecar();
+        mock->enableMTPSidecarLogitsStreamHandoff();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->setVerifierAcceptedPrefixScript({1, 1});
+        mock->enableDeviceResidentGeneration(
+            DeviceGenerationTerminalRequestResult{
+                .tokens = {MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                           MockInferenceRunner::MTP_ARGMAX_TOKEN},
+                .remaining_token_count = 0,
+                .model_stopped = false,
+                .transaction_count = 1,
+                .accepted_speculative_token_count = 1,
+                .rejected_transaction_count = 0,
+                .consumed_verifier_row_count = 2,
+                .published_state_commit_count = 2,
+                .attempted_draft_token_count = 1,
+                .verifier_token_count = 2,
+                .final_draft_depth = 1,
+            });
 
-        {
-            // Scoped lease construction: the local lease copy is destroyed
-            // after the residentHandle takes ownership, so the only owners
-            // are the mock and the residentHandle.
-            auto lease = mock_ptr->makeMockMTPTransactionLease(/*request_count=*/1);
-            ASSERT_TRUE(lease.valid());
-            DeviceResidentLogicalSequenceStateHandle residentHandle;
-            residentHandle.mtp_transaction = std::move(lease);
-            residentHandle.request_count = 1;
-            residentHandle.device = DeviceId::cuda(0);
-            residentHandle.live_state_epoch = 1;
-            residentHandle.publication_generation = 1;
-            ASSERT_TRUE(residentHandle.mtp_transaction.valid());
+        // Predecessor admission: opens the device-resident controller and
+        // leaves a lease-bearing condition in the slot handoff bank. The
+        // mock's deviceResidentLogicalSequenceState() populates the
+        // mtp_transaction lease on the handle, so the bank co-owns the lease.
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const GenerationResult first = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(first.success()) << first.error;
 
-            // The mock + residentHandle: exactly 2 owners.
-            const auto prePublishCount = mock_ptr->mockMTPTransactionUseCount();
-            EXPECT_EQ(prePublishCount, 2u)
-                << "mock + local residentHandle should be the only owners";
+        const auto &predecessorBank = runner->servingSlotHandoffForTest();
+        EXPECT_FALSE(predecessorBank.retired);
+        ASSERT_TRUE(predecessorBank.hasPayload());
+        ASSERT_TRUE(predecessorBank.ready_mtp_condition_.has_value());
+        ASSERT_TRUE(predecessorBank.ready_mtp_condition_->resident_state.has_value());
+        const auto &predecessorResidentState =
+            *predecessorBank.ready_mtp_condition_->resident_state;
+        EXPECT_TRUE(predecessorResidentState.mtp_transaction.valid());
 
-            // Move the residentHandle into the runner's bank through the seam.
-            auto [runner, captured_mock] =
-                createRunner<TestableServingSlotRunner>(/*mtp_enabled=*/true);
-            (void)captured_mock;
-            runner->publishLeaseBearingConditionForTest(std::move(residentHandle));
+        // Record the use_count through the mock's owning shared_ptr.
+        const auto predecessorUseCount =
+            mock->mockMTPTransactionUseCount();
+        EXPECT_GE(predecessorUseCount, 2u)
+            << "the lease must be co-owned by the mock and the bank";
+        const uint64_t predecessorEpoch = predecessorBank.admission_epoch;
 
-            // After the move, the bank holds the lease. The mock still holds
-            // its own copy. The use_count reflects both.
-            const auto bankHeldCount = mock_ptr->mockMTPTransactionUseCount();
-            EXPECT_EQ(bankHeldCount, prePublishCount)
-                << "the move transfers ownership; total count unchanged";
+        // Direct replacement (no clearCache): the admission edge retires the
+        // predecessor through the single clearing owner (lease-first order:
+        // the resident lease is released before companion token/params),
+        // then opens the successor. The lease shared_ptr refcount drops.
+        ASSERT_TRUE(runner->prefill({6, 7}));
 
-            // Verify the bank state.
-            const auto &bank = runner->servingSlotHandoffForTest();
-            EXPECT_FALSE(bank.retired);
-            EXPECT_TRUE(bank.hasPayload());
-            EXPECT_TRUE(bank.ready_mtp_condition_.has_value());
-            EXPECT_TRUE(bank.ready_mtp_condition_->resident_state.has_value());
-            EXPECT_TRUE(bank.ready_mtp_condition_->resident_state->mtp_transaction.valid());
+        // The use_count drops: the bank's lease copy was released.
+        const auto postReplacementUseCount =
+            mock->mockMTPTransactionUseCount();
+        EXPECT_LT(postReplacementUseCount, predecessorUseCount)
+            << "the bank's lease copy must be released on replacement: "
+               "use_count " << predecessorUseCount << " → "
+               << postReplacementUseCount;
 
-            // Retire: the lease-first clearing order releases the condition
-            // (which holds the lease shared_ptr), dropping the refcount.
-            runner->clearCache();
-            EXPECT_TRUE(runner->servingSlotHandoffForTest().retired);
+        // The successor bank is fresh: all predecessor lease-bearing fields
+        // are cleared, the epoch advanced.
+        const auto &replacementBank = runner->servingSlotHandoffForTest();
+        EXPECT_FALSE(replacementBank.retired);
+        EXPECT_EQ(replacementBank.admission_epoch, predecessorEpoch + 1u)
+            << "the direct replacement must mint the next admission generation";
+        EXPECT_FALSE(replacementBank.ready_mtp_condition_.has_value());
+        EXPECT_FALSE(replacementBank.pending_mtp_condition_resident_state_.has_value());
+        EXPECT_FALSE(replacementBank.prelaunched_mtp_first_sidecar_resident_state_.has_value());
 
-            // The lease refcount drops to the mock's sole count.
-            const auto afterRetireCount = mock_ptr->mockMTPTransactionUseCount();
-            EXPECT_EQ(afterRetireCount, 1u)
-                << "the bank's lease copy must be released by retire(): "
-                << bankHeldCount << " → " << afterRetireCount << " (expected 1)";
-        }
+        // Recovery: the successor decode path works with the new lease.
+        const GenerationResult second = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(second.success()) << second.error;
+        const auto &successorBank = runner->servingSlotHandoffForTest();
+        ASSERT_TRUE(successorBank.ready_mtp_condition_.has_value());
+        EXPECT_GE(successorBank.ready_mtp_condition_->resident_state
+                      ->publication_generation,
+                  1u)
+            << "the successor must have a fresh publication";
+
+        // Ordering: two full admission/finish cycles on record.
+        EXPECT_THAT(mock->deviceGenerationLifecycleEvents(),
+                    ElementsAre("admission", "resident_verifier",
+                                "materialize:greedy", "launch", "finish",
+                                "admission", "resident_verifier",
+                                "materialize:greedy", "launch", "finish"));
     }
 #endif // LLAMINAR_CB_HANDOFF_BASE_CAPTURE
 
