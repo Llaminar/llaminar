@@ -206,3 +206,35 @@ pending; ab860378b content = 53461e5bc content, range-diff `=` 13/13 —
 verdict transfer is the reviewer's call). ctest -N inventory unchanged
 from reviewer-pinned content. No FF until Main's 18×14 current-binding
 acceptance.
+
+### #191 fix-back delivered: c00246613 (arm-addon, ~05:21Z) — IN REVIEW
+
+FF from 53461e5bc; 15 commits on 880429059; driver-only.
+- ROOT CAUSE of the earlier "closed" claims: acceptance writer emitted
+  schema-2 `artifacts`+`inputs` while the publication reader still queried
+  the schema-1 `digests` key — all retained-artifact verification silently
+  vanished. Reader REWRITTEN: strict schema check (schema==2),
+  missing-key refusal, per-entry verification of EVERY sealed artifact
+  against retained bytes and EVERY sealed input against the tree's file.
+- RG4 REPLACED with canonical-binding authentication: publication verifies
+  retained proof.o/proof.dis/proof.i bytes against the proof's OWN
+  object/disassembly/translation_unit sha256, tree checker/budget/envelope
+  files against the proof's recorded digests, and proof identity vs the
+  requested identity. No compile-DB shape invented; the DB now contains
+  real cmake-generated probe entries.
+- RG1 COMPLETE: every mkdir/cleanup/summary/status/retention/gate write
+  checked with its own rc; retention digests SOURCE bytes before the copy
+  AND the copy after (source-vs-copy equality); stale-receipt refusal
+  drops nothing (stale summary stays byte-identical); set -e restored OFF
+  after reconciliation (the inherited-errexit root cause).
+- RG2 COMPLETE: attached spellings refused (-Spath/-Bpath/-GNinja/-Cfile);
+  split -D rejects owned names; the configure no-op check compares CACHE
+  CONTENT (re-run must not change the cache) + home/cachefile/generator
+  before build.
+- Regression 12 tests OK device-free (real cmake-generated compile-DB
+  shape, post-accept mutation refused, missing-artifact named,
+  status/manifest injection knobs consumed by the coordinator).
+- Real tree: 9/9 PASS publication=authenticated (45 artifacts, 6 sealed
+  inputs).
+No FF/Main campaign until review + Main's 18×14 acceptance. Holds
+unchanged.
