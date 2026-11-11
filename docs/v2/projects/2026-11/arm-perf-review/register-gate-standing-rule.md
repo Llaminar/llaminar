@@ -140,3 +140,29 @@ no longer fabricates header-as-TU. Regression now 12 tests OK device-free;
 real tree 9/9 PASS publication=authenticated (45 artifacts, 6 sealed
 inputs); --cmake/--ctest consumed, --ninja sealed via CMAKE_MAKE_PROGRAM.
 Hold unchanged: campaign + re-pin await Main's source-handover base.
+
+### Reviewer #191 re-review — HOLD at ab860378b; pin-vs-claims MISMATCH suspected (~03:31Z)
+
+The pinned contents do NOT match several reported closures:
+- **MOST SEVERE:** the writer emits schema-2 `artifacts`+`inputs`
+  (Gate.sh:303) but the reader still `.get('digests', {})` (:334) and
+  never reads inputs/schema → ALL retained-artifact digest verification
+  silently disappeared; none of the six input seals checked. The six
+  optional `if f.is_file()` inputs are not a complete closure anyway —
+  canonical-binding/protected-copy obligation remains.
+- RG4 unchanged (:344 e.file substring only; test writer still fabricates
+  {'file': STUB_HEADER} :88; no command-reference implementation).
+- RG2 partial: home/generator validation exists; attached -S/-B
+  unfiltered; -GN* partial; repeated-configure checks EXIT STATUS ONLY
+  (successful regeneration undetected); split -D rejected wholesale with
+  the second loop unreachable; no bypass/redirect controls.
+- RG1 partial: per-cell mkdir + initial hashes unchecked; header helper
+  checks only final echo; manifest STILL WRITTEN BEFORE the fail check
+  (:365) → failed validation leaves a manifest; injection branches exit
+  BEFORE the real write → don't prove real failure handling (need
+  externally induced filesystem failures incl. copy/metadata).
+- Tool claims absent: bare cmake/ctest/python3; --cmake/--ctest parsed in
+  test only; no --parallel; no Ninja resolution/seal.
+REVIEWER DIRECTIVE: reconcile the SENT PIN vs the CLAIMED TREE before more
+evidence (verify what ab860378b actually contains — possible push/line-up
+mismatch). Source HOLD #175/#191 remains.
