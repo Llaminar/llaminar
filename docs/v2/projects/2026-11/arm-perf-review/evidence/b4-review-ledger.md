@@ -243,3 +243,18 @@ D6/D3/D2 stand. Reviewer re-verdict pending.
 CLOSED: A2 (228 assertions), A4 (token-1 boundary + endpoints), A5
 (coverage + scope limits), .8-negatives as total-mass validation.
 NONBLOCKING PROSE: :190, :251-254, head:259 wording.
+
+## DIAGNOSTIC ROUND-5 TIP (~23:33Z): 52fec643f + W3 window requested
+
+parent 688b0c14b; 2 files +77/-101. A1 sequencing (future case after the
+cap observations, current epoch 9/position 100, cap 5..10 corrected);
+A3(1) vector inequality; A3(2) DE-CONFOUNDED omitted-residual negative
+(same q both sides, positive control proves p, then only the
+rejected-token source changes → (5/16,5/16,3/16,3/16) vs p); prose
+(:190, observe-contract, head:259). PROCESS: next tip Linux-validated
+BEFORE re-review (reviewer 222/223 commitment).
+W3 (updated card, replaces d7/688 chain): build 52fec643f on .80 Release
+NEON_I8MM SHARED_CORE=ON, run BOTH Unit targets, JUnit into seal
+K14-B4-52FEC643, JUnit+tip to the reviewer together. .80 sequence: B1
+named-attribution export FIRST (~25 min, K14-B1ATTR-12675C956), then W3.
+Fallbacks: .79 after W2, or the station (device-free Unit work).
