@@ -132,3 +132,27 @@ record. **PROGRAM LESSON: when a correction is applied at the canonical
 location, synchronize the AUTHOR's local working copy in the same cycle —
 a diverged shadow draft silently reverts applied fixes on every future
 assembly (shadow-copy divergence, the label-vs-body class).**
+
+## DIAGNOSTIC RE-REVIEW #2 (~23:06Z): a42ac312b SOURCE HOLD — partial closures, A1-A5
+
+CLOSED: D6 arch split (source-closed); D3 tree mismatch (BackendNative +
+bit patterns + real grouped verifier call); D2 reused-U (production
+helpers, independent residual threshold).
+NEW FINDINGS (portable TU/fixtures):
+- A1: selector hard-failure controls cannot pass (has_high_water_ never
+  set; shortlist() unsorted/uncapped; lifecycle contradictions in the
+  fixtures; no request-epoch binding; stale v2 class comment).
+- A2: head-traffic assertion arithmetically false (227 executions vs
+  reported 5); rowBytes = logical prepared-operand volume, NOT measured
+  DRAM traffic.
+- A3: Mode P negatives test the wrong condition (same q both sides;
+  undercoverage q sums to .8 → silently-invalid PMF, not an omitted
+  residual).
+- A4: 64³ enumeration not exact for non-dyadic PMFs (midpoint-bin
+  quantization; predicted 1e-9 failure on the truthful positive is TEST
+  bias, not production defect); no loosened tolerances.
+- A5: coverage exceeds execution (heads[1] constructed-only; odd-N
+  branch dead; ID95 unclaimed-coverage mismatch; G still copies the
+  authored target token — header claim false).
+DISPOSITION: repair authorization intact; fixes stay in existing files;
+no new apparatus. Reviewer → spec 10137aa3 (§3-only) next.
