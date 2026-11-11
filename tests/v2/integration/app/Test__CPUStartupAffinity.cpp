@@ -214,6 +214,24 @@ namespace
     }
 
     /**
+     * @brief Exercise original guardian loans after actual native placement entry.
+     * @return Zero only when the same native process can use its authenticated shared backing.
+     */
+    int checkNativeStartupOwnership()
+    {
+        (void)NativeCPUPlacement::admission();
+        auto directory=MPISessionOwner::sharedDirectory();
+        if(!directory)throw std::runtime_error("Native startup lost its original shared directory loan");
+        const auto identity=directory->identity();
+        auto file=directory->createExclusive("native-core-entry-proof");
+        if(file.descriptor()<0)throw std::runtime_error("Native startup cannot use its original backing loan");
+        file.unlink();
+        std::cout<<"PASS native_entry_pid="<<::getpid()
+                 <<" shared_device="<<identity.device<<" shared_inode="<<identity.inode<<std::endl;
+        return 0;
+    }
+
+    /**
      * @brief Run the real parser/bootstrap and check the resulting MPI worker team.
      * @param argc Argument count passed through MPI bootstrap unchanged.
      * @param argv Arguments naming one device and one MPI rank.
@@ -267,6 +285,8 @@ int main(int argc, char **argv)
 
     try
     {
+        if (argc==2 && std::string(argv[1])=="--native-startup-ownership-contract")
+            return checkNativeStartupOwnership();
         if (argc==2 && std::string(argv[1])=="--cluster-master-placement-contract")
         {
             return checkClusterMasterPlacement(NativeCPUPlacement::admission());

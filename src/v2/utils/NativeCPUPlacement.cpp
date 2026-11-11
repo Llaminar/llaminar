@@ -38,7 +38,10 @@ namespace
         // Process-launch protocol owned here, not a live diagnostic/tuning switch.
         constexpr const char *kNativeCorePlacesEnvironment="LLAMINAR_NATIVE_CORE_PLACES";
 
-        /** @return Canonical explicit OpenMP syntax for an already ordered place list. */
+        /**
+         * @param places Already ordered physical-core places.
+         * @return Canonical explicit OpenMP environment syntax.
+         */
         std::string encodeCorePlaces(const CorePlaces &places)
         {
             std::ostringstream output;
@@ -56,7 +59,10 @@ namespace
             return output.str();
         }
 
-        /** @return This caller's native partition order, not a guessed global worker roster. */
+        /**
+         * @return This caller's native partition order, not a guessed worker roster.
+         * @throws std::runtime_error for invalid or overlapping native place geometry.
+         */
         CorePlaces nativeCorePlaces()
         {
             const int count=omp_get_partition_num_places();
@@ -124,7 +130,10 @@ namespace
     EntryPhase phase=EntryPhase::Unclaimed;
     std::unique_ptr<NativeOpenMPCorePlaces> admitted;
 
-    /** @return Whether every place is one distinct physical core. */
+    /**
+     * @param places Observed native CPU membership for each place.
+     * @return Whether every place is one distinct physical core.
+     */
     bool physicalPlaces(const CorePlaces &places)
     {
         if(places.empty())return false;
@@ -140,7 +149,10 @@ namespace
         return true;
     }
 
-    /** @return The admitted CPUs, independent of their current native place order. */
+    /**
+     * @param places Observed native CPU membership for each place.
+     * @return Admitted CPUs, independent of their native place order.
+     */
     std::vector<int> placeCpus(const CorePlaces &places)
     {
         std::vector<int> cpus;
@@ -149,7 +161,10 @@ namespace
         return cpus;
     }
 
-    /** @brief Reject a process that already owns MPI or a live worker pool. */
+    /**
+     * @brief Require original single-main-thread entry before runtime work.
+     * @throws std::runtime_error for a foreign thread, active MPI or existing workers.
+     */
     void requireInitialMainThread()
     {
         if(::syscall(SYS_gettid)!=::getpid() || omp_get_level()!=0)

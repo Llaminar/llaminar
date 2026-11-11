@@ -14,6 +14,7 @@
 #include "utils/MPIBootstrap.h"
 #include "utils/DebugEnv.h"
 #include "utils/MPISessionOwner.h"
+#include "fixtures/cpu/RecordedGB10NativeCorePlaces.h"
 #include "app/MPIBootstrapPhase.h"
 #include "backends/ComputeBackend.h"
 #include "backends/HardwareInventory.h"
@@ -499,6 +500,42 @@ TEST(Test__MPIBootstrap, NativeCorePlaceReceiptRejectsMalformedAndIncompatiblePu
     // Matching native/receipt bytes are insufficient when their capacity order is wrong.
     EXPECT_THROW(NativeCPUPlacement::validateCapacityReceipt(
         "v1;"+process+";{1},{0}",{{1},{0}},::getpid(),root),std::runtime_error);
+}
+
+/** @test Replay recorded GB10 kernel observations through the production place resolver. */
+TEST(Test__MPIBootstrap, RecordedGB10NativePlaceOrderReplay)
+{
+    using namespace llaminar2;
+    char pattern[]="/tmp/llaminar-native-place-replay-XXXXXX";
+    const char *root=::mkdtemp(pattern);
+    ASSERT_NE(root,nullptr);
+    struct Cleanup {std::filesystem::path path;~Cleanup(){std::filesystem::remove_all(path);}} cleanup{root};
+    ASSERT_EQ(test::kRecordedCorePlacePolicyVersion,1);
+    std::vector<int> allowed;
+    std::vector<std::vector<int>> expected;
+    for(const auto &cpu:test::kRecordedGB10CoreCapacities)
+    {
+        const auto directory=std::filesystem::path(root)/("cpu"+std::to_string(cpu.cpu));
+        std::filesystem::create_directories(directory/"topology");
+        {std::ofstream output(directory/"cpu_capacity");output<<cpu.capacity<<'\n';ASSERT_TRUE(output.good());}
+        {std::ofstream output(directory/"topology/thread_siblings_list");output<<cpu.physical_sibling<<'\n';ASSERT_TRUE(output.good());}
+        allowed.push_back(cpu.cpu);
+    }
+    for(const int cpu:test::kRecordedGB10CorePlaceOrder)expected.push_back({cpu});
+    for(int repeat=0;repeat<2;++repeat)
+        EXPECT_EQ(NativeCPUPlacement::capacityOrderedCorePlaces(allowed,root),expected);
+    const auto process=std::to_string(::getpid());
+    const std::string encoding="{19},{15},{16},{17},{18},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{0},{1},{2},{3},{4}";
+    EXPECT_NO_THROW(NativeCPUPlacement::validateCapacityReceipt("v1;"+process+';'+encoding,expected,::getpid(),root));
+    std::vector<std::vector<int>> stale;
+    std::string stale_encoding;
+    for(const int cpu:allowed)
+    {
+        stale.push_back({cpu});
+        if(!stale_encoding.empty())stale_encoding+=',';
+        stale_encoding+='{'+std::to_string(cpu)+'}';
+    }
+    EXPECT_THROW(NativeCPUPlacement::validateCapacityReceipt("v1;"+process+';'+stale_encoding,stale,::getpid(),root),std::runtime_error);
 }
 
 /** @test Late and foreign callers cannot reopen original entry or publish another exec. */
