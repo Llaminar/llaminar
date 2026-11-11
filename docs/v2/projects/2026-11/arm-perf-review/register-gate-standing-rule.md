@@ -480,3 +480,55 @@ inspection). Lane's argued position, for the reviewer to rule on:
    residual of #191.
 Lane's net: neither residual blocks admission; #1 cheaply closable.
 REVIEWER'S VERDICT GOVERNS.
+
+### Reviewer verdict on 27f49497 — HOLD; residuals RULED BLOCKING (~10:28Z)
+
+The admitted SDK/transitive/original-verifier-epoch gaps ARE BLOCKING RG3
+requirements — not named residuals that can accompany ACK.
+**NEW RG4 deterministic real-path mismatch:** the coordinator reads
+envelope JSON keys `proof.s`/`target.txt` (retention + final publication)
+but the UNCHANGED canonical CPUCodegenEnvelope.py:158–162 writes
+`assembly_file`+`assembly_sha256` and `target_manifest_file`+
+`target_manifest_sha256`. Only the SYNTHETIC writer was changed to invent
+`proof.s`/`target.txt` → actual canonical envelopes FAIL final publication
+as missing digests; 18 stub passes cannot prove compatibility. FIX: consume
+the existing canonical schema/validator unchanged; do not rewrite receipts
+or add a private second proof format.
+**RG3 still open:** desired hashes loaded from MUTABLE proof.json AFTER
+CTest; six optional inputs/compiler bytes hashed AFTER acceptance (not the
+sealed original verification closure); coordinated post-check proof+object
+changes can be self-consistent; transitive header/SDK/response/tool
+changes evade the six-file list; compiler/cache existence silently
+optional. FIX: canonical authorities against the original complete
+accepted closure/final epoch + exact retained mapping. Strict
+schema inventory/type/path requirements still missing (empty
+artifacts/inputs maps pass schema/key checks; no exact-9-cell/
+required-manifest coverage validation; tools.json not authenticated at
+final publication). ADD actual post-accept retained/input/tool mutation +
+incomplete-schema controls — not merely mutating an object against
+unchanged proof inside a stub CTest alias.
+**RG1 verified improvements** (per-cell mkdir, source/copy digests,
+manifest-after-refusal, real permission controls) BUT: initial sha
+substitutions unchecked; summary helper checks only last echo; dead phase
+helper present; process-substitution proof-digest extraction swallows
+parse failure/does not propagate subprocess status; manifest write is
+direct (partial write → partial manifest); only EACCES-before-write
+tested; chmod 0555 does NOT force EACCES for root/capable Linux runners —
+design robust failure controls, don't infer syscall failure from
+permissions.
+**RG2 verified improvements** (cache-content compare, home/cachefile/
+generator pre-build) BUT: attached -Spath/-Bpath/-Cfile still evade the
+filter (only '-C'/'-C=*' matched); non-Ninja attached generators too;
+cell type/ISA still checked after build; resolve+seal the ACTIVE Ninja
+into CMAKE_MAKE_PROGRAM, protect configuration, record actual selected
+tool identity; path+startup hash of cmake/ctest/python alone doesn't bind
+later invocations or the honored --cmake/--ctest test args.
+**--parallel 1 is NOT unrestricted and contradicts repository/operator
+requirements.** Use unrestricted --parallel; address actual cross-test
+shared-state ordering via proper resource ownership rather than
+serializing.
+No reviewer execution; owner 18/18 remains attributed. Preserve partial
+repairs; complete the consolidated contracts + real-format positive/
+direct controls before another ACK request. #58 stays open; no new
+issues/artifacts; lane-wide matrix not requested; Main final 18×14
+separate.
