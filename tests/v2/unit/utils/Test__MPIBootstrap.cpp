@@ -249,60 +249,98 @@ TEST(Test__MPIBootstrap, OpenMPTeamForkCounterDefaultAndPublication)
 
         constexpr std::uint64_t kMeasuredNotes = 1u << 20;
         // Per-owner note latency, measured under the ownership configurations
-        // production runs. Every measuring thread constructs its OWN
-        // same-thread owner scope inside the thread (thread-affine lifecycle
-        // end to end), the timed window excludes thread creation and
-        // teardown, each run verifies its exact cell and process deltas, and
-        // the concurrent variant divides the concurrent wall time by the
-        // notes ONE thread executed - aggregate throughput would understate
-        // the per-owner latency the decode path experiences. Basis labels say
-        // so explicitly; earlier no-walk figures do not transfer.
+        // production runs. The body matches what the basis label claims:
+        // owners==0 constructs NO scope; the scope configuration is built OFF
+        // the clock; the concurrent worker exists and has signalled readiness
+        // with its own same-thread scope before the start gate opens (the
+        // measuring main thread owns a cell too, so contention is between two
+        // real owners); the timed window contains the notes only; cell and
+        // process verification, the join and the teardown all happen after
+        // the clock stops; the LIFO teardown is enforced inner-first with the
+        // restored stack asserted. The concurrent figure divides by the notes
+        // ONE thread executed: per-owner latency, not aggregate throughput.
+        // Earlier no-walk figures do not transfer and are superseded.
         const auto measure = [&](int owners, bool concurrent) -> double
         {
             const std::uint64_t before = llaminar::v2::openMPTeamForkSnapshot();
-            const auto cost_start = std::chrono::steady_clock::now();
+            std::optional<llaminar::v2::OpenMPTeamForkScope> outer;
+            std::optional<llaminar::v2::OpenMPTeamForkScope> inner;
+            std::optional<llaminar::v2::OpenMPTeamForkScope> main_owner;
+            std::atomic<bool> worker_ready{false};
+            std::atomic<bool> start_gate{false};
+            std::atomic<bool> worker_notes_done{false};
+            std::atomic<bool> verify_gate{false};
+            std::thread worker;
             if (concurrent)
             {
-                std::atomic<bool> gate{false};
-                std::atomic<bool> worker_done{false};
-                std::thread worker([&]
+                main_owner.emplace(); // The measuring thread owns a cell too.
+                worker = std::thread([&]
                 {
-                    llaminar::v2::OpenMPTeamForkScope scope;
-                    gate.store(true, std::memory_order_release);
+                    llaminar::v2::OpenMPTeamForkScope scope; // Built off the clock.
+                    worker_ready.store(true, std::memory_order_release);
+                    while (!start_gate.load(std::memory_order_acquire))
+                        std::this_thread::yield();
                     for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
                         llaminar::v2::noteOpenMPTeamFork();
+                    worker_notes_done.store(true, std::memory_order_release);
+                    while (!verify_gate.load(std::memory_order_acquire))
+                        std::this_thread::yield();
                     EXPECT_EQ(scope.forks(), kMeasuredNotes);
-                    worker_done.store(true, std::memory_order_release);
                 });
-                while (!gate.load(std::memory_order_acquire))
+                while (!worker_ready.load(std::memory_order_acquire))
                     std::this_thread::yield();
-                llaminar::v2::OpenMPTeamForkScope scope;
-                for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
-                    llaminar::v2::noteOpenMPTeamFork();
-                EXPECT_EQ(scope.forks(), kMeasuredNotes);
-                while (!worker_done.load(std::memory_order_acquire))
-                    std::this_thread::yield();
-                worker.join();
             }
             else
             {
-                llaminar::v2::OpenMPTeamForkScope outer;
-                std::optional<llaminar::v2::OpenMPTeamForkScope> inner;
-                for (int owner = 1; owner < owners; ++owner)
+                if (owners >= 1)
+                    outer.emplace();
+                if (owners >= 2)
                     inner.emplace();
-                for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
-                    llaminar::v2::noteOpenMPTeamFork();
-                EXPECT_EQ(outer.forks(), kMeasuredNotes);
+            }
+            const auto cost_start = std::chrono::steady_clock::now();
+            if (concurrent)
+                start_gate.store(true, std::memory_order_release);
+            for (std::uint64_t note = 0; note < kMeasuredNotes; ++note)
+                llaminar::v2::noteOpenMPTeamFork();
+            if (concurrent)
+                while (!worker_notes_done.load(std::memory_order_acquire))
+                    std::this_thread::yield();
+            const auto cost_stop = std::chrono::steady_clock::now();
+            if (concurrent)
+                verify_gate.store(true, std::memory_order_release);
+            if (concurrent)
+            {
+                EXPECT_EQ(main_owner->forks(), kMeasuredNotes);
+                worker.join(); // Verified and destroyed on its own thread.
+            }
+            else
+            {
+                EXPECT_EQ(outer ? outer->forks() : kMeasuredNotes, kMeasuredNotes)
+                    << "owners " << owners;
                 if (inner)
-                    EXPECT_EQ(inner->forks(), kMeasuredNotes);
-                inner.reset(); // Enforced reverse teardown before the outer dies.
+                    EXPECT_EQ(inner->forks(), kMeasuredNotes) << "owners " << owners;
+                // The total is checked BEFORE the teardown probe so the
+                // probe's own fork stays out of the measured figure.
+                EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - before,
+                          kMeasuredNotes)
+                    << "nested owners " << owners;
+                inner.reset(); // LIFO: the inner dies first.
+                {
+                    llaminar::v2::OpenMPTeamForkScope restored;
+                    auto local_idle = [] {};
+                    OMP_WORKSHARE_REGION(local_idle);
+                    EXPECT_EQ(restored.forks(), 1u)
+                        << "the owner stack must be exactly the outer scope "
+                           "after the inner was torn down";
+                }
+                outer.reset(); // Only after the inner is gone and verified.
             }
             const auto cost_ns = static_cast<double>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - cost_start)
+                std::chrono::duration_cast<std::chrono::nanoseconds>(cost_stop - cost_start)
                     .count());
             const std::uint64_t expected_total =
-                kMeasuredNotes * (concurrent ? 2u : 1u);
+                kMeasuredNotes * (concurrent ? 2u : 1u) +
+                (concurrent ? 0u : 1u); // The nested branch's restoration probe.
             EXPECT_EQ(llaminar::v2::openMPTeamForkSnapshot() - before, expected_total);
             return cost_ns / static_cast<double>(kMeasuredNotes);
         };
