@@ -388,3 +388,21 @@ permanent-master contract fails on the applied route at 5b→763, and
 ClusterInventory shows a worker-count/bind-memory mismatch. Over to Main
 for the fix iteration; arm-sparks HOLDS .79 (no reruns) until the next
 corrected pin.
+
+### B12 attempt-2 deep-dive (arm-sparks → Main fix iteration, 2026-11-11 ~01:48Z)
+
+From run1.log — CPUClusterPermanentMasterPlacement @763:
+`Cluster permanent placement changed: requested=0 width=20 worker=15
+cpu=15 expected_first_cpu=0 observed=19,15,16,17,18,5,6,7,8,9,10,11,12,
+13,14,15,16,17,18,19` → the observed worker CPU list contains
+**15,16,17,18,19 TWICE** (and 0-4 + 14 absent) = the RAII-restore
+corruption PERSISTS on the applied route at the fixed build (the stale
+caller place still leaks into the permanent team binding; the tail of the
+list is polluted with fast-core IDs already used by the head).
+ClusterInventoryBootstrap: mpirun hwloc bind-memory WARNING + rank-0
+inventory mismatch (workers=20 affinity=ok but inventory sees 1) —
+worker-count/bind-memory mismatch on the mpirun route.
+Both under GOMP_SPINCOUNT=3000000 (test env default, MPIBootstrap.cpp:546),
+20T places=cores bind=close. Full logs: .79 /home/factory/idea25/
+b12-final/run1.log. .79 HELD for Main's next corrected pin; the tests-only
+runner (b12tests.sh, SHA-staged) is reusable as-is.
