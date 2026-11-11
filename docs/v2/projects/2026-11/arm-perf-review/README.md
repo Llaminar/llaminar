@@ -1763,3 +1763,20 @@ build until Main hands the lease back in writing; sparks quiesce ACK
 requested; queued items (greedy rider, M=1 window, B1 focused checks,
 Lane-2 window) locked behind the campaign. No new experiment/qual
 model.
+
+### .80 LEASE EXECUTION UNBLOCKED (coordinator, ~14:36Z)
+
+Sparks' definitive state (third message): **quiesced — nothing launched/
+written/built/touched on .80 since the lease transfer**; awaiting Main
+handback. The earlier "launching the full wrapper NOW" language did not
+materialize into a running process. FACTS STANDING: focused epoch-480
+phase completed BEFORE the lease transfer (attempt #3: BUILD3=0, 4/4
+PASS at 14:23:30 — Main's copied logs; readelf standalone = no core-DSO;
+BB evidence preserved untouched incl. prerequisites.json 13:37:27Z +
+preserve-bb-failed/ snapshot). Available to Main: sparks' staged
+campaign480-full.sh wrapper + fresh 480 contexts (build-campaign-480,
+campaign-src-480 @ 480de4344, ccache-warm) — use-or-replace is Main's
+call. Main proceeds with lease execution; own read-only dockerps at
+start per its standard practice. Sparks quiesced until lease returned
+in writing; lockbox (greedy rider, M=1 window, B1 checks, Dir-B, nsys
+smoke) queued behind the campaign.
