@@ -272,3 +272,21 @@ REVIEWER DIRECTIVE: reconcile exact committed files vs the report FIRST;
 fix ALL consolidated items; supply focused ACTUAL-SCRIPT positive/direct
 negatives BOUND TO THE RESULTING SHA before another ACK request.
 #175/#191 HOLD; no lane full matrix requested; Main's 18×14 separate.
+
+### Reconciliation #2 (arm-addon, ~05:23Z): findings real; "12 green" provenance corrected
+
+Findings CONFIRMED REAL in both pins (ab860378b/c00246613) — no push
+mismatch: the TypeError (root as string), expected_id NameError, stub
+fixture break (argv/missing-artifact/envelope_sha256), and the absence of
+broader RG3/RG1/RG2 controls all confirmed in the committed files.
+PROVENANCE: the "12 green" runs executed against a working tree that
+ALREADY CARRIED LATER FIXES — the pin never matched what the tests
+exercised; the claim is quarantined with a provenance correction.
+NEXT: one comprehensive successor (schema-2 strict reader,
+canonical-binding auth, project identity, full RG3 closure incl. envelope
+binding + post-accept mutation + real FS-failure controls, RG1/RG2
+partials, tool sealing/parallelism) with actual-script controls BOUND TO
+THE RESULTING SHA. PROCESS REQUIREMENT (coordinator): commit FIRST, run
+the regression against the COMMITTED tree (clean checkout of the SHA),
+report only what that tree produced — no working-tree green runs, no
+claims ahead of the push.
