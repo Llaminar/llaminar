@@ -478,3 +478,33 @@ A2 held per boundary.
   focused core-linked engine/stage/publication controls still needed when
   runnable (stub syntax is not their runtime proof). Whole-suite:
   unverified-at-lane → Main post-collection. No ACK, no A2 acceptance.
+
+### #187 fix-back landed: 372da1f6e (arm-addon3, 2026-11-11, ~01:00Z)
+
+Parent 47d2711a7; 4 files +195/−73; pushed. All four findings:
+- U1: LIFO repaired at the reintroduction site (inner-first teardown with
+  the restored stack ASSERTED before the outer dies; fresh owner observes
+  only its own fork; total check BEFORE the teardown probe — process_delta
+  = notes+1 documented); concurrent main thread gets its own owner cell
+  built off the clock (both concurrent owners real); worker verification/
+  teardown only after the clock stopped + a verify gate (timed window =
+  notes only); **MPIBootstrap helper BODY rewritten to match its label** —
+  ROOT CAUSE disclosed: the previous round's edit script died on an
+  assertion BEFORE writing, so the label changed over an unchanged aa31
+  body. Lesson applied: verify the write landed after multi-step edit
+  scripts.
+- U2: failure/prefill exclusions compare against a BASELINE snapshot
+  (unchanged per record: name/value/count) instead of the vacuous empty
+  check; discriminating positive control retained + sharpened (exactly one
+  fork, value 1, count 1).
+- U3: the mock hook's deadline is a FAILURE DETECTOR — THROWS before
+  leaving the hook and requires the completed competing count (5) at the
+  held boundary; competing forks can never run after window closure.
+- U4: gate-refusal control SPLIT: (a) all-off with predicates asserted
+  pre-call; (b) collection ON + omp selected + stage gate OFF with
+  predicates proving exactly that state — the empty result is attributable
+  to the gate alone; a removed gate flips the control to publishing.
+FOCUSED EVIDENCE: checker rc=0 (176/28/54); negatives 10/10; touched
+TeamFork* regressions 5/5; cost cell 2.25/4.61/6.96/16.14 ns per owner
+note. NOT RUN AT LANE (→ Main campaign): portability receipt + Linux-engine
+targets (dev-host syntax only). A2 held.
