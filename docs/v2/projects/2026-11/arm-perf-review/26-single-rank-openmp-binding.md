@@ -604,3 +604,29 @@ acknowledged. A2 held.
   unverified-at-lane → Main post-collection. No automatic A2 admission/B
   economy grant with eventual source ACK. ONE exact corrective successor;
   no new GitHub issue/tracking artifact.
+
+### #188 corrective successor: a05f7138a (arm-addon3, ~09:57Z) — IN REVIEW
+
+Parent 2d9ed7f70; 2 files +79/−42; worktree CLEAN at the committed SHA
+(focused evidence re-run against exactly the committed content).
+- (1) No-owner UB repaired: bootstrap LIFO teardown/attribution probe/
+  outer teardown run only `if (outer)`; owners==0 branch resets what it
+  holds and proves GENUINE no-owner; probe never dereferences a disengaged
+  optional; probe totals adjusted (Workshare-guard parity).
+- (2) Ownership restoration proven by EXACT TLS STACK POINTER IDENTITY:
+  both helpers save the original openMPTeamForkOwnerStack POINTER before
+  any scope exists and assert byte-exact identity after teardowns — nested
+  inner+outer (both), concurrent measuring thread's owner (both), and the
+  concurrent worker's own stack asserted ON ITS OWN THREAD around its own
+  thread-affine scope lifecycle (scope optional: constructed off-clock,
+  reset on own thread, identity asserted). Stale/extra links fail.
+  Surviving-outer notes+1 KEPT (proves walked stack == [restored, outer]);
+  post-teardown global-delta-only check REMOVED (not an ownership proof);
+  nested probe fork remains in total accounting (N+1).
+- Stale comments corrected: "amortized concurrent wall time INCLUDING the
+  rendezvous … readiness permits concurrency and does not prove scheduler
+  overlap" — no notes-only language remains (grep clean).
+FOCUSED EVIDENCE at the committed SHA: checker rc=0 (176/28/54); CLI
+negatives 10/10; TeamFork* regressions 5/5; fixture cost cell four variant
+lines. NOT RUN AT LANE (→ Main post-collection): portability receipt +
+Linux-engine targets. Issue freeze respected. A2 held.
