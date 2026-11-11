@@ -602,3 +602,19 @@ paths, its legacy-referenced targets would compile different bytes —
 irrelevant to the P1 cells, noted for future cross-host audits.
 r8 in flight with OneDNN reuse: configure + core build + canonical
 V2_Unit_CPUHalfOperands + four P1 cells with JUnit.
+
+### Station r8→r9: awk field bug in the v7 check (self-caught, transport correct)
+
+r8 exited 92 because the tracked-clean check read the WRONG awk field:
+$2 (the LINK path, an untracked symlink) instead of $4 (the TARGET
+path) — git status ran on the symlink and tripped the refusal. The
+transport itself was CORRECT: all 27 references linked with
+SHA256-recorded targets (legacy-transport.txt in the r8 archive); every
+TARGET verifies tracked-clean on the host (empty git status, ls-files
+confirms tracked). One-field fix applied ($2→$4, message names the
+actual target); cleanup had already removed all symlinks (tree clean).
+r8 receipts archived (attempt8-check-field-bug/). r9 relaunched with
+the corrected check — next report = the real one: exit + JUnit + SHAs.
+NOTE: second self-caught harness defect tonight (dirname peek, awk
+field) — both caught by the station's own verification before they
+could contaminate a receipt.
