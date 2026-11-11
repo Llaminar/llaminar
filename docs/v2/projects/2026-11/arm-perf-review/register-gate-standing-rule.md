@@ -334,3 +334,22 @@ base = 880/PR43.
 LANE OBLIGATIONS: link the fix commit(s) to issue 58; do NOT close it
 from working-tree green — closure requires exact-source evidence + the
 focused ACK + collection admission.
+
+### Addon context-rollover handoff written (~09:13Z) — #191 successor pending
+
+File: /Users/floriankinder/repo/arm-addon-notes/issue58-handoff.md
+(mirror /tmp/issue58-handoff.md). Verbatim git facts: remote tip =
+c00246613; /tmp/rb880 CLEAN (earlier stale-edit note corrected by disk);
+mac-final @ 686e25ef1 with ONE uncommitted change (publication root
+str→Path fix, diff pasted); feat base 880429059. Regression (working-tree
+provenance, NOT evidence): 9 FAIL/3 PASS, identical set to Main's run
+(passers: coordinator-owned-settings, stale-receipt-dir,
+status-write-failure). Debug status: stub-clobber theory DISPROVED for
+c002 (committed stub already writes proof.json last with real digests);
+final divergence (c002 test module + mac-final coordinator → proof.json
+MISSING from build dir) NOT root-caused. Path fix = working-tree only;
+no successor; HOLD unchanged. NEXT SESSION: start from Main's raw log
+(/tmp/arm-review-c002/actual-regression.log + tracker archive), chase the
+coordinator consumption path / generated-tree assembly (stub writer
+exonerated). Successor commits carry Refs #58; commit-first +
+clean-checkout + per-file SHAs + raw log path.
