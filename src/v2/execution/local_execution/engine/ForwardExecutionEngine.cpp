@@ -6396,6 +6396,12 @@ namespace llaminar2
          */
         void *execution_stream_used = nullptr;
 
+        /* A CPU decode cache miss executes its first step eagerly here rather
+         * than through executeCacheHit(). It owns the same per-step fork cell,
+         * so the first decode step is not silently missing from the summary
+         * that cache-hit steps publish. GPU first use returned above. */
+        const llaminar::v2::OpenMPTeamForkScope openmp_forks_at_exec_entry;
+
         // The graph and every producer stream belong to this participant.
         {
             LOG_DEBUG("[ForwardExecutionEngine] Getting device context for " << effective_input.device << "...");
@@ -6662,6 +6668,17 @@ namespace llaminar2
                 host,
                 host.getDeviceContext(effective_input.device),
                 is_decode, effective_input, start, stage_context);
+
+            // Same publisher, key and gate as the cache-hit step; a CPU cache
+            // miss never replays a captured graph.
+            if (is_decode && !effective_input.device.is_gpu())
+            {
+                llaminar::v2::publishOpenMPTeamForkSummary(
+                    openmp_forks_at_exec_entry,
+                    effective_input.device,
+                    [this, &signature] { return forwardGraphPerfContext(signature); },
+                    /*used_graph_replay=*/false);
+            }
         }
 
         if (success)

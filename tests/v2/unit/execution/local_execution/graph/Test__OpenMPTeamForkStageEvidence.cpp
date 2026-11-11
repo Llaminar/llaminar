@@ -226,7 +226,13 @@ TEST(OpenMPTeamForkStageEvidence, RetainedLoopPublishesExactPerStageCells)
     graph.addNode("retained_stage_1", std::make_unique<ForkingStage>("retained_stage_1", DeviceId::cpu(), 5), DeviceId::cpu());
     graph.addDependency("retained_stage_1", "retained_stage_0");
     graph.buildFastSchedule();
-    ASSERT_TRUE(executor.executeMultiDevice(graph, {{DeviceId::cpu(), &context}}));
+    // executeMultiDevice() is the generic name-ordered loop; only the sealed
+    // retained plan reaches the retained publication seam under test.
+    DeviceGraphExecutor::RetainedMultiDeviceExecutionPlan plan;
+    std::string error;
+    ASSERT_TRUE(executor.prepareRetainedMultiDeviceExecutionPlan(
+        graph, {{DeviceId::cpu(), &context}}, plan, &error)) << error;
+    ASSERT_TRUE(executor.executeRetainedMultiDevice(plan, &error)) << error;
 
     const auto records = llaminar2::PerfStatsCollector::snapshot({"omp"});
     const auto stage_value = [&records](const std::string &name) -> const PerfStatRecord *
